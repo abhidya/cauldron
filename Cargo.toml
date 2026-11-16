@@ -33,6 +33,8 @@ members = [
     # REL-6a3 rule B: a dev-dependency only; exports CAULDRON_ISOLATED=1 at a
     # test binary's load so every child a test spawns is isolated.
     "testkit/test-isolation",
+    # A dev-dependency of libs/spine only (its per-run scratch root).
+    "testkit/test-scratch",
     # Services whose code lives here. `tts` is the first, rewritten from
     # substrate `lib/tts`; `threads` follows.
     "services/tts",
@@ -41,6 +43,11 @@ members = [
     # REL-3.S1: the MINIMAL soup crate on the release branch: the curated
     # `cauldron-build` dataset and its loader, until the real soup lands.
     "libs/soup",
+    # The transaction spine, the store under a cauldron's soup. A
+    # library only: `cauldron create` makes a soup with it and `cauldron soup`
+    # reads and writes one offline. No soup daemon or other service uses it
+    # in this release.
+    "libs/spine",
 ]
 # `services/` holds the things that RUN — one declaration (`<name>.toml`) per
 # service, carrying its OWN build profile, and, for a service whose code lives
@@ -48,7 +55,7 @@ members = [
 # discovered by filename, so a service directory is not mistaken for one.
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 
 [workspace.dependencies]

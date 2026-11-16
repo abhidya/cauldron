@@ -21,16 +21,34 @@ name = "cauldron-launcher"
 path = "src/bin/cauldron-launcher.rs"
 
 
-# DG-5: every integration test is a module of tests/it/main.rs; add new ones
-# there, never as a new top-level tests/*.rs (skill core:cargo-lease).
+# Every integration test is a module of tests/it/main.rs; add new ones there,
+# never as a new top-level tests/*.rs (one test binary per crate keeps build
+# time and disk use down).
 [[test]]
 name = "it"
 path = "tests/it/main.rs"
+
+[features]
+# Test-only: builds the spine's fault-injection seam into this crate's
+# binaries, so a test can stop a real `cauldron soup import` at a named
+# commit stage (`SPINE_FAULT=decided`) instead of racing a kill against the
+# clock. Off in every normal build, where a set SPINE_FAULT is refused.
+#   cargo test -p cauldron --features fault-injection --test it soup
+fault-injection = ["spine/fault-injection"]
 
 [dependencies]
 env = { path = "../libs/env" }
 # REL-3.S1: `env create cauldron-build` seeds the curated dataset it owns.
 soup = { package = "soup-seed", path = "../libs/soup" }
+# `cauldron create` makes a cauldron's soup (one `ws` pool, grammar v6)
+# and `cauldron soup` opens it offline. Default features: the one-door gate
+# stays closed.
+spine = { path = "../libs/spine" }
+# `rename` / `remove` read a cauldron's own `spine.db` READ-ONLY for a
+# live tranche. The version and features spine already links.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# `soup import` reads records as JSON or YAML; the version spine already links.
+serde_yaml = "0.9"
 # R5.S2 (DEC-34): the MCP tool host the daemon owns.
 mcp-host = { path = "../libs/mcp-host" }
 serde = { workspace = true }

@@ -45,6 +45,9 @@
 //!    consumer* — never by sitting in the data path.
 
 pub mod alias;
+// Cauldrons live inside environments (`data/<env>/cauldrons/<name>/`).
+pub mod cauldron;
+pub use cauldron::{Cauldron, CauldronKind, CauldronMeta, CauldronSource, Fallback};
 // R9.CFG1 (E18-19): `[cli] interface` — which binary PATH's `cauldron` runs.
 pub mod cli_config;
 pub mod decl;

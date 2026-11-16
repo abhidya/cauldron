@@ -17,6 +17,7 @@ mod c7f7_create_cleanup_lock;
 mod c7f7_relaunch_reads_migrating;
 mod c7f7_rollback_owed;
 mod ctl;
+mod soup;
 mod daemon_owned_rows;
 mod demo_env_seed;
 mod drain_pin;

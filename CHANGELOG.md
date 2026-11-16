@@ -15,17 +15,58 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Ripples live.** Dumps set off ripples, and ripples write to the soup. The
   soup engine is hardened, and the Ledger shows real ripple events. Neither is
-  in 0.1.0, 0.1.1, 0.1.2 or 0.1.3.
+  in 0.1.0, 0.1.1, 0.1.2, 0.1.3 or 0.1.4.
 
 ### Not yet scheduled to a release
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.3, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.4, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.3, only an
+  the disable and trigger a fresh usage reading. Through 0.1.4, only an
   explicit enable clears it.
+
+## [0.1.4] — 2026-11-16
+
+A cauldron's soup as a knowledge graph you can use from Claude Code. Nothing
+new runs in the background: there is still no soup engine and no ripples, no
+new service or daemon, and nothing changes for an existing install until you
+run one of the new commands. The soup here is a store you write and read
+with the `cauldron` command.
+
+### Added
+
+- **The soup's schema is published: `schema/soup/workspace-v6/`.** The soup's
+  grammar as JSON (`grammar.json`), one JSON Schema per node type, the edge
+  table (`edges.json`), and a README for anyone writing records from outside.
+  It is generated from the soup's grammar, and a test fails if the two drift.
+- **`cauldron create <cauldron> --env <env>`** makes a cauldron, with its own
+  empty soup, under `data/<env>/cauldrons/<cauldron>/`, and `cauldron list
+  --env <env>` lists an environment's cauldrons. (`--seed` is not in this
+  release and is refused.)
+- **`cauldron soup import | regions | get | nodes | search | region`.** Land
+  records written in the published shape into a cauldron's soup, as one
+  all-or-nothing write after each record is checked against the soup's
+  grammar (`--dry-run` checks without writing; `--remint` gives the records
+  fresh ids). Then read them back: every region, one region with its
+  neighbours and members, nodes newest first, a word search over handles and
+  bodies, and whole records by id. Every command names its environment, prints
+  JSON, and exits non-zero on a refusal; the reads never write. An import that
+  is interrupted lands nothing until `cauldron soup recover` settles the soup:
+  recover either finishes that import (it says `landed`, with the ids; do not
+  import that batch again) or rolls it back (it says `rolled-back`; importing
+  it again is safe), and the next import can then run.
+- **A Claude Code plugin: `claude-code/cauldron/`.** A curator subagent and a
+  `/cauldron:curate` command that turn notes and findings into soup records
+  and land them with `cauldron soup import`, plus a copy of the schema.
+  `claude-code/cauldron/README.md` says how to install it and walks through a
+  session.
+
+### Changed
+
+- **`cauldron env create` accepts `--no-engine`.** This release has no engine,
+  so it changes nothing, and the command says so.
 
 ## [0.1.3] — 2026-10-31
 
@@ -214,7 +255,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/broomstick-ai/cauldron/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/broomstick-ai/cauldron/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/broomstick-ai/cauldron/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/broomstick-ai/cauldron/compare/v0.1.0...v0.1.1

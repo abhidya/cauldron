@@ -917,6 +917,16 @@ const TEST_SPAWN_ALLOWED: &[(&str, &str)] = &[
         "the daemons' own suites start their own binary on ephemeral ports (and read keychain identities read-only); \
          outside the face/CLI reach — the weaker ones are listed in REL-6a5's report",
     ),
+    // The bin-exe token is split (as drive_isolation's detector splits it),
+    // so this reason text never spells it and is not read as a raw spawn of
+    // the face.
+    (
+        "libs/spine/tests/",
+        concat!(
+            "the spine's kill tests run their OWN `spine_victim` binary (CARGO_BIN_",
+            "EXE_spine_victim) against a scratch store; it controls no daemon and dials nothing"
+        ),
+    ),
 ];
 
 /// A dial line in a test source that names a live port.

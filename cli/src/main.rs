@@ -70,7 +70,18 @@
 //! supervisor process. See [`verb_status`].
 
 mod bundle;
+// The `--seed` hook `cauldrons::create` calls; refuses here.
+mod cauldron_seed;
+// `create` and `list` are wired; rename / remove stay unwired
+// in this release, so their code is unused here.
+#[allow(dead_code)]
+mod cauldrons;
 mod ctl;
+// `cauldron soup import | recover | regions | get | nodes |
+// search | region`, the soup offline.
+mod soup;
+// `ensure_soup_cauldron` only; this release has no engine.
+mod engine;
 mod daemon;
 mod envs;
 mod gc;
@@ -112,6 +123,9 @@ const VERBS: &[(&str, &str)] = &[
     ("supervisions", "every act this environment's supervisor performed on a service, and WHY"),
     ("tui", "the Cauldron face (the default); --chat for the chat face"),
     ("ctl", "the coordinator's face, headless: dump | frame | node (`ctl help`)"),
+    ("create", "make a cauldron (cauldrons/<name>/, with its own empty soup) in this environment"),
+    ("list", "the cauldrons of this environment (the implicit legacy one marked)"),
+    ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region (`soup help`)"),
 ];
 
 const USAGE: &str = "\
@@ -126,6 +140,17 @@ cauldron — the Cauldron entry point
                                      stdin) exactly as the send key does; `ctl frame` is one
                                      `--dump` frame; `ctl node <id>` reads one soup node.
                                      JSON out, non-zero on refusal (`cauldron ctl help`)
+    cauldron create <cauldron> [--env <e>]
+                                     make a cauldron: cauldrons/<name>/ with its own
+                                     empty soup (one pool, `ws`, grammar v6)
+    cauldron list [--env <e>] [--json]
+                                     the cauldrons of an environment; writes nothing
+    cauldron soup import|recover|regions|get|nodes|search|region ...
+                                     a cauldron's soup, offline: land records in the
+                                     published schema shape as one all-or-nothing
+                                     write; settle an interrupted import; list
+                                     regions; read and search nodes.
+                                     JSON out, non-zero on refusal (`cauldron soup help`)
     cauldron --build-stamp           the commit THIS binary was built from, as
                                      one `key=value` line, the format it reads
                                      off every service it launches
@@ -153,7 +178,7 @@ cauldron — the Cauldron entry point
                                      (refuses to overwrite one without --force)
     cauldron envs   [--probe]        every environment in this root, side by side
     cauldron env list [--probe]      the same listing, under the `env` verb
-    cauldron env create <name> [--auto-restart] [--from <env> [--pins-only]]
+    cauldron env create <name> [--auto-restart] [--from <env> [--pins-only]] [--no-engine]
                                      make a new environment: its own data root,
                                      seam table, logs, hold and launchd label.
                                      --from SEEDS it: the source's pins, a fresh
@@ -334,6 +359,9 @@ fn run() -> Result<i32> {
             Ok(2)
         }
         Some("ctl") => ctl::verb_ctl(&argv[1..]),
+        Some("soup") => soup::verb_soup(&argv[1..]),
+        Some("create") => cauldrons::verb_create(&argv[1..]),
+        Some("list") | Some("ls") => cauldrons::verb_list(&argv[1..]),
         Some("daemon") => daemon::verb_daemon(&argv[1..]),
         Some("install") => launchd::verb_install(&argv[1..]),
         Some("uninstall") => launchd::verb_uninstall(&argv[1..]),
@@ -371,7 +399,10 @@ fn run() -> Result<i32> {
 /// The verbs that start, stop, restart, drain, pin or otherwise control a
 /// daemon or its launchd job (REL-6a5, REL-6a3-I F1).
 const CONTROL_VERBS: &[&str] =
-    &["daemon", "install", "uninstall", "promote", "restart", "start", "stop", "down", "pin", "rollback", "env", "test"];
+    &["daemon", "install", "uninstall", "promote", "restart", "start", "stop", "down", "pin", "rollback", "env", "test",
+      // `create` writes a cauldron; `soup import` writes its
+      // soup, and the soup reads share the guard.
+      "create", "soup"];
 
 /// **REL-6a5: A DAEMON-CONTROL VERB IN AN ISOLATED PROCESS ACTS ONLY ON A
 /// SCRATCH ROOT.** Isolated (`env::egress::process_isolation`: the marker,
@@ -413,7 +444,7 @@ mod rel6a5_control_verbs {
     #[test]
     fn rel6a5_a_control_verb_in_an_isolated_process_acts_only_on_a_scratch_root() {
         let real = Path::new("/Users/someone/.cauldron");
-        for v in ["start", "stop", "restart", "daemon", "install", "uninstall", "promote", "down", "pin", "rollback", "env", "test"] {
+        for v in ["start", "stop", "restart", "daemon", "install", "uninstall", "promote", "down", "pin", "rollback", "env", "test", "create", "soup"] {
             assert!(admit_control_verb_with(v, real, Some(real), "a test").is_err(), "`{v}` admitted on his real root");
             assert!(admit_control_verb_with(v, &real.join("x"), Some(real), "a test").is_err(), "`{v}` admitted inside it");
             assert!(admit_control_verb_with(v, Path::new("/tmp/scratch/.cauldron"), Some(real), "a test").is_ok(), "`{v}` refused on scratch");

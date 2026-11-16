@@ -49,6 +49,7 @@ scripts/prune-target
 scripts/test-prune-target
 apps/tui/HANDOFF.md
 scripts/personal-patterns.private
+scripts/history-fixtures.private
 services/threads/docs/R1.S4-promote-provenance-gate.patch
 services/threads/docs/account-model-changes.md
 services/threads/docs/aui-data-contract.md
@@ -66,6 +67,7 @@ libs/tui-render/PROVENANCE.md
 libs/projects/PROVENANCE.md
 libs/aui-wire/PROVENANCE.md
 libs/term-shell/PROVENANCE.md
+libs/spine/tests/grammar_v6_data_source.rs
 scripts/prove-warnings
 scripts/prove-compile-gate
 scripts/prove-supervisor

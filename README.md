@@ -101,12 +101,13 @@ for your family. They don't mix: each environment's data is its own, under
 
 ## What is in this release
 
-This is **0.1.3**, the V1 interface: two tab bars, a first-run screen, the
+This is **0.1.4**, the V1 interface: two tab bars, a first-run screen, the
 Ledger on the environment's own data, the real account pool under Status →
 Tokens, Config → Accounts, secret human actions, and `cauldron ctl`. 0.1.3
-adds account polish: account settings open read-only, with a notice, when the
+added account polish: account settings open read-only, with a notice, when the
 install's key is wrong, and a face stops waiting on a service that never
-answers. Ripples and the soup engine arrive in 0.2.0. [CHANGELOG.md](CHANGELOG.md) lists every change.
+answers. 0.1.4 adds a cauldron's soup as a knowledge graph you can use from
+Claude Code (see [below](#using-a-soup-from-claude-code)). Ripples and the soup engine arrive in 0.2.0. [CHANGELOG.md](CHANGELOG.md) lists every change.
 
 cauldron has three parts:
 
@@ -257,6 +258,17 @@ shows it. Open it with:
 cauldron env create cauldron-build
 cauldron --env cauldron-build
 ```
+
+## Using a soup from Claude Code
+
+`cauldron create` makes a cauldron with its own soup, and `cauldron soup
+import | regions | get | nodes | search | region` write records into it and
+read them back, with no service running (`cauldron soup recover` settles a
+soup after an interrupted import). The records follow the published
+schema in [`schema/soup/workspace-v6/`](schema/soup/workspace-v6/README.md).
+The Claude Code plugin in [`claude-code/cauldron/`](claude-code/cauldron/README.md)
+adds a curator subagent that writes and lands those records for you; its
+README says how to install it and walks through a session.
 
 ## Known limitations
 

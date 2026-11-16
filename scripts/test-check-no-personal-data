@@ -67,6 +67,14 @@
 #       GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_TEMPLATE_DIR: each changes a
 #       plain `git archive` (sentinel) and none changes build-public-archive's
 #       bytes (== a fresh clone's archive).
+#   H1-H6   history patterns: a line that shipped at the base is not judged;
+#           a new line, a non-allow-listed UUID and a new path are caught;
+#           an allow-listed synthetic UUID passes; a kind with no sample, a
+#           sample that does not match, and a base that is not a commit: rc 2.
+#   H7      the history self-test: a fixtures file whose bad lines are all
+#           caught and good lines all clean passes and says so; a bad line
+#           that is not caught, a good line that is, a named file that is
+#           missing, and an unknown kind: rc 2, the line never quoted.
 #   A16 (F3) bz2 with a damaged block magic: fails closed, its intact later
 #       block is recovered and caught, also behind an allow entry; a corrupt
 #       first block: the second is caught; opposed: text starting `BZh5` and
@@ -97,7 +105,10 @@ if git -C "$HERE/.." ls-files -z | git -C "$HERE/.." check-attr -z --stdin expor
     | tr '\0' '\n' | paste - - - | awk -F'\t' '$3=="set"{f=1} END{exit !f}'; then src_private=1; fi
 REAL=0
 if [ -f "$SRC_PATTERNS" ]; then
-  REAL=1; cp "$SRC_PATTERNS" "$W/patterns"
+  REAL=1
+  # History lines name a base commit of THIS repository, which the scratch
+  # repositories below do not hold; the H cases plant their own.
+  grep -v '^history' "$SRC_PATTERNS" > "$W/patterns" || true
 elif (( src_private )); then
   fail "PRE scripts/personal-patterns.private is missing from a private tree"
   echo "test-check-no-personal-data: 1 FAILED"; finish 1
@@ -635,6 +646,83 @@ drop .gitattributes private-note.md
 # A10 — the published guard states none of the identifiers it protects.
 if pmatch < "$W/guard.orig"; then fail "A10 the guard under test carries a personal literal"
 else pass "A10 the guard under test carries no personal literal"; fi
+
+# ---- H1-H6: history patterns, matched only on lines new since a base -------
+# A synthetic history set: the base is this scratch repository's own HEAD.
+# UUID canaries are made at run time, so this file carries none.
+U1=$(python3 -c 'import uuid; print(uuid.uuid4())'); U2=$(python3 -c 'import uuid; print(uuid.uuid4())')
+hist_on() {  # [extra lines...]
+  cp "$W/patterns" scripts/personal-patterns.private
+  { printf 'history-base\t%s\n' "$(git rev-parse HEAD)"
+    printf 'history\tstep\t\\bQZ[0-9]+\\.S[0-9]+\n'
+    printf 'history\tuuid\t[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\n'
+    printf 'history-allow\tuuid\t00000000-0000-4000-8000-[0-9]{12}\n'
+    printf 'history-sample\tstep\tsee QZ5.S1\n'
+    printf 'history-sample\tuuid\t%s\n' "$U1"
+    for l in "$@"; do printf '%s\n' "$l"; done
+  } >> scripts/personal-patterns.private
+}
+printf 'old QZ1.S1 line\n' > hist-old.txt; git add hist-old.txt; git commit -qm hist-base
+hist_on
+run
+[ "$RC" = 0 ] && pass "H1 a history hit that already shipped at the base is not re-judged: rc 0" || { fail "H1 old line: rc=$RC (want 0)"; show; }
+printf 'new QZ7.S2 line\n' >> hist-old.txt; git add hist-old.txt
+run
+[ "$RC" = 1 ] && has "HISTORY: hist-old.txt:2: [step]" && pass "H2 a new line with a step code: caught" || { fail "H2 new step line: rc=$RC (want 1)"; show; }
+git checkout -q HEAD -- hist-old.txt
+printf 'thread %s\n' "$U2" > hist-new.txt; git add hist-new.txt
+run
+[ "$RC" = 1 ] && has "HISTORY: hist-new.txt:1: [uuid]" && pass "H3 a UUID outside the allow list: caught" || { fail "H3 uuid: rc=$RC (want 1)"; show; }
+printf 'thread 00000000-0000-4000-8000-000000000007\n' > hist-new.txt; git add hist-new.txt
+run
+[ "$RC" = 0 ] && pass "H4 opposed: an allow-listed synthetic UUID: rc 0" || { fail "H4 synthetic uuid: rc=$RC (want 0)"; show; }
+drop hist-new.txt
+printf 'x\n' > QZ3.S4-notes.txt; git add QZ3.S4-notes.txt
+run
+[ "$RC" = 1 ] && has "HISTORY: QZ3.S4-notes.txt: path" && pass "H5 a new path named with a step code: caught" || { fail "H5 path: rc=$RC (want 1)"; show; }
+drop QZ3.S4-notes.txt
+hist_on 'history	cite	\breport [0-9]{4}\b'
+run
+[ "$RC" = 2 ] && pass "H6a a history kind with no sample: rc 2" || { fail "H6a no sample: rc=$RC (want 2)"; show; }
+hist_on 'history-sample	step	nothing here'
+run
+[ "$RC" = 2 ] && pass "H6b a history sample its kind cannot find: rc 2" || { fail "H6b broken sample: rc=$RC (want 2)"; show; }
+cp "$W/patterns" scripts/personal-patterns.private
+{ printf 'history-base\t%s\n' 0123456789012345678901234567890123456789
+  printf 'history\tstep\t\\bQZ[0-9]+\\.S[0-9]+\n'; printf 'history-sample\tstep\tQZ1.S1\n'; } >> scripts/personal-patterns.private
+run
+[ "$RC" = 2 ] && pass "H6c a history base that is not a commit here: rc 2" || { fail "H6c bad base: rc=$RC (want 2)"; show; }
+cp "$W/patterns" scripts/personal-patterns.private
+run
+[ "$RC" = 0 ] && pass "H6d opposed: no history lines: rc 0" || { fail "H6d no history: rc=$RC (want 0)"; show; }
+
+# H7: the history self-test. The fixtures file stays untracked, so it is
+# never in the archive.
+fx_on() {  # <fixture lines...>
+  hist_on 'history-fixtures	hist-fixtures.txt'
+  : > hist-fixtures.txt
+  for l in "$@"; do printf '%s\n' "$l" >> hist-fixtures.txt; done
+}
+fx_on 'bad	step	see QZ9.S9' 'good	a plain line'
+run
+[ "$RC" = 0 ] && has "history self-test: 1 known-bad lines caught, 1 known-good lines clean" \
+  && pass "H7a a fixtures file that passes: rc 0, and the guard says so" || { fail "H7a passing fixtures: rc=$RC (want 0)"; show; }
+fx_on 'bad	step	see QZ9.S9' 'bad	step	QZ-canary-not-a-step' 'good	a plain line'
+run
+[ "$RC" = 2 ] && has "line 2: a known-bad step line is not caught" && ! has "QZ-canary-not-a-step" \
+  && pass "H7b a known-bad line the patterns miss: rc 2, named by line, not quoted" || { fail "H7b missed bad line: rc=$RC (want 2)"; show; }
+fx_on 'bad	step	see QZ9.S9' 'good	QZ4.S4 is no good line'
+run
+[ "$RC" = 2 ] && has "line 2: a known-good line is caught as step" && ! has "QZ4.S4 is no good" \
+  && pass "H7c a known-good line the patterns catch: rc 2, not quoted" || { fail "H7c caught good line: rc=$RC (want 2)"; show; }
+fx_on 'bad	nosuchkind	see QZ9.S9' 'good	a plain line'
+run
+[ "$RC" = 2 ] && pass "H7d a fixture naming an unknown kind: rc 2" || { fail "H7d unknown kind: rc=$RC (want 2)"; show; }
+hist_on 'history-fixtures	no-such-fixtures.txt'
+run
+[ "$RC" = 2 ] && has "cannot be read" && pass "H7e a named fixtures file that is missing: rc 2" || { fail "H7e missing fixtures: rc=$RC (want 2)"; show; }
+rm -f hist-fixtures.txt
+cp "$W/patterns" scripts/personal-patterns.private
 
 # ---- S11-S17 (REL-4.S7g), now against the archive -----------------------
 printf 'a\0b\nsee %s\n' "$HOMEPATH" > bin.dat; git add bin.dat
