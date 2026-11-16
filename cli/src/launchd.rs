@@ -737,7 +737,7 @@ pub(crate) fn running_job_guard(
     let found = loaded_jobs_for_env(q, dom, &env.name, configured);
     if let Some(why) = &found.list_failed {
         eprintln!(
-            "cauldron: WARNING: `launchctl list` could not be read ({why}), so a job for '{}'              under an UNKNOWN label prefix cannot be detected. Only the configured, default and              legacy labels were checked.",
+            "cauldron: WARNING: `launchctl list` could not be read ({why}), so a job for '{}' under an UNKNOWN label prefix cannot be detected. Only the configured, default and legacy labels were checked.",
             env.name
         );
     }
@@ -758,7 +758,7 @@ pub(crate) fn running_job_guard(
             cmd.push_str(" --dry-run");
         }
         eprintln!(
-            "cauldron: REFUSED: a cauldron job for environment '{}' is already loaded (listed              above). Installing over it boots it out and bootstraps it again, which RESTARTS              that running holder. Nothing was written or loaded.\n\
+            "cauldron: REFUSED: a cauldron job for environment '{}' is already loaded (listed above). Installing over it boots it out and bootstraps it again, which RESTARTS that running holder. Nothing was written or loaded.\n\
              cauldron: To replace it and restart it, run exactly:\n\
              cauldron:   {cmd}",
             env.name

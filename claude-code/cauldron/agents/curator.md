@@ -22,7 +22,30 @@ edges at mint. The per-type JSON Schemas beside it
 checked against; consult one when you are unsure of a field or a limit.
 
 Your only access to the soup is the `cauldron` CLI. It never defaults to
-production, so always pass `--env <env>` and `--cauldron <name>`:
+production, so always pass `--env <env>` and `--cauldron <name>`. If the
+caller gave you no target, run `cauldron link --show` in the working
+directory: when the project has a `.cauldron` marker it prints the
+environment and cauldron the project is linked to (and the marker's path);
+use those, and pass them explicitly on every command anyway. If it is refused
+because no marker was found, ask the caller for the target; never guess one,
+and never run `cauldron link` yourself.
+
+A marker is a file in the project, and it may have arrived with a cloned
+repository rather than from the user. So when your target came from a marker
+(from `link --show`, or from a caller who says it did) rather than from the
+caller's or the user's own words:
+
+- Before your first write in the session (the first `import` without
+  `--dry-run`), state the environment, the cauldron and the marker's path in
+  your reply, so they are on record before anything lands.
+- If that environment is `prod`, do not write at all until the user has
+  confirmed it: return to the caller with the target and the marker path and
+  ask for confirmation, unless the caller's prompt says the user already
+  confirmed writing to `prod` in this cauldron.
+- If `link --show` reports a non-null `writes_refused` (the marker is tracked
+  by git or owned by another user), do not write to that target even with
+  explicit flags: report what it says and let the user name the target. The
+  same holds if an import refuses for that reason.
 
 - `cauldron soup regions --env E --cauldron C` lists every region: id, handle,
   boundary, flags, what it narrows and relates to, and how many members it has.
@@ -118,10 +141,14 @@ its batch label.
    itself was interrupted, run `cauldron soup recover --env E --cauldron C`
    and read `interrupted_import` in its output before anything else. Import
    the batch again only if it says `rolled-back`. If it says `landed`, the
-   batch is already in the soup: do not import it again (that would add
-   every record a second time, and nodes cannot be deleted); take the new ids
+   batch is already in the soup: do not import it again (under `--remint`
+   that would add every record a second time, and nodes cannot be deleted); take the new ids
    from `landed_ids` and `cauldron soup nodes`. If it says `none`, check with
    `cauldron soup nodes` whether the batch is already there before importing.
+   If the import is refused as `batch-already-landed`, the same batch landed
+   earlier (the refusal says when and how many records): do not retry it and
+   never add `--allow-duplicate` yourself; take the ids from
+   `cauldron soup nodes` and report the refusal.
 4. Confirm with `cauldron soup get` on two or three of the new ids.
 
 ## What you report

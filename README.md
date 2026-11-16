@@ -266,6 +266,12 @@ import | regions | get | nodes | search | region` write records into it and
 read them back, with no service running (`cauldron soup recover` settles a
 soup after an interrupted import). The records follow the published
 schema in [`schema/soup/workspace-v6/`](schema/soup/workspace-v6/README.md).
+`cauldron link <cauldron> --env <env>` writes a `.cauldron` marker into a
+project directory, so `cauldron soup` run inside the project finds its
+cauldron without `--env` and `--cauldron` (explicit flags still win). The
+marker names cauldrons on this machine only, so add `.cauldron` to the
+project's `.gitignore`; writes refuse to take their target from a marker that
+git tracks.
 The Claude Code plugin in [`claude-code/cauldron/`](claude-code/cauldron/README.md)
 adds a curator subagent that writes and lands those records for you; its
 README says how to install it and walks through a session.

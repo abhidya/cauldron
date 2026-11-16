@@ -177,7 +177,7 @@ impl SpineError {
                 spine_version,
                 binary_version,
             } => format!(
-                "refusing to open: this spine carries spine schema version {spine_version} and this                  binary knows only {binary_version}; an older binary's recovery would abort a live                  tranche's anchor row"
+                "refusing to open: this spine carries spine schema version {spine_version} and this binary knows only {binary_version}; an older binary's recovery would abort a live tranche's anchor row"
             ),
             SpineError::NotYet { what, step } => {
                 format!("{what} is not built in this build; it lands with {step}")

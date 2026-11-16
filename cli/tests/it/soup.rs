@@ -39,7 +39,18 @@
 //!   deterministic: stopped after its decision, `recover` finishes it and
 //!   says `landed` with the ids and "do NOT import that batch again", and
 //!   the soup holds one copy; stopped before it, `recover` rolls it back,
-//!   says importing again is safe, and doing so leaves one copy.
+//!   says importing again is safe, and doing so leaves one copy. A
+//!   re-import of the landed batch is refused as `batch-already-landed`.
+//! - **S11** `--pool` must be a pool name, never a path, on every verb.
+//! - **S12** a batch identical to one that landed is refused as
+//!   `batch-already-landed` (file or directory, dry run or real, with or
+//!   without `--remint`), naming when and how many; a different batch or
+//!   another cauldron is not; `--allow-duplicate` lands a second copy.
+//! - **S13** `cauldron link` writes a `.cauldron` project marker after
+//!   checking what it names; soup verbs run in the project (or below) then
+//!   need neither `--env` nor `--cauldron`; a flag or variable always wins;
+//!   an explicit env that differs from the marker's refuses; a broken marker
+//!   refuses; a directory named `.cauldron` is never a marker.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
@@ -337,7 +348,10 @@ fn s4_remint_twice_gives_two_disjoint_sets_with_their_own_references() {
 
     let mut maps = Vec::new();
     for round in 0..2 {
-        let o = import(&s, "kb", &dir, &["--remint"]);
+        // The same batch a second time is refused as already landed (S12)
+        // unless asked for: here it is, to check the two id sets.
+        let extra: &[&str] = if round == 0 { &["--remint"] } else { &["--remint", "--allow-duplicate"] };
+        let o = import(&s, "kb", &dir, extra);
         assert_eq!(o.rc, 0, "round {round}: {}\n{}", o.out, o.err);
         let d = o.json();
         assert_eq!(d["outcome"], "landed", "{d}");
@@ -938,6 +952,13 @@ fn s10_recover_says_whether_the_import_landed_and_following_it_leaves_one_copy()
     for i in [1, 20, 40] {
         assert_eq!(with_handle(&soup, &format!("load task {i}")), 1);
     }
+    // And NOT following it is refused: the batch recovery finished is known
+    // as landed, so a re-import under --remint lands nothing.
+    let o = import(&s, "kb", &batch, &["--remint"]);
+    assert_eq!(o.rc, 1, "re-imported a batch recover had landed: {}\n{}", o.out, o.err);
+    assert_eq!(o.json()["refusal"], "batch-already-landed", "{}", o.out);
+    assert_eq!(o.json()["landed_before"][0]["records"], 41, "{}", o.out);
+    assert_eq!(node_count(&soup), held + 41, "a refused re-import landed something");
     let o = recover(&s);
     assert_eq!(o.json()["interrupted_import"], "none", "{}", o.out);
 
@@ -959,4 +980,457 @@ fn s10_recover_says_whether_the_import_landed_and_following_it_leaves_one_copy()
     for i in [1, 20, 40] {
         assert_eq!(with_handle(&soup, &format!("load task {i}")), 1);
     }
+}
+
+// --------------------------------------------------------------------- S11
+
+#[test]
+fn s11_pool_must_be_a_pool_name_never_a_path() {
+    let s = scratch("s11", &["kb"]);
+    let input = write_json(&s, "example.json", &example());
+    // A file that a path-shaped `--pool` would otherwise reach, outside the soup.
+    let outside = s.0.join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::copy(s.soup("kb").join("ws.db"), outside.join("stolen.db")).unwrap();
+    let abs = outside.join("stolen");
+    let abs = abs.to_str().unwrap();
+    let before = db_bytes(&s.soup("kb"));
+    for bad in [abs, "ws/../ws", "../ws", "WS", "1ws", "w_s", "", "spine"] {
+        for verb in [&["soup", "nodes"][..], &["soup", "regions"][..], &["soup", "get", "IS-1"][..], &["soup", "search", "x"][..]] {
+            let mut args = verb.to_vec();
+            args.extend_from_slice(&["--env", "dev", "--cauldron", "kb", "--pool", bad]);
+            let o = run(&s, &args);
+            assert_eq!(o.rc, 1, "{verb:?} --pool {bad:?} was accepted: {}\n{}", o.out, o.err);
+            assert!(o.err.contains("REFUSED") && o.err.contains("--pool"), "{verb:?} --pool {bad:?}: {}", o.err);
+            assert!(o.out.is_empty(), "{verb:?} --pool {bad:?} printed a result: {}", o.out);
+        }
+        let mut args = vec!["soup", "import", input.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"];
+        args.push("--pool");
+        args.push(bad);
+        let o = run(&s, &args);
+        assert_eq!(o.rc, 1, "import --pool {bad:?} was accepted: {}", o.out);
+        assert!(o.err.contains("REFUSED") && o.err.contains("--pool"), "import --pool {bad:?}: {}", o.err);
+    }
+    // The `=` spelling is held to the same grammar.
+    let o = run(&s, &["soup", "nodes", "--env", "dev", "--cauldron", "kb", &format!("--pool={abs}")]);
+    assert_eq!(o.rc, 1, "--pool=<path> was accepted: {}", o.out);
+    assert_eq!(db_bytes(&s.soup("kb")), before, "a refused --pool changed the store");
+    // A well-formed name is still accepted: the default pool, spelled out.
+    let o = run(&s, &["soup", "nodes", "--env", "dev", "--cauldron", "kb", "--pool", "ws"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!(o.json()["pool"], "ws");
+}
+
+// --------------------------------------------------------------------- S12
+
+#[test]
+fn s12_a_batch_that_already_landed_is_refused_unless_allowed() {
+    let s = scratch("s12", &["kb", "other"]);
+    let soup = s.soup("kb");
+    // The example without its viewer (one viewer per role, so a second copy
+    // of it would be refused for that alone), its ids as batch labels.
+    let records = relabel(example().into_iter().filter(|r| r["type"] != "viewer").collect(), "b-");
+    let input = write_json(&s, "batch.json", &records);
+    let o = import(&s, "kb", &input, &["--remint"]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    let first = o.json();
+    assert_eq!(first["outcome"], "landed");
+    let digest = first["batch_digest"].as_str().unwrap().to_string();
+    assert_eq!(digest.len(), 64, "{first}");
+    let held = node_count(&soup);
+
+    // The same records again, as the same file, as a YAML directory, in a
+    // dry run and for real, with and without --remint: refused by name,
+    // saying when it landed and how many records it held; nothing written.
+    for (i, r) in records.iter().enumerate() {
+        s.file(&format!("dir/{i:02}.yaml"), &serde_yaml::to_string(r).unwrap());
+    }
+    let dir = s.0.join("in").join("dir");
+    let before = db_bytes(&soup);
+    for (src, extra) in [
+        (&input, &["--remint"][..]),
+        (&input, &["--remint", "--dry-run"][..]),
+        (&dir, &["--remint"][..]),
+        (&input, &[][..]),
+    ] {
+        let o = import(&s, "kb", src, extra);
+        assert_eq!(o.rc, 1, "{src:?} {extra:?} was not refused: {}", o.out);
+        let d = o.json();
+        assert_eq!(d["outcome"], "refused", "{d}");
+        assert_eq!(d["refusal"], "batch-already-landed", "{d}");
+        assert_eq!(d["batch_digest"], digest.as_str(), "{d}");
+        let earlier = d["landed_before"].as_array().unwrap();
+        assert_eq!(earlier.len(), 1, "{d}");
+        assert_eq!(earlier[0]["seq"], first["landed"]["seq"], "{d}");
+        assert_eq!(earlier[0]["records"], records.len(), "{d}");
+        assert!(earlier[0]["landed_at"].as_str().unwrap().contains('T'), "{d}");
+        assert!(o.err.contains("batch-already-landed") && o.err.contains("--allow-duplicate"), "{}", o.err);
+        assert_eq!(db_bytes(&soup), before, "a refused re-import changed the store ({extra:?})");
+    }
+
+    // A different batch is not refused; nor is this one in another cauldron.
+    let mut changed = records.clone();
+    changed[0]["handle"] = json!("A different first handle");
+    let o = import(&s, "kb", &write_json(&s, "changed.json", &changed), &["--remint", "--dry-run"]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert_eq!(o.json()["outcome"], "validated");
+    let o = import(&s, "other", &input, &["--remint"]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+
+    // --allow-duplicate lands the second copy, under new ids; a third try
+    // names both earlier landings.
+    let o = import(&s, "kb", &input, &["--remint", "--allow-duplicate"]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert_eq!(o.json()["outcome"], "landed");
+    assert_eq!(node_count(&soup), held + records.len() as i64);
+    let o = import(&s, "kb", &input, &["--remint"]);
+    assert_eq!(o.rc, 1);
+    assert_eq!(o.json()["landed_before"].as_array().unwrap().len(), 2, "{}", o.out);
+}
+
+// --------------------------------------------------------------------- S13
+
+/// `run`, in directory `cwd`, with extra environment variables.
+fn run_in(s: &Scratch, cwd: &Path, vars: &[(&str, &str)], args: &[&str]) -> Out {
+    let mut c = Command::new(CAULDRON);
+    c.args(args)
+        .current_dir(cwd)
+        .env("CAULDRON_HOME", s.root())
+        .env("HOME", s.0.join("home"))
+        .env_remove("CAULDRON_ENV")
+        .env_remove("ENV")
+        .env_remove("CAULDRON_CAULDRON")
+        .stdin(Stdio::null());
+    for (k, v) in vars {
+        c.env(k, v);
+    }
+    let o = c.output().expect("spawn cauldron");
+    Out {
+        rc: o.status.code().unwrap_or(-1),
+        out: String::from_utf8_lossy(&o.stdout).into_owned(),
+        err: String::from_utf8_lossy(&o.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn s13_a_linked_project_directory_resolves_to_its_cauldron() {
+    let s = scratch("s13", &["kb", "other"]);
+    let proj = s.0.join("proj");
+    let sub = proj.join("src").join("deep");
+    std::fs::create_dir_all(&sub).unwrap();
+    let marker = proj.join(".cauldron");
+
+    // Unlinked: the verbs still ask for --env, and say how to link.
+    let o = run_in(&s, &sub, &[], &["soup", "nodes"]);
+    assert_ne!(o.rc, 0, "{}", o.out);
+    assert!(o.err.contains("needs --env") && o.err.contains("cauldron link"), "{}", o.err);
+
+    // `link` checks what it names and writes nothing on a refusal.
+    let o = run_in(&s, &proj, &[], &["link", "nope", "--env", "dev"]);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("no cauldron `nope`"), "{}", o.err);
+    let o = run_in(&s, &proj, &[], &["link", "kb"]);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("needs --env"), "{}", o.err);
+    let o = run_in(&s, &proj, &[], &["link", "kb", "--env", "nowhere"]);
+    assert_ne!(o.rc, 0);
+    assert!(!marker.exists(), "a refused link wrote a marker");
+
+    // Linked.
+    let o = run_in(&s, &sub, &[], &["link", "kb", "--env", "dev", "--dir", proj.to_str().unwrap()]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!(o.json()["outcome"], "linked");
+    let text = std::fs::read_to_string(&marker).unwrap();
+    assert!(text.contains("env = dev\n") && text.contains("cauldron = kb\n"), "{text}");
+    let o = run_in(&s, &proj, &[], &["link", "kb", "--env", "dev"]);
+    assert_eq!(o.json()["outcome"], "unchanged");
+
+    // `--show` from a directory below: both from the marker.
+    let o = run_in(&s, &sub, &[], &["link", "--show"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let d = o.json();
+    assert_eq!((d["env"].as_str(), d["cauldron"].as_str()), (Some("dev"), Some("kb")), "{d}");
+    assert!(d["env_from"].as_str().unwrap().contains("project marker"), "{d}");
+    assert_eq!(d["marker"], marker.to_str().unwrap());
+    assert_eq!(d["cauldron_exists"], true);
+
+    // Soup verbs need neither flag inside the project; an import lands.
+    let input = write_json(&s, "example.json", &example());
+    let o = run_in(&s, &sub, &[], &["soup", "import", input.to_str().unwrap()]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    let d = o.json();
+    assert_eq!((d["env"].as_str(), d["cauldron"].as_str(), d["outcome"].as_str()), (Some("dev"), Some("kb"), Some("landed")), "{d}");
+    assert!(o.err.contains("project marker") && o.err.contains(marker.to_str().unwrap()), "{}", o.err);
+    let o = run_in(&s, &sub, &[], &["soup", "get", "DEC-1"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+
+    // Explicit always wins: --cauldron, $CAULDRON_CAULDRON (env still from the
+    // marker), and both flags (marker not even read, so no note).
+    let o = run_in(&s, &sub, &[], &["soup", "nodes", "--cauldron", "other"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!(o.json()["cauldron"], "other");
+    assert_eq!(o.json()["total"], 0, "the marker's cauldron was read instead");
+    let o = run_in(&s, &sub, &[("CAULDRON_CAULDRON", "other")], &["soup", "nodes"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!(o.json()["cauldron"], "other");
+    let o = run_in(&s, &sub, &[], &["soup", "nodes", "--env", "dev", "--cauldron", "other"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert!(!o.err.contains("marker"), "{}", o.err);
+
+    // A different explicit env with the marker's cauldron: refused, never
+    // looked for elsewhere; nor by the variable.
+    std::fs::create_dir_all(s.root().join("data").join("prod")).unwrap();
+    for (vars, args) in [
+        (&[][..], &["soup", "nodes", "--env", "prod"][..]),
+        (&[("CAULDRON_ENV", "prod")][..], &["soup", "nodes"][..]),
+    ] {
+        let o = run_in(&s, &sub, vars, args);
+        assert_ne!(o.rc, 0, "{}", o.out);
+        assert!(o.err.contains("REFUSED") && o.err.contains("in environment `dev`") && o.err.contains("`prod`"), "{}", o.err);
+    }
+
+    // A variable naming no usable environment is an error, named, and the
+    // marker is not used in its place.
+    for bad in ["PROD", "shared"] {
+        let o = run_in(&s, &sub, &[("CAULDRON_ENV", bad)], &["soup", "nodes"]);
+        assert_ne!(o.rc, 0, "{bad}: {}", o.out);
+        assert!(o.err.contains("$CAULDRON_ENV") && !o.err.contains("project marker"), "{bad}: {}", o.err);
+    }
+
+    // Re-pointing needs --replace.
+    let o = run_in(&s, &proj, &[], &["link", "other", "--env", "dev"]);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("--replace"), "{}", o.err);
+    let o = run_in(&s, &proj, &[], &["link", "other", "--env", "dev", "--replace"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!(run_in(&s, &sub, &[], &["soup", "nodes"]).json()["cauldron"], "other");
+
+    // A nearer marker that does not parse refuses, naming itself.
+    let broken = sub.join(".cauldron");
+    std::fs::write(&broken, "cauldron: kb\n").unwrap();
+    let o = run_in(&s, &sub, &[], &["soup", "nodes"]);
+    assert_ne!(o.rc, 0, "{}", o.out);
+    assert!(o.err.contains(broken.to_str().unwrap()), "{}", o.err);
+
+    // A directory named `.cauldron` (as the data root is) is not a marker,
+    // and cannot be linked into.
+    let home_like = s.0.join("homelike");
+    std::fs::create_dir_all(home_like.join(".cauldron")).unwrap();
+    let o = run_in(&s, &home_like, &[], &["soup", "nodes"]);
+    assert!(o.err.contains("needs --env"), "{}", o.err);
+    let o = run_in(&s, &home_like, &[], &["link", "kb", "--env", "dev"]);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("not a file"), "{}", o.err);
+}
+
+#[test]
+fn s14_link_never_writes_through_a_symbolic_link() {
+    use std::os::unix::fs::symlink;
+    let s = scratch("s14", &["kb"]);
+    let victim = s.0.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+
+    // A dangling link: nothing is created where it points, with or without --replace.
+    let repo = s.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    symlink(victim.join("created-by-link"), repo.join(".cauldron")).unwrap();
+    for extra in [&[][..], &["--replace"][..]] {
+        let mut args = vec!["link", "kb", "--env", "dev"];
+        args.extend_from_slice(extra);
+        let o = run_in(&s, &repo, &[], &args);
+        assert_ne!(o.rc, 0, "{}", o.out);
+        assert!(o.err.contains("symbolic link") && o.err.contains(repo.join(".cauldron").to_str().unwrap()), "{}", o.err);
+        assert!(!victim.join("created-by-link").exists(), "link wrote through a dangling symlink");
+    }
+    assert!(std::fs::symlink_metadata(repo.join(".cauldron")).unwrap().file_type().is_symlink());
+
+    // A live link to someone's file: refused, and --replace does not overwrite it.
+    let repo2 = s.0.join("repo2");
+    std::fs::create_dir_all(&repo2).unwrap();
+    std::fs::write(victim.join("precious.txt"), "precious\n").unwrap();
+    symlink(victim.join("precious.txt"), repo2.join(".cauldron")).unwrap();
+    for extra in [&[][..], &["--replace"][..]] {
+        let mut args = vec!["link", "kb", "--env", "dev", "--dir", repo2.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let o = run_in(&s, &s.0, &[], &args);
+        assert_ne!(o.rc, 0, "{}", o.out);
+        assert!(o.err.contains("symbolic link"), "{}", o.err);
+        assert_eq!(std::fs::read_to_string(victim.join("precious.txt")).unwrap(), "precious\n");
+    }
+
+    // The reader does not follow either link, and says explicit flags work.
+    for dir in [&repo, &repo2] {
+        let o = run_in(&s, dir, &[], &["soup", "nodes"]);
+        assert_ne!(o.rc, 0, "{}", o.out);
+        assert!(o.err.contains("symbolic link") && o.err.contains("--env and --cauldron"), "{}", o.err);
+        let o = run_in(&s, dir, &[], &["soup", "nodes", "--env", "dev", "--cauldron", "kb"]);
+        assert_eq!(o.rc, 0, "{}", o.err);
+    }
+
+    // --replace replaces a regular file, through a new file renamed into place.
+    let repo3 = s.0.join("repo3");
+    std::fs::create_dir_all(&repo3).unwrap();
+    std::fs::write(repo3.join(".cauldron"), "not a marker\n").unwrap();
+    let o = run_in(&s, &repo3, &[], &["link", "kb", "--env", "dev"]);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("--replace"), "{}", o.err);
+    let o = run_in(&s, &repo3, &[], &["link", "kb", "--env", "dev", "--replace"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!(o.json()["outcome"], "linked");
+    let text = std::fs::read_to_string(repo3.join(".cauldron")).unwrap();
+    assert!(text.contains("env = dev\n") && text.contains("cauldron = kb\n"), "{text}");
+    let left: Vec<_> = std::fs::read_dir(&repo3).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(left, vec![std::ffi::OsString::from(".cauldron")], "a temporary file was left behind");
+}
+
+#[test]
+fn s15_both_flags_need_no_current_directory() {
+    let s = scratch("s15", &["kb"]);
+    let input = write_json(&s, "example.json", &example());
+    let gone = s.0.join("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+    // A child whose working directory is removed before it reads it.
+    let spawn = |args: &[&str]| -> Out {
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c")
+            .arg(r#"cd "$1" && rmdir "$1" && shift && exec "$@""#)
+            .arg("sh")
+            .arg(&gone)
+            .arg(CAULDRON)
+            .args(args)
+            .env("CAULDRON_HOME", s.root())
+            .env("HOME", s.0.join("home"))
+            .env_remove("CAULDRON_ENV")
+            .env_remove("ENV")
+            .env_remove("CAULDRON_CAULDRON")
+            .stdin(Stdio::null());
+        let o = c.output().expect("spawn sh");
+        Out { rc: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into_owned(), err: String::from_utf8_lossy(&o.stderr).into_owned() }
+    };
+    let o = spawn(&["soup", "import", input.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert!(!gone.exists());
+    std::fs::create_dir_all(&gone).unwrap();
+    let o = spawn(&["soup", "nodes", "--env", "dev", "--cauldron", "kb"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!(o.json()["total"], example().len());
+    // With a value missing, the marker is needed, and the refusal says why.
+    std::fs::create_dir_all(&gone).unwrap();
+    let o = spawn(&["soup", "nodes", "--env", "dev"]);
+    assert_ne!(o.rc, 0, "{}", o.out);
+    assert!(o.err.contains("current directory") && o.err.contains("--cauldron"), "{}", o.err);
+}
+
+#[test]
+fn s16_a_marker_is_reported_and_a_tracked_marker_cannot_aim_a_write() {
+    if Command::new("git").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+        eprintln!("s16: git is not available; skipped");
+        return;
+    }
+    let s = scratch("s16", &["kb"]);
+    let input = write_json(&s, "example.json", &example());
+    let git = |dir: &Path, args: &[&str]| {
+        let o = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C"])
+            .arg(dir)
+            .args(args)
+            .env("HOME", s.0.join("home"))
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    };
+
+    // `link` in a git work tree hints at .gitignore until the marker is ignored.
+    let proj = s.0.join("proj");
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    git(&proj, &["init", "-q"]);
+    let o = run_in(&s, &proj, &[], &["link", "kb", "--env", "dev"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert!(o.err.contains("hint") && o.err.contains(".gitignore"), "{}", o.err);
+    std::fs::write(proj.join(".gitignore"), ".cauldron\n").unwrap();
+    let o = run_in(&s, &proj, &[], &["link", "kb", "--env", "dev"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert!(!o.err.contains("hint"), "{}", o.err);
+    let o = run_in(&s, &s.0, &[], &["link", "kb", "--env", "dev", "--dir", s.0.join("home").to_str().unwrap()]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert!(!o.err.contains("hint"), "outside a work tree: {}", o.err);
+
+    // An ignored marker aims writes, and every JSON says where the target came from.
+    let marker = proj.join(".cauldron");
+    let from = format!("marker:{}", marker.display());
+    let o = run_in(&s, &proj.join("src"), &[], &["soup", "import", input.to_str().unwrap()]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert_eq!(o.json()["resolved_from"], from.as_str());
+    assert_eq!(run_in(&s, &proj, &[], &["link", "--show"]).json()["writes_refused"], Value::Null);
+    let o = run_in(&s, &proj.join("src"), &[], &["soup", "import", input.to_str().unwrap()]);
+    assert_eq!(o.rc, 1, "{}", o.err);
+    assert_eq!((o.json()["refusal"].as_str(), o.json()["resolved_from"].as_str()), (Some("batch-already-landed"), Some(from.as_str())));
+    for args in [&["soup", "nodes"][..], &["soup", "regions"][..], &["soup", "get", "DEC-1"][..], &["soup", "search", "soup"][..]] {
+        let o = run_in(&s, &proj.join("src"), &[], args);
+        assert_eq!(o.rc, 0, "{args:?}: {}", o.err);
+        assert_eq!(o.json()["resolved_from"], from.as_str(), "{args:?}");
+    }
+    let o = run_in(&s, &proj.join("src"), &[], &["soup", "nodes", "--env", "dev", "--cauldron", "kb"]);
+    assert!(o.json().get("resolved_from").is_none(), "{}", o.out);
+
+    // Committed, the marker no longer aims a write; a dry run, a read and
+    // explicit flags still work.
+    std::fs::write(proj.join(".gitignore"), "").unwrap();
+    git(&proj, &["add", ".cauldron"]);
+    git(&proj, &["commit", "-qm", "marker"]);
+    let mut fresh = example()[0].clone();
+    fresh["id"] = json!("R-9");
+    let other = write_json(&s, "other.json", &[fresh]);
+    let before = tree(&s.soup("kb"));
+    for args in [&["soup", "import", other.to_str().unwrap()][..], &["soup", "recover"][..]] {
+        let o = run_in(&s, &proj.join("src"), &[], args);
+        assert_ne!(o.rc, 0, "{args:?}: {}", o.out);
+        assert!(o.err.contains("REFUSED") && o.err.contains("tracked by git") && o.err.contains(marker.to_str().unwrap()), "{}", o.err);
+        assert!(o.err.contains("--env dev --cauldron kb"), "{}", o.err);
+    }
+    assert_eq!(tree(&s.soup("kb")), before, "a refused write touched the soup");
+    let o = run_in(&s, &proj.join("src"), &[], &["soup", "import", other.to_str().unwrap(), "--dry-run"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!(o.json()["resolved_from"], from.as_str());
+    let o = run_in(&s, &proj.join("src"), &[], &["soup", "nodes"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let o = run_in(&s, &proj, &[], &["link", "kb", "--env", "dev"]);
+    assert!(o.err.contains("tracked by git"), "{}", o.err);
+    let o = run_in(&s, &proj.join("src"), &[], &["link", "--show"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert!(o.json()["writes_refused"].as_str().is_some_and(|w| w.contains("tracked by git")), "{}", o.out);
+    let o = run_in(&s, &proj.join("src"), &[], &["soup", "import", other.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert!(o.json().get("resolved_from").is_none());
+}
+
+#[test]
+fn s17_a_mark_in_an_agent_label_or_file_name_is_not_a_landing() {
+    let s = scratch("s17", &["kb"]);
+    let ex = example();
+    let b = write_json(&s, "b.json", &ex[..2]);
+    let o = import(&s, "kb", &b, &["--dry-run"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let digest = o.json()["batch_digest"].as_str().unwrap().to_string();
+    let mark = format!("[batch sha256:{digest}, 2 records]");
+
+    // A different batch whose --agent label and file name both carry b's mark.
+    let a = write_json(&s, &format!("a {mark}.json"), &ex[..1]);
+    let label = format!("bot {mark}");
+    let o = import(&s, "kb", &a, &["--agent", &label]);
+    assert_eq!((o.rc, o.json()["outcome"].as_str()), (0, Some("landed")), "{}", o.err);
+
+    // b itself has never landed, so it is not refused. It collides on R-1 under
+    // carried ids, so --remint; the guard is judged before the door.
+    let o = import(&s, "kb", &b, &["--remint", "--dry-run"]);
+    assert_ne!(o.json()["refusal"], "batch-already-landed", "{}", o.out);
+    let mut fresh = ex[1].clone();
+    fresh["id"] = json!("R-7");
+    let c = write_json(&s, "c.json", &[fresh]);
+    let o = import(&s, "kb", &c, &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    // And a real landing is still found by its own mark.
+    let o = import(&s, "kb", &c, &[]);
+    assert_eq!((o.rc, o.json()["refusal"].as_str()), (1, Some("batch-already-landed")), "{}", o.out);
+    assert_eq!(o.json()["landed_before"][0]["records"], 1);
 }

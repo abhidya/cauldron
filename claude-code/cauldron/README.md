@@ -37,6 +37,39 @@ cauldron env create dev            # an environment
 cauldron create kb --env dev       # a cauldron with an empty soup (pool `ws`)
 ```
 
+To make a project directory name its cauldron, so neither you nor the
+curator has to pass `--env` and `--cauldron` inside it:
+
+```sh
+cd <project>
+cauldron link kb --env dev         # writes <project>/.cauldron
+cauldron link --show               # what this directory resolves to, and from where
+```
+
+`cauldron soup` run in that directory or any directory below it then uses
+`kb` in `dev`. The marker is a text file holding two `key = value` lines,
+`env = dev` and `cauldron = kb`, and `#` comments. An explicit `--env`,
+`--cauldron`, `$CAULDRON_ENV`, `$ENV` or `$CAULDRON_CAULDRON` always wins over
+it; an explicit environment that
+differs from the marker's, with no cauldron named, is refused rather than
+guessed. Without a marker, nothing changes: every verb still needs the
+environment named.
+
+The marker is per-machine: it names an environment and a cauldron on this
+machine, so keep it out of version control by adding `.cauldron` to the
+project's `.gitignore` (`cauldron link` prints a hint when it is not ignored).
+It can name only an environment and a cauldron, never a path, a pool or a
+file. A marker found in the directory or any parent is obeyed, including one
+that arrived with a cloned repository, so check `cauldron link --show` in a
+project you did not link yourself. Every soup verb that took its target from a
+marker says so: a line on stderr, and `"resolved_from": "marker:<path>"` in its
+JSON. An import (without `--dry-run`) or `recover` refuses to take its target
+from a marker that is tracked by git or owned by another user; naming `--env`
+and `--cauldron` explicitly writes without reading any marker. A `.cauldron`
+that is a symbolic link is never followed or written through. The curator
+states the target it took from a marker before its first write, and asks you
+to confirm before writing to `prod` from a marker.
+
 A new soup has **no regions**, and the curator never invents one. On the first
 run it files nothing it cannot place and proposes regions instead; approve
 them (or import a few region records yourself with `cauldron soup import`) and
@@ -58,7 +91,9 @@ from it (inside Claude Code):
 
 ## The verbs
 
-All need the environment named (`--env`); none defaults to production. All
+All need the environment and the cauldron named, by `--env` and `--cauldron`
+or by the project's `.cauldron` marker (`cauldron link`); none defaults to
+production. All
 print JSON and exit non-zero on a refusal. The reads cannot write, and each
 takes `--max-chars N` (longer text is cut and listed under `truncated`); the
 lists take `--limit N` and say how many `more` there were.
@@ -77,7 +112,7 @@ lists take `--limit N` and say how many `more` there were.
   regions, score, snippet}` (default 20).
 - `cauldron soup get <id>... --env E --cauldron C`: nodes as records in the
   published shape, with their outgoing edges.
-- `cauldron soup import <file-or-dir> --env E --cauldron C [--dry-run] [--remint]`:
+- `cauldron soup import <file-or-dir> --env E --cauldron C [--dry-run] [--remint] [--allow-duplicate]`:
   judges every record with the soup's own write door and lands the batch as
   one write, all or nothing. `--remint` treats ids as batch-local labels and
   prints the old-to-new map; a label may not equal an id the soup already
@@ -85,13 +120,17 @@ lists take `--limit N` and say how many `more` there were.
   label always means the existing node. A real import is refused while
   another import or recovery is writing to the same soup, or while an earlier
   import was interrupted and left the soup unsettled; `--dry-run` still works
-  then, judged on a read-only snapshot.
+  then, judged on a read-only snapshot. A batch identical to one that already
+  landed in the soup (the same records, before re-minting) is refused as
+  `batch-already-landed`, saying when it landed and how many records it held;
+  `--allow-duplicate` lands a second copy on purpose. Batches landed by
+  0.1.4 or earlier carry no record of their content and are not recognised.
 - `cauldron soup recover --env E --cauldron C`: settles a soup an interrupted
   import left unsettled, by the soup's own record, and says which way it went
   in `interrupted_import`. `landed` means the interrupted import was finished
   and all of it is now in the soup (the output gives the count and ids): do
-  NOT import that batch again, because it would land every record a second
-  time and nodes cannot be deleted. `rolled-back` means none of it landed:
+  NOT import that batch again: under `--remint` it would land every record a
+  second time, and nodes cannot be deleted. `rolled-back` means none of it landed:
   importing it again is safe. `none` means there was nothing to settle; check
   `cauldron soup nodes` before importing a batch whose fate you do not know.
 

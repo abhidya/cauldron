@@ -209,7 +209,7 @@ impl SpineConfig {
         let t = &self.tranche;
         if t.heartbeat_interval.is_zero() || t.timeout < t.heartbeat_interval * 3 {
             return Err(crate::error::SpineError::usage(format!(
-                "SpineConfig: tranche timeout ({} ms) must be at least 3 x a non-zero heartbeat                  interval ({} ms), so one dropped beat never abandons a tranche",
+                "SpineConfig: tranche timeout ({} ms) must be at least 3 x a non-zero heartbeat interval ({} ms), so one dropped beat never abandons a tranche",
                 t.timeout.as_millis(),
                 t.heartbeat_interval.as_millis()
             )));

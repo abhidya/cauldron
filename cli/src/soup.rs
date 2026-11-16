@@ -67,6 +67,18 @@
 //! a rolled-back import may be run again, a landed one must not be (with
 //! `--remint` it would land every record a second time).
 //!
+//! # A batch that already landed
+//!
+//! Every import writes its batch's content digest (SHA-256 of the pool name
+//! and the records as read, before any `--remint`) into its own transaction
+//! row's provenance, the `dispatch` text of its `agent` initiator. Before it
+//! writes, an import looks for a DECIDED row carrying the same digest and,
+//! finding one, refuses as `batch-already-landed` unless `--allow-duplicate`
+//! is passed. That covers an import `recover` finished, too, since a decided
+//! row is one that landed. No table or column is added, so a store from an
+//! earlier release opens unchanged; its earlier imports carry no digest and
+//! are not recognised.
+//!
 //! Like `ctl`, every verb needs the environment NAMED (`--env`, a leading
 //! `--env`, or `$CAULDRON_ENV`): it never defaults to prod. The cauldron is
 //! always named too.
@@ -91,8 +103,8 @@ const SOUP_SEAM: &str = "soup";
 const USAGE: &str = "\
 cauldron soup — a cauldron's soup, offline
 
-    cauldron soup import <file-or-dir> --cauldron <name> [--env <env>] [--dry-run] [--remint]
-                         [--agent <label>]
+    cauldron soup import <file-or-dir> [--cauldron <name>] [--env <env>] [--dry-run] [--remint]
+                         [--allow-duplicate] [--agent <label>]
         Land records written in the published shape (schema/soup/workspace-v6/README.md):
         one file holding a list (or one record), or a directory of one-record files; JSON,
         or YAML for .yaml/.yml. Every record is judged by the soup's own door; the JSON
@@ -105,39 +117,48 @@ cauldron soup — a cauldron's soup, offline
         already holds (refused, `label-shadows-existing`), so a bare id that is not a label
         always names the existing node; `<ID>@<pool>` names it explicitly. An edge to an id
         outside the batch must name a node the soup already holds. A real import is refused
-        while a soup daemon runs in the environment, while another import or recover is
-        writing to the same soup, and while the soup is not at rest (an earlier import was
-        interrupted: see `recover`); --dry-run is then judged against a read-only snapshot.
-        --agent records who wrote (default `outside-agent`).
-    cauldron soup recover --cauldron <name> [--env <env>]
+        while another import or recover is writing to the same soup, while the soup is not
+        at rest (an earlier import was interrupted: see `recover`), and when the
+        environment's seam table cannot be read or lists a running `soup` service (this
+        release ships no soup service, so in practice that means only an unreadable seam
+        table); --dry-run is then judged against a read-only snapshot. A batch whose records
+        (as read, before any --remint) are identical to one that already landed in this
+        pool is refused as `batch-already-landed`, with when it landed and how many records
+        it held: under --remint every record would land again under new ids, and without it
+        the carried ids would collide and the import would be refused; --allow-duplicate
+        skips this check. Each import records the batch's digest in its own spine row, so
+        batches landed by an earlier release are not recognised. --agent records who wrote
+        (default `outside-agent`).
+    cauldron soup recover [--cauldron <name>] [--env <env>]
         Settle a soup that an interrupted import left not at rest: an import that never
         reached its commit decision is rolled back (none of it lands), one that did is
-        finished (all of it lands, once). Refused while a soup daemon runs in the
-        environment or another import or recover is writing to the soup; a soup already at
+        finished (all of it lands, once). Refused while another import or recover is
+        writing to the soup, and on the same seam-table check as import; a soup already at
         rest is not touched. Prints (JSON on stdout, the same in words on stderr) which of
         the two happened: `interrupted_import` is `landed` (with how many records and their
-        ids: do NOT import that batch again, or every record lands twice), `rolled-back`
+        ids: do NOT import that batch again; under --remint every record would land twice),
+        `rolled-back`
         (none of it landed: importing it again is safe) or `none` (nothing to recover).
         Also says what still stands in the way if anything does.
-    cauldron soup regions --cauldron <name> [--env <env>] [--max-chars N]
+    cauldron soup regions [--cauldron <name>] [--env <env>] [--max-chars N]
         Every region: id, handle, boundary, flags, the regions it narrows or relates to,
         and how many nodes sit in it.
-    cauldron soup region <id> --cauldron <name> [--env <env>] [--depth N] [--limit N] [--max-chars N]
+    cauldron soup region <id> [--cauldron <name>] [--env <env>] [--depth N] [--limit N] [--max-chars N]
         One region: its record, the regions it narrows (parents) and that narrow it
         (children) to --depth levels (default 1), the regions it relates to either way, and
         its direct members (id, type, state, handle), newest first, at most --limit (50).
-    cauldron soup nodes --cauldron <name> [--env <env>] [--region <id>] [--type <t>]
+    cauldron soup nodes [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
                         [--state <s>] [--limit N] [--max-chars N]
         Nodes as {id, type, state, handle, regions}, newest first (by the spine's commit
         order; one write's nodes by id prefix, then serial, highest first), at most --limit
         (default 50); --region keeps a region's direct members.
-    cauldron soup search <query> --cauldron <name> [--env <env>] [--region <id>] [--type <t>]
+    cauldron soup search <query> [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
                          [--limit N] [--max-chars N]
         Lexical search over handles and bodies: every word of the query a term, found
         case-insensitively as a substring; ranked by how many terms match, then handle hits over body hits, then newest.
         Prints {id, type, state, handle, regions, score, snippet}, at most --limit (20);
         the snippet is --max-chars long (default 160) around the first hit.
-    cauldron soup get <id>... --cauldron <name> [--env <env>] [--max-chars N]
+    cauldron soup get <id>... [--cauldron <name>] [--env <env>] [--max-chars N]
         Those nodes as records in the published shape, with their outgoing edges.
     cauldron soup help
 
@@ -145,6 +166,14 @@ cauldron soup — a cauldron's soup, offline
   so that they cannot write. --max-chars cuts any longer text field, and the output's
   `truncated` lists what was cut; a list cut by --limit says how many `more` there are.
   `--pool <p>` names another pool than `ws`.
+
+  --env and --cauldron may be left out inside a project linked with `cauldron link`: the
+  nearest `.cauldron` marker file in the current directory or a parent names both. A flag
+  or variable ($CAULDRON_ENV, $ENV, $CAULDRON_CAULDRON) always wins over the marker. When
+  the marker supplied either value, stderr says so and the JSON carries
+  `resolved_from: \"marker:<path>\"`. A write (import without --dry-run, recover) refuses
+  to take its target from a marker that is tracked by git or owned by another user: the
+  marker is per-machine and belongs in .gitignore (`cauldron link help`).
 ";
 
 /// `cauldron soup <verb> …`.
@@ -186,6 +215,7 @@ struct Args {
     depth: Option<usize>,
     dry_run: bool,
     remint: bool,
+    allow_duplicate: bool,
     pos: Vec<String>,
 }
 
@@ -212,7 +242,7 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
         match flag {
             "--env" => a.env = Some(take(&mut it)?),
             "--cauldron" | "-c" => a.cauldron = Some(take(&mut it)?),
-            "--pool" => a.pool = Some(take(&mut it)?),
+            "--pool" => a.pool = Some(checked_pool(&take(&mut it)?)?),
             "--agent" => a.agent = Some(take(&mut it)?),
             "--max-chars" => a.max_chars = Some(count(flag, &take(&mut it)?)?),
             "--limit" => a.limit = Some(count(flag, &take(&mut it)?)?),
@@ -222,6 +252,7 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--state" => a.state = Some(take(&mut it)?),
             "--dry-run" => a.dry_run = true,
             "--remint" => a.remint = true,
+            "--allow-duplicate" => a.allow_duplicate = true,
             _ => a.pos.push(s.clone()),
         }
     }
@@ -233,26 +264,37 @@ fn count(flag: &str, v: &str) -> Result<usize> {
 }
 
 /// The environment, named (never the default — a forgotten `--env` must not
-/// land in prod), and the named cauldron in it.
-fn target(verb: &str, a: &Args) -> Result<(Environment, env::Cauldron)> {
-    let env_name = match &a.env {
-        Some(n) => n.clone(),
-        None => match Environment::resolve() {
-            Ok(e) if e.name_source != env::paths::Source::Default => e.name,
-            _ => bail!("`cauldron soup {verb}` needs --env <name>: it never defaults to prod"),
-        },
-    };
-    let e = Environment::resolve()?.for_name(&env_name)?;
+/// land in prod), and the named cauldron in it. Either may come from the
+/// project marker (`.cauldron`, `cauldron link`) found from the current
+/// directory, but only where no flag or variable names it (`link.rs`).
+/// When it does, the JSON the verb prints says so (`resolved_from`), and a
+/// verb that `writes` refuses a marker that is tracked by git or owned by
+/// another user.
+fn target(verb: &str, a: &Args, writes: bool) -> Result<(Environment, env::Cauldron)> {
+    // The current directory is read only if the marker is needed: given both
+    // --env and --cauldron, a verb works from a directory that was deleted.
+    let r = crate::link::resolve(&format!("`cauldron soup {verb}`"), None, a.env.as_deref(), a.cauldron.as_deref())?;
+    if let Some(m) = &r.marker {
+        eprintln!(
+            "cauldron soup {verb}: cauldron `{}` (from {}) in environment `{}` (from {}); marker {}",
+            r.cauldron,
+            if r.cauldron_from.starts_with("the project marker") { "the project marker" } else { r.cauldron_from.as_str() },
+            r.env,
+            if r.env_from.starts_with("the project marker") { "the project marker" } else { r.env_from.as_str() },
+            m.display()
+        );
+    }
+    let e = Environment::resolve()?.for_name(&r.env)?;
     if !e.data_root.is_dir() {
         bail!("REFUSED: there is no environment `{}` ({} does not exist)", e.name, e.data_root.display());
     }
-    let name = match &a.cauldron {
-        Some(n) => n.clone(),
-        None => match env::cauldron::requested_cauldron()? {
-            Some((n, _)) => n,
-            None => bail!("`cauldron soup {verb}` needs --cauldron <name>"),
-        },
-    };
+    if let Some(m) = &r.marker {
+        if writes {
+            crate::link::refuse_untrusted_marker_for_write(&format!("`cauldron soup {verb}`"), &r, &e.data_root)?;
+        }
+        let _ = RESOLVED_FROM.set(format!("marker:{}", m.display()));
+    }
+    let name = r.cauldron;
     let Some(c) = e.find_cauldron(&name)? else {
         bail!(
             "REFUSED: there is no cauldron `{name}` in environment `{}`. `cauldron list --env {}` shows its cauldrons.",
@@ -267,25 +309,62 @@ fn target(verb: &str, a: &Args) -> Result<(Environment, env::Cauldron)> {
     Ok((e, c))
 }
 
+/// `--pool` names a pool FILE (`<soup>/<pool>.db`), so it is held to the
+/// pool name grammar (`[a-z][a-z0-9-]*`, `spine` reserved) before it goes
+/// anywhere near a path: a slash, `..` or an absolute path would otherwise
+/// open a file outside the soup. Nothing is guessed or sanitised.
+fn checked_pool(name: &str) -> Result<String> {
+    let p = PoolName::new(name);
+    if !p.is_well_formed() {
+        bail!(
+            "REFUSED: `--pool {name}` is not a pool name. A pool name is [a-z][a-z0-9-]* (a lowercase \
+             letter, then lowercase letters, digits or `-`); it names a file inside the soup, so a path \
+             is never accepted. Nothing was read or written."
+        );
+    }
+    if p.is_reserved() {
+        bail!(
+            "REFUSED: `--pool {name}` names the spine's own file, not a pool. Nothing was read or written."
+        );
+    }
+    Ok(name.to_string())
+}
+
 fn pool_name(a: &Args) -> PoolName {
     PoolName::new(a.pool.as_deref().unwrap_or(DEFAULT_POOL))
 }
 
+/// Set by [`target`] when the project marker supplied the environment or the
+/// cauldron: `marker:<path>`. Every JSON document the verb prints then
+/// carries it as `resolved_from`, so a caller reading only stdout knows the
+/// target was not named explicitly.
+static RESOLVED_FROM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn print(v: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(v)?);
+    let mut v = v.clone();
+    if let (Some(from), Some(obj)) = (RESOLVED_FROM.get(), v.as_object_mut()) {
+        obj.insert("resolved_from".to_string(), json!(from));
+    }
+    println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
 }
 
 // ------------------------------------------------------------------- import
 
 fn import(args: &[String]) -> Result<i32> {
-    let a = parse("import", args, &["--env", "--cauldron", "-c", "--pool", "--agent", "--dry-run", "--remint"])?;
+    let a = parse(
+        "import",
+        args,
+        &["--env", "--cauldron", "-c", "--pool", "--agent", "--dry-run", "--remint", "--allow-duplicate"],
+    )?;
     let [input] = a.pos.as_slice() else {
         bail!("`cauldron soup import` takes ONE file or directory (got {}); `cauldron soup help`", a.pos.len());
     };
     let records = read_records(Path::new(input))?;
-    let (e, c) = target("import", &a)?;
+    let (e, c) = target("import", &a, !a.dry_run)?;
     let soup = c.soup();
+    let pool = pool_name(&a);
+    let digest = batch_digest(&pool, &records);
 
     // A dry run never opens the live store with the spine's writing open:
     // it is judged on a snapshot copy (see the module docs), so it needs no
@@ -299,6 +378,10 @@ fn import(args: &[String]) -> Result<i32> {
         })?;
         let opened = spine::Cauldron::open(&dir.0, spine::config::SpineConfig::default())
             .map_err(|err| anyhow::anyhow!("opening the snapshot of cauldron `{}`'s soup: {err}", c.name))?;
+        // The same duplicate-batch judgement the real import makes, on the copy.
+        if let Some(refused) = refuse_landed_batch(&e, &c, &dir.0, &pool, &digest, &a)? {
+            return Ok(refused);
+        }
         _copy = dir;
         opened
     } else {
@@ -315,8 +398,8 @@ fn import(args: &[String]) -> Result<i32> {
                 "REFUSED: cauldron `{}`'s soup is not at rest, and an outside import writes only to a soup at rest: {}. \
                  An import that was interrupted (killed, or its machine stopped) leaves a soup like this. \
                  Run `cauldron soup recover --env {} --cauldron {}` first and read what it prints: it either \
-                 FINISHES the interrupted import (it landed in full: do NOT import that batch again, or every \
-                 record lands twice) or ROLLS IT BACK (none of it landed: importing it again is safe). \
+                 FINISHES the interrupted import (it landed in full: do NOT import that batch again; under \
+                 --remint every record would land twice) or ROLLS IT BACK (none of it landed: importing it again is safe). \
                  Nothing was written.",
                 c.name,
                 unrest.join("; "),
@@ -324,7 +407,11 @@ fn import(args: &[String]) -> Result<i32> {
                 c.name
             );
         }
-        // 3. The spine's own open, checked: it must have done nothing.
+        // 3. Not a batch that already landed (unless --allow-duplicate).
+        if let Some(refused) = refuse_landed_batch(&e, &c, &soup, &pool, &digest, &a)? {
+            return Ok(refused);
+        }
+        // 4. The spine's own open, checked: it must have done nothing.
         let cauldron = spine::Cauldron::open(&soup, spine::config::SpineConfig::default())
             .map_err(|err| anyhow::anyhow!("opening cauldron `{}`'s soup: {err}", c.name))?;
         let rec = cauldron.recovered_at_open();
@@ -341,7 +428,11 @@ fn import(args: &[String]) -> Result<i32> {
     let agent = a.agent.clone().unwrap_or_else(|| "outside-agent".to_string());
     let mut plan = MigrationPlan::new(spine::envelope::Initiator::Agent {
         thread: agent,
-        dispatch: format!("cauldron soup import {}", Path::new(input).file_name().and_then(|n| n.to_str()).unwrap_or("records")),
+        dispatch: format!(
+            "cauldron soup import {} [{}]",
+            Path::new(input).file_name().and_then(|n| n.to_str()).unwrap_or("records"),
+            batch_mark(&digest, records.len())
+        ),
     });
     // Two imports of the same text are two writes, never one replayed.
     plan.idempotency_nonce = Some(format!(
@@ -349,7 +440,7 @@ fn import(args: &[String]) -> Result<i32> {
         std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
     ));
-    let opts = RecordsOptions { pool: pool_name(&a), remint: a.remint, commit: !a.dry_run };
+    let opts = RecordsOptions { pool, remint: a.remint, commit: !a.dry_run };
     let run = import_records(&cauldron, &plan, &records, &opts).map_err(|err| anyhow::anyhow!("{err}"))?;
 
     let accepted = run.records.iter().filter(|r| r.disposition == "accepted").count();
@@ -374,6 +465,7 @@ fn import(args: &[String]) -> Result<i32> {
         "accepted": accepted,
         "refused": refused,
         "records": serde_json::to_value(&run.records)?,
+        "batch_digest": digest,
     });
     if a.remint {
         doc["id_map"] = serde_json::to_value(&run.id_map)?;
@@ -387,6 +479,114 @@ fn import(args: &[String]) -> Result<i32> {
     print(&doc)?;
     drop(writer_lock);
     Ok(if outcome == "landed" || outcome == "validated" { 0 } else { 1 })
+}
+
+// ------------------------------------------------- a batch that already landed
+
+/// **The batch's content digest**: SHA-256 over the pool name and the
+/// records exactly as read (before any `--remint`), each object's keys
+/// sorted, so the same records give the same digest whether they came as
+/// one JSON file or a directory of YAML files.
+fn batch_digest(pool: &PoolName, records: &[Value]) -> String {
+    use sha2::{Digest, Sha256};
+    fn canonical(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let sorted: BTreeMap<&String, Value> = m.iter().map(|(k, v)| (k, canonical(v))).collect();
+                Value::Object(sorted.into_iter().map(|(k, v)| (k.clone(), v)).collect())
+            }
+            Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
+            other => other.clone(),
+        }
+    }
+    let mut h = Sha256::new();
+    h.update(pool.as_str().as_bytes());
+    h.update([0u8]);
+    h.update(serde_json::to_string(&canonical(&Value::Array(records.to_vec()))).unwrap_or_default().as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The mark an import writes into its transaction row's provenance (the
+/// `dispatch` text of its `agent` initiator), and so into the spine's own
+/// record of every write. No new table or column: a store from an earlier
+/// release opens unchanged, and its earlier imports simply carry no mark.
+fn batch_mark(digest: &str, records: usize) -> String {
+    format!("batch sha256:{digest}, {records} records")
+}
+
+/// **Refuse a batch that already landed** in this soup, unless
+/// `--allow-duplicate`. Reads `spine.db` under `dir` read-only for a
+/// DECIDED transaction row (one that landed, or that recovery finished)
+/// whose provenance carries this batch's mark. On a match prints the named
+/// refusal `batch-already-landed` as JSON (with when each earlier landing
+/// was written and how many records it held) and returns the exit code.
+fn refuse_landed_batch(
+    e: &Environment,
+    c: &env::Cauldron,
+    dir: &Path,
+    pool: &PoolName,
+    digest: &str,
+    a: &Args,
+) -> Result<Option<i32>> {
+    if a.allow_duplicate {
+        return Ok(None);
+    }
+    let conn = spine::offline::read_only_connection(&dir.join(spine::spine_db::SPINE_FILE))
+        .map_err(|err| anyhow::anyhow!("REFUSED: cannot read {}'s spine to check for an earlier landing of this batch: {err}", c.name))?;
+    let needle = format!("batch sha256:{digest}, ");
+    let mut stmt = conn
+        .prepare("SELECT seq, ts, initiator FROM transactions WHERE decided = 1 AND instr(initiator, ?1) > 0 ORDER BY seq")
+        .context("reading the spine's transaction rows")?;
+    let rows = stmt
+        .query_map([&needle], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+        .context("reading the spine's transaction rows")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("reading the spine's transaction rows")?;
+    // The SQL only narrows the rows; the match is made here, on the mark an
+    // import itself writes: the END of the `dispatch` text, exactly
+    // ` [batch sha256:<digest>, <n> records]`. A mark copied into an --agent
+    // label (`thread`) or into a file name earlier in `dispatch` never counts.
+    let earlier: Vec<Value> = rows
+        .into_iter()
+        .filter_map(|(seq, ts, initiator)| {
+            let v: Value = serde_json::from_str(&initiator).ok()?;
+            let dispatch = v.get("dispatch")?.as_str()?;
+            let (_, tail) = dispatch.rsplit_once(" [batch sha256:")?;
+            let n = tail.strip_prefix(digest)?.strip_prefix(", ")?.strip_suffix(" records]")?;
+            let records = (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| n.parse::<u64>().ok()).flatten()?;
+            Some(json!({"seq": seq, "landed_at": ts, "records": records}))
+        })
+        .collect();
+    if earlier.is_empty() {
+        return Ok(None);
+    }
+    let first = &earlier[0];
+    let why = format!(
+        "this exact batch (the same records, before any --remint, into pool `{pool}`) already landed in cauldron `{}` \
+         at {} as spine transaction {} ({} records){}. Under --remint, importing it again would land every \
+         record a second time under new ids, and this release cannot delete nodes; without --remint, its carried \
+         ids would collide and the import would be refused. Nothing was written. If a second copy is really wanted, run the same \
+         command with --allow-duplicate.",
+        c.name,
+        first["landed_at"].as_str().unwrap_or("?"),
+        first["seq"],
+        first["records"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "?".to_string()),
+        if earlier.len() > 1 { format!(", and {} more time(s) after that", earlier.len() - 1) } else { String::new() },
+    );
+    print(&json!({
+        "env": e.name,
+        "cauldron": c.name,
+        "pool": pool.as_str(),
+        "dry_run": a.dry_run,
+        "remint": a.remint,
+        "outcome": "refused",
+        "refusal": "batch-already-landed",
+        "batch_digest": digest,
+        "landed_before": earlier,
+        "why": why,
+    }))?;
+    eprintln!("cauldron soup import: REFUSED (batch-already-landed): {why}");
+    Ok(Some(1))
 }
 
 // ------------------------------------------------------------------ recover
@@ -438,7 +638,7 @@ fn recover(args: &[String]) -> Result<i32> {
     if !a.pos.is_empty() {
         bail!("`cauldron soup recover` takes no arguments (got `{}`); `cauldron soup help`", a.pos.join(" "));
     }
-    let (e, c) = target("recover", &a)?;
+    let (e, c) = target("recover", &a, true)?;
     let soup = c.soup();
     refuse_live_soup(&e)?;
     let _lock = take_writer_lock(&c, "recover")?;
@@ -498,8 +698,8 @@ fn recover(args: &[String]) -> Result<i32> {
         doc["landed_ids"] = landed_summary(&landed);
         steps.push(format!(
             "The interrupted import LANDED: recover finished it, and its {} record(s) are now in the soup ({}). \
-             Do NOT import that batch again: every record would land a second time, and this release cannot \
-             delete nodes. An import run with --remint printed no id map; `{nodes_cmd}` lists the landed nodes \
+             Do NOT import that batch again: under --remint every record would land a second time under new \
+             ids, and this release cannot delete nodes. An import run with --remint printed no id map; `{nodes_cmd}` lists the landed nodes \
              newest first.",
             landed.len(),
             id_ranges_text(&landed)
@@ -705,7 +905,7 @@ fn regions(args: &[String]) -> Result<i32> {
     if let Some(p) = a.pos.first() {
         bail!("`cauldron soup regions` takes no ids (got `{p}`); `soup get` reads nodes");
     }
-    let (e, c) = target("regions", &a)?;
+    let (e, c) = target("regions", &a, false)?;
     let pool = pool_name(&a);
     let handle = read_pool(&c, &pool)?;
     let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -749,7 +949,7 @@ fn get(args: &[String]) -> Result<i32> {
     if a.pos.is_empty() {
         bail!("`cauldron soup get` needs at least one id");
     }
-    let (e, c) = target("get", &a)?;
+    let (e, c) = target("get", &a, false)?;
     let pool = pool_name(&a);
     let handle = read_pool(&c, &pool)?;
     let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -948,7 +1148,7 @@ fn nodes(args: &[String]) -> Result<i32> {
     if let Some(p) = a.pos.first() {
         bail!("`cauldron soup nodes` takes no ids (got `{p}`); `soup get` reads nodes by id");
     }
-    let (e, c) = target("nodes", &a)?;
+    let (e, c) = target("nodes", &a, false)?;
     let pool = pool_name(&a);
     let handle = read_pool(&c, &pool)?;
     let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -1034,7 +1234,7 @@ fn search(args: &[String]) -> Result<i32> {
     if wanted.is_empty() {
         bail!("`cauldron soup search` needs a query with at least one word");
     }
-    let (e, c) = target("search", &a)?;
+    let (e, c) = target("search", &a, false)?;
     let pool = pool_name(&a);
     let handle = read_pool(&c, &pool)?;
     let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;
@@ -1110,7 +1310,7 @@ fn region(args: &[String]) -> Result<i32> {
     let [id] = a.pos.as_slice() else {
         bail!("`cauldron soup region` takes ONE region id (got {}); `cauldron soup regions` lists them", a.pos.len());
     };
-    let (e, c) = target("region", &a)?;
+    let (e, c) = target("region", &a, false)?;
     let pool = pool_name(&a);
     let handle = read_pool(&c, &pool)?;
     let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;

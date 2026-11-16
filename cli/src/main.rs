@@ -80,6 +80,8 @@ mod ctl;
 // `cauldron soup import | recover | regions | get | nodes |
 // search | region`, the soup offline.
 mod soup;
+// `cauldron link` and the `.cauldron` project marker the soup verbs read.
+mod link;
 // `ensure_soup_cauldron` only; this release has no engine.
 mod engine;
 mod daemon;
@@ -126,6 +128,7 @@ const VERBS: &[(&str, &str)] = &[
     ("create", "make a cauldron (cauldrons/<name>/, with its own empty soup) in this environment"),
     ("list", "the cauldrons of this environment (the implicit legacy one marked)"),
     ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region (`soup help`)"),
+    ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
 ];
 
 const USAGE: &str = "\
@@ -151,6 +154,10 @@ cauldron — the Cauldron entry point
                                      write; settle an interrupted import; list
                                      regions; read and search nodes.
                                      JSON out, non-zero on refusal (`cauldron soup help`)
+    cauldron link <cauldron> --env <e> [--dir <path>] | --show
+                                     write a .cauldron marker naming this project's
+                                     environment and cauldron, so `cauldron soup` run
+                                     here or below needs neither (`cauldron link help`)
     cauldron --build-stamp           the commit THIS binary was built from, as
                                      one `key=value` line, the format it reads
                                      off every service it launches
@@ -360,6 +367,7 @@ fn run() -> Result<i32> {
         }
         Some("ctl") => ctl::verb_ctl(&argv[1..]),
         Some("soup") => soup::verb_soup(&argv[1..]),
+        Some("link") => link::verb_link(&argv[1..]),
         Some("create") => cauldrons::verb_create(&argv[1..]),
         Some("list") | Some("ls") => cauldrons::verb_list(&argv[1..]),
         Some("daemon") => daemon::verb_daemon(&argv[1..]),
@@ -4210,7 +4218,7 @@ fn verb_pin(args: &[String]) -> Result<i32> {
     if let Some(a) = &addr {
         if d.registers {
             bail!(
-                "REFUSED: `--addr` is for a HOSTED service; `{service}` registers its own seam on                  a kernel-assigned port (127.0.0.1:0), so it has no address to declare"
+                "REFUSED: `--addr` is for a HOSTED service; `{service}` registers its own seam on a kernel-assigned port (127.0.0.1:0), so it has no address to declare"
             );
         }
     }

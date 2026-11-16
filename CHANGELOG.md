@@ -15,17 +15,75 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Ripples live.** Dumps set off ripples, and ripples write to the soup. The
   soup engine is hardened, and the Ledger shows real ripple events. Neither is
-  in 0.1.0, 0.1.1, 0.1.2, 0.1.3 or 0.1.4.
+  in any 0.1.x release so far.
 
 ### Not yet scheduled to a release
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.4, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.5, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.4, only an
+  the disable and trigger a fresh usage reading. Through 0.1.5, only an
   explicit enable clears it.
+
+## [0.1.5] — 2026-11-16
+
+Small fixes to the soup commands, and a way for a project directory to name
+its cauldron. Nothing new runs in the background, and stores made by 0.1.4
+open unchanged.
+
+### Added
+
+- **`cauldron link <cauldron> --env <env>`.** Writes a `.cauldron` marker
+  file into a project directory, after checking that the environment and the
+  cauldron exist. `cauldron soup` run in that directory or below it then
+  needs neither `--env` nor `--cauldron`. An explicit flag or variable always
+  wins over the marker (a variable that names no usable environment is an
+  error, not a gap the marker fills), and an explicit environment that
+  differs from the marker's, with no cauldron named, is refused rather than
+  guessed. Given both `--env` and `--cauldron`, a verb reads no marker and
+  not even the current directory. `cauldron link --show` prints what a
+  directory resolves to and where each value came from. Without a marker the
+  verbs behave as before, and nothing defaults to `prod`. The plugin's
+  curator and `/cauldron:curate` use it when no cauldron is named.
+- **The marker is per-machine, and a shared one cannot aim a write.** It
+  names an environment and a cauldron on this machine, never a path or a
+  pool, so keep it out of version control: add `.cauldron` to `.gitignore`.
+  `cauldron link` prints a hint when it writes a marker in a git work tree
+  that does not ignore it, and never edits `.gitignore` itself. A marker in
+  any parent directory is obeyed, including one that came with a cloned
+  repository, so every soup verb that took its target from a marker says so
+  on stderr and as `"resolved_from": "marker:<path>"` in its JSON. A write
+  (`cauldron soup import` without `--dry-run`, and `recover`) refuses to take
+  its target from a marker that git tracks or that another user owns;
+  `--env` and `--cauldron` given explicitly still write, and reads are not
+  affected. `cauldron link --show` reports that judgement as
+  `writes_refused`. A `.cauldron` that is a symbolic link is never followed
+  when read, and `cauldron link` never writes through one, even with
+  `--replace`. The plugin's curator states a target it took from a marker
+  before its first write, and asks before writing to `prod` from one.
+- **`cauldron soup import` refuses a batch that already landed.** Re-importing
+  the same records (as read, before `--remint`) into the same pool is refused
+  as `batch-already-landed`, with when that batch landed and how many records
+  it held. This includes an import that `cauldron soup recover` finished.
+  Before, with `--remint`, the second import landed every record again under
+  new ids. `--allow-duplicate` lands a second copy on purpose. Each import
+  records its batch's digest in its own transaction row, so batches landed by
+  0.1.4 or earlier are not recognised.
+
+### Fixed
+
+- **`--pool` must be a pool name.** It was joined into a file path unchecked,
+  so a path or `..` could open a file outside the soup (read-only). It is
+  now refused unless it is `[a-z][a-z0-9-]*` and not `spine`.
+- **`cauldron soup help` lists the refusals this release makes.** It said
+  `import` and `recover` were refused while a soup daemon runs, but this
+  release has no soup daemon. It now names the writer lock, a soup not at
+  rest, and the environment's seam table.
+- **Five error messages no longer carry long runs of spaces** in the middle of
+  a sentence: the tranche timeout check, the newer-spine refusal, two
+  `cauldron install` messages and the `--addr` refusal.
 
 ## [0.1.4] — 2026-11-16
 
