@@ -10,6 +10,7 @@
 //! | `meta.stop` | directive, milestone |
 //! | `meta.blocking` | question |
 //! | `meta.addressed` | idea |
+//! | `meta.approved` | every content type (not region, not viewer): the owner's review of a record a ripple wrote |
 //! | `retired`, `provisional`, `deferred_by` | region |
 //! | `sealed` | every type (only the `SEAL` statement touches it) |
 //!
@@ -61,6 +62,15 @@ pub const FLAG_FIELDS: &[FlagField] = &[
     FlagField { name: "meta.stop", path: &["meta", "stop"], on: Some(&["directive", "milestone"]) },
     FlagField { name: "meta.blocking", path: &["meta", "blocking"], on: Some(&["question"]) },
     FlagField { name: "meta.addressed", path: &["meta", "addressed"], on: Some(&["idea"]) },
+    // A record a ripple wrote is UNREVIEWED until this is set. A flag, so a
+    // ripple can never approve its own work: no ripple scope lists it (the
+    // ripples service always writes with an empty scope), and a type-one
+    // ripple is refused every flag.
+    FlagField {
+        name: "meta.approved",
+        path: &["meta", "approved"],
+        on: Some(&["directive", "milestone", "handoff", "constraint", "danger", "issue", "decision", "question", "task", "idea"]),
+    },
     FlagField { name: "retired", path: &["retired"], on: Some(&["region"]) },
     FlagField { name: "provisional", path: &["provisional"], on: Some(&["region"]) },
     FlagField { name: "deferred_by", path: &["deferred_by"], on: Some(&["region"]) },

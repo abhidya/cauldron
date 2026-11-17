@@ -21,6 +21,21 @@ use anyhow::{Context, Result};
 /// The file's name under the service's directory.
 pub const FILE: &str = "door.secret";
 
+/// **The ripples key**: a second secret, minted the same way at every boot
+/// into `<dir>/ripples.secret` (0600, in the 0700 directory). Only the
+/// `ripples` service reads it: it proves a seam connection is the ripples
+/// service's (`crate::ripple`). The bridge never reads it, and no tool of
+/// the door accepts it.
+pub const RIPPLES_FILE: &str = "ripples.secret";
+
+/// **The approval key**: a third secret, minted the same way at every boot
+/// into `<dir>/approve.secret`. Only `cauldron soup approve` reads it, and
+/// only after it has checked that its input and output are an interactive
+/// terminal: it proves a seam connection is the owner's command line
+/// (`crate::approve`). The bridge and the `ripples` service never read it,
+/// and no tool of the door accepts it.
+pub const APPROVE_FILE: &str = "approve.secret";
+
 /// The bearer secret. 64 lowercase hex characters (32 random bytes).
 #[derive(Clone)]
 pub struct Secret(String);
@@ -43,6 +58,18 @@ impl Secret {
         a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
     }
 
+    /// Is `given` exactly this secret (no scheme)? Constant time.
+    pub fn is(&self, given: &str) -> bool {
+        let (a, b) = (given.as_bytes(), self.0.as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+
+    /// The secret itself, for a client that sends it on a seam line. Never
+    /// logged.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
     /// The header value a client sends. For tests and for the bridge's own
     /// copy; never logged.
     pub fn bearer(&self) -> String {
@@ -59,12 +86,17 @@ pub fn path(dir: &Path) -> PathBuf {
 /// (mode 0600), replacing any earlier one by rename, so a reader sees the
 /// old file or the new one and never half of either.
 pub fn mint(dir: &Path) -> Result<Secret> {
+    mint_named(dir, FILE)
+}
+
+/// [`mint`] into `dir/<file>`.
+pub fn mint_named(dir: &Path, file: &str) -> Result<Secret> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(|| format!("restricting {}", dir.display()))?;
     let mut bytes = [0u8; 32];
     std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).context("reading /dev/urandom")?;
     let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let tmp = dir.join(format!(".{FILE}.{}", std::process::id()));
+    let tmp = dir.join(format!(".{file}.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     {
         let mut f = std::fs::OpenOptions::new()
@@ -75,13 +107,18 @@ pub fn mint(dir: &Path) -> Result<Secret> {
             .with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(secret.as_bytes()).and_then(|_| f.sync_all()).with_context(|| format!("writing {}", tmp.display()))?;
     }
-    std::fs::rename(&tmp, path(dir)).with_context(|| format!("installing {}", path(dir).display()))?;
+    std::fs::rename(&tmp, dir.join(file)).with_context(|| format!("installing {}", dir.join(file).display()))?;
     Ok(Secret(secret))
 }
 
 /// Read the secret a running service minted (what a client does).
 pub fn read(dir: &Path) -> Result<Secret> {
-    let p = path(dir);
+    read_named(dir, FILE)
+}
+
+/// [`read`] of `dir/<file>`.
+pub fn read_named(dir: &Path, file: &str) -> Result<Secret> {
+    let p = dir.join(file);
     let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
     Ok(Secret(text.trim().to_string()))
 }

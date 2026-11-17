@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "A dump ripple's record batch (dump package v1)",
+  "description": "What the model answers for one dump: new records, each in one or more existing regions, linked only to records of this batch.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["records"],
+  "properties": {
+    "records": {
+      "type": "array",
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "type", "state", "handle", "regions"],
+        "properties": {
+          "label": {"type": "string", "pattern": "^n[1-9][0-9]{0,2}$"},
+          "type": {"enum": ["idea", "issue", "question", "decision", "constraint", "task", "danger"]},
+          "state": {"type": "string"},
+          "handle": {"type": "string", "minLength": 1, "maxLength": 235},
+          "body": {"type": "string", "maxLength": 10000},
+          "regions": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^(R|SUB)-[1-9][0-9]*$"}},
+          "derived_from": {"type": "array", "items": {"type": "string", "pattern": "^n[1-9][0-9]{0,2}$"}}
+        },
+        "allOf": [
+          {"if": {"properties": {"type": {"const": "idea"}}}, "then": {"properties": {"state": {"const": "idea"}}}},
+          {"if": {"properties": {"type": {"const": "issue"}}}, "then": {"properties": {"state": {"const": "open"}}}},
+          {"if": {"properties": {"type": {"const": "question"}}}, "then": {"properties": {"state": {"const": "open"}}}},
+          {"if": {"properties": {"type": {"const": "decision"}}}, "then": {"properties": {"state": {"const": "decided"}}}},
+          {"if": {"properties": {"type": {"const": "constraint"}}}, "then": {"properties": {"state": {"const": "standing"}}}},
+          {"if": {"properties": {"type": {"const": "task"}}}, "then": {"properties": {"state": {"const": "ready"}}}},
+          {"if": {"properties": {"type": {"const": "danger"}}}, "then": {"properties": {"state": {"const": "lurking"}}}}
+        ]
+      }
+    },
+    "notes": {"type": "string", "maxLength": 2000, "description": "Anything the owner should know about this answer, e.g. why nothing was recorded."}
+  }
+}

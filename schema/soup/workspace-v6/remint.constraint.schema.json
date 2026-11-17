@@ -245,6 +245,9 @@
     },
     "meta": {
       "properties": {
+        "approved": {
+          "description": "The review flag. A record a ripple wrote reads as `unreviewed: true` until this is set (any value but false or null; the owner's `cauldron soup approve`, run at a terminal, writes {at, by}; no MCP tool sets it). It is a flag: the soup refuses it to every ripple, so a ripple can never approve its own records. Leave it out when you write a record."
+        },
         "cites": {
           "description": "External citations: each a `kind` with the keys that locate it. See README.md, \"Conventions\".",
           "items": {
@@ -432,6 +435,24 @@
             "type": "object"
           },
           "type": "array"
+        },
+        "ripple": {
+          "description": "Set by the MCP door on every record a ripple writes, overwriting anything the batch put here: {package, version, run, model}. For display only; who wrote a record is read from the transaction that wrote it, which no field can change. Leave it out when you write a record.",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "package": {
+              "type": "string"
+            },
+            "run": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "type": "object"
         }
       },
       "type": "object"

@@ -2111,3 +2111,44 @@ fn e1_the_plugin_s_example_regions_validate_against_a_fresh_soup() {
     assert_eq!(real.json()["id_map"], json!({"r-code": "R-1", "r-tests": "R-2", "r-product": "R-3", "r-process": "R-4"}));
     assert_eq!(read(&s, "regions", &[])["regions"].as_array().unwrap().len(), 4);
 }
+
+/// A record a ripple wrote reads as `unreviewed: true` in `nodes`, `search`
+/// and `get`, and `--review pending|reviewed` filters on it; the CLI's items
+/// equal the library's (the door's). A bad value is refused.
+#[test]
+fn rv1_unreviewed_records_are_marked_and_filtered_by_the_cli() {
+    use spine::envelope::{Envelope, Initiator, Instrument, Mode, Provenance, RippleKind, ENVELOPE_FORMAT_VERSION};
+    let s = scratch("review", &["kb"]);
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../claude-code/cauldron/regions.example.json");
+    assert_eq!(import(&s, "kb", &file, &["--remint"]).rc, 0);
+    assert_eq!(read(&s, "nodes", &["--review", "pending"])["total"], 0);
+    let c = spine::Cauldron::open(&s.soup("kb"), spine::config::SpineConfig::default()).unwrap();
+    let env = Envelope {
+        statement: "MATCH (r: ws/region { id: $r }) CREATE (i: ws/issue { state: \"open\", handle: $h }) CREATE (i) -[in_region]-> (r) RETURN i.id".into(),
+        bindings: [("r".to_string(), json!("R-1")), ("h".to_string(), json!("flaky build cache"))].into_iter().collect(),
+        format_version: ENVELOPE_FORMAT_VERSION,
+        provenance: Provenance {
+            initiator: Initiator::Ripple { kind: RippleKind::TypeTwo, run_id: "run-cli".into(), step_id: "put".into(), scope: vec![] },
+            instrument: Instrument { name: "test".into(), version: "0".into() },
+        },
+        mode: Mode::Commit,
+        idempotency_nonce: Some("cli-review".into()),
+    };
+    assert!(matches!(c.submit(env).unwrap(), spine::Outcome::Committed { .. }));
+    drop(c);
+    let p = read(&s, "nodes", &["--review", "pending"]);
+    assert_eq!(p["total"], 1, "{p}");
+    assert_eq!((p["nodes"][0]["id"].clone(), p["nodes"][0]["unreviewed"].clone()), (json!("IS-1"), json!(true)));
+    let r = read(&s, "nodes", &["--review", "reviewed"]);
+    assert_eq!(r["total"], 4);
+    assert!(!r.to_string().contains("unreviewed"));
+    let all = read(&s, "nodes", &[]);
+    assert_eq!(all["total"], 5);
+    let found = read(&s, "search", &["cache", "--review", "pending"]);
+    assert_eq!(found["results"][0]["unreviewed"], json!(true));
+    let got = get(&s, "kb", &["IS-1"]).json();
+    assert_eq!(got["records"][0]["unreviewed"], json!(true));
+    let bad = run(&s, &["soup", "nodes", "--review", "maybe", "--env", "dev", "--cauldron", "kb"]);
+    assert_ne!(bad.rc, 0);
+    assert!(bad.err.contains("pending"), "{}", bad.err);
+}

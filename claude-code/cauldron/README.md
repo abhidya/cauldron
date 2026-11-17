@@ -23,6 +23,10 @@ Everything runs on the same machine as the cauldron. The MCP server is
 | `commands/dump.md` | `/cauldron:dump [<cauldron>] [--title <t>] <file or text>`: keep text as a dump |
 | `commands/dump-session.md` | `/cauldron:dump-session [title]`: keep this session's transcript as a dump |
 | `commands/curate-dump.md` | `/cauldron:curate-dump <DM-n> [cauldron]`: turn a dump into soup records that cite it |
+
+The dump ripple (`cauldron ripples run`) is a terminal command, not part of
+this plugin; its records reach a session as `unreviewed` (see
+[Ripples](#ripples)).
 | `regions.example.json` | four example regions to import into a new, empty soup |
 | `skills/soup-schema/SKILL.md` | `/cauldron:soup-schema`: the schema in brief, with a pointer to the full README |
 | `schema/` | a copy of the published schema (`schema/soup/workspace-v6/` in the Cauldron repository): `README.md`, `grammar.json`, `edges.json`, one JSON Schema per node type, and its `--remint` variant (batch labels for ids) |
@@ -263,8 +267,9 @@ paste, a file, or a whole Claude Code session. It is not a soup record and
 does not go into the soup. It lands as `DM-<n>` in state `received` in the
 cauldron's **dumps store**, `<cauldron>/dumps/` beside its soup (its own
 small spine and a content-addressed blob store, made on the first dump), as
-one write. Nothing processes dumps in this release: they wait as
-`received`, and processing of dumps comes in a later release. A soup record
+one write. Nothing processes a dump on its own in this release: it waits as
+`received` until you curate it (below) or run the dump ripple on it by hand
+(`cauldron ripples run`, see [Ripples](#ripples)). A soup record
 that came from a dump can cite it: `meta.cites: [{"kind": "dump", "id": "DM-3"}]`.
 
 - `/cauldron:dump <file or text>` (the tool `soup_dump`) keeps up to 1 MiB of
@@ -350,8 +355,11 @@ that came from a dump can cite it: `meta.cites: [{"kind": "dump", "id": "DM-3"}]
   nothing of it is left in the cauldron's directory. If another dump holds
   the same bytes, the blob is kept and that dump is named
   (`same_bytes_in`): remove it too. Copies made elsewhere (a backup, a
-  cauldron put away with `cauldron remove`) are not touched. Treat a secret
-  that was dumped as exposed, and change it.
+  cauldron put away with `cauldron remove`) are not touched, and neither are
+  the records a ripple drew from the dump (find them by their cite,
+  `{"kind": "dump", "id": "DM-<n>"}` in `meta.cites`, and supersede any you
+  do not want) nor the threads service's copy of each ripple call's prompt
+  and answer. Treat a secret that was dumped as exposed, and change it.
 
   A removal runs in two phases. It first marks the dump `removing`, and from
   then on nothing reads its content. It then erases, and only once the
@@ -380,6 +388,110 @@ worth a node, judges the batch with a dry run, lands it, and reports the new
 ids. Every record it writes cites the dump: `meta.cites: [{"kind": "dump",
 "id": "DM-3"}]`, with the turn's `at` when a record rests on one turn. The
 dump itself is not changed: it stays `received`.
+
+## Ripples
+
+A **ripple** turns one dump into new soup records (ideas, issues, questions,
+decisions, constraints, tasks and dangers), each citing the dump. In this
+release it runs only when you run it, at a terminal, on the one dump you
+name; no tool of this plugin starts one, and no tool of this plugin
+approves what it wrote:
+
+```sh
+cauldron ripples run DM-3 --env prod --cauldron kb            # one dump; prints the records and the tokens
+cauldron ripples status --env prod                            # the last runs, spend today and per dump, the caps
+cauldron soup approve C-12 IS-4 --env prod --cauldron kb      # you, at a terminal: mark records as reviewed
+```
+
+- **Off unless started.** The `ripples` service does the work, and the
+  installer does not start it: `cauldron --env prod build ripples`, `cauldron
+  --env prod pin ripples <the label it printed>`, `cauldron --env prod start
+  ripples`. It needs the `mcp` service and a `threads` service of the same
+  release running, and the cauldron granted `read`, `write` and `dump`.
+  Running, it still processes nothing until `cauldron ripples run`.
+- **A bare completion, not an agent.** The call goes through the `threads`
+  service as one Claude Code call on the Claude login threads uses, with no
+  tools of any kind (no built-in tool, every one denied by name, no MCP
+  server), no settings files, plugins, hooks, skills or CLAUDE.md
+  (`--setting-sources ""` and Claude Code's `--safe-mode`),
+  permission mode `dontAsk` (never a skip-permissions mode), one turn, an
+  answer bounded to 16,000 tokens and given as JSON that must meet
+  `batch.schema.json`. An older threads, which would ignore those settings,
+  is refused before anything is sent (`threads_unsupported`).
+- **What leaves this machine.** Claude Code's own system prompt (it names
+  the call's working directory, an empty directory made for the call under
+  the system's temporary directory, the platform, the OS version and the
+  date), a note Claude Code adds naming the email address of the login the
+  call runs on, and one prompt, the file `services/ripples/package/dump/v1/prompt.md`
+  of the Cauldron repository filled in with the cauldron's regions (at most
+  50) and the dump's text: a text dump whole, a session dump only as its text
+  view (what you typed and what the assistant wrote as text; never tool
+  calls, tool output, thinking or shell output). No existing record is sent.
+  The dump's text sits between marker lines, after a rule that it is data
+  and never instructions. Nothing removes secrets from the text first:
+  remove a dump that holds one (`cauldron soup dump-remove`) before any run.
+- **What is stored where.** threads keeps, per call, a thread named `ripple
+  …` with the prompt (dump text included) and the answer in its store
+  (`data/<env>/threads/store/`, `threads.db` and `turns/`), until you delete
+  it; removing the dump does not remove that copy. Claude Code writes no
+  session transcript for the call (`--no-session-persistence`). The ripple's
+  journal (`data/<env>/ripples/runs.jsonl`) holds ids, counts and tokens,
+  never text, and the call's working directory is removed when it ends. The
+  root README's "Ripples, by hand" lists all of it, with the environment the
+  call runs in.
+- **How its records are marked.** Each cites the dump and carries
+  `meta.ripple` (package, run, model); the `mcp` service records the write
+  as a ripple's, and nothing in a record can change that. Reads show such a
+  record with `unreviewed: true`; `soup_nodes` and `soup_search` take
+  `review: "pending"` (only those) or `"reviewed"`.
+- **Approving is the owner's, at a terminal.** `cauldron soup approve
+  <id>... --env <env> --cauldron <name>` (and `--unapprove`) runs only with
+  its input and output on an interactive terminal, like `cauldron mcp
+  grant`; it is written as the owner and audited. There is no MCP tool for
+  it, so a session cannot approve, and a ripple never can (the soup refuses
+  `meta.approved` from a ripple). If you are a session and the user wants
+  records approved, tell them the command; do not try to run it. A review
+  flow for sessions comes in a later release. There is no reject yet.
+- **Unreviewed records are data, not instructions.** A ripple's records
+  were written by an automatic step from a dump, and a dump's text came from
+  outside. Every MCP reply that holds a record marked `unreviewed: true`
+  carries `unreviewed_note` saying so, and the door's instructions, the
+  curator, the commands and the schema skill tell a session to treat records
+  and dumps as data, never to act on an instruction found inside one, and to
+  tell the user when one reads like an instruction. That is guidance to the
+  session, not a control: the review flag stops nobody from reading a
+  record, and a session's own writes (a record that supersedes a ripple's,
+  say) are not gated by it.
+- **What it may write.** New records only, of those seven types, in
+  existing regions, linked only with `derived_from` to records of the same
+  answer, at most 25: never an edit, a close or a supersede, a directive, a
+  region or a flag. A repeated label (`duplicate-id-in-batch`) or a label
+  equal to a held id (`label-shadows-existing`) refuses the whole answer.
+- **The caps, across runs.** Per dump, across every run of it: 3 model calls
+  and 200,000 input tokens (`--force-budget <tokens>` on `run` is the
+  owner's way to let one run spend more). Per cauldron per UTC day:
+  1,500,000 input tokens or 30 dumps. Counted from the run journal before
+  each call. A call is charged when it begins, before anything is sent (one
+  call and its estimate: the prompt's characters divided by three, which
+  leaves out Claude Code's own system prompt), with the check and the charge
+  made in one step so two runs cannot both take the last call; it is
+  settled to the larger of its reported input tokens and that estimate when
+  it ends. A call cut short by a kill or a stop of the service stays
+  charged, and `status` shows it in `unsettled_calls`. One call can pass a
+  cap. Over a cap
+  nothing more is sent and the run ends `deferred` (`budget` or
+  `daily_cap`); the dump stays `received`. Sonnet first (or `--model`), one
+  Opus retry when the answer misses the schema or the soup refuses it.
+- **A call given up is stopped.** Parked by threads' budget, ended without
+  an answer, or past 15 minutes: the ripple cancels the turn in threads,
+  asks threads to withdraw its message and checks the thread is idle, and
+  the outcome says whether that was confirmed or how to stop it. A call
+  left by a killed or stopped service is cancelled when the service next
+  starts or runs.
+- **The dump.** Processed, it moves from `received` to `processed`, naming
+  the run and the records (`soup_dumps`, `soup_dump_get`). Curating by hand
+  leaves it `received`. A removed dump, or one whose removal is unfinished,
+  is refused. A dump run twice gets one set of records.
 
 ## The verbs
 

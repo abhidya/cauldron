@@ -7,7 +7,8 @@
 //! interrupted import left behind, and [`lock`] holds the two proofs every
 //! writer makes first. [`budget`] bounds a whole reply, and [`grants`] is the
 //! store of which cauldrons the owner opened to the MCP door; [`catalogue`]
-//! is the list of tools that door answers.
+//! is the list of tools that door answers. [`ripple`] holds what a ripple
+//! may write and finds what a ripple run already wrote.
 //!
 //! Every answer is a [`serde_json::Value`] (the JSON the CLI prints, byte
 //! for byte) or an [`Error`] with a stable [`Code`] and the message a person
@@ -24,6 +25,7 @@ pub mod lock;
 pub mod marker;
 pub mod reads;
 pub mod recover;
+pub mod ripple;
 pub mod target;
 
 pub use error::{Code, Error, Result};

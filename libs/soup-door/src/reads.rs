@@ -15,6 +15,16 @@
 //! leave superseded nodes out unless [`ReadOpts::include_superseded`], and
 //! each says how many it left out (`superseded_hidden`). With the option, a
 //! superseded node is listed with its `superseded_by`.
+//!
+//! # Unreviewed records
+//!
+//! A record a ripple wrote (its creating transaction's initiator is of class
+//! `ripple`) is UNREVIEWED until its `meta.approved` is set, which only the
+//! owner's side can do (the spine's flag rule refuses it to every ripple).
+//! Every read shows such a record, marked `unreviewed: true`; every other
+//! record carries no such key, so a store with no ripple record reads
+//! exactly as before. `nodes` and `search` take [`ReadOpts::review`]:
+//! `pending` keeps only unreviewed records, `reviewed` only the rest.
 
 use std::collections::BTreeMap;
 
@@ -58,6 +68,9 @@ pub struct ReadOpts {
     /// `nodes`, `search`, `region`: list superseded nodes too (they are
     /// left out, and counted, by default).
     pub include_superseded: bool,
+    /// `nodes`, `search`: `pending` (only unreviewed records) or
+    /// `reviewed` (only the others); checked with [`checked_review`].
+    pub review: Option<String>,
 }
 
 impl ReadOpts {
@@ -88,6 +101,39 @@ pub fn checked_pool(name: &str) -> Result<String> {
 
 fn store(err: impl std::fmt::Display) -> Error {
     Error::new(Code::Store, err.to_string())
+}
+
+/// The review filter's two values.
+pub const REVIEW_VALUES: [&str; 2] = ["pending", "reviewed"];
+
+/// A review filter, checked: `pending` or `reviewed`.
+pub fn checked_review(v: &str) -> Result<String> {
+    if REVIEW_VALUES.contains(&v) {
+        return Ok(v.to_string());
+    }
+    refuse!(Code::Usage, "the review filter is `pending` (only records a ripple wrote that nobody approved yet) or `reviewed` (every other record), not `{v}`")
+}
+
+/// The hashes of the landed transactions a RIPPLE initiated, read from the
+/// spine through a connection that cannot write. A spine with no such row
+/// (every store written before ripples) answers an empty set.
+pub fn ripple_commits(c: &env::Cauldron) -> Result<std::collections::HashSet<String>> {
+    let conn = spine::offline::read_only_connection(&c.soup().join(spine::spine_db::SPINE_FILE))
+        .map_err(|err| store(format!("reading cauldron `{}`'s spine: {err}", c.name)))?;
+    let mut stmt = conn
+        .prepare("SELECT hash FROM transactions WHERE decided = 1 AND json_extract(initiator, '$.class') = 'ripple'")
+        .map_err(store)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(store)?;
+    rows.collect::<std::result::Result<_, _>>().map_err(store)
+}
+
+/// Does a node's `meta` carry an approval (`meta.approved` present and
+/// neither `false` nor `null`)?
+pub fn approved(fields: &BTreeMap<String, spine::pool::FieldValue>) -> bool {
+    fields
+        .get("meta")
+        .and_then(|m| m.value.get("approved"))
+        .is_some_and(|a| !a.is_null() && *a != Value::Bool(false))
 }
 
 /// The pool, through a connection that cannot write.
@@ -158,6 +204,7 @@ pub fn get(t: &Target, ids: &[String], o: &ReadOpts) -> Result<Value> {
     let pool = o.pool_name();
     let handle = read_pool(c, &pool)?;
     let snap = handle.snapshot().map_err(store)?;
+    let ripples = ripple_commits(c)?;
     let mut records = Vec::new();
     let mut missing = Vec::new();
     let mut cut = Cut::new(o.max_chars);
@@ -196,6 +243,10 @@ pub fn get(t: &Target, ids: &[String], o: &ReadOpts) -> Result<Value> {
         if !by.is_empty() {
             rec.insert("superseded_by".into(), json!(by));
         }
+        let created = snap.created_tx(&n.id).map_err(store)?;
+        if created.is_some_and(|h| ripples.contains(&h.to_hex())) && !approved(&n.fields) {
+            rec.insert("unreviewed".into(), json!(true));
+        }
         records.push(Value::Object(rec));
     }
     let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "records": records});
@@ -222,6 +273,8 @@ struct Entry {
     /// The nodes whose `supersedes` edge points at it, by id; empty for a
     /// node nothing supersedes.
     superseded_by: Vec<String>,
+    /// A ripple wrote it and nobody approved it yet.
+    unreviewed: bool,
 }
 
 /// Every node of the pool, newest first: by the commit that created it
@@ -230,6 +283,7 @@ struct Entry {
 fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>, types: &[String]) -> Result<Vec<Entry>> {
     let order = spine::offline::commit_order(&c.soup())
         .map_err(|err| store(format!("reading cauldron `{}`'s commit order: {err}", c.name)))?;
+    let ripples = ripple_commits(c)?;
     let mut out = Vec::new();
     for t in types {
         for n in snap.nodes_of(t, None).map_err(store)? {
@@ -242,6 +296,7 @@ fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>,
                 .collect();
             let created = snap.created_tx(&n.id).map_err(store)?;
             let superseded_by = superseded_by(snap, pool, &n.id)?;
+            let unreviewed = created.as_ref().is_some_and(|h| ripples.contains(&h.to_hex())) && !approved(&n.fields);
             out.push(Entry {
                 id: n.id.0.clone(),
                 node_type: n.node_type.clone(),
@@ -251,6 +306,7 @@ fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>,
                 regions,
                 order: created.and_then(|h| order.get(&h.to_hex()).copied()),
                 superseded_by,
+                unreviewed,
             });
         }
     }
@@ -273,8 +329,20 @@ fn stated(mut item: Value, n: &Entry) -> Value {
         if !n.superseded_by.is_empty() {
             m.insert("superseded_by".into(), json!(n.superseded_by));
         }
+        if n.unreviewed {
+            m.insert("unreviewed".into(), json!(true));
+        }
     }
     item
+}
+
+/// Does `n` pass the review filter `review` (none passes everything)?
+fn reviewed_as(review: Option<&str>, n: &Entry) -> bool {
+    match review {
+        Some("pending") => n.unreviewed,
+        Some("reviewed") => !n.unreviewed,
+        _ => true,
+    }
 }
 
 /// The ids of the nodes whose `supersedes` edge points at `id`, sorted.
@@ -345,6 +413,9 @@ fn bounded<T>(mut v: Vec<T>, limit: usize) -> (Vec<T>, usize) {
 /// Nodes as `{id, type, state, handle, regions}`, newest first, filtered by
 /// region, type and state, at most `limit` (default [`NODES_LIMIT`]).
 pub fn nodes(t: &Target, o: &ReadOpts) -> Result<Value> {
+    if let Some(r) = &o.review {
+        checked_review(r)?;
+    }
     let (e, c) = (&t.env, &t.cauldron);
     let pool = o.pool_name();
     let handle = read_pool(c, &pool)?;
@@ -355,6 +426,7 @@ pub fn nodes(t: &Target, o: &ReadOpts) -> Result<Value> {
         .into_iter()
         .filter(|n| o.state.as_deref().is_none_or(|s| n.state.as_deref() == Some(s)))
         .filter(|n| region.as_ref().is_none_or(|r| n.regions.contains(r)))
+        .filter(|n| reviewed_as(o.review.as_deref(), n))
         .collect();
     let (all, hidden) = unsuperseded(all, o.include_superseded, |n| n);
     let total = all.len();
@@ -444,6 +516,9 @@ pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
     if wanted.is_empty() {
         refuse!(Code::Usage, "a search needs a query with at least one word");
     }
+    if let Some(r) = &o.review {
+        checked_review(r)?;
+    }
     let (e, c) = (&t.env, &t.cauldron);
     let pool = o.pool_name();
     let handle = read_pool(c, &pool)?;
@@ -454,7 +529,7 @@ pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
     // (matched terms, score, catalog position, entry, first body hit)
     let mut hits = Vec::new();
     for (pos, n) in catalog(c, &pool, &snap, &types)?.into_iter().enumerate() {
-        if region.as_ref().is_some_and(|r| !n.regions.contains(r)) {
+        if region.as_ref().is_some_and(|r| !n.regions.contains(r)) || !reviewed_as(o.review.as_deref(), &n) {
             continue;
         }
         let (h, b) = (fold(&n.handle), fold(&n.body));

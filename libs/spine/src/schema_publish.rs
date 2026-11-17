@@ -195,6 +195,37 @@ fn cites_schema() -> Value {
     })
 }
 
+/// Does the review flag (`meta.approved`, [`crate::flags::FLAG_FIELDS`])
+/// apply to this type?
+fn reviewable(name: &str) -> bool {
+    crate::flags::FLAG_FIELDS
+        .iter()
+        .find(|f| f.name == "meta.approved")
+        .is_some_and(|f| f.on.is_none_or(|on| on.contains(&name)))
+}
+
+/// `meta.approved`: the review flag. Described, never required.
+fn approved_schema() -> Value {
+    json!({
+        "description": "The review flag. A record a ripple wrote reads as `unreviewed: true` until this is set (any value but false or null; the owner's `cauldron soup approve`, run at a terminal, writes {at, by}; no MCP tool sets it). It is a flag: the soup refuses it to every ripple, so a ripple can never approve its own records. Leave it out when you write a record.",
+    })
+}
+
+/// `meta.ripple`: what a ripple's record carries about the run that wrote
+/// it. For display: the truth is the writing transaction's initiator.
+fn ripple_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Set by the MCP door on every record a ripple writes, overwriting anything the batch put here: {package, version, run, model}. For display only; who wrote a record is read from the transaction that wrote it, which no field can change. Leave it out when you write a record.",
+        "properties": {
+            "package": {"type": "string"},
+            "version": {"type": "string"},
+            "run": {"type": "string"},
+            "model": {"type": "string"},
+        },
+    })
+}
+
 /// The id pattern a `to` of edge kind `kind`, leaving a node of `src`, must
 /// match: local targets by their prefix; targets reached in any pool of this
 /// grammar's kind by their prefix with an optional `@<pool>`; targets in a
@@ -333,6 +364,10 @@ fn node_schema(g: &PoolGrammar, name: &str, file: &str) -> Value {
         let mut fs = field_schema(f);
         if fname == META && f.kind == FieldKind::Object {
             fs["properties"] = json!({"cites": cites_schema()});
+            if reviewable(name) {
+                fs["properties"]["approved"] = approved_schema();
+                fs["properties"]["ripple"] = ripple_schema();
+            }
         }
         props.insert(fname.clone(), fs);
         if f.required {

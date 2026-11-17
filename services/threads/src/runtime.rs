@@ -703,6 +703,29 @@ impl TeardownStrategy {
     }
 }
 
+/// **What a failure message never names**, longest first when applied
+/// (`retry::stderr_tail`): the thread's working directory, the temporary
+/// directory and the home directory, each replaced by a label.
+fn scrub_prefixes(cwd: &str) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = Vec::new();
+    let mut add = |p: Option<String>, label: &str| {
+        if let Some(p) = p.filter(|p| p.len() > 1) {
+            v.push((p.trim_end_matches('/').to_string(), label.to_string()));
+            // macOS reaches `/var/...` and `/tmp/...` through `/private`.
+            if let Ok(c) = std::fs::canonicalize(p.trim_end_matches('/')) {
+                let c = c.display().to_string();
+                if !v.iter().any(|(q, _)| q == &c) {
+                    v.push((c, label.to_string()));
+                }
+            }
+        }
+    };
+    add(Some(cwd.to_string()), "<cwd>");
+    add(std::env::var("TMPDIR").ok(), "$TMPDIR");
+    add(std::env::var("HOME").ok(), "~");
+    v
+}
+
 /// Send `sig` to a turn's child. With [`TeardownStrategy::ProcessGroup`] the
 /// child is its own group leader (`pgid == pid`), so `killpg` sweeps every
 /// descendant; with `ChildOnly` only the claude process is signalled.
@@ -5914,7 +5937,9 @@ impl ThreadManager {
         bare: bool,
     ) -> (String, Vec<u64>) {
         let message_ids: Vec<u64> = batch.iter().map(|q| q.message_id).collect();
-        if bare {
+        // A bare completion's model sees exactly the text sent: no preamble,
+        // header or notice (`ThreadSettings::completion`).
+        if bare || state.settings.lock().unwrap().completion.is_some() {
             return (batch[0].text.clone(), message_ids);
         }
         let (inj, cwd, app_id) = {
@@ -10229,6 +10254,7 @@ impl ThreadManager {
                     outcome.reset.as_deref(),
                     outcome.pool.as_deref(),
                     &tx_mark,
+                    outcome.stderr_tail.as_deref(),
                 ) {
                     VerdictLanding::RunAgain => {
                         attempt += 1;
@@ -10459,7 +10485,32 @@ impl ThreadManager {
         reset: Option<&str>,
         pool: Option<&str>,
         tx_mark: &Option<(PathBuf, u64)>,
+        stderr_tail: Option<&str>,
     ) -> VerdictLanding {
+        // ── A BARE COMPLETION IS NEVER RE-DELIVERED BLINDLY ──
+        //
+        // First, above the fresh-start recovery and every ladder: a
+        // completion (`ThreadSettings::completion`) whose `claude` ended
+        // without an answer ends its delivery NOW, `turn_failed` with the
+        // stderr tail, so the caller waiting on it hears why at once instead
+        // of after a ladder of identical re-runs (`retry::completion_fails_fast`
+        // names the account-level classes that keep theirs). The prompt is
+        // kept on the queue as `failed`, like every give-up.
+        if state.settings.lock().unwrap().completion.is_some() {
+            if let Some((kind, reason)) = crate::retry::completion_fails_fast(&decision) {
+                self.rollback_failed_attempt(state, tx_mark);
+                let cwd = state.settings.lock().unwrap().cwd.clone();
+                let owned = scrub_prefixes(&cwd);
+                let prefixes: Vec<(&str, &str)> = owned.iter().map(|(p, l)| (p.as_str(), l.as_str())).collect();
+                let message = crate::retry::completion_failure_message(&kind, &reason, stderr_tail, &prefixes);
+                tracing::warn!(
+                    thread = %state.id, attempt, error_kind = kind.kind_str(),
+                    "a bare completion ended without an answer — failed at once, not re-delivered: {message}"
+                );
+                self.give_up_and_keep_the_prompt(state, message_ids, &kind, message);
+                return VerdictLanding::Done;
+            }
+        }
         // ── ONE VERDICT CARRIES A RECOVERY, NOT JUST A LADDER ──
         //
         // `RestartFresh` means the CLI could not find the
@@ -11134,6 +11185,7 @@ impl ThreadManager {
             compaction_stopped: false,
             login_refused: true,
             projection_refused: false,
+            stderr_tail: None,
         }
     }
 
@@ -11224,6 +11276,7 @@ impl ThreadManager {
             compaction_stopped: false,
             login_refused: false,
             projection_refused: true,
+            stderr_tail: None,
         }
     }
 
@@ -12392,7 +12445,8 @@ impl ThreadManager {
         // Snapshot LIVE settings + rescan plugins (Q9/Q10 hot paths).
         let (cfg, snapshot) = {
             let s = state.settings.lock().unwrap();
-            let dirs = plugins::collect_plugin_dirs(&s);
+            // A bare completion attaches no plugin (`ThreadSettings::completion`).
+            let dirs = if s.completion.is_some() { Vec::new() } else { plugins::collect_plugin_dirs(&s) };
             let snapshot = plugins::snapshot(&dirs);
             let dir_strs: Vec<String> = dirs.iter().map(|p| p.display().to_string()).collect();
             (SpawnConfig::from_settings(&state.id, &s, dir_strs), snapshot)
@@ -12585,10 +12639,21 @@ impl ThreadManager {
         // for THIS cookie, so it verifies only while this turn's
         // `running_turns` row stands; the config file is removed when
         // `_mcp_file` drops at the end of this function.
-        let (run_token, _mcp_file) = self.turn_mcp(&state.id, &cookie);
+        //
+        // A BARE COMPLETION (`ThreadSettings::completion`) gets neither: no
+        // token is minted, no config file is written, and its argv carries an
+        // empty `--strict-mcp-config` instead (`SpawnConfig::build_args`).
         let mut cfg = cfg;
-        cfg.run_token = Some(run_token);
-        cfg.mcp_config = _mcp_file.as_ref().map(TurnMcpConfig::path);
+        let _mcp_file = if cfg.completion.is_some() {
+            cfg.run_token = None;
+            cfg.mcp_config = None;
+            None
+        } else {
+            let (run_token, f) = self.turn_mcp(&state.id, &cookie);
+            cfg.run_token = Some(run_token);
+            cfg.mcp_config = f.as_ref().map(TurnMcpConfig::path);
+            f
+        };
         // R11.J3: `--json-schema` rides the turn that delivers the
         // schema-bearing message, and only that turn (STRUCTURED-OUTPUT §3.2).
         cfg.json_schema = crate::managed::turn_json_schema(self, &state.id, message_ids);
@@ -12654,6 +12719,7 @@ impl ThreadManager {
         let mut cmd = Command::new(&program);
         cmd.args(&args);
         cmd.current_dir(&cfg.cwd);
+        let cfg_cwd = cfg.cwd.to_string();
         for (k, v) in &env_overrides {
             match v {
                 Some(val) => {
@@ -13156,6 +13222,7 @@ impl ThreadManager {
                 compaction_stopped: false,
             login_refused: false,
             projection_refused: false,
+            stderr_tail: None,
             };
         }
 
@@ -13171,6 +13238,7 @@ impl ThreadManager {
                 compaction_stopped: false,
             login_refused: false,
             projection_refused: false,
+            stderr_tail: None,
             };
         }
         if let Some(k) = limit_killed {
@@ -13189,6 +13257,7 @@ impl ThreadManager {
                 compaction_stopped: false,
             login_refused: false,
             projection_refused: false,
+            stderr_tail: None,
             };
         }
         // ── AND THE SAME SHORT-CIRCUIT FOR THE POST-COMPACTION ENDING ────────
@@ -13222,6 +13291,7 @@ impl ThreadManager {
                 compaction_stopped: true,
                 login_refused: false,
             projection_refused: false,
+            stderr_tail: None,
             };
         }
 
@@ -13320,6 +13390,24 @@ impl ThreadManager {
                 },
             }));
         }
+        // ── THE STDERR TAIL OF A FAILED TURN ─────────────────────────────────
+        //
+        // Joined (bounded, as above) when a failure verdict was reached and the
+        // reader is still running, so a bare completion's `turn_failed` can
+        // say what `claude` said (`retry::completion_failure_message`).
+        let stderr_tail = if decision.is_some() {
+            if let Some(mut reader) = stderr_reader.take() {
+                if tokio::time::timeout(self.tunables.stderr_drain, &mut reader).await.is_err() {
+                    reader.abort();
+                }
+            }
+            let err = stderr_buf.lock().unwrap().clone();
+            let owned = scrub_prefixes(&cfg_cwd);
+            let prefixes: Vec<(&str, &str)> = owned.iter().map(|(p, l)| (p.as_str(), l.as_str())).collect();
+            crate::retry::stderr_tail(&err, &prefixes)
+        } else {
+            None
+        };
         TurnOutcome {
             decision,
             reset: sig.reset,
@@ -13330,6 +13418,7 @@ impl ThreadManager {
             compaction_stopped: false,
             login_refused: false,
             projection_refused: false,
+            stderr_tail,
         }
     }
 
@@ -16753,6 +16842,8 @@ impl ThreadManager {
                         // No transcript mark: the attempt began in the previous
                         // daemon, which is where the mark was taken.
                         &None,
+                        // Nor its stderr: that pipe closed with the daemon.
+                        None,
                     ) {
                         VerdictLanding::Done => {}
                         // Placement moved the turn, or it restarts fresh:
@@ -17066,6 +17157,10 @@ struct TurnOutcome {
     /// shape as `login_refused`, for the same reason — a turn that never reached
     /// `cmd.spawn()` is ended, not laddered.
     projection_refused: bool,
+    /// **The end of the child's stderr**, scrubbed and bounded
+    /// (`retry::stderr_tail`), when a failure verdict was reached and stderr
+    /// said anything. What a bare completion's `turn_failed` carries.
+    stderr_tail: Option<String>,
 }
 
 impl TurnOutcome {
@@ -17080,6 +17175,7 @@ impl TurnOutcome {
             compaction_stopped: false,
             login_refused: false,
             projection_refused: false,
+            stderr_tail: None,
         }
     }
 }

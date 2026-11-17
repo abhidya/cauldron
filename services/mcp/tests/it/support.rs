@@ -107,7 +107,20 @@ impl Scratch {
     /// Land records directly, as `cauldron soup import --remint` would.
     pub fn import(&self, c: &str, records: &[Value]) -> Value {
         let o = ImportOptions { remint: true, agent: "fixture".into(), dispatch: "fixture".into(), ..ImportOptions::default() };
-        match soup_door::import::import(&self.target(c), records, &o).unwrap() {
+        // A child another test spawns can hold a copy of this process's lock
+        // descriptor for the instant between its fork and its exec, so the
+        // writer lock of the import just before can still look held: retry.
+        let mut tries = 0;
+        let out = loop {
+            match soup_door::import::import(&self.target(c), records, &o) {
+                Err(e) if e.code == soup_door::Code::Locked && tries < 50 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.unwrap(),
+            }
+        };
+        match out {
             ImportOutcome::Judged { doc, ok } => {
                 assert!(ok, "fixture refused: {doc}");
                 doc
@@ -157,6 +170,8 @@ pub fn load_batch(n: usize, tag: &str) -> Vec<Value> {
 pub struct Service {
     pub child: Child,
     pub door: SocketAddr,
+    /// The service's cauldron seam (the line protocol).
+    pub seam: SocketAddr,
     pub bearer: String,
     pub log: PathBuf,
 }
@@ -219,7 +234,7 @@ impl Service {
         let url = seam_say(seam, "MCP");
         let door: SocketAddr = url.strip_prefix("http://").and_then(|u| u.strip_suffix("/mcp")).expect("MCP answers the door's url").parse().unwrap();
         let bearer = format!("Bearer {}", std::fs::read_to_string(s.mcp_dir().join("door.secret")).unwrap().trim());
-        Service { child, door, bearer, log }
+        Service { child, door, seam, bearer, log }
     }
 
     pub fn log(&self) -> String {

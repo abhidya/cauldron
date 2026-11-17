@@ -63,7 +63,7 @@ impl SideEffects for LogOnly {
         match landed {
             Landing::Dump { env, cauldron, id, kind, bytes, cursor } => tracing::info!(
                 %env, %cauldron, dump = %id, %kind, bytes, %cursor,
-                "dump received; it waits as `received` (processing comes in a later release)"
+                "dump received; it waits as `received` until its owner processes it (`cauldron ripples run`)"
             ),
         }
     }
@@ -222,6 +222,15 @@ impl Dumps {
             cursor: &cursor,
         });
         Ok(receipt)
+    }
+
+    /// Run `f` on `t`'s dumps store, holding it (opened first if needed, as
+    /// for a dump).
+    pub fn with_store<R>(&self, t: &Target, who: &Who, f: impl FnOnce(&Store) -> Result<R, Refusal>) -> Result<R, Refusal> {
+        let h = self.get_or_open(t, who)?;
+        let store = h.store.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(store) = store.as_ref() else { return Err(closed()) };
+        f(store)
     }
 
     /// Close `cauldron`'s dumps store: the dump being written (if any)

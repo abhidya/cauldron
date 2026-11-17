@@ -232,7 +232,9 @@ them too.
   `revisit_trigger`. `question`: `blocking` (boolean), `recommendation`,
   `human_action`. `issue`: `answer`, `status`, `severity`, `area`, `tb_id`,
   `next_action`, `human_action`. `task`: `file`, `report`, `model`,
-  `dispatched_as`. `handoff`: `covers`, `repair_report`.
+  `dispatched_as`. `handoff`: `covers`, `repair_report`. Every content
+  type: `approved` (the review flag, below) and `ripple` (set by the MCP
+  door on a record a ripple wrote, below).
 - **Retired `meta` keys** must not be written: `subjects`, `regions` (use
   `in_region`), `resolution` (use `resolved_by`), `depends_on` (use the edge),
   `verbatim_evidence`, `operator_cite`, `traces_raw`, `expand_on_init`,
@@ -272,6 +274,19 @@ per-type schemas say the same under `meta.cites`.
 
 `meta.cites` is evidence. It is not `operator`: only the human's own message
 makes a node the human's.
+
+**Records a ripple wrote, and the review flag.** A ripple (`cauldron
+ripples run`, from 0.1.10) writes new records only, each citing its dump
+(`{"kind": "dump", "id": "DM-<n>"}`) and carrying `meta.ripple: {package,
+version, run, model}`, which the MCP door sets and a batch cannot change.
+Who wrote a record is read from the transaction that wrote it, not from any
+field. Such a record is unreviewed until its `meta.approved` is set (any
+value but `false` or `null`; the owner's `cauldron soup approve`, run at a
+terminal, writes `{at, by}`, and no MCP tool sets it); the reads mark it `unreviewed: true`,
+which is computed and is not a field (leave it out when you write the record
+again). `meta.approved` is a flag: the soup refuses it to every ripple, so a
+ripple can never approve its own records. Do not write `meta.approved` or
+`meta.ripple` yourself on a record you create.
 
 **Knowledge capture: patterns and cases.** There is no `pattern` or `case`
 type. Record a **pattern** (a lesson, a rule learned) as a `decision` (a call

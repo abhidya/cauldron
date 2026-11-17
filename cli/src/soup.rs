@@ -184,11 +184,13 @@ cauldron soup — a cauldron's soup, offline
         its direct members (id, type, state, handle), newest first, at most --limit (50).
     cauldron soup nodes [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
                         [--state <s>] [--limit N] [--max-chars N] [--include-superseded]
+                        [--review pending|reviewed]
         Nodes as {id, type, state, handle, regions}, newest first (by the spine's commit
         order; one write's nodes by id prefix, then serial, highest first), at most --limit
         (default 50); --region keeps a region's direct members.
     cauldron soup search <query> [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
                          [--limit N] [--max-chars N] [--include-superseded]
+                         [--review pending|reviewed]
         Lexical search over handles and bodies: every word of the query a term, found
         case-insensitively as a substring; ranked by how many terms match, then handle hits over body hits, then newest.
         Prints {id, type, state, handle, regions, score, snippet}, at most --limit (20);
@@ -201,7 +203,7 @@ cauldron soup — a cauldron's soup, offline
     cauldron soup dump <file|-> [--cauldron <name>] [--env <env>] [--title <t>] [--source <s>]
         Keep the file's text (or stdin's, with -) as a dump in the cauldron's dumps store,
         beside its soup (not as a soup node): DM-<n>, in state `received`, as one write,
-        for later processing (processing of dumps comes in a later release). At most 1 MiB
+        for later processing (by hand: `cauldron ripples run <id>`). At most 1 MiB
         of UTF-8 text; a larger one is refused as `too_large` (split it). Prints a receipt
         (id, bytes, sha256), never the text. While the `mcp` service holds the cauldron's
         dumps store (`cauldron mcp status`), the dump is sent to it and lands through it,
@@ -246,6 +248,16 @@ cauldron soup — a cauldron's soup, offline
         Refused while the `mcp` service holds the cauldron's dumps store: revoke its
         grant (`cauldron mcp revoke <name> --env <env>`) or stop the service, run this,
         then grant again. Never an MCP tool.
+    cauldron soup approve <id>... --env <env> --cauldron <name> [--unapprove]
+        Approve records a ripple wrote (`cauldron ripples run`): each named record that
+        reads as `unreviewed` gets `meta.approved: {at, by: \"owner\"}` and reads as
+        reviewed from then on; with --unapprove, each approved one reads as unreviewed
+        again. All in one write, through the running `mcp` service, audited in its
+        calls.jsonl. Approving is the owner's act: this runs only with its input and output
+        on an interactive terminal, and no option skips that; no MCP tool approves, and a
+        ripple never can. An id that is not a ripple's record, or is already in the asked
+        state, is listed in `skipped` with why. A review flow for sessions comes in a later
+        release.
     cauldron soup help
 
   Every verb prints JSON on stdout and exits non-zero on a refusal. Reads open the store
@@ -256,6 +268,9 @@ cauldron soup — a cauldron's soup, offline
   supersedes) and say how many they left out in `superseded_hidden`; --include-superseded
   lists them too, each with its `superseded_by`. `total` and `members_total` count what
   is listed, before --limit.
+  A record a ripple wrote (`cauldron ripples run`) is unreviewed until its owner approves
+  it (`cauldron soup approve`): every read shows it, marked `unreviewed: true`.
+  --review pending lists only those; --review reviewed only the rest.
   `--pool <p>` names another pool than `ws`.
 
   --env and --cauldron may be left out inside a project linked with `cauldron link`: the
@@ -285,13 +300,14 @@ pub(crate) fn verb_soup(args: &[String]) -> Result<i32> {
         Some("dumps") => dumps(&args[1..]),
         Some("dump-get") => dump_get(&args[1..]),
         Some("dump-remove") => dump_remove(&args[1..]),
+        Some("approve") => approve(&args[1..]),
         None => {
             eprint!("{USAGE}");
             Ok(2)
         }
         Some(other) => {
             eprintln!(
-                "cauldron soup: no verb `{other}` (import | recover | regions | region | nodes | search | get | dump | dumps | dump-get | dump-remove | help)"
+                "cauldron soup: no verb `{other}` (import | recover | regions | region | nodes | search | get | dump | dumps | dump-get | dump-remove | approve | help)"
             );
             Ok(2)
         }
@@ -314,12 +330,14 @@ struct Args {
     remint: bool,
     allow_duplicate: bool,
     include_superseded: bool,
+    review: Option<String>,
     title: Option<String>,
     source: Option<String>,
     kind: Option<String>,
     offset: Option<usize>,
     raw: bool,
     yes: bool,
+    unapprove: bool,
     view: Option<String>,
     turn_offset: Option<usize>,
     pos: Vec<String>,
@@ -361,12 +379,14 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--remint" => a.remint = true,
             "--allow-duplicate" => a.allow_duplicate = true,
             "--include-superseded" => a.include_superseded = true,
+            "--review" => a.review = Some(soup_door::reads::checked_review(&take(&mut it)?)?),
             "--title" => a.title = Some(take(&mut it)?),
             "--source" => a.source = Some(take(&mut it)?),
             "--kind" => a.kind = Some(take(&mut it)?),
             "--offset" => a.offset = Some(count(flag, &take(&mut it)?)?),
             "--raw" => a.raw = true,
             "--yes" => a.yes = true,
+            "--unapprove" => a.unapprove = true,
             "--view" => a.view = Some(take(&mut it)?),
             "--turn-offset" => a.turn_offset = Some(count(flag, &take(&mut it)?)?),
             _ => a.pos.push(s.clone()),
@@ -433,6 +453,7 @@ fn read_opts(a: &Args) -> ReadOpts {
         node_type: a.node_type.clone(),
         state: a.state.clone(),
         include_superseded: a.include_superseded,
+        review: a.review.clone(),
     }
 }
 
@@ -647,7 +668,7 @@ fn nodes(args: &[String]) -> Result<i32> {
     let a = parse(
         "nodes",
         args,
-        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--state", "--limit", "--max-chars", "--include-superseded"],
+        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--state", "--limit", "--max-chars", "--include-superseded", "--review"],
     )?;
     if let Some(p) = a.pos.first() {
         bail!("`cauldron soup nodes` takes no ids (got `{p}`); `soup get` reads nodes by id");
@@ -661,7 +682,7 @@ fn search(args: &[String]) -> Result<i32> {
     let a = parse(
         "search",
         args,
-        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--limit", "--max-chars", "--include-superseded"],
+        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--limit", "--max-chars", "--include-superseded", "--review"],
     )?;
     let query = a.pos.join(" ");
     if soup_door::reads::search_terms(&query).is_empty() {
@@ -807,6 +828,59 @@ fn dump_forward(t: &Target, text: &str, a: &Args, pid: u32) -> Result<Option<i32
         "not_granted" | "locked" => Ok(None),
         _ => bail!("REFUSED ({holder} answered `{code}`): {}", refused["message"].as_str().unwrap_or("")),
     }
+}
+
+/// **`cauldron soup approve <id>... --env <e> --cauldron <c> [--unapprove]`**:
+/// the owner's approval of a ripple's records, sent to the running `mcp`
+/// service's `APPROVE` seam verb with the approval key it minted
+/// (`approve.secret`). Refused unless stdin and stdout are an interactive
+/// terminal, checked before the key is read, as `cauldron mcp grant` is.
+fn approve(args: &[String]) -> Result<i32> {
+    use std::io::IsTerminal;
+    let a = parse("approve", args, &["--env", "--cauldron", "-c", "--unapprove"])?;
+    if a.pos.is_empty() {
+        bail!("`cauldron soup approve` takes one or more record ids (`cauldron soup nodes --review pending` lists them)");
+    }
+    let (Some(env_name), Some(cauldron)) = (a.env.as_deref(), a.cauldron.as_deref()) else {
+        bail!(
+            "REFUSED: `cauldron soup approve` takes the environment and the cauldron only as flags: --env <env> --cauldron \
+             <name>. Nothing was written."
+        );
+    };
+    let e = crate::mcp::environment(Some(env_name))?;
+    let word = if a.unapprove { "unapprove" } else { "approve" };
+    let command = format!(
+        "cauldron soup approve {} --env {} --cauldron {cauldron}{}",
+        a.pos.join(" "),
+        e.name,
+        if a.unapprove { " --unapprove" } else { "" }
+    );
+    // Checked before anything is read or sent, so the command the refusal
+    // names is one that would work.
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!(
+            "REFUSED: approving a ripple's records is the owner's act at a terminal. `cauldron soup approve` runs only with \
+             its input and output on an interactive terminal, so an agent, a ripple or a script cannot {word} records by \
+             itself, and no option skips this. Nothing was written. Ask the user to run, in a terminal on this machine:\n    \
+             {command}"
+        );
+    }
+    let found = match crate::mcp_door::find(&e) {
+        Ok(f) => f,
+        Err(why) => bail!(
+            "REFUSED: the `mcp` service writes the approval, and {}. Nothing was written. Start it: `{}`.",
+            why.say(),
+            crate::mcp_door::start_command(&e.name)
+        ),
+    };
+    let key_path = soup_door::grants::store_dir(&e).join("approve.secret");
+    let key = std::fs::read_to_string(&key_path)
+        .with_context(|| format!("reading the approval key {} (the `mcp` service mints it when it starts)", key_path.display()))?;
+    let body = serde_json::json!({"cauldron": cauldron, "ids": a.pos, "unapprove": a.unapprove});
+    let answer = crate::mcp_door::seam_ask(&found.seam, &format!("APPROVE {} {body}", key.trim()))?;
+    let v: serde_json::Value = serde_json::from_str(&answer).with_context(|| format!("the mcp service answered `{answer}`"))?;
+    print(&v)?;
+    Ok(if v["ok"] == serde_json::json!(true) { 0 } else { 1 })
 }
 
 /// **`cauldron soup dump-remove <id> --env <e> --cauldron <c> [--yes]`**:

@@ -45,6 +45,8 @@ pub async fn run(se: ServiceEnv) -> Result<()> {
     let addr = std_listener.local_addr()?;
     let dir = crate::dir(&env);
     let secret = secret::mint(&dir)?;
+    let ripples = secret::mint_named(&dir, secret::RIPPLES_FILE)?;
+    let approve = secret::mint_named(&dir, secret::APPROVE_FILE)?;
     let door = Door::new(env, secret, se.version.clone(), &dir);
 
     {
@@ -80,6 +82,8 @@ pub async fn run(se: ServiceEnv) -> Result<()> {
         door: addr,
         started_at: st,
         state,
+        ripples,
+        approve,
     })
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(door = %addr, seam = %seam_addr, env = %se.env, "cauldron-mcp listening on http://{addr}/mcp");

@@ -14,18 +14,159 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 <!-- RIPPLES: filled when the ripple executor's RV1.S16 lands -->
 
 - **Ripples live.** Dumps set off ripples, and ripples write to the soup. The
-  soup engine is hardened, and the Ledger shows real ripple events. Neither is
-  in any 0.1.x release so far.
+  soup engine is hardened, and the Ledger shows real ripple events. Through
+  0.1.9 neither is in a release; 0.1.10 adds the first ripple, run by hand on
+  one dump at a time.
 
 ### Not yet scheduled to a release
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.9, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.10, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.9, only an
+  the disable and trigger a fresh usage reading. Through 0.1.10, only an
   explicit enable clears it.
+
+## [0.1.10] — 2026-11-17
+
+The first ripple, run by hand: `cauldron ripples run <DM-n>` turns one dump
+into new records in the soup, each citing the dump and marked unreviewed
+until its owner approves it at a terminal. Off unless you start its service
+and run it; nothing is processed on its own.
+
+### Added
+
+- **`cauldron ripples run <DM-n> --env E --cauldron C [--model M]
+  [--force-budget N]`.** It sends one dump to the new `ripples` service,
+  which reads the dump and the cauldron's regions through the `mcp` service,
+  makes a structured-output call through the `threads` service, and hands
+  the answer back to the `mcp` service, which lands it as new records and
+  moves the dump from `received` to `processed`. The prompt and the
+  answer's JSON schema are two files, `services/ripples/package/dump/v1/`
+  `prompt.md` and `batch.schema.json`. What leaves the machine is the dump's
+  id, kind and text (a session dump only as its text view: what was typed
+  and what the assistant wrote as text), the cauldron's regions (at most
+  50), the answer's schema, and Claude Code's own system prompt; no
+  existing record. The README's "Ripples, by
+  hand" lists what is sent and what is stored where. Sonnet first, one Opus
+  retry when the answer misses the schema or the soup refuses it. The
+  outcome prints the records and the tokens (input, output, cached, calls,
+  models), and failures say what to do. A dump that is removed, or whose
+  removal is unfinished, is refused; a dump run twice gets one set of
+  records; a run cut short reads as `interrupted` and is safe to run again.
+- **The model call is a bare completion.** The call runs in Claude Code
+  with no tools of any kind (no built-in tool, each denied by name, no MCP
+  server), no settings files, plugins, hooks, skills or CLAUDE.md
+  (`--setting-sources ""` and Claude Code's `--safe-mode`),
+  permission mode `dontAsk`, one turn, an answer bounded to 16,000 tokens,
+  no session transcript, an environment stripped to what Claude Code needs,
+  and an empty working directory made for the call and removed after it.
+  The dump's text is marked in the prompt as untrusted data, and the answer
+  is checked against the schema by the ripple as well as by threads.
+- **`threads`: a thread can be a bare completion.** A new thread setting,
+  `completion: {max_output_tokens}`, absent unless a caller names it, makes
+  every turn of that thread run as above; threads mints no run token and
+  writes no MCP config for it, and sends the prompt as it was given. It is
+  set only at creation and cannot be loosened by a later update. A ripple
+  reads the thread back before sending anything and refuses a threads that
+  did not keep it (`threads_unsupported`), so the `ripples` service needs
+  the `threads` service of this release. A completion whose `claude` ends
+  without an answer fails at once (`turn_failed`, with the last lines of its
+  error output, the home and working directories shown as `~` and `<cwd>`)
+  and is not delivered again; a usage limit, a spent credit balance or an
+  expired login still parks it. A ripple ends its call the same way if
+  threads schedules a re-delivery.
+- **Caps that hold across runs.** Counted from the run journal before every
+  call: per dump, across every run of it, at most 3 model calls and 200,000
+  input tokens (`--force-budget N` lets one run spend N more); per cauldron
+  per UTC day, at most 1,500,000 input tokens or 30 dumps. A call is
+  charged when it begins, before anything is sent, as one call and its
+  estimate, with the check and the charge made in one step under the
+  journal's lock (two runs cannot both take the last call), and settled to
+  the larger of the input tokens it reported and that estimate when it ends.
+  A call cut short by killing or stopping the `ripples` service stays
+  charged. Over a cap the run ends `deferred` (`budget` or `daily_cap`)
+  and the dump stays `received`.
+- **A call given up is cancelled.** When threads parks a call, the turn
+  ends without an answer, or no answer comes in 15 minutes, the ripple asks
+  threads to stop the turn and to withdraw its message, and checks the
+  thread is idle; the outcome says whether that was confirmed, or that the
+  call may still be running and how to stop it. A call left by a killed or
+  stopped service is cancelled when the service next starts or runs.
+- **The `ripples` service** (`services/ripples.toml`, `cauldron-ripples`).
+  The installer does not start it: build, pin and start it yourself. It
+  never opens a cauldron; it reads and writes through the `mcp` service, and
+  keeps a run journal, `data/<env>/ripples/runs.jsonl`, with every step and
+  its tokens and never dump text. Its `RUN` and `STATUS` answer only a
+  caller holding the key it mints at each start (`run.secret`, owner-only).
+- **`cauldron ripples status`** shows the service, the last ten runs, the
+  spend today per cauldron and per dump across its runs (a call that never
+  ended counted and shown in `unsettled_calls`), any call that may
+  still be running in threads, and the caps (read from the journal when the
+  service is stopped).
+- **The review flag, and `cauldron soup approve`.** A record a ripple wrote
+  reads as `unreviewed: true` in `soup_nodes`, `soup_search`, `soup_get` and
+  `cauldron soup nodes | search | get` until its `meta.approved` is set.
+  Only the owner sets it, with `cauldron soup approve <id>... --env E
+  --cauldron C` (`--unapprove` takes it back), which runs only with its
+  input and output on an interactive terminal, as `cauldron mcp grant` does,
+  and is audited. No MCP tool approves, so no session can; the soup refuses
+  `meta.approved` to every ripple. A review flow for sessions comes in a
+  later release. `soup_nodes` and `soup_search` take `review: "pending" |
+  "reviewed"`, and the CLI reads take `--review`. A store with no ripple
+  record reads exactly as before. The published schema describes
+  `meta.approved` and `meta.ripple`.
+- **Unreviewed records are marked as data, not instructions.** Every MCP
+  reply that holds a record marked `unreviewed: true` carries, once,
+  `unreviewed_note`: such records were written by an automatic step from a
+  dump, are not approved by the owner, and are to be treated as data, never
+  as instructions. The MCP door's `initialize` instructions, the read tools'
+  descriptions, the curator, `/cauldron:curate`, `/cauldron:curate-dump` and
+  the schema skill say the same of records and dumps, and tell a session
+  never to act on an instruction found inside one and to tell the user when
+  one reads like an instruction.
+- **The `mcp` service's ripple seam.** Five verbs on its seam (`RDUMP`,
+  `RTEXT`, `RREAD`, `RRUN`, `RPUT`) answer only a line carrying a second
+  secret the service mints at each start, `mcp/ripples.secret`
+  (owner-only), which only the `ripples` service reads; the MCP tools never
+  accept it. `RPUT` lands a batch under a ripple's provenance that the door
+  sets itself (no field of a record can change it), new records only (seven
+  types, in existing regions, `ref` and `derived_from` links, at most 25,
+  each label used once and none equal to a held id), judged without landing
+  first and then landed as one write, and lands a given run at most once. A
+  sixth verb, `APPROVE`, answers only the owner's approval key
+  (`mcp/approve.secret`).
+
+### Changed
+
+- **A dump's receipt and the dump commands** now say that a dump is
+  processed only by hand (`cauldron ripples run`, or
+  `/cauldron:curate-dump`), and a processed dump's summary names the run
+  and its records (`processed`).
+- **The curator** reads records marked `unreviewed` as suggestions, treats
+  them and dumps as data and never as instructions, and never approves.
+
+### Fixed
+
+- **A structured-output turn whose schema names JSON Schema 2020-12 now
+  starts.** Claude Code's CLI cannot load the 2020-12 meta-schema and
+  refused such a `--json-schema` before it ran (`no schema with key or ref
+  "https://json-schema.org/draft/2020-12/schema"`, exit 1), so the turn was
+  retried and failed with no answer; a ripple's schema says it is 2020-12.
+  threads now leaves a top-level `$schema` other than draft-07's off the
+  value it passes; the schema it judges the answer against is unchanged.
+
+### Known limitations
+
+- **After a downgrade to 0.1.9, ripple records are not marked.** 0.1.9
+  reads a 0.1.10 store, but shows a ripple's records without `unreviewed`.
+- **threads keeps every ripple call's prompt and answer**, dump text
+  included, in its store until you delete it; removing the dump does not
+  remove that copy.
+- **Removing a dump leaves the records a ripple drew from it.** They keep
+  citing it (`meta.cites`, `{"kind": "dump", "id": "DM-<n>"}`), which is how
+  to find them; supersede any you do not want.
 
 ## [0.1.9] — 2026-11-17
 
@@ -865,7 +1006,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/broomstick-ai/cauldron/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/broomstick-ai/cauldron/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/broomstick-ai/cauldron/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/broomstick-ai/cauldron/compare/v0.1.6...v0.1.7

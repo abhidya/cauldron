@@ -361,8 +361,18 @@ fn the_flag_rule_refuses_a_ripple_outside_its_scope_and_admits_one_inside() {
     let (f, k, node, _) = only_flag(&w);
     assert_eq!((f, k, node), ("meta.blocking", "type_one", qid.as_str()));
     // A whole-object SET above the flag writes it too.
+    // It writes every flag under `meta`: the question's `meta.blocking` and
+    // its `meta.approved` (the review flag, on every content type).
     let w = witnesses(submit(&c, ripple(RippleKind::TypeTwo, "out-3", &[]), &set("meta"), &[("id", json!(qid)), ("v", json!({"note": 1}))]));
-    assert_eq!(only_flag(&w).0, "meta.blocking");
+    let mut fields: Vec<&str> = w
+        .iter()
+        .map(|x| match x {
+            Witness::FlagNotWritable { field, .. } => field.as_str(),
+            other => panic!("expected flag_not_writable, got {other:?}"),
+        })
+        .collect();
+    fields.sort();
+    assert_eq!(fields, ["meta.approved", "meta.blocking"]);
     // SEAL is the `sealed` flag.
     let w = witnesses(submit(&c, ripple(RippleKind::TypeTwo, "out-4", &["meta.blocking"]), "MATCH (q: board/question { id: $id }) SEAL (q)", &[("id", json!(qid))]));
     assert_eq!(only_flag(&w).0, "sealed");
@@ -443,4 +453,39 @@ fn a_refused_flag_write_leaves_no_row_for_any_landing_to_land() {
     committed(submit(&c, ripple(RippleKind::TypeTwo, "i-c", &["meta.blocking"]), set, &params));
     assert_eq!(tx_rows(&root), before + 1);
     assert_eq!(meta_of(&c, "q"), json!({"blocking": true}));
+}
+
+/// **THE REVIEW FLAG.** `meta.approved` is a flag on every content type: a
+/// ripple (type one, or type two with the empty scope the ripples service
+/// always writes with) is refused it whether it creates a record already
+/// approved or sets it on one, dotted or by a whole `meta`; and nothing of
+/// those writes lands. An agent (the owner's tools) sets it and it lands.
+#[test]
+fn a_ripple_never_approves_and_an_agent_does() {
+    let (_dir, c) = cauldron();
+    // A ripple's own record, unapproved: lands.
+    committed(create_question(&c, ripple(RippleKind::TypeTwo, "rv-1", &[]), "r", json!({"cites": []})));
+    let qid = question_id(&c, "r");
+    let set = |path: &str| format!("MATCH (q: board/question {{ id: $id }}) SET q.{path} = $v");
+    // Minted approved: refused.
+    let w = witnesses(create_question(&c, ripple(RippleKind::TypeTwo, "rv-2", &[]), "r2", json!({"approved": {"by": "ripple"}})));
+    assert_eq!(only_flag(&w).0, "meta.approved");
+    // A dotted SET, by type two and by type one: refused.
+    for (kind, step) in [(RippleKind::TypeTwo, "rv-3"), (RippleKind::TypeOne, "rv-4")] {
+        let w = witnesses(submit(&c, ripple(kind, step, &[]), &set("meta.approved"), &[("id", json!(qid)), ("v", json!(true))]));
+        assert_eq!(only_flag(&w).0, "meta.approved");
+    }
+    // A whole `meta` carrying it: refused.
+    let w = witnesses(submit(&c, ripple(RippleKind::TypeTwo, "rv-5", &[]), &set("meta"), &[("id", json!(qid)), ("v", json!({"approved": true}))]));
+    assert!(w.iter().any(|x| matches!(x, Witness::FlagNotWritable { field, .. } if field == "meta.approved")), "{w:?}");
+    assert_eq!(meta_of(&c, "r"), json!({"cites": []}), "nothing of a refused write landed");
+    assert_eq!(read(&c, "MATCH (q: board/question) RETURN q.id").len(), 1);
+    // The owner's side (an agent initiator) approves it.
+    committed(submit(
+        &c,
+        Initiator::Agent { thread: "cli".into(), dispatch: "approve".into() },
+        &set("meta.approved"),
+        &[("id", json!(qid)), ("v", json!({"at": "2026-01-01T00:00:00Z", "by": "cli"}))],
+    ));
+    assert_eq!(meta_of(&c, "r")["approved"]["by"], json!("cli"));
 }

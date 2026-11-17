@@ -1,0 +1,50 @@
+[package]
+name = "cauldron-ripples"
+version.workspace = true
+edition.workspace = true
+description = "The ripples service: turns one named dump into knowledge-graph records when its owner asks (`cauldron ripples run`), through one structured model call, writing only through the mcp service."
+
+# One integration-test binary (tests/it/); a new test is a module there.
+autotests = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cauldron-ripples"
+path = "src/main.rs"
+
+[dependencies]
+env = { path = "../../libs/env" }
+# The seam a service registers through, and the warnings counter.
+shapewire = { path = "../../libs/shapewire", features = ["server", "seam"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+# The answer is checked against the package's schema here, whatever the backend judged.
+jsonschema = { version = "0.49", default-features = false }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+# The threads chassis speaks websocket frames: a handshake over the
+# TcpStream `env::egress::connect_tcp` admitted (as `cauldron ctl node`
+# does); this crate dials nothing itself. The version the lockfile holds.
+tungstenite = "0.24"
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+[dev-dependencies]
+# Every child a test spawns is isolated (CAULDRON_ISOLATED=1).
+test-isolation = { path = "../../testkit/test-isolation" }
+# The tests run the mcp door's ripple seam in process, over a scratch
+# cauldron.
+cauldron-mcp = { path = "../mcp" }
+soup-door = { path = "../../libs/soup-door" }
+spine = { path = "../../libs/spine" }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,393 @@
+//! **The ripple seam**: the verbs only the `ripples` service may call, on
+//! this service's cauldron seam (the `CAULDRON_BIND` line protocol).
+//!
+//! The `ripples` service never opens a cauldron: this service is the one
+//! writer of every granted cauldron, and a ripple reads and writes through
+//! it.
+//!
+//! # Who is calling: the ripples key
+//!
+//! At every start this service mints a second secret beside the door's,
+//! `<data root>/mcp/ripples.secret` (32 random bytes as hex, mode 0600, in
+//! the 0700 directory; `crate::secret`). Every ripple verb carries it as its
+//! first word, and a line without it, or with any other value, is refused as
+//! `unauthorized` before anything is read or written. Only a process that can
+//! read this user's private files holds it: the same trust the door secret
+//! gives. The stdio bridge never reads it, and the door's tools (`POST
+//! /mcp`) never accept it, so an MCP client cannot reach these verbs through
+//! the door; a process of this user that reads the file directly can, as it
+//! could read the cauldron's files themselves.
+//!
+//! # Provenance
+//!
+//! A record a ripple lands is written under the initiator
+//! `{"class":"ripple","kind":"type_two","run_id","step_id","scope":[]}`,
+//! minted HERE: the class, the kind and the empty scope are this module's
+//! constants, and only the run and step come from the request (they are what
+//! a run is known by). Nothing in a record can change it: a record carrying
+//! `provenance` is refused, and `meta.ripple` (which a reader sees) is
+//! overwritten from the same request fields. With an empty scope, the
+//! spine's flag rule refuses the ripple every flag, `meta.approved`
+//! included.
+//!
+//! # The verbs (one line in: `<VERB> <key> <json>`; one JSON line out)
+//!
+//! - `RDUMP {cauldron, dump}`: the dump's summary and, for a text dump, its
+//!   text. A session dump's text is read through `RTEXT` only.
+//! - `RTEXT {cauldron, dump, offset?, turn_offset?, max_chars?}`: one page of
+//!   a session dump's text view (user and assistant text only).
+//! - `RREAD {cauldron, query?, limit?}`: the regions, and the existing
+//!   nodes a search for `query` finds (at most `limit`, default 20).
+//! - `RRUN {cauldron, run}`: whether run `run` already landed, and what.
+//! - `RPUT {cauldron, dump, run, step, package, version, model, records}`:
+//!   the batch held to the stage's limits (`soup_door::ripple`), stamped,
+//!   judged without landing, then landed as ONE write (one spine
+//!   transaction, all or nothing) on the cauldron's writer thread, which is
+//!   the only writer, so nothing else writes the soup between the two;
+//!   then the dump is marked `processed` in its own write. An empty batch
+//!   (the model found nothing worth recording) marks the dump and lands
+//!   nothing. A run that
+//!   already landed is never landed again: the dump is marked and the
+//!   records it landed are answered.
+//!
+//! Every answer is `{"ok": true, ...}` or `{"ok": false, "code", "message",
+//! "detail"?}`. Every call after the key is checked is a line in
+//! `calls.jsonl` (client `ripples`), never with text.
+//!
+//! A cauldron must be granted `read`, `write` and `dump` (`Door::ripple_target`).
+
+use serde_json::{json, Map, Value};
+use shapewire::envelope::Refusal;
+use soup_door::reads::{self, ReadOpts};
+use soup_door::Target;
+use spine::envelope::{Initiator, RippleKind};
+
+use crate::audit::Line;
+use crate::door::Door;
+use crate::refusal;
+use crate::secret::Secret;
+use crate::writer::Who;
+
+/// The verbs, in the order the seam lists them.
+pub const VERBS: [&str; 5] = ["RDUMP", "RTEXT", "RREAD", "RRUN", "RPUT"];
+
+/// The client name every ripple call is audited under.
+pub const CLIENT: &str = "ripples";
+
+/// The longest a run or step id may be.
+const ID_MAX: usize = 128;
+
+/// The initiator a ripple's write is landed under. The class, the kind and
+/// the scope are fixed here.
+pub fn initiator(run: &str, step: &str) -> Initiator {
+    Initiator::Ripple { kind: RippleKind::TypeTwo, run_id: run.to_string(), step_id: step.to_string(), scope: vec![] }
+}
+
+fn fail(r: &Refusal) -> Value {
+    let mut v = json!({"ok": false, "code": r.code, "message": r.message});
+    if let Some(d) = &r.detail {
+        v["detail"] = d.clone();
+    }
+    v
+}
+
+fn usage(msg: impl Into<String>) -> Refusal {
+    Refusal::new("usage", format!("{}. Nothing was read or written.", msg.into()))
+}
+
+fn who() -> Who {
+    Who { client: CLIENT.into(), thread: CLIENT.into(), session: None }
+}
+
+/// **Answer one ripple verb**: `rest` is `<key> <json>`. Always one JSON
+/// line, never an error.
+pub fn answer(door: &Door, key: &Secret, verb: &str, rest: &str) -> String {
+    let (given, body) = rest.split_once(' ').unwrap_or((rest, ""));
+    if given.is_empty() || !key.is(given) {
+        tracing::warn!(verb, "a ripple verb without the ripples key was refused");
+        return fail(&Refusal::new(
+            "unauthorized",
+            "the ripple verbs answer only the ripples service: the line must carry the key this service minted into \
+             its directory (ripples.secret) at its last start. Nothing was read or written.",
+        ))
+        .to_string();
+    }
+    let args: Map<String, Value> = match serde_json::from_str::<Value>(body.trim()) {
+        Ok(Value::Object(m)) => m,
+        _ => return fail(&usage(format!("{verb} takes one JSON object after the key"))).to_string(),
+    };
+    let cauldron = args.get("cauldron").and_then(Value::as_str).unwrap_or("").to_string();
+    let out = run(door, verb, &args);
+    let mut line = Line {
+        client: Some(CLIENT.into()),
+        cauldron: (!cauldron.is_empty()).then_some(cauldron),
+        tool: format!("ripple_{}", verb[1..].to_lowercase()),
+        dump: args.get("dump").and_then(Value::as_str).map(str::to_string),
+        ..Line::default()
+    };
+    let mut counts = Map::new();
+    match &out {
+        Ok(v) => {
+            line.outcome = v.get("outcome").and_then(Value::as_str).unwrap_or("ok").to_string();
+            line.tx = v.get("tx").and_then(Value::as_str).map(str::to_string);
+            if let Some(r) = v.get("records").and_then(Value::as_array) {
+                counts.insert("records".into(), json!(r.len()));
+            }
+            if let Some(r) = v.get("turns").and_then(Value::as_array) {
+                counts.insert("turns".into(), json!(r.len()));
+            }
+        }
+        Err(r) => line.outcome = r.code.to_string(),
+    }
+    line.counts = Value::Object(counts);
+    door.audit(line);
+    match out {
+        Ok(mut v) => {
+            v["ok"] = json!(true);
+            v.to_string()
+        }
+        Err(r) => fail(&r).to_string(),
+    }
+}
+
+fn s<'a>(a: &'a Map<String, Value>, k: &str) -> Result<&'a str, Refusal> {
+    a.get(k).and_then(Value::as_str).filter(|v| !v.trim().is_empty()).ok_or_else(|| usage(format!("`{k}` must be a non-empty string")))
+}
+
+fn n(a: &Map<String, Value>, k: &str) -> Result<Option<u64>, Refusal> {
+    match a.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| usage(format!("`{k}` must be a whole number"))),
+    }
+}
+
+fn plain_id(a: &Map<String, Value>, k: &str) -> Result<String, Refusal> {
+    let v = s(a, k)?;
+    if v.len() > ID_MAX || !v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-')) {
+        return Err(usage(format!("`{k}` is a plain id ([A-Za-z0-9._:-], at most {ID_MAX})")));
+    }
+    Ok(v.to_string())
+}
+
+fn run(door: &Door, verb: &str, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let t = door.ripple_target(s(a, "cauldron")?)?;
+    match verb {
+        "RDUMP" => rdump(&t, a),
+        "RTEXT" => rtext(&t, a),
+        "RREAD" => rread(&t, a),
+        "RRUN" => {
+            let run = plain_id(a, "run")?;
+            let (txs, records) = landed(&t, &run)?;
+            Ok(json!({"run": run, "landed": !txs.is_empty(), "records": records, "txs": txs}))
+        }
+        "RPUT" => rput(door, &t, a),
+        other => Err(usage(format!("`{other}` is not a ripple verb"))),
+    }
+}
+
+fn dump_id(a: &Map<String, Value>) -> Result<String, Refusal> {
+    let id = s(a, "dump")?;
+    if !soup_door::dumps::dump_id_ok(id) {
+        return Err(usage(format!("`{id}` is not a dump id (DM-<n>)")));
+    }
+    Ok(id.to_string())
+}
+
+/// Is the dump being removed or removed (`removing` or `removed`)? Either
+/// way its content is gone or going, and a ripple never reads or processes it.
+fn removed(summary: &Value) -> bool {
+    matches!(summary["state"].as_str(), Some(spine::grammar_dump::REMOVED) | Some(spine::grammar_dump::REMOVING))
+}
+
+fn rdump(t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let id = dump_id(a)?;
+    let summary = soup_door::dumps::summary(&t.cauldron, &id).map_err(refusal)?;
+    let created_at = t.cauldron.meta().ok().and_then(|m| m.created_at).unwrap_or_default();
+    let mut v = json!({"env": t.env.name, "cauldron": t.cauldron.name, "cauldron_created_at": created_at, "dump": summary});
+    if summary["kind"] == "text" && !removed(&summary) {
+        v["text"] = json!(soup_door::dumps::text_of(&t.cauldron, &id).map_err(refusal)?);
+    }
+    Ok(v)
+}
+
+fn rtext(t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let id = dump_id(a)?;
+    let max = n(a, "max_chars")?.unwrap_or(20_000) as usize;
+    soup_door::dumps::check_page_max(Some(max)).map_err(refusal)?;
+    let max = max.min(soup_door::budget::MAX_CHARS_CEILING);
+    soup_door::dumps::get_text(&t.cauldron, &id, n(a, "offset")?.unwrap_or(0), n(a, "turn_offset")?.unwrap_or(0), max).map_err(refusal)
+}
+
+fn rread(t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let regions = reads::regions(t, &ReadOpts::default()).map_err(refusal)?;
+    let regions: Vec<Value> = regions["regions"]
+        .as_array()
+        .map(|rs| rs.iter().filter(|r| r["flags"].get("retired").is_none_or(|x| x != &json!(true))).map(|r| json!({"id": r["id"], "handle": r["handle"], "boundary": r["boundary"]})).collect())
+        .unwrap_or_default();
+    let mut related = vec![];
+    if let Some(q) = a.get("query").and_then(Value::as_str).filter(|q| !reads::search_terms(q).is_empty()) {
+        let o = ReadOpts { limit: Some(n(a, "limit")?.unwrap_or(20).min(50) as usize), ..ReadOpts::default() };
+        let found = reads::search(t, q, &o).map_err(refusal)?;
+        related = found["results"]
+            .as_array()
+            .map(|rs| rs.iter().map(|r| json!({"id": r["id"], "type": r["type"], "state": r["state"], "handle": r["handle"], "snippet": r["snippet"]})).collect())
+            .unwrap_or_default();
+    }
+    Ok(json!({"env": t.env.name, "cauldron": t.cauldron.name, "regions": regions, "related": related}))
+}
+
+/// What run `run` landed: its transactions and the ids they created.
+fn landed(t: &Target, run: &str) -> Result<(Vec<String>, Vec<String>), Refusal> {
+    let txs = soup_door::ripple::run_landed(&t.cauldron, run).map_err(refusal)?;
+    let ids = soup_door::ripple::created_by(&t.cauldron, &txs).map_err(refusal)?;
+    Ok((txs, ids))
+}
+
+/// Mark the dump processed by `run` (its own write in the dumps store).
+fn mark(door: &Door, t: &Target, dump: &str, run: &str, step: &str, records: &[String]) -> Result<bool, Refusal> {
+    let processed = json!({
+        "run": run,
+        "records": records,
+        "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    door.dumps.with_store(t, &who(), |store| store.mark_processed(dump, processed, initiator(run, &format!("{step}:dump"))).map_err(refusal))
+}
+
+/// The records as the door lands them: `meta.cites` gains the dump,
+/// `meta.ripple` is the request's, whatever the batch said.
+fn stamp(records: &[Value], dump: &str, ripple: &Value) -> Vec<Value> {
+    records
+        .iter()
+        .map(|r| {
+            let mut r = r.clone();
+            if let Some(o) = r.as_object_mut() {
+                let meta = o.entry("meta").or_insert_with(|| json!({}));
+                if let Some(m) = meta.as_object_mut() {
+                    m.insert("ripple".into(), ripple.clone());
+                    let cites = m.entry("cites").or_insert_with(|| json!([]));
+                    if let Some(list) = cites.as_array_mut() {
+                        let cite = json!({"kind": "dump", "id": dump});
+                        if !list.iter().any(|c| c.get("kind") == cite.get("kind") && c.get("id") == cite.get("id")) {
+                            list.push(cite);
+                        }
+                    }
+                }
+            }
+            r
+        })
+        .collect()
+}
+
+fn rput(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let dump = dump_id(a)?;
+    let run = plain_id(a, "run")?;
+    let step = plain_id(a, "step")?;
+    let ripple = json!({
+        "package": plain_id(a, "package")?,
+        "version": plain_id(a, "version")?,
+        "run": run,
+        "model": plain_id(a, "model")?,
+    });
+    let records: Vec<Value> = match a.get("records") {
+        Some(Value::Array(r)) => r.clone(),
+        _ => return Err(usage("`records` must be a list")),
+    };
+    let summary = soup_door::dumps::summary(&t.cauldron, &dump).map_err(refusal)?;
+    if removed(&summary) {
+        return Err(Refusal::new("dump_removed", format!("dump `{dump}` was removed (or its removal is unfinished); it is never processed. Nothing was written.")));
+    }
+    let base = json!({"env": t.env.name, "cauldron": t.cauldron.name, "run": run, "dump": dump});
+    // A run lands once: one that already landed is answered, never landed again.
+    let (txs, ids) = landed(t, &run)?;
+    if !txs.is_empty() {
+        let marked = mark(door, t, &dump, &run, &step, &ids)?;
+        let mut v = base;
+        v["outcome"] = json!("already_landed");
+        v["records"] = json!(ids);
+        v["txs"] = json!(txs);
+        v["dump_marked"] = json!(marked);
+        return Ok(v);
+    }
+    if summary["state"] == "processed" {
+        return Err(Refusal::with_detail(
+            "dump_processed",
+            format!("dump `{dump}` was already processed (by another run). Nothing was written."),
+            summary,
+        ));
+    }
+    // An answer with nothing worth recording: the dump is processed, and
+    // nothing lands.
+    if records.is_empty() {
+        let marked = mark(door, t, &dump, &run, &step, &[])?;
+        let mut v = base;
+        v["outcome"] = json!("nothing_to_record");
+        v["records"] = json!([]);
+        v["dump_marked"] = json!(marked);
+        return Ok(v);
+    }
+    let problems = soup_door::ripple::check_batch(&t.cauldron, &records).map_err(refusal)?;
+    if !problems.is_empty() {
+        return Err(Refusal::with_detail(
+            "batch_refused",
+            format!("{} problem(s) with the batch against what a ripple may write; nothing was written", problems.len()),
+            json!({"problems": problems}),
+        ));
+    }
+    let records = stamp(&records, &dump, &ripple);
+    let (run2, step2) = (run.clone(), step.clone());
+    let landed_doc = door.writers.with(
+        t,
+        who(),
+        Box::new(move |c, t| {
+            // Again on the writer thread: two puts of one run never both land.
+            if !soup_door::ripple::run_landed(&t.cauldron, &run2).map_err(refusal)?.is_empty() {
+                return Err(Refusal::new("run_landed", "this run landed while this put waited; nothing more was written"));
+            }
+            // Judged without landing first, then landed: one write.
+            for commit in [false, true] {
+                match soup_door::ripple::land(c, &t.cauldron, &records, initiator(&run2, &step2), commit).map_err(refusal)? {
+                    soup_door::ripple::Landed::Refused { witnesses } => {
+                        return Err(Refusal::with_detail(
+                            "records_refused",
+                            format!(
+                                "the soup's grammar refused the batch when {}; nothing was written. `detail.witnesses` says why.",
+                                if commit { "it landed" } else { "judged without landing" }
+                            ),
+                            json!({"witnesses": witnesses}),
+                        ))
+                    }
+                    soup_door::ripple::Landed::Ok { ids, tx } if commit => {
+                        return Ok(json!({"id_map": ids, "tx": tx}));
+                    }
+                    soup_door::ripple::Landed::Ok { .. } => {}
+                }
+            }
+            unreachable!("the second pass lands or refuses")
+        }),
+    );
+    let doc = match landed_doc {
+        Err(r) if r.code == "run_landed" => return rput(door, t, a),
+        other => other?,
+    };
+    fault_point();
+    let mut ids: Vec<String> = doc["id_map"].as_object().map(|m| m.values().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+    ids.sort_by(|a, b| reads::prefix(a).cmp(reads::prefix(b)).then(reads::serial(a).cmp(&reads::serial(b))));
+    let marked = mark(door, t, &dump, &run, &step, &ids)?;
+    let mut v = base;
+    v["outcome"] = json!("landed");
+    v["records"] = json!(ids);
+    v["id_map"] = doc["id_map"].clone();
+    v["tx"] = doc["tx"].clone();
+    v["dump_marked"] = json!(marked);
+    Ok(v)
+}
+
+/// Test-only: with `--features fault-injection` and
+/// `CAULDRON_MCP_FAULT=ripple-landed`, the process dies right after a
+/// ripple's records landed and before its dump is marked processed.
+fn fault_point() {
+    #[cfg(feature = "fault-injection")]
+    if std::env::var("CAULDRON_MCP_FAULT").as_deref() == Ok("ripple-landed") {
+        std::process::abort();
+    }
+}

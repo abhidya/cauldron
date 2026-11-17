@@ -89,6 +89,8 @@ mod mcp;
 mod mcp_door;
 // `cauldron mcp stdio`: the bridge Claude Code launches.
 mod mcp_bridge;
+// `cauldron ripples`: a dump into records, by hand, through the ripples service.
+mod ripples;
 // `ensure_soup_cauldron` only; this release has no engine.
 mod engine;
 mod daemon;
@@ -136,9 +138,10 @@ const VERBS: &[(&str, &str)] = &[
     ("list", "the cauldrons of this environment (the implicit legacy one marked)"),
     ("rename", "rename a cauldron of this environment (its soup, dumps and MCP grant follow)"),
     ("remove", "put a cauldron away in cauldrons/.removed/ (never deleted; a dry run without --yes)"),
-    ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get | dump-remove (`soup help`)"),
+    ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get | dump-remove | approve (`soup help`)"),
     ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
     ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
+    ("ripples", "a dump into knowledge-graph records, by hand: run | status (`ripples help`); approve them with `soup approve`"),
 ];
 
 const USAGE: &str = "\
@@ -167,12 +170,13 @@ cauldron — the Cauldron entry point
                                      move a cauldron to cauldrons/.removed/<name>-<stamp>/
                                      and drop its MCP grant; never deletes. Without
                                      --yes, a dry run (exit 2)
-    cauldron soup import|recover|regions|get|nodes|search|region|dump|dumps|dump-get|dump-remove ...
+    cauldron soup import|recover|regions|get|nodes|search|region|dump|dumps|dump-get|dump-remove|approve ...
                                      a cauldron's soup, offline: land records in the
                                      published schema shape as one all-or-nothing
                                      write; settle an interrupted import; list
                                      regions; read and search nodes; keep text as a
-                                     dump beside the soup, and read dumps back.
+                                     dump beside the soup, read dumps back, and remove
+                                     one; approve a ripple's records (at a terminal).
                                      JSON out, non-zero on refusal (`cauldron soup help`)
     cauldron link <cauldron> --env <e> [--dir <path>] | --show
                                      write a .cauldron marker naming this project's
@@ -389,6 +393,7 @@ fn run() -> Result<i32> {
         Some("soup") => soup::verb_soup(&argv[1..]),
         Some("link") => link::verb_link(&argv[1..]),
         Some("mcp") => mcp::verb_mcp(&argv[1..]),
+        Some("ripples") => ripples::verb_ripples(&argv[1..]),
         Some("create") => cauldrons::verb_create(&argv[1..]),
         Some("list") | Some("ls") => cauldrons::verb_list(&argv[1..]),
         Some("rename") => cauldrons::verb_rename(&argv[1..]),

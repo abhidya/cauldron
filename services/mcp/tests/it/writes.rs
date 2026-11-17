@@ -19,6 +19,22 @@ fn lock_free(s: &Scratch, c: &str) -> bool {
     f.try_lock().is_ok()
 }
 
+/// A call made right after [`lock_free`] probed the lock: a child another
+/// test spawns can hold a copy of the probe's descriptor for the instant
+/// between its fork and its exec, so the door's open can still find the lock
+/// held (`locked`) although nothing writes. Asked again, briefly, for that
+/// case only (as `Scratch::import` does); any other answer is returned.
+fn call_after_probe(svc: &Service, tool: &str, args: Value, c: &Value) -> Value {
+    for _ in 0..50 {
+        let r = svc.call(tool, args.clone(), c);
+        if r["structuredContent"]["refused"]["code"] != json!("locked") {
+            return r;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    svc.call(tool, args, c)
+}
+
 #[test]
 fn w1_eight_clients_twenty_puts_each_all_land_once() {
     let s = Scratch::new("w1", &["kb"]);
@@ -173,7 +189,7 @@ fn w3_revoke_closes_the_cauldron_and_frees_the_lock() {
     let svc = Service::start(&s);
     let c = ctx(&s.project("p"));
     assert!(lock_free(&s, "kb"), "the service took the lock at boot");
-    ok(&svc.call("soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "Before the revoke", "R-1")]}), &c));
+    ok(&call_after_probe(&svc, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "Before the revoke", "R-1")]}), &c));
     assert!(!lock_free(&s, "kb"));
     assert_eq!(ok(&svc.call("soup_status", json!({"cauldron": "kb"}), &c))["writer"]["open"], true);
 
@@ -190,7 +206,7 @@ fn w3_revoke_closes_the_cauldron_and_frees_the_lock() {
     // Granted again, it opens again; revoked, it closes, and the next call is
     // refused.
     s.grant("kb", &Scope::ALL, &[]);
-    ok(&svc.call("soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "After the regrant", "R-1")]}), &c));
+    ok(&call_after_probe(&svc, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "After the regrant", "R-1")]}), &c));
     assert!(!lock_free(&s, "kb"));
     s.revoke("kb");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

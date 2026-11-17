@@ -99,7 +99,7 @@ pub const TEXT_MEDIA: &str = "text/plain; charset=utf-8";
 pub const TRANSCRIPT_MEDIA: &str = "application/x-claude-code-transcript+jsonl";
 
 /// What every receipt says about what happens next.
-pub const NEXT: &str = "processing of dumps comes in a later release; this dump waits in state `received`";
+pub const NEXT: &str = "this dump waits in state `received`; in this release a dump is processed only when its owner runs `cauldron ripples run <id>` on it, and automatic processing comes in a later release";
 
 /// The dumps store of `c`: `<cauldron>/dumps/` (the legacy cauldron's is
 /// `data/<env>/soup/dumps/`, beside its soup).
@@ -357,6 +357,46 @@ impl Store {
                 self.discard(&blob);
                 Err(err(e))
             }
+        }
+    }
+
+    /// **Mark a dump processed** (a ripple run landed its records): ONE
+    /// transaction sets its state to `processed` and its `meta.processed` to
+    /// `processed`, written under `initiator`. Only a dump in state
+    /// `received` (or `failed`) is marked; a removed dump is refused, and a
+    /// dump already `processed` is left as it is (answers `false`).
+    pub fn mark_processed(&self, id: &str, processed: Value, initiator: Initiator) -> Result<bool> {
+        let c = &self.cauldron;
+        let n = find(c, id)?;
+        if is_tombstone(&n) {
+            refuse!(Code::NotFound, "REFUSED: dump `{id}` was removed; it cannot be processed");
+        }
+        if n.state.as_deref() == Some("processed") {
+            return Ok(false);
+        }
+        let mut meta = field(&n, "meta").cloned().unwrap_or_else(|| json!({}));
+        if !meta.is_object() {
+            meta = json!({});
+        }
+        meta["processed"] = processed;
+        let mut b = Bindings::new();
+        b.insert("id".into(), json!(id));
+        b.insert("meta".into(), meta);
+        let env = Envelope {
+            statement: format!("MATCH (d: {POOL}/{DUMP} {{ id: $id }}) SET d.state = \"processed\" SET d.meta = $meta RETURN d.id"),
+            bindings: b,
+            format_version: ENVELOPE_FORMAT_VERSION,
+            provenance: Provenance { initiator, instrument: Instrument { name: "cauldron-mcp".into(), version: env!("CARGO_PKG_VERSION").into() } },
+            mode: Mode::Commit,
+            idempotency_nonce: Some(format!("dump-processed:{id}:{}", next_serial())),
+        };
+        match self.spine.submit(env) {
+            Ok(spine::Outcome::Committed { .. }) => Ok(true),
+            Ok(_) => Err(store_err(c, "marking the dump processed was validated and not committed")),
+            Err(spine::error::SpineError::Refused { witnesses }) => {
+                Err(store_err(c, format!("the dumps store refused to mark the dump processed: {}", json!(witnesses))))
+            }
+            Err(e) => Err(store_err(c, format!("marking the dump processed: {e}"))),
         }
     }
 
@@ -1378,7 +1418,30 @@ fn summary_of(n: &NodeRecord) -> Value {
     if let Some(src) = meta.get("source") {
         s["source"] = src.clone();
     }
+    // Set by a ripple run that processed it (`Store::mark_processed`).
+    if let Some(p) = meta.get("processed") {
+        s["processed"] = p.clone();
+    }
     s
+}
+
+/// One dump's summary (never its text), or its tombstone's.
+pub fn summary(c: &env::Cauldron, id: &str) -> Result<Value> {
+    Ok(summary_of(&find(c, id)?))
+}
+
+/// A text dump's whole text (at most [`TEXT_LIMIT`] bytes). A session dump
+/// is refused as `usage`: its text is read through the text view
+/// ([`get_text`]) only, and a removed dump as `not_found`.
+pub fn text_of(c: &env::Cauldron, id: &str) -> Result<String> {
+    let n = find(c, id)?;
+    if is_tombstone(&n) {
+        refuse!(Code::NotFound, "REFUSED: dump `{id}` was removed; its content is gone");
+    }
+    match artifact(&n).0 {
+        Kind::Text => Ok(field(&n, "body").and_then(Value::as_str).unwrap_or("").to_string()),
+        Kind::Session => refuse!(Code::Usage, "REFUSED: `{id}` is a session dump; read it through the text view"),
+    }
 }
 
 /// `{store, total, by_state}` for `soup_status`.
@@ -2682,6 +2745,45 @@ mod tests {
         b.insert("artifacts".into(), json!({}));
         set_state(c, &spine, id, grammar_dump::REMOVING, b, " SET d.body = $body SET d.meta = $meta SET d.artifacts = $artifacts", &remover())
             .unwrap();
+    }
+
+    /// A dump whose removal is unfinished (`removing`) or done (`removed`)
+    /// is never read whole and never marked processed: its content is gone
+    /// or going, so a ripple run can neither read it nor finish on it.
+    #[test]
+    fn a_removing_or_removed_dump_is_never_read_whole_or_marked_processed() {
+        let (_t, c) = cauldron("removing-processed");
+        let s = Store::open(&c, "test").unwrap();
+        text_dump(&s, "first note\n", None);
+        text_dump(&s, "second note\n", None);
+        text_dump(&s, "third note\n", None);
+        drop(s);
+        // (A removal also finishes any other left `removing`, so it goes first.)
+        remove(&c, "DM-2", true, &remover()).unwrap();
+        marked_only(&c, "DM-1");
+        for (id, state) in [("DM-1", "removing"), ("DM-2", "removed")] {
+            assert_eq!(summary(&c, id).unwrap()["state"], state);
+            let e = text_of(&c, id).err().expect("refused");
+            assert_eq!(e.code, Code::NotFound, "{id}: {}", e.message);
+        }
+        // A store opened without finishing the removal (as a writer whose
+        // finishing failed leaves it): both are refused, nothing is marked.
+        let s = Store {
+            cauldron: c.clone(),
+            dir: dir(&c),
+            _lock: take_lock(&c, "test").unwrap(),
+            spine: open_spine(&c).unwrap(),
+            created: false,
+            recovered: json!({}),
+        };
+        let who = Initiator::Agent { thread: "test".into(), dispatch: "test".into() };
+        for (id, state) in [("DM-1", "removing"), ("DM-2", "removed")] {
+            let e = s.mark_processed(id, json!({"run": "r"}), who.clone()).err().expect("refused");
+            assert_eq!(e.code, Code::NotFound, "{id}: {}", e.message);
+            assert_eq!(summary(&c, id).unwrap()["state"], state);
+        }
+        assert!(s.mark_processed("DM-3", json!({"run": "r"}), who).unwrap());
+        assert_eq!(summary(&c, "DM-3").unwrap()["state"], "processed");
     }
 
     /// A removal stopped after its mark: every read says the removal is

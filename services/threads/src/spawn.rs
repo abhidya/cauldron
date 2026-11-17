@@ -7,7 +7,7 @@
 //! mid-thread model changes (Q10) and plugin hot-reload (Q9) work with zero
 //! extra machinery.
 
-use crate::settings::{ThreadSettings, ToolConfig};
+use crate::settings::{Completion, ThreadSettings, ToolConfig};
 
 /// The claude binary the daemon invokes. Honors `THREADS_CLAUDE_BIN` (tests
 /// point it at a fake stream-json emitter); defaults to `claude` on PATH.
@@ -141,7 +141,72 @@ pub struct SpawnConfig {
     /// the runtime fills it per turn (`run_once`, from
     /// [`crate::managed::turn_json_schema`]) and the next turn starts without.
     pub json_schema: Option<String>,
+    /// **A BARE COMPLETION** ([`ThreadSettings::completion`]): `Some` builds
+    /// the restricted argv ([`Self::build_args`]) and environment
+    /// ([`Self::env`]) instead of the agent's, whatever else is set.
+    pub completion: Option<Completion>,
 }
+
+/// **The permission mode of a bare completion**: `dontAsk`, which denies
+/// every tool use that no allow rule pre-approves (and a bare completion has
+/// no allow rule), and is never a skip-permissions mode.
+pub const COMPLETION_PERMISSION_MODE: &str = "dontAsk";
+
+/// **The MCP config of a bare completion**: no server at all, inline (there
+/// is no token in it), always with `--strict-mcp-config` so no other MCP
+/// configuration is read.
+pub const COMPLETION_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
+
+/// **The tools a bare completion denies by name** (`--disallowedTools`), on
+/// top of `--tools ""` (no built-in tool is offered) and an empty MCP config:
+/// every built-in tool that runs a command, reads or writes a file, fetches,
+/// spawns an agent or runs a skill, and this daemon's own MCP server. Claude
+/// Code's `StructuredOutput` (how `--json-schema` is answered) is NOT here:
+/// it carries the answer itself.
+pub const COMPLETION_DENIED_TOOLS: &[&str] = &[
+    "Agent",
+    "Task",
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "Read",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+    "Skill",
+    "SlashCommand",
+    "ExitPlanMode",
+    "mcp__threads",
+];
+
+/// **The only inherited variables a bare completion's child keeps**: what
+/// `claude` needs to find itself, its login and its temporary directory, the
+/// locale, and a proxy when the machine reaches the network through one.
+/// Every other variable of the daemon's environment is removed.
+pub const COMPLETION_ENV_KEPT: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+];
 
 /// **WHAT ONLY PRINT MODE CARRIES** — the flags [`SpawnConfig::build_args`]
 /// puts on a daemon turn and [`SpawnConfig::build_interactive_args`] never
@@ -236,6 +301,7 @@ impl SpawnConfig {
             mcp_config: None,
             run_token: None,
             json_schema: None,
+            completion: s.completion,
         }
     }
 
@@ -270,6 +336,9 @@ impl SpawnConfig {
     }
 
     fn build_args_for(&self, first_turn: bool, print: bool) -> Vec<String> {
+        if self.completion.is_some() {
+            return self.completion_args(print);
+        }
         let mut a: Vec<String> = Vec::new();
 
         // Streaming print mode — always for a daemon turn (the daemon parses
@@ -405,6 +474,91 @@ impl SpawnConfig {
         a
     }
 
+    /// **THE ARGV OF A BARE COMPLETION** ([`ThreadSettings::completion`]):
+    /// a text answer, with nothing an agent has. Built here alone, never by
+    /// editing the agent's argv, so no agent flag can survive into it:
+    ///
+    /// - `--permission-mode dontAsk`, whatever `permission_mode` says (never
+    ///   `--dangerously-skip-permissions`);
+    /// - `--tools ""` (no built-in tool), NO `--allowedTools` (the allow list
+    ///   is empty), `--disallowedTools` for each of
+    ///   [`COMPLETION_DENIED_TOOLS`] and the thread's own deny list;
+    /// - `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`: no MCP
+    ///   server, this daemon's own MCP endpoint included;
+    /// - `--setting-sources ""`: no user, project or local settings file, so
+    ///   no hooks, enabled plugins or permission rules from them;
+    /// - `--safe-mode`: `claude --help` says it starts with every
+    ///   customization disabled, CLAUDE.md, skills, plugins, hooks, MCP
+    ///   servers and custom agents named, while auth, model selection and
+    ///   permissions work normally. `--setting-sources` is not documented to
+    ///   stop CLAUDE.md (user memory, the login's own, a parent directory's);
+    ///   this is. Admin-managed policy settings still apply, as for every
+    ///   `claude`;
+    /// - `--disable-slash-commands`: no skill or command;
+    /// - no `--plugin-dir`, `--add-dir`, `--agent`, `--agents`;
+    /// - `--no-session-persistence` (print mode): no session file is written;
+    /// - always `--session-id`: with nothing persisted there is nothing to
+    ///   `--resume`;
+    /// - the model, fallback, effort, role prompt, spend cap and
+    ///   `--json-schema` as for any turn.
+    fn completion_args(&self, print: bool) -> Vec<String> {
+        let mut a: Vec<String> = Vec::new();
+        if print {
+            for f in ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"] {
+                a.push(f.into());
+            }
+        }
+        a.push("--permission-mode".into());
+        a.push(COMPLETION_PERMISSION_MODE.into());
+        a.push("--model".into());
+        a.push(self.model.clone());
+        if let Some(fb) = &self.fallback_model {
+            a.push("--fallback-model".into());
+            a.push(fb.clone());
+        }
+        if let Some(e) = &self.effort {
+            a.push("--effort".into());
+            a.push(e.clone());
+        }
+        if let Some(sp) = &self.append_system_prompt {
+            a.push("--append-system-prompt".into());
+            a.push(sp.clone());
+        }
+        a.push("--session-id".into());
+        a.push(self.thread_id.clone());
+        if let Some(b) = self.max_budget_usd.filter(|_| print) {
+            a.push("--max-budget-usd".into());
+            a.push(format!("{b}"));
+        }
+        a.push("--tools".into());
+        a.push(String::new());
+        let mut denied: Vec<String> = Vec::new();
+        for t in COMPLETION_DENIED_TOOLS.iter().map(|t| t.to_string()).chain(self.tools.disallowed_tools.iter().cloned()) {
+            if !denied.contains(&t) {
+                denied.push(t);
+            }
+        }
+        for t in denied {
+            a.push("--disallowedTools".into());
+            a.push(t);
+        }
+        a.push("--strict-mcp-config".into());
+        a.push("--mcp-config".into());
+        a.push(COMPLETION_MCP_CONFIG.into());
+        a.push("--setting-sources".into());
+        a.push(String::new());
+        a.push("--safe-mode".into());
+        a.push("--disable-slash-commands".into());
+        if print {
+            a.push("--no-session-persistence".into());
+        }
+        if let Some(schema) = self.json_schema.as_ref().filter(|_| print) {
+            a.push("--json-schema".into());
+            a.push(schema.clone());
+        }
+        a
+    }
+
     /// The environment overrides for a spawn (ported from CCW, identical to
     /// AUI's): strip the API key so subscription auth is used, disable
     /// auto-memory, keep async subagents alive past claude's default 10-min
@@ -418,7 +572,38 @@ impl SpawnConfig {
     /// a type that has to be named out loud; see [`SpawnLogin`] and
     /// `ThreadManager::spawn_login`, which is the only thing that decides which
     /// one a turn gets.
+    ///
+    /// **A bare completion** ([`ThreadSettings::completion`]) adds the bound
+    /// on its answer (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`), turns off Claude
+    /// Code's telemetry, error reports and other non-essential traffic, and
+    /// REMOVES every variable of the daemon's own environment not in
+    /// [`COMPLETION_ENV_KEPT`] (see [`Self::env_from`]).
     pub fn env(&self, login: &SpawnLogin) -> Vec<(String, Option<String>)> {
+        self.env_from(login, std::env::vars_os().map(|(k, _)| k.to_string_lossy().into_owned()))
+    }
+
+    /// [`Self::env`] against the names of an inherited environment.
+    pub fn env_from<I: IntoIterator<Item = String>>(&self, login: &SpawnLogin, inherited: I) -> Vec<(String, Option<String>)> {
+        let mut e = self.agent_env(login);
+        if let Some(c) = &self.completion {
+            for (k, v) in [
+                ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", c.max_output_tokens.to_string()),
+                ("DISABLE_TELEMETRY", "1".into()),
+                ("DISABLE_ERROR_REPORTING", "1".into()),
+                ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into()),
+            ] {
+                e.push((k.into(), Some(v)));
+            }
+            for k in inherited {
+                if !COMPLETION_ENV_KEPT.contains(&k.as_str()) && !e.iter().any(|(ek, _)| ek == &k) {
+                    e.push((k, None));
+                }
+            }
+        }
+        e
+    }
+
+    fn agent_env(&self, login: &SpawnLogin) -> Vec<(String, Option<String>)> {
         let config_dir = login.config_dir();
         let mut e: Vec<(String, Option<String>)> = vec![
             ("ANTHROPIC_API_KEY".into(), None), // remove

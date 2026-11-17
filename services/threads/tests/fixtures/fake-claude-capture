@@ -16,6 +16,10 @@ set -u
 
 PROMPT="$(cat)"
 
+# Refuse what the real CLI refuses, as it refuses it (`claude-cli-check`).
+. "$(dirname "${BASH_SOURCE[0]}")/claude-cli-check"
+claude_cli_check "$@"
+
 emit_init() {
   echo '{"type":"system","subtype":"init","session_id":"fake-sess","cwd":"/tmp","model":"claude-fable-5","tools":["Bash","Read"],"mcp_servers":[],"permissionMode":"bypassPermissions","slash_commands":[],"apiKeySource":"none","agents":[]}'
 }

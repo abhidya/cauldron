@@ -6,7 +6,9 @@ argument-hint: [<cauldron>] [--title <title>] <file or text to keep>
 Keep material in a Cauldron cauldron as a **dump**: raw text the cauldron
 holds for later processing. A dump is not a soup record. It lands as
 `DM-<n>` in state `received` in the cauldron's dumps store, beside its soup,
-and waits there; processing of dumps comes in a later release.
+and waits there until its owner processes it: by hand with
+`/cauldron:curate-dump`, or with `cauldron ripples run <DM-n>` at a
+terminal. Nothing processes it on its own in this release.
 
 Arguments: $ARGUMENTS
 

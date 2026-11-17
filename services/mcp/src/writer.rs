@@ -95,9 +95,14 @@ pub struct Who {
     pub session: Option<String>,
 }
 
+/// A write of another kind (the owner's approval, a ripple's batch), run on the
+/// writer thread with the cauldron's handle, after the same grant check.
+pub type WithFn = Box<dyn FnOnce(&spine::Cauldron, &Target) -> Result<Value, Refusal> + Send>;
+
 enum Job {
     Put(Put, Who, mpsc::Sender<Result<Value, Refusal>>),
     Link(Vec<Link>, Who, mpsc::Sender<Result<Value, Refusal>>),
+    With(WithFn, mpsc::Sender<Result<Value, Refusal>>),
 }
 
 /// One open cauldron.
@@ -174,6 +179,14 @@ impl Writers {
         let w = self.get_or_open(t, &who)?;
         let (tx, rx) = mpsc::channel();
         w.send(Job::Link(links, who, tx))?;
+        rx.recv().unwrap_or_else(|_| Err(closed()))
+    }
+
+    /// Run `f` on the target's writer, opening it first if needed.
+    pub fn with(&self, t: &Target, who: Who, f: WithFn) -> Result<Value, Refusal> {
+        let w = self.get_or_open(t, &who)?;
+        let (tx, rx) = mpsc::channel();
+        w.send(Job::With(f, tx))?;
         rx.recv().unwrap_or_else(|_| Err(closed()))
     }
 
@@ -327,6 +340,12 @@ fn run(t: Target, gate: Gate, ready: mpsc::Sender<Result<Value, Refusal>>, jobs:
                     None => link(&cauldron, &t, &l, &who),
                 });
             }
+            Job::With(f, reply) => {
+                let _ = reply.send(match refused {
+                    Some(r) => Err(r),
+                    None => f(&cauldron, &t),
+                });
+            }
         }
     }
     drop(cauldron);
@@ -397,7 +416,7 @@ fn pool() -> PoolName {
     PoolName::new(DEFAULT_POOL)
 }
 
-fn cursor_after(c: &spine::Cauldron, t: &Target) -> Value {
+pub fn cursor_after(c: &spine::Cauldron, t: &Target) -> Value {
     match (c.committed_commit_counter(), soup_door::dumps::counter(&t.cauldron)) {
         (Ok(n), Ok(d)) => json!(crate::cursor::cursor(&t.cauldron, n, d)),
         _ => Value::Null,

@@ -5,8 +5,9 @@ argument-hint: [title]
 
 Keep this session's transcript in a Cauldron cauldron as a **dump**, for
 later processing. It lands as `DM-<n>` in state `received` in the
-cauldron's dumps store, beside its soup; processing of dumps comes in a
-later release.
+cauldron's dumps store, beside its soup, and waits there until its owner
+processes it (`/cauldron:curate-dump`, or `cauldron ripples run <DM-n>` at a
+terminal).
 
 Title: $ARGUMENTS
 

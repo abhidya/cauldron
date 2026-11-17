@@ -599,6 +599,13 @@ const SHIPPED_ALLOWED: &[(&str, &str, usize, &str, &str)] = &[
     ),
     ("apps/tui/src/cauldron_env.rs", concat!("cauldron_", "bin()"), 1, "pub fn cauldron_bin", "the resolver's definition, not a spawn"),
     (
+        "services/ripples/src/threads.rs",
+        concat!("tungstenite::", "client("),
+        1,
+        "env::egress::connect_tcp(",
+        "the ripples service's threads backend: a websocket HANDSHAKE over the TcpStream env::egress::connect_tcp already admitted; it dials nothing itself",
+    ),
+    (
         "services/mcp/src/http.rs",
         concat!("hyper", "::"),
         1,

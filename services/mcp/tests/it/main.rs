@@ -13,6 +13,12 @@
 //!   transcript streams leaving no byte behind (and, under
 //!   `--features fault-injection`, a dump killed before its commit, its
 //!   blob swept at the next open).
+//! - `review`: records a ripple wrote, marked `unreviewed` in every read,
+//!   filtered by `review`, approved only through the owner's `APPROVE` verb.
+//! - `ripple`: the seam verbs only the ripples service may call: the key,
+//!   provenance the batch cannot change, the stage's write limits, a run
+//!   that lands once (and, under `--features fault-injection`, a kill
+//!   between the landing and the dump's mark).
 //! - `issues`: the consumer's filed issues, each reproduction as the door
 //!   answers it (the CLI's twins are the `i<n>_` tests of `cli/tests/it/soup.rs`).
 //! - `writes`: the writer: concurrency, `partial`, refusals named by id,
@@ -33,4 +39,6 @@ mod dumps;
 mod issues;
 mod limits;
 mod reads;
+mod review;
+mod ripple;
 mod writes;

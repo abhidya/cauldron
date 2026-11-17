@@ -1444,3 +1444,104 @@ pub fn usage_limit_verdict(attempt: u32, ceiling: u32) -> UsageLimitVerdict {
     }
     UsageLimitVerdict::Wait
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// A BARE COMPLETION FAILS FAST
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// A bare completion (`ThreadSettings::completion`) is one call a caller is
+// waiting on, with its own retry policy. When its `claude` ends without an
+// answer, re-delivering the same prompt to the same command line only repeats
+// the failure (a refused flag or schema fails identically every time) and
+// keeps the caller waiting with nothing to show. So the delivery ends at once,
+// `turn_failed`, carrying the end of `claude`'s stderr, scrubbed and bounded.
+//
+// The exceptions are facts about ONE ACCOUNT (a usage limit, an exhausted
+// credit balance, an expired login): those are placement questions, not a
+// failure of the command, and they keep their ladders (a park is what the
+// caller hears for them).
+
+/// The ladder a completion's failed verdict would take, when it is one that
+/// ENDS the delivery at once instead: everything but the account-level
+/// classes. `None` = keep the ordinary ladder.
+pub fn completion_fails_fast(decision: &RetryDecision) -> Option<(TransientKind, String)> {
+    let (kind, reason) = ladder_for(decision);
+    match kind {
+        TransientKind::RateLimit | TransientKind::CreditBalance | TransientKind::LoginExpired => None,
+        _ => Some((kind, reason)),
+    }
+}
+
+/// The most lines of stderr a completion's failure carries.
+pub const STDERR_TAIL_LINES: usize = 6;
+/// The most characters of stderr a completion's failure carries.
+pub const STDERR_TAIL_CHARS: usize = 800;
+
+/// **The end of a child's stderr, safe to hand a caller**: ANSI escapes and
+/// other control characters removed, each of `prefixes` (the home directory,
+/// the temporary directory) replaced by its label, repeated lines once, the
+/// last [`STDERR_TAIL_LINES`] non-empty lines and at most
+/// [`STDERR_TAIL_CHARS`] characters (the END is kept: that is where an error
+/// is). `None` when nothing is left.
+pub fn stderr_tail(stderr: &str, prefixes: &[(&str, &str)]) -> Option<String> {
+    let mut clean = String::with_capacity(stderr.len());
+    let mut chars = stderr.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // CSI: ESC [ … final byte in @..~; any other escape: drop ESC and
+            // the one character after it.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for f in chars.by_ref() {
+                    if ('@'..='~').contains(&f) {
+                        break;
+                    }
+                }
+            } else {
+                chars.next();
+            }
+            continue;
+        }
+        if c == '\n' || c == '\t' || !c.is_control() {
+            clean.push(c);
+        }
+    }
+    let mut prefixes: Vec<&(&str, &str)> = prefixes.iter().filter(|(p, _)| p.len() > 1).collect();
+    // The longest prefix first, so a directory inside another is named by its
+    // own label.
+    prefixes.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+    for (p, label) in prefixes {
+        let p = p.trim_end_matches('/');
+        clean = clean.replace(p, label);
+    }
+    let mut lines: Vec<&str> = Vec::new();
+    for l in clean.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()) {
+        if !lines.contains(&l) {
+            lines.push(l);
+        }
+    }
+    let start = lines.len().saturating_sub(STDERR_TAIL_LINES);
+    let joined = lines[start..].join("\n");
+    let n = joined.chars().count();
+    let out = if n > STDERR_TAIL_CHARS {
+        let cut: String = joined.chars().skip(n - STDERR_TAIL_CHARS).collect();
+        format!("…{cut}")
+    } else {
+        joined
+    };
+    (!out.is_empty()).then_some(out)
+}
+
+/// The `turn_failed` message of a completion that ended without an answer:
+/// what ended it, and the stderr tail when there is one (else the verdict's
+/// own reason, bounded the same way).
+pub fn completion_failure_message(kind: &TransientKind, reason: &str, stderr_tail: Option<&str>, prefixes: &[(&str, &str)]) -> String {
+    let head = format!("claude ended without an answer ({}); a completion is not re-delivered", kind.kind_str());
+    match stderr_tail {
+        Some(t) => format!("{head}. stderr: {t}"),
+        None => match self::stderr_tail(reason, prefixes) {
+            Some(r) => format!("{head}: {r}"),
+            None => head,
+        },
+    }
+}

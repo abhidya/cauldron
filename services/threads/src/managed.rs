@@ -652,9 +652,39 @@ pub fn turn_json_schema(m: &ThreadManager, thread_id: &str, message_ids: &[u64])
             .get(META_KEY)
             .and_then(|t| t.get("json_schema"))
             .filter(|s| s.is_object())
-            .map(Value::to_string),
+            .map(cli_json_schema),
         _ => None,
     })
+}
+
+/// The `$schema` a `claude --json-schema` value may keep: the draft the CLI's
+/// validator knows.
+pub const CLI_SCHEMA_DIALECT: &str = "http://json-schema.org/draft-07/schema";
+
+/// **A schema as `claude --json-schema` will load it.** The daemon checks and
+/// judges every schema as JSON Schema 2020-12 ([`check_json_schema`],
+/// [`judge_structured`]), and a caller may say so with a top-level
+/// `"$schema": "https://json-schema.org/draft/2020-12/schema"`. The CLI
+/// (2.1.x) refuses exactly that before it starts — `Error: --json-schema is
+/// not a valid JSON Schema: no schema with key or ref
+/// "https://json-schema.org/draft/2020-12/schema"`, exit 1, nothing on
+/// stdout — while it loads the same schema with no `$schema` at all, or with
+/// the draft-07 one. So a top-level `$schema` naming any other dialect is
+/// removed from what rides argv; the stored schema, and the daemon's own
+/// judgment of the answer against it, are unchanged.
+pub fn cli_json_schema(schema: &Value) -> String {
+    let keep = |d: &str| d.trim_end_matches('#') == CLI_SCHEMA_DIALECT;
+    match schema.get("$schema").and_then(Value::as_str) {
+        Some(d) if keep(d) => schema.to_string(),
+        None if schema.get("$schema").is_none() => schema.to_string(),
+        _ => {
+            let mut s = schema.clone();
+            if let Some(o) = s.as_object_mut() {
+                o.remove("$schema");
+            }
+            s.to_string()
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

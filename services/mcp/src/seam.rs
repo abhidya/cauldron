@@ -8,7 +8,12 @@
 //! - `OPEN` answers, as one JSON line, the cauldrons this service holds open
 //!   for writing (`[{cauldron, opened_at, recovered_at_open}]`), for
 //!   `cauldron mcp status`. Names and times only, never soup content;
-//! - `DUMPS` answers the same for the dumps stores it holds.
+//! - `DUMPS` answers the same for the dumps stores it holds;
+//! - `RDUMP`, `RTEXT`, `RREAD`, `RRUN`, `RPUT`: the ripple verbs, answered
+//!   only to a line carrying the ripples key (`crate::ripple`);
+//! - `APPROVE`: the owner's approval (or unapproval) of a ripple's records,
+//!   answered only to a line carrying the approval key, which only
+//!   `cauldron soup approve` at a terminal reads (`crate::approve`).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,6 +32,10 @@ pub struct McpSeam {
     pub started_at: String,
     /// The door, for `OPEN`.
     pub state: Arc<crate::door::Door>,
+    /// The ripples key minted at this start (`crate::ripple`).
+    pub ripples: crate::secret::Secret,
+    /// The approval key minted at this start (`crate::approve`).
+    pub approve: crate::secret::Secret,
 }
 
 impl ServesWarnings for McpSeam {
@@ -46,6 +55,12 @@ impl Service for McpSeam {
         Verb::new("OPEN", McpSeam::v_open),
         Verb::new("DUMPS", McpSeam::v_dumps),
         Verb::new("PING", McpSeam::v_ping),
+        Verb::new("RDUMP", McpSeam::v_rdump),
+        Verb::new("RTEXT", McpSeam::v_rtext),
+        Verb::new("RREAD", McpSeam::v_rread),
+        Verb::new("RRUN", McpSeam::v_rrun),
+        Verb::new("RPUT", McpSeam::v_rput),
+        Verb::new("APPROVE", McpSeam::v_approve),
     ];
 
     fn service_env(&self) -> &ServiceEnv {
@@ -75,6 +90,36 @@ impl McpSeam {
 
     fn v_ping(&self, c: &mut Conn<'_>, _rest: &str) -> Result<()> {
         c.line("PONG")?;
+        Ok(())
+    }
+
+    fn ripple(&self, c: &mut Conn<'_>, verb: &str, rest: &str) -> Result<()> {
+        c.line(&crate::ripple::answer(&self.state, &self.ripples, verb, rest))?;
+        Ok(())
+    }
+
+    fn v_rdump(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        self.ripple(c, "RDUMP", rest)
+    }
+
+    fn v_rtext(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        self.ripple(c, "RTEXT", rest)
+    }
+
+    fn v_rread(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        self.ripple(c, "RREAD", rest)
+    }
+
+    fn v_rrun(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        self.ripple(c, "RRUN", rest)
+    }
+
+    fn v_rput(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        self.ripple(c, "RPUT", rest)
+    }
+
+    fn v_approve(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        c.line(&crate::approve::answer(&self.state, &self.approve, rest))?;
         Ok(())
     }
 }

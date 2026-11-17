@@ -39,6 +39,7 @@ mod owned_live_pid;
 mod permissions_cargo_built;
 mod pin_revives_parked;
 mod quiet_repin;
+mod ripples;
 mod repin_deferral_why;
 mod restart_unhealthy_drains;
 mod self_stamp;
