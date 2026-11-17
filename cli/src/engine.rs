@@ -19,10 +19,18 @@ pub(crate) fn ensure_soup_cauldron(dir: &Path) -> Result<bool> {
         return Ok(false);
     }
     if let Some(p) = dir.parent() {
-        std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
+        if !p.exists() {
+            if let Some(pp) = p.parent() {
+                std::fs::create_dir_all(pp).with_context(|| format!("creating {}", pp.display()))?;
+            }
+            // The soup's directory is its owner's only (`env::private`).
+            env::private::make_dir(p).with_context(|| format!("creating {}", p.display()))?;
+        }
     }
+    env::private::make_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
     let c = spine::Cauldron::create(dir, &[spine::grammar_v6::workspace_v6(SOUP_POOL)], spine::config::SpineConfig::default())
         .map_err(|e| anyhow::anyhow!("creating the soup's cauldron at {}: {e}", dir.display()))?;
     drop(c);
+    env::private::tighten_tree(dir).with_context(|| format!("making {} private to its owner", dir.display()))?;
     Ok(true)
 }

@@ -118,7 +118,10 @@ question, idea, decision) do not inherit.
 
 A region is a **topic of the pool and the unit of navigation**, not a
 container. It holds no member list: membership lives on each member as an
-`in_region` edge, so a node may sit in several regions. Regions form a DAG by
+`in_region` edge, so a node may sit in several regions. Regions are an
+overlapping index: a node about two topics belongs in both, and several homes
+are normal. The one limit is along a chain (see "Not in a region and its
+ancestor" below). Regions form a DAG by
 `narrows` (child to parent, acyclic, several parents allowed). A region with no
 parent is normal; there is no root.
 
@@ -201,9 +204,11 @@ them too.
   in the same act.
 - **Boundaries have both clauses**, `Inside:` and `Outside:`.
 - **`narrows` is acyclic.**
-- **No dual home along one chain.** A node may not sit in both a region and one
-  of that region's ancestors; put it in the most specific region that admits it.
-  Membership in unrelated regions is fine.
+- **Not in a region and its ancestor.** A node may not sit in both a region
+  and one of that region's ancestors (a region it `narrows`, directly or
+  through others); put it in the most specific region that admits it. This is
+  the only limit on a node's regions: membership in several regions that are
+  not on one chain is normal.
 - **Ready means unblocked.** A task may be `ready` only when every `depends_on`
   target is finished (`done`, `dropped`, `closed`, or `resolved`).
 - **Close by edge, while open.** `resolved_by` is written on an `open` issue or
@@ -258,6 +263,12 @@ be migrated, not refused.
                    {"kind": "file", "path": "src/lib.rs", "line": 40}]}
 ```
 
+The import checks every citation: a `kind` outside this table, a citation
+that is not an object, or a required key missing, null or empty refuses the
+record as `bad-cite` (dry run and real, `cauldron soup import` and `soup_put`
+alike), naming the record and the citation. Other keys are allowed. The
+per-type schemas say the same under `meta.cites`.
+
 `meta.cites` is evidence. It is not `operator`: only the human's own message
 makes a node the human's.
 
@@ -268,7 +279,11 @@ or finding) or a `constraint` (a rule that should bind future work), with
 as an `idea` or an `issue` (when something went wrong), with
 `meta.kind: "case"`. A pattern carries `derived_from` to each case it was drawn
 from; a later case that illustrates an existing pattern carries `ref` to it
-(and links it as `[[ID]]` in its body).
+(and links it as `[[ID]]` in its body). A plain decision (not a pattern) that
+was drawn from a case carries `derived_from` to it too; one that only mentions
+a case carries `ref` (and the `[[ID]]` link). A case recorded as an `idea` is
+a finished record of something that happened: its state is `done`. (A case
+recorded as an `issue` is `open` until something resolves it.)
 
 ## A worked example
 
@@ -385,15 +400,72 @@ likely) before the round of work that wrote it ends.
 ## Writing records into a cauldron
 
 `cauldron soup import <file-or-dir> --cauldron <name> --env <env>` lands records
-in this shape into a cauldron's soup when no soup daemon holds it. Input is
+in this shape into a cauldron's soup. Nothing has to be stopped first: the
+face (the terminal UI) being open does not matter, and no release so far ships
+a soup daemon, so the import writes the soup itself. The one other writer is
+the environment's `mcp` service: while it holds a granted cauldron, the import
+is sent to it and lands through it (its output says `forwarded_to`), with the
+same judgement. Records can also be written from a Claude Code session with
+the MCP tool `soup_put`, which takes the same records. Input is
 one file holding a list of records (or one record), or a directory of
 one-record files; JSON, or YAML for `.yaml` / `.yml`. Every record is judged by
 the soup's own write door, and the printed JSON gives each record's
 disposition: `accepted`, or `refused` with the reason (the grammar's own
 witnesses when the grammar refused it). The batch lands as **one write, all or
-nothing**: one refused record and nothing lands. `--dry-run` judges and lands
-nothing; it also works while a soup daemon holds the soup, judged on a
-read-only snapshot of it.
+nothing**: one refused record and nothing lands. A record whose edge points
+at a refused record of the same batch is refused too, as `target-refused`, so
+the refused count can be larger than the number of problems: fix the records
+refused for any other reason first, and the `target-refused` ones usually
+follow. `--dry-run` judges and lands nothing, on a read-only snapshot of the
+soup. A dry run also reports `batch-already-landed` when the same batch
+already landed, exactly as the real import would. A refused batch always prints the same keys:
+`outcome: "refused"`, a one-word `refusal` (`records-refused`,
+`landing-refused`, or `batch-already-landed` for a batch identical to one that
+already landed), `accepted`, `refused` and `records` (empty when the batch was
+refused before any record was judged).
+
+**What the import checks, and what it does not.** It judges each record by
+the grammar (types, states, fields and their limits, edge kinds and their
+ends, the mint rules) and checks `meta.cites`. It does not check the rules
+under "Rules the grammar leaves out" (a boundary quoted in `in_region`'s
+note, `Outside:` clauses, `[[links]]` matching `ref` edges, retired `meta`
+keys, a node in a region and its ancestor, and the rest): a batch that breaks
+them can validate and land. Keeping them is the writer's job.
+
+**Changing a node.** A node is never edited in place, and an import only
+creates nodes. To change one, write a new node of the **same type** with a
+new id (a label, under `--remint`) that carries a `supersedes` edge to the
+old one, with a `note` naming the clauses it replaces, and carries forward the
+old node's `in_region` and other edges that still hold:
+
+```json
+{"id": "n1", "type": "decision", "state": "decided",
+ "handle": "Read region ids from `soup regions` before writing, and cache them per batch",
+ "edges": [{"kind": "supersedes", "to": "DEC-2", "note": "adds: cache region ids per batch"},
+           {"kind": "in_region", "to": "R-1", "note": "how outside agents use it"}]}
+```
+
+`supersedes` across types is refused (`wrong_endpoint_type`). The old node
+keeps its text and reads as superseded (see the reads below).
+
+**Adding an edge to a node that exists.** Edges are written on the node they
+leave, when it is minted, so an import cannot add an outgoing edge to a node
+the soup already holds: supersede the node with a copy that carries its old
+edges plus the new one. An edge INTO an existing node needs nothing special:
+any new record can carry it. From a Claude Code session, the MCP tool
+`soup_link` adds an edge between two nodes the soup already holds.
+
+**Edge order.** `get` answers a node's edges sorted by kind, then by target,
+not in the order they were written; compare records as sets of edges.
+
+**Validating a `--remint` batch against the per-type schemas.** The schemas
+check `id` and every edge's `to` against the `<PREFIX>-<n>` id pattern, so a
+batch label such as `n1` fails them, though the import accepts it. Skip those
+two checks for labels: the `id` pattern of every record, and the `to` pattern
+of an edge that names a label of the batch. Or validate a copy in which each
+label is replaced by a placeholder id with its record's prefix (`DEC-1001` for
+a decision, `R-1001` for a region): every other check still applies. The
+import itself judges labels (`label-shadows-existing`, `unknown-target`).
 
 - An edge's `to` names a record of the same batch when one carries that id;
   otherwise it must name a node the soup already holds, or the record is
@@ -402,7 +474,8 @@ read-only snapshot of it.
   refuses the whole import. With `--remint`, every id in the batch is a label:
   each record gets the next free id for its type, references and `[[links]]`
   between batch records are rewritten, and the output's `id_map` gives old to
-  new. Under `--remint` a label may be any string without `@` or `#` that is
+  new when the batch landed (or, on a dry run, would land as it stands); a
+  refused batch prints no `id_map`, since its ids were never taken. Under `--remint` a label may be any string without `@` or `#` that is
   not an id the soup already holds: such a label is refused
   (`label-shadows-existing`), so a bare id that is not a label always names
   the existing node. Labels like `n1` never collide.
@@ -412,10 +485,15 @@ read-only snapshot of it.
   `cauldron soup region <id> [--depth N]` (one region, its parents, children,
   related regions and members); `cauldron soup nodes [--region R] [--type T]
   [--state S] [--limit N]` (id, type, state, handle and regions, newest
-  first); `cauldron soup search <words> [--region R] [--type T] [--limit N]`
+  first; a region or viewer is listed without `state`, as it carries none); `cauldron soup search <words> [--region R] [--type T] [--limit N]`
   (each word of the query found case-insensitively, as a substring, in
   handles and bodies; ranked, with a snippet); and `cauldron soup get <id>...` (nodes in this shape, with their
   outgoing edges).
+- A superseded node (one another node's `supersedes` edge points at) is left
+  out of `nodes`, `search` and a region's members, each saying how many it
+  left out (`superseded_hidden`); `--include-superseded` lists it too. `get`
+  always answers it, adding `superseded_by: [ids]`. That key is read from the
+  edges, not stored: leave it out when writing the record again.
 
 ## Validating a record
 
@@ -428,4 +506,5 @@ jsonschema.Draft202012Validator(schema).validate(record)
 ```
 
 The schemas check one record. The rules under "Rules the grammar leaves out"
-need the whole pool and are not checked by them.
+need the whole pool and are not checked by them. A `--remint` batch's labels
+fail the `id` and `to` patterns: see "Validating a `--remint` batch" above.

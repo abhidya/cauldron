@@ -19,7 +19,7 @@
 #      --dry-run too (read-only: `launchctl print|list`). A failed `list`
 #      is a stderr WARNING, not a silent skip. `cauldron install` repeats the
 #      same check itself, and gets --replace-running passed through.
-#   2c. When this run will build threads (step 4b), REFUSES a checkout that
+#   2c. When this run will build threads or mcp (step 4b or 4c), REFUSES a checkout that
 #      is not clean — any modified, staged or UNTRACKED file — before it
 #      builds or writes anything. `cauldron build threads` names the version
 #      by the commit and refuses a dirty tree itself (a commit does not
@@ -32,7 +32,7 @@
 #      which 2c asks that binary for (read-only: `versions` of a service no
 #      one declares, whose refusal names the shipped declarations directory,
 #      `<workspace>/services`), or a `[build] workspace` named by an override
-#      declaration `<root>/services/threads.toml`. Without `--from`, step 3
+#      declaration `<root>/services/<service>.toml` of a service it builds. Without `--from`, step 3
 #      builds cauldron from this checkout, so the two are the same tree.
 #   3. Builds `cauldron` and `tui` in release (skipped with `--from <dir>`,
 #      which installs binaries already built into <dir>).
@@ -83,18 +83,38 @@
 #      an install that finished) is never touched.
 #   4c. Brings up the MCP door, the `mcp` service (Claude Code's way to this
 #      environment's soups; every cauldron stays closed to it until its owner
-#      runs `cauldron mcp grant` at a terminal), under the same rules as 4b:
+#      runs `cauldron mcp grant` at a terminal):
 #      `cauldron --env <name> build mcp --json --env-copy`, a release build
 #      from this tree installed as a NEW version `<label>+<env>` (the shared
 #      `<label>` is never written), then `cauldron --env <name> pin mcp
 #      <label>+<env>`. Nothing is signed: the service runs under cauldron's
-#      own identity. Done ONLY for an environment this run creates (or
-#      resumes, below): an existing env.toml is never edited, an existing
-#      pin is untouched, and an existing env with no mcp pin is told the two
-#      commands that add one. The marker of 4b stays until BOTH services are
-#      pinned, and is re-bound to env.toml after the threads pin (which
-#      edits it), so a run stopped between the two pins is finished by a
-#      re-run: threads, already pinned, is left as it is, and mcp is pinned.
+#      own identity. Done for an environment this run creates (or resumes,
+#      below) AND, on an UPGRADE, for an existing environment that has no
+#      mcp pin yet: the plan says so in a line of its own, and `cauldron
+#      pin` (the supported editor of env.toml) writes the pin; the script
+#      never edits env.toml itself, and every other pin in it is left as it
+#      is. AN EXISTING mcp PIN: its version label names the commit it was
+#      built from (`<commit>-<profile>+<env>`), and step 2c compares that
+#      commit with the one `cauldron build mcp` would compile now. A pin at
+#      this checkout's build is left exactly as it is. A pin at any other
+#      build (an older install's) is UPGRADED under `--replace-running`: the
+#      same `build mcp --json --env-copy` and `cauldron pin mcp <label>+<env>`,
+#      with the same check right before the pin (another writer's re-pin
+#      during the build stands), and the running service moves to it by the
+#      supervisor's own path: `cauldron pin` tells the holder, which re-pins
+#      it at a quiet moment, and step 5 restarts the holder, which launches
+#      the pinned build. The script never stops or kills a service itself.
+#      Without `--replace-running` that pin is left as it is, and the run
+#      says plainly that the mcp service is still the old build and prints
+#      the two commands that upgrade it. A re-run after an upgrade finds the
+#      pin at this checkout's build and changes nothing.
+#      The marker of 4b stays until BOTH services are pinned, and is
+#      re-bound to env.toml after the threads pin (which edits it), so a run
+#      stopped between the two pins is finished by a re-run: threads,
+#      already pinned, is left as it is, and mcp is pinned. A marker beside
+#      an env.toml that pins threads but no longer matches the marker (an
+#      older install stopped after its threads pin, before clearing it) is
+#      cleared, and mcp is added as for any existing environment.
 #   5. Runs `cauldron --env <name> install`: copies the binary to
 #      <root>/bin/cauldron (and `tui` beside it), writes
 #      ~/Library/LaunchAgents/<label>.plist, and bootstraps it into this user's
@@ -105,10 +125,17 @@
 # identity (`cauldron install` prints how to do that deliberately).
 #
 # RE-RUNNING: rebuilds, keeps env.toml (finishing steps 4b and 4c first if
-# an earlier run stopped before the threads or the mcp pin), re-places the binaries (the previous
-# one is kept as `.prev`), and reloads the job — which RESTARTS this user's
-# holder, so a re-run over a loaded job needs `--replace-running` (2b). Run
-# `scripts/install --replace-running` after a `git pull` to upgrade.
+# an earlier run stopped before the threads or the mcp pin, adding the
+# mcp pin to an environment that has none, and, under --replace-running,
+# moving an mcp pin at an older build to this checkout's), re-places the binaries (the
+# previous one is kept as `.prev`), and reloads the job — which RESTARTS this
+# user's holder, so a re-run over a loaded job needs `--replace-running`
+# (2b). Run `scripts/install --replace-running` after a `git pull` to
+# upgrade.
+#
+# Its closing lines (and a --dry-run's) say that `cauldron` must be on the
+# PATH Claude Code itself sees, since the plugin's MCP server is the bare
+# command `cauldron mcp stdio`, and how to check.
 #
 # --dry-run prints the plan and runs nothing that writes: no build, no
 # env create, no install. If a built `cauldron` is already available it also
@@ -182,6 +209,28 @@ run()  {
     # Print every command; run it only when not a dry run.
     printf 'install: $'; printf ' %q' "$@"; printf '\n'
     if [[ ${DRY} -eq 0 ]]; then "$@"; fi
+}
+
+# bridge_note: the closing lines on the PATH Claude Code sees. The plugin's
+# .mcp.json runs the bare command `cauldron`, resolved on the PATH of the
+# Claude Code process, which is not always a terminal's.
+# The closing line for an mcp pin left on an old build (step 4c).
+old_mcp_note() {
+    [[ ${MCP_OLD_LEFT:-0} -eq 1 ]] || return 0
+    say ""
+    say "mcp:      the mcp service is still the old build (${MCP_PIN}); to upgrade it:"
+    say "            ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy"
+    say "            ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
+}
+bridge_note() {
+    say ""
+    say "MCP:      Claude Code runs the plugin's MCP server as the bare command \`cauldron mcp stdio\`,"
+    say "          so \`cauldron\` must be on the PATH that Claude Code itself sees, not only your"
+    say "          terminal's. Started from a terminal, Claude Code inherits that terminal's PATH;"
+    say "          started from the Dock, Finder or an IDE, it may not read your shell startup file,"
+    say "          and its sessions then have no cauldron tools."
+    say "          to check: \`command -v cauldron\` in the terminal you start Claude Code from prints"
+    say "          ${ROOT}/bin/cauldron, and \`/mcp\` inside a session lists cauldron as connected."
 }
 
 [[ ${DRY} -eq 1 ]] && say "DRY RUN — nothing below is executed; this is the plan."
@@ -281,6 +330,14 @@ fi
 THREADS_PENDING="${ROOT}/data/.install-threads-pending.${ENV_NAME}"
 threads_pinned() { grep -qE '^[[:space:]]*\[services\.threads\][[:space:]]*$' "${MANIFEST}"; }
 mcp_pinned() { grep -qE '^[[:space:]]*\[services\.mcp\][[:space:]]*$' "${MANIFEST}"; }
+# pinned_version <service>: the `version` of `[services.<service>]` in
+# env.toml (a basic string), or nothing.
+pinned_version() {
+    awk -v want="[services.$1]" '
+        /^[[:space:]]*\[/ { sec=$0; gsub(/[[:space:]]/,"",sec); next }
+        sec==want && /^[[:space:]]*version[[:space:]]*=/ {
+            s=$0; sub(/^[^=]*=[[:space:]]*"/,"",s); sub(/".*$/,"",s); print s; exit }' "${MANIFEST}"
+}
 # THE MARKER PROVES OWNERSHIP (REL-4.S5d). It is written `state=creating`
 # before `env create`, and rewritten `state=created` with the FINGERPRINT of
 # the env.toml that create wrote — `<device>:<inode>:<birth time>` and the
@@ -345,14 +402,25 @@ marker_owns_manifest() {
 }
 NEED_THREADS=0
 RESUME_THREADS=0
+# NEED_MCP: step 4c builds and pins mcp (a new env, a resumed one, or an
+# existing env with no mcp pin: the upgrade).
+NEED_MCP=0
 if [[ -e "${THREADS_PENDING}" && ! -e "${MANIFEST}" ]]; then
     say "stale marker ${THREADS_PENDING}: there is no ${MANIFEST}, so the install that wrote it never finished \`env create\` (or the environment was removed since); removing it"
     run rm -f "${THREADS_PENDING}"
 fi
 if [[ ! -e "${MANIFEST}" ]]; then
     NEED_THREADS=1
+    NEED_MCP=1
 elif [[ -e "${THREADS_PENDING}" ]] && ! { threads_pinned && mcp_pinned; }; then
-    if ! marker_owns_manifest; then
+    if ! marker_owns_manifest && threads_pinned; then
+        # The marker's own job, the threads pin, is done: an install stopped
+        # after it and before clearing the marker (an older one had no mcp
+        # step and cleared it right after the pin), and env.toml changed
+        # since. Nothing is left for the marker to protect: step 4b clears
+        # it, and step 4c adds mcp as for any existing environment.
+        say "${MANIFEST} pins threads, and the marker ${THREADS_PENDING} beside it no longer matches it: an earlier install pinned threads and stopped before clearing its marker; it is treated as an existing environment"
+    elif ! marker_owns_manifest; then
         # REL-4.S5e M2: written to the person who ran install, who is most
         # often the one who stopped the earlier run (a Ctrl-C right after
         # `env create`), and who may never have heard of a marker. It says
@@ -388,15 +456,27 @@ elif [[ -e "${THREADS_PENDING}" ]] && ! { threads_pinned && mcp_pinned; }; then
             fi
             printf 'install:   rm -f %q\n' "${THREADS_PENDING}"
             printf 'install:   %s\n' "${rerun}"
-            printf 'install: That installs everything else, never edits env.toml, and prints the two commands\n'
-            printf 'install: that add threads to it. If you made or edited this env.toml yourself, that is the\n'
-            printf 'install: way to take.\n'
+            printf 'install: That installs everything else, adds mcp to it with `cauldron pin`, and prints the\n'
+            printf 'install: two commands that add threads to it.\n'
+            printf 'install: If you made or edited this env.toml yourself, that is the way to take.\n'
         } >&2
         exit 2
+    else
+        NEED_THREADS=1
+        RESUME_THREADS=1
     fi
-    NEED_THREADS=1
-    RESUME_THREADS=1
 fi
+if [[ -e "${MANIFEST}" ]] && ! mcp_pinned; then NEED_MCP=1; fi
+# An EXISTING mcp pin (step 4c): MCP_PIN is its version, MCP_HEAD the commit
+# `cauldron build mcp` would compile now, and MCP_STATE what 2c found:
+# `current` (the pin is this checkout's build), `old` (another build) or
+# `unknown` (the commit could not be read). MCP_REPIN: 4c rebuilds and
+# re-pins it (an old pin, under --replace-running).
+MCP_PIN=""
+MCP_HEAD=""
+MCP_STATE=""
+MCP_REPIN=0
+if [[ -e "${MANIFEST}" ]] && mcp_pinned; then MCP_PIN="$(pinned_version mcp)"; fi
 # A service name no declaration uses: `versions` of it is refused with the
 # two places declarations are looked for, `<root>/services/<name>.toml` and
 # then `<workspace the binary was built from>/services/<name>.toml`.
@@ -406,14 +486,14 @@ WS_PROBE="install-workspace-probe"
 check_tree() {
     local dir="$1" why="$2" tree_state
     if ! tree_state="$(git -C "${dir}" status --porcelain --untracked-files=normal)"; then
-        die "\`git status\` failed in ${dir} (its error is above), so whether ${why} is clean cannot be told. \`cauldron build threads\` names the version by the commit and refuses a tree it cannot read. Install from a git clone. Nothing was built, written or loaded."
+        die "\`git status\` failed in ${dir} (its error is above), so whether ${why} is clean cannot be told. \`cauldron build\` names the version by the commit and refuses a tree it cannot read. Install from a git clone. Nothing was built, written or loaded."
     fi
     if [[ -n "${tree_state}" ]]; then
         {
             printf 'install: REFUSED: %s has uncommitted or untracked files:\n' "${dir}"
             printf '%s\n' "${tree_state}" | sed 's/^/install:     /'
             printf 'install: (%s is %s.)\n' "${dir}" "${why}"
-            printf 'install: Step 4b runs `cauldron build threads`, which names the version it installs by\n'
+            printf 'install: Steps 4b and 4c run `cauldron build`, which names the version it installs by\n'
             printf 'install: the commit, and so refuses a tree whose files the commit does not contain.\n'
             printf 'install: Commit, remove or move these files (or add them to .git/info/exclude), then\n'
             printf 'install: run the install again. Nothing was built, written or loaded.\n'
@@ -422,34 +502,15 @@ check_tree() {
     fi
     say "clean: ${dir} at $(git -C "${dir}" rev-parse --short=12 HEAD 2>/dev/null || echo '?') with no uncommitted or untracked files"
 }
-step "2c. is this checkout clean? (only needed when step 4b builds threads)"
-if [[ ${NEED_THREADS} -eq 0 ]]; then
-    say "step 4b will not build threads for '${ENV_NAME}', so the tree is not checked"
-else
-    command -v git >/dev/null 2>&1 \
-        || die "git is not on PATH. Step 4b runs \`cauldron build threads\`, which names the version by the commit of the tree it compiles and needs git to read it."
-    check_tree "${REPO}" "this checkout (scripts/install's own)"
-    # Which tree step 4b compiles (REL-4.S5c M1).
-    BUILD_TREE="${REPO}"
-    BUILD_WHY="the tree \`cauldron build threads\` compiles: step 3 builds cauldron from it"
-    if [[ -n "${FROM}" ]]; then
-        probe_bin="${FROM%/}/cauldron"
-        [[ -x "${probe_bin}" ]] \
-            || die "--from ${FROM} holds no executable cauldron, so which checkout \`cauldron build threads\` compiles (the one that binary was built from) cannot be asked. Nothing was built, written or loaded."
-        printf 'install: $'; printf ' %q' "${probe_bin}" --env "${ENV_NAME}" versions "${WS_PROBE}"; printf '   (read-only; expected to be refused)\n'
-        probe_out="$("${probe_bin}" --env "${ENV_NAME}" versions "${WS_PROBE}" 2>&1 || true)"
-        looked="$(grep -E "^  /.*/services/${WS_PROBE}\.toml\$" <<<"${probe_out}" || true)"
-        first="$(sed -n 1p <<<"${looked}")"
-        second="$(sed -n 2p <<<"${looked}")"
-        if [[ "$(grep -c . <<<"${looked}" || true)" != 2 || "${first}" != "  ${ROOT}/services/${WS_PROBE}.toml" ]]; then
-            die "${probe_bin} did not say which workspace it was built from (asked: \`versions ${WS_PROBE}\`, expecting its two declaration paths, ${ROOT}/services first). It printed: ${probe_out}. \`cauldron build threads\` compiles that workspace, so whether it is clean cannot be checked. Nothing was built, written or loaded."
-        fi
-        BUILD_TREE="${second#  }"
-        BUILD_TREE="${BUILD_TREE%/services/${WS_PROBE}.toml}"
-        BUILD_WHY="the tree \`cauldron build threads\` compiles: the workspace ${probe_bin} was built from"
-    fi
-    OVERRIDE_DECL="${ROOT}/services/threads.toml"
-    if [[ -f "${OVERRIDE_DECL}" ]]; then
+# build_tree <service>: sets TREE and TREE_WHY to the tree `cauldron build
+# <service>` compiles (BASE_TREE, or an override declaration's own
+# `[build] workspace`).
+build_tree() {
+    local svc="$1" ovr ovr_ws
+    TREE="${BASE_TREE}"
+    TREE_WHY="${BASE_WHY}"
+    ovr="${ROOT}/services/${svc}.toml"
+    if [[ -f "${ovr}" ]]; then
         # The three TOML spellings of build.workspace (REL-4.S5d, inspect
         # REL-4.S5c-I M-b): `workspace = "…"` under `[build]`, a top-level
         # inline table `build = { …, workspace = "…" }`, and a top-level
@@ -465,26 +526,102 @@ else
                 s=$0; sub(/^[^=]*=[[:space:]]*/,"",s); print val(s); exit }
             sec=="" && /^[[:space:]]*build[[:space:]]*=[[:space:]]*\{/ {
                 s=$0; if (match(s, /[{,][[:space:]]*workspace[[:space:]]*=[[:space:]]*/)) { print val(substr(s, RSTART + RLENGTH)); exit } }
-            ' "${OVERRIDE_DECL}")"
+            ' "${ovr}")"
         if [[ "${ovr_ws}" == "?" ]]; then
-            die "${OVERRIDE_DECL} names a [build] workspace in a form this script cannot read (it reads \`workspace = \"…\"\` under [build], \`build = { workspace = \"…\" }\` and \`build.workspace = \"…\"\`, basic strings only), so whether the tree \`cauldron build threads\` compiles is clean cannot be checked. Nothing was built, written or loaded."
+            die "${ovr} names a [build] workspace in a form this script cannot read (it reads \`workspace = \"…\"\` under [build], \`build = { workspace = \"…\" }\` and \`build.workspace = \"…\"\`, basic strings only), so whether the tree \`cauldron build ${svc}\` compiles is clean cannot be checked. Nothing was built, written or loaded."
         fi
         if [[ -n "${ovr_ws}" ]]; then
             case "${ovr_ws}" in
                 "~") ovr_ws="${HOME}" ;;
                 "~/"*) ovr_ws="${HOME}/${ovr_ws#"~/"}" ;;
             esac
-            BUILD_TREE="${ovr_ws}"
-            BUILD_WHY="the tree \`cauldron build threads\` compiles: [build] workspace in ${OVERRIDE_DECL}"
+            TREE="${ovr_ws}"
+            TREE_WHY="the tree \`cauldron build ${svc}\` compiles: [build] workspace in ${ovr}"
         fi
     fi
-    repo_real="$(cd -P "${REPO}" && pwd -P)"
-    build_real="$(cd -P "${BUILD_TREE}" 2>/dev/null && pwd -P)" \
-        || die "${BUILD_TREE} (${BUILD_WHY}) is not a directory, so \`cauldron build threads\` cannot compile it. Nothing was built, written or loaded."
-    if [[ "${build_real}" != "${repo_real}" ]]; then
-        say "step 4b compiles another tree: ${BUILD_TREE} (${BUILD_WHY})"
-        check_tree "${BUILD_TREE}" "${BUILD_WHY}"
+}
+# check_build_tree <service> <step>: the tree `cauldron build <service>`
+# compiles is clean (each distinct tree is checked once).
+check_build_tree() {
+    local svc="$1" st="$2" tree why real
+    build_tree "${svc}"
+    tree="${TREE}"
+    why="${TREE_WHY}"
+    real="$(cd -P "${tree}" 2>/dev/null && pwd -P)" \
+        || die "${tree} (${why}) is not a directory, so \`cauldron build ${svc}\` cannot compile it. Nothing was built, written or loaded."
+    case "${CHECKED}" in *" ${real} "*) return 0 ;; esac
+    CHECKED="${CHECKED}${real} "
+    say "step ${st} compiles another tree: ${tree} (${why})"
+    check_tree "${tree}" "${why}"
+}
+# resolve_base_tree: which tree `cauldron build` compiles: this checkout, or
+# the workspace the `--from` cauldron was built from (an override
+# declaration's own `[build] workspace` is build_tree's). Asked once.
+BASE_TREE=""
+BASE_WHY=""
+resolve_base_tree() {
+    [[ -z "${BASE_TREE}" ]] || return 0
+    BASE_TREE="${REPO}"
+    BASE_WHY="the tree \`cauldron build\` compiles: step 3 builds cauldron from it"
+    if [[ -n "${FROM}" ]]; then
+        probe_bin="${FROM%/}/cauldron"
+        [[ -x "${probe_bin}" ]] \
+            || die "--from ${FROM} holds no executable cauldron, so which checkout \`cauldron build\` compiles (the one that binary was built from) cannot be asked. Nothing was built, written or loaded."
+        printf 'install: $'; printf ' %q' "${probe_bin}" --env "${ENV_NAME}" versions "${WS_PROBE}"; printf '   (read-only; expected to be refused)\n'
+        probe_out="$("${probe_bin}" --env "${ENV_NAME}" versions "${WS_PROBE}" 2>&1 || true)"
+        looked="$(grep -E "^  /.*/services/${WS_PROBE}\.toml\$" <<<"${probe_out}" || true)"
+        first="$(sed -n 1p <<<"${looked}")"
+        second="$(sed -n 2p <<<"${looked}")"
+        if [[ "$(grep -c . <<<"${looked}" || true)" != 2 || "${first}" != "  ${ROOT}/services/${WS_PROBE}.toml" ]]; then
+            die "${probe_bin} did not say which workspace it was built from (asked: \`versions ${WS_PROBE}\`, expecting its two declaration paths, ${ROOT}/services first). It printed: ${probe_out}. \`cauldron build\` compiles that workspace, so whether it is clean cannot be checked. Nothing was built, written or loaded."
+        fi
+        BASE_TREE="${second#  }"
+        BASE_TREE="${BASE_TREE%/services/${WS_PROBE}.toml}"
+        BASE_WHY="the tree \`cauldron build\` compiles: the workspace ${probe_bin} was built from"
     fi
+}
+step "2c. is this checkout clean? (only needed when step 4b or 4c builds)"
+# An existing mcp pin: is it this checkout's build? Its label starts with
+# the commit it was built from (12 characters) and the profile; a `-dirty`
+# build is never this checkout's.
+if [[ -n "${MCP_PIN}" ]]; then
+    MCP_STATE=unknown
+    if command -v git >/dev/null 2>&1; then
+        resolve_base_tree
+        build_tree mcp
+        if MCP_HEAD="$(git -C "${TREE}" rev-parse --short=12 HEAD 2>/dev/null)" && [[ -n "${MCP_HEAD}" ]]; then
+            MCP_HEAD="${MCP_HEAD:0:12}"
+            pin_base="${MCP_PIN%%+*}"
+            if [[ "${pin_base}" == "${MCP_HEAD}-"* && "${pin_base}" != *-dirty.* ]]; then MCP_STATE=current; else MCP_STATE=old; fi
+        fi
+    fi
+    case "${MCP_STATE}" in
+        current) say "mcp is pinned at ${MCP_PIN}, this checkout's build (commit ${MCP_HEAD}); step 4c leaves it as it is" ;;
+        *)
+            if [[ "${MCP_STATE}" == old ]]; then
+                say "mcp is pinned at ${MCP_PIN}, which is NOT this checkout's build (commit ${MCP_HEAD})"
+            else
+                say "mcp is pinned at ${MCP_PIN}, and whether that is this checkout's build cannot be told (the commit of ${TREE:-${REPO}} could not be read)"
+            fi
+            if [[ ${REPLACE_RUNNING} -eq 1 ]]; then
+                say "  --replace-running: step 4c builds mcp from this checkout and re-pins it (upgrade)"
+                NEED_MCP=1
+                MCP_REPIN=1
+            else
+                say "  without --replace-running step 4c leaves it as it is; the mcp service stays the old build"
+            fi ;;
+    esac
+fi
+if [[ ${NEED_THREADS} -eq 0 && ${NEED_MCP} -eq 0 ]]; then
+    say "steps 4b and 4c will build nothing for '${ENV_NAME}' (threads is not built here, and mcp is already pinned), so the tree is not checked"
+else
+    command -v git >/dev/null 2>&1 \
+        || die "git is not on PATH. Steps 4b and 4c run \`cauldron build\`, which names the version by the commit of the tree it compiles and needs git to read it."
+    check_tree "${REPO}" "this checkout (scripts/install's own)"
+    resolve_base_tree
+    CHECKED=" $(cd -P "${REPO}" && pwd -P) "
+    if [[ ${NEED_THREADS} -eq 1 ]]; then check_build_tree threads 4b; fi
+    if [[ ${NEED_MCP} -eq 1 ]]; then check_build_tree mcp 4c; fi
 fi
 
 # ── 3. binaries ─────────────────────────────────────────────────────────────
@@ -549,7 +686,7 @@ if [[ ${CREATED_ENV} -eq 0 && ${RESUME_THREADS} -eq 0 ]]; then
             run rm -f "${THREADS_PENDING}"
         fi
     else
-        say "threads is NOT pinned in the existing ${MANIFEST}, and install never edits an existing env.toml."
+        say "threads is NOT pinned in the existing ${MANIFEST}, and install does not add threads to an existing environment."
         say "  to host it:  ${CAULDRON} --env ${ENV_NAME} build threads --env-copy"
         say "         then: ${CAULDRON} --env ${ENV_NAME} pin threads <the label that build printed> --addr auto"
     fi
@@ -646,17 +783,43 @@ fi
 # ── 4c. the mcp service ─────────────────────────────────────────────────────
 step "4c. mcp service for '${ENV_NAME}'"
 MCP_PINNED=""
-if [[ ${CREATED_ENV} -eq 0 && ${RESUME_THREADS} -eq 0 ]]; then
-    if mcp_pinned; then
-        say "mcp is already pinned in ${MANIFEST}; left exactly as it is (its version is not changed)"
-    else
-        say "mcp is NOT pinned in the existing ${MANIFEST}, and install never edits an existing env.toml."
-        say "  to host it:  ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy"
-        say "         then: ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
-    fi
-elif mcp_pinned; then
+MCP_ADDED=0
+MCP_OLD_LEFT=0
+if mcp_pinned && [[ ${MCP_REPIN} -eq 0 ]]; then
     say "mcp is already pinned in ${MANIFEST}; left exactly as it is (its version is not changed)"
+    if [[ "${MCP_STATE}" == old || "${MCP_STATE}" == unknown ]]; then
+        # Said plainly, with the two commands, here and again at the end.
+        MCP_OLD_LEFT=1
+        if [[ "${MCP_STATE}" == old ]]; then
+            say "  THE mcp SERVICE IS STILL THE OLD BUILD: it is pinned at ${MCP_PIN}, and this checkout is commit ${MCP_HEAD}."
+        else
+            say "  the mcp service may still be an old build: it is pinned at ${MCP_PIN}, which cannot be compared with this checkout."
+        fi
+        say "  Claude Code sessions reach that service, so this release's mcp changes do not reach them. To upgrade it:"
+        say "    ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy"
+        say "    then: ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
+        say "  (or run this install again with --replace-running, which does both)"
+    fi
 else
+    if [[ ${MCP_REPIN} -eq 1 ]]; then
+        # THE UPGRADE OF AN EXISTING PIN (--replace-running): built and
+        # pinned as below; `cauldron pin` replaces the old pin, and the
+        # supervisor moves the running service to the new build (the holder
+        # re-pins it at a quiet moment, and step 5 restarts the holder).
+        # The script stops and kills nothing itself.
+        MCP_ADDED=1
+        say "mcp is pinned in ${MANIFEST} at ${MCP_PIN}, not this checkout's build: re-pinning it (upgrade,"
+        say "  --replace-running). \`cauldron pin\` writes the new pin, and the supervisor moves the running"
+        say "  mcp service to it; every other pin and setting in env.toml is left exactly as it is"
+    elif [[ ${CREATED_ENV} -eq 0 && ${RESUME_THREADS} -eq 0 ]]; then
+        # THE UPGRADE: an existing environment with no mcp pin (one made
+        # before mcp shipped). Built and pinned like a new one's, by the same
+        # two commands; `cauldron pin` writes the pin, and nothing else in
+        # env.toml changes.
+        MCP_ADDED=1
+        say "mcp is NOT pinned in the existing ${MANIFEST}: adding it (upgrade). \`cauldron pin\` writes"
+        say "  the pin; every other pin and setting in env.toml is left exactly as it is"
+    fi
     if [[ ${DRY} -eq 0 ]]; then
         command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH, and \`cauldron build mcp\` compiles it from ${REPO}. Install Rust (https://rustup.rs) and re-run."
     fi
@@ -677,14 +840,27 @@ else
         CLAIMED="${MCP_BUILDS}/${MCP_LABEL}"
         say "built mcp as this environment's own version ${MCP_LABEL}"
     fi
-    # The pin edits env.toml: re-check, right before it, that the file is
-    # still the one this install created (or the one it resumes).
-    if [[ ${DRY} -eq 0 ]] && ! marker_owns_manifest; then
-        die "${MANIFEST} is no longer the env.toml this install created (its marker ${THREADS_PENDING} records another identity or other bytes, or is gone), so mcp is NOT pinned into it, and the version this run built is removed. To host it there: ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy, then ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
+    if [[ ${MCP_ADDED} -eq 1 ]]; then
+        # Right before the pin: another writer may have pinned (or, for an
+        # upgrade, re-pinned) mcp while this run built. Its pin stands; the
+        # version this run built is removed.
+        if [[ ${DRY} -eq 0 ]] && mcp_pinned && [[ "$(pinned_version mcp)" != "${MCP_PIN}" ]]; then
+            say "mcp was pinned in ${MANIFEST} while this run built it; that pin is left as it is, and the version this run built is removed"
+        else
+            run "${CAULDRON}" --env "${ENV_NAME}" pin mcp "${MCP_LABEL}"
+            CLAIMED=""
+            MCP_PINNED="${MCP_LABEL}"
+        fi
+    else
+        # The pin edits env.toml: re-check, right before it, that the file is
+        # still the one this install created (or the one it resumes).
+        if [[ ${DRY} -eq 0 ]] && ! marker_owns_manifest; then
+            die "${MANIFEST} is no longer the env.toml this install created (its marker ${THREADS_PENDING} records another identity or other bytes, or is gone), so mcp is NOT pinned into it, and the version this run built is removed. To host it there: ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy, then ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
+        fi
+        run "${CAULDRON}" --env "${ENV_NAME}" pin mcp "${MCP_LABEL}"
+        CLAIMED=""
+        MCP_PINNED="${MCP_LABEL}"
     fi
-    run "${CAULDRON}" --env "${ENV_NAME}" pin mcp "${MCP_LABEL}"
-    CLAIMED=""
-    MCP_PINNED="${MCP_LABEL}"
 fi
 if [[ ${CREATED_ENV} -eq 1 || ${RESUME_THREADS} -eq 1 ]]; then
     run rm -f "${THREADS_PENDING}"
@@ -705,6 +881,8 @@ if [[ ${DRY} -eq 1 ]]; then
     else
         say "(no built cauldron at ${CAULDRON} yet, so the label and paths it would resolve are not shown)"
     fi
+    old_mcp_note
+    bridge_note
     say "DRY RUN complete: nothing was built, written or loaded."
     FINISHED=1
     exit 0
@@ -716,11 +894,15 @@ say "status:   ${ROOT}/bin/cauldron --env ${ENV_NAME} status"
 if [[ -n "${THREADS_PINNED}" ]]; then
     say "services: threads pinned at ${THREADS_PINNED}; the supervisor launches it (its address: ${ROOT}/bin/cauldron --env ${ENV_NAME} status)."
 fi
-if [[ -n "${MCP_PINNED}" ]]; then
+if [[ -n "${MCP_PINNED}" && ${MCP_REPIN} -eq 1 ]]; then
+    say "services: mcp re-pinned at ${MCP_PINNED} (it was ${MCP_PIN}); the supervisor runs that build, and every grant is kept."
+    say "            to check: ${ROOT}/bin/cauldron mcp status --env ${ENV_NAME} (its version, beside this cauldron's)"
+elif [[ -n "${MCP_PINNED}" ]]; then
     say "services: mcp pinned at ${MCP_PINNED}; every cauldron is closed to it until you run, in a terminal:"
     say "            ${ROOT}/bin/cauldron mcp grant <cauldron> --env ${ENV_NAME} --project <dir>"
 fi
 say "more:     cauldron build <service>   then   cauldron pin <service> <label>"
+old_mcp_note
 # `cauldron` is only a bare command once ${ROOT}/bin is on PATH; install
 # never edits a shell startup file, so it says exactly how (REL-4.S5 D1).
 if [[ "$(command -v cauldron 2>/dev/null || true)" != "${ROOT}/bin/cauldron" ]]; then
@@ -729,4 +911,5 @@ if [[ "$(command -v cauldron 2>/dev/null || true)" != "${ROOT}/bin/cauldron" ]];
     say "            echo 'export PATH=\"${ROOT}/bin:\$PATH\"' >> ~/.zshrc"
     say "          and open a new terminal (for bash, use ~/.bash_profile)."
 fi
+bridge_note
 FINISHED=1

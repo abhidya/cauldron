@@ -24,12 +24,20 @@ pub const SOUP_SEAM: &str = "soup";
 /// the returned file is dropped. Another writer holding it refuses
 /// ([`Code::Locked`]). `verb` names the act in the refusal
 /// (`cauldron soup <verb>`).
+///
+/// The cauldron's data is made its owner's only first (`env::private`):
+/// a store made before that was the rule is tightened by its next writer.
 pub fn take_writer_lock(c: &env::Cauldron, verb: &str) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    env::private::tighten_cauldron(c).map_err(|err| {
+        Error::caused(Code::Store, format!("making cauldron `{}`'s data private to its owner", c.name), &err)
+    })?;
     let path = c.soup().join(WRITER_LOCK);
     let fh = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(env::private::FILE_MODE)
         .open(&path)
         .map_err(|err| Error::caused(Code::Store, format!("opening {}", path.display()), &err))?;
     match fh.try_lock() {

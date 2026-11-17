@@ -13,6 +13,8 @@
 //!   transcript streams leaving no byte behind (and, under
 //!   `--features fault-injection`, a dump killed before its commit, its
 //!   blob swept at the next open).
+//! - `issues`: the consumer's filed issues, each reproduction as the door
+//!   answers it (the CLI's twins are the `i<n>_` tests of `cli/tests/it/soup.rs`).
 //! - `writes`: the writer: concurrency, `partial`, refusals named by id,
 //!   cites, `soup_link`, the duplicate guard, the audit log, revoke, and a
 //!   kill mid-write recovered at the next open (and, under
@@ -27,6 +29,7 @@ mod support;
 mod changes;
 mod door;
 mod dumps;
+mod issues;
 mod limits;
 mod reads;
 mod writes;

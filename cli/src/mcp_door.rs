@@ -250,19 +250,139 @@ fn dechunk(mut b: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// One `tools/call` to the door: the JSON-RPC `result` (a tool result, with
-/// `isError` on a refusal), or an error for anything that is not one.
+/// `isError` on a refusal), or an error for anything that is not one. A
+/// refusal that says the service does not know the call's tool or an
+/// argument is annotated with the version skew, when there is one
+/// ([`annotate_skew`]).
 pub fn call(e: &Environment, door: SocketAddr, tool: &str, arguments: serde_json::Value) -> Result<serde_json::Value> {
     let a = post(e, door, &call_body(tool, arguments))?;
-    let v: serde_json::Value = serde_json::from_str(&a.body).with_context(|| format!("the mcp door answered HTTP {} with no JSON", a.status))?;
+    let mut v: serde_json::Value = serde_json::from_str(&a.body).with_context(|| format!("the mcp door answered HTTP {} with no JSON", a.status))?;
+    if is_unknown_to_service(&v) {
+        if let Some(sv) = service_version(e, door) {
+            annotate_skew(&mut v, &sv, &e.name);
+        }
+    }
     if let Some(r) = v.get("result") {
         return Ok(r.clone());
     }
     bail!("the mcp door answered HTTP {}: {}", a.status, v.get("error").map(|e| e.to_string()).unwrap_or_else(|| v.to_string()))
 }
 
+// ------------------------------------------------------------ version skew
+
+/// This cauldron's version: the command line's, the bridge's.
+pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// **The running service's version**, as its `initialize` answers it
+/// (`serverInfo.version`, which every release of the service has carried).
+/// `None` when it cannot be asked.
+pub fn service_version(e: &Environment, door: SocketAddr) -> Option<String> {
+    let body = serde_json::json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "cauldron", "version": CLI_VERSION}}})
+    .to_string();
+    let a = post(e, door, &body).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&a.body).ok()?;
+    v.pointer("/result/serverInfo/version").and_then(serde_json::Value::as_str).map(str::to_string)
+}
+
+/// The two commands that move `env`'s `mcp` service to this checkout's build.
+pub fn upgrade_commands(env: &str) -> [String; 2] {
+    [
+        format!("cauldron --env {env} build {SERVICE} --env-copy"),
+        format!("cauldron --env {env} pin {SERVICE} <the label that build printed>"),
+    ]
+}
+
+/// **What to say when the running service is not this cauldron's version**
+/// (`None` when it is): which is which, what that means for a call, and the
+/// commands that upgrade it.
+pub fn skew_note(service: &str, env: &str) -> Option<String> {
+    if service == CLI_VERSION {
+        return None;
+    }
+    let [build, pin] = upgrade_commands(env);
+    Some(format!(
+        "the `{SERVICE}` service running in environment `{env}` is cauldron {service}, and this cauldron is \
+         {CLI_VERSION}: a tool or argument that {service} does not know is refused by it. To run this version's \
+         service, run `scripts/install --replace-running` from your checkout, or `{build}` and then `{pin}` (the \
+         supervisor moves the running service to the new build)"
+    ))
+}
+
+/// Does `v` (a JSON-RPC answer from the door) say the service does not know
+/// a tool, or an argument, that the call used: what an older service
+/// answers a newer client?
+pub fn is_unknown_to_service(v: &serde_json::Value) -> bool {
+    let refused = v.pointer("/result/structuredContent/refused");
+    let usage_arg = refused.is_some_and(|r| {
+        r["code"] == "usage" && r["message"].as_str().is_some_and(|m| m.contains(" takes no argument `"))
+    });
+    let unknown_tool = v.pointer("/error/message").and_then(serde_json::Value::as_str).is_some_and(|m| m.starts_with("unknown tool: "));
+    usage_arg || unknown_tool
+}
+
+/// Add the skew note to a refusal (`v` a JSON-RPC answer) when the service
+/// is another version than this cauldron. Answers whether it did.
+pub fn annotate_skew(v: &mut serde_json::Value, service: &str, env: &str) -> bool {
+    let Some(note) = skew_note(service, env) else { return false };
+    let tail = format!(" Version skew: {note}.");
+    if let Some(r) = v.pointer_mut("/result/structuredContent/refused").and_then(serde_json::Value::as_object_mut) {
+        if let Some(m) = r.get("message").and_then(serde_json::Value::as_str).map(str::to_string) {
+            r.insert("message".into(), serde_json::json!(format!("{m}{tail}")));
+        }
+        r.insert("version_skew".into(), serde_json::json!({"service": service, "cauldron": CLI_VERSION}));
+        if let Some(t) = v.pointer_mut("/result/content/0/text") {
+            if let Some(s) = t.as_str().map(str::to_string) {
+                *t = serde_json::json!(format!("{s}{tail}"));
+            }
+        }
+        return true;
+    }
+    if let Some(m) = v.pointer_mut("/error/message") {
+        if let Some(s) = m.as_str().map(str::to_string) {
+            *m = serde_json::json!(format!("{s}{tail}"));
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An older service's refusal of a newer argument, or of a tool it does
+    /// not have, says which versions are running and how to upgrade; the
+    /// same refusal from the same version is left as it is.
+    #[test]
+    fn an_older_service_s_refusal_names_the_skew_and_the_upgrade() {
+        let refusal = |m: &str| {
+            serde_json::json!({"jsonrpc": "2.0", "id": 3, "result": {"isError": true,
+                "content": [{"type": "text", "text": format!("refused (usage): {m}")}],
+                "structuredContent": {"refused": {"code": "usage", "message": m}}}})
+        };
+        let mut v = refusal("soup_dump_get takes no argument `view`. Nothing was read or written.");
+        assert!(is_unknown_to_service(&v));
+        assert!(annotate_skew(&mut v, "0.0.1", "prod"));
+        let m = v.pointer("/result/structuredContent/refused/message").unwrap().as_str().unwrap();
+        for want in ["takes no argument `view`", "is cauldron 0.0.1", CLI_VERSION, "scripts/install --replace-running",
+                     "cauldron --env prod build mcp --env-copy", "cauldron --env prod pin mcp <the label that build printed>"] {
+            assert!(m.contains(want), "{want}: {m}");
+        }
+        assert!(v.pointer("/result/content/0/text").unwrap().as_str().unwrap().contains("is cauldron 0.0.1"));
+        assert_eq!(v.pointer("/result/structuredContent/refused/version_skew/service").unwrap(), "0.0.1");
+        // A tool the service does not have at all.
+        let mut u = serde_json::json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32602, "message": "unknown tool: soup_dump_get"}});
+        assert!(is_unknown_to_service(&u) && annotate_skew(&mut u, "0.0.1", "dev"));
+        assert!(u["error"]["message"].as_str().unwrap().contains("cauldron --env dev pin mcp"), "{u}");
+        // Same version: untouched. Another refusal: not this kind.
+        let mut same = refusal("soup_nodes takes no argument `colour`. Nothing was read or written.");
+        let before = same.clone();
+        assert!(!annotate_skew(&mut same, CLI_VERSION, "prod"));
+        assert_eq!(same, before);
+        assert!(!is_unknown_to_service(&refusal("max_chars 5 is under 1000")));
+        assert!(skew_note(CLI_VERSION, "prod").is_none());
+    }
 
     #[test]
     fn an_answer_is_read_by_its_length_or_its_chunks() {

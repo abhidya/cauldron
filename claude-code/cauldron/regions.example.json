@@ -1,0 +1,28 @@
+[
+  {
+    "id": "r-code",
+    "type": "region",
+    "handle": "How this project is built: its code, architecture, build and tools",
+    "boundary": "Inside: decisions, rules, hazards, defects, questions and tasks about this project's code, its architecture, its build and its developer tools. Outside: what the product should do for its users (the region on the product), how the work is organised (the region on the process), and how the code is tested (the region on testing, which narrows this one)."
+  },
+  {
+    "id": "r-tests",
+    "type": "region",
+    "handle": "How this project is tested: its test suites, fixtures and checks",
+    "boundary": "Inside: anything about testing this project's code: test suites, fixtures, checks run before a release, and failures they catch. Outside: the code itself and its design (the region on how the project is built, which this one narrows).",
+    "edges": [{"kind": "narrows", "to": "r-code"}]
+  },
+  {
+    "id": "r-product",
+    "type": "region",
+    "handle": "What the product does for its users, and why",
+    "boundary": "Inside: what the product should do for the people who use it: features, behaviour they see, requirements and the reasons behind them. Outside: how it is built (the region on how the project is built) and how the work is organised (the region on the process).",
+    "edges": [{"kind": "relates", "to": "r-code"}]
+  },
+  {
+    "id": "r-process",
+    "type": "region",
+    "handle": "How the work on this project is organised: releases, reviews and plans",
+    "boundary": "Inside: how the work is planned, reviewed and released: release steps, review rules, plans and their order. Outside: what the product does (the region on the product) and how the code is built (the region on how the project is built)."
+  }
+]

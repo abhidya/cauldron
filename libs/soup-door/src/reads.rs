@@ -4,6 +4,17 @@
 //! default and by an optional per-field `max_chars`; what was cut is listed
 //! in `truncated`, and a list cut by its limit says how many `more` there
 //! are.
+//!
+//! # Superseded nodes
+//!
+//! A node is SUPERSEDED when another node carries a `supersedes` edge to it
+//! (the grammar's computed state: "read from an inbound `supersedes`"). An
+//! update is a supersede, so without this every reader would see the stale
+//! and the current version side by side. `get` always answers the node and
+//! adds `superseded_by: [ids]`; `nodes`, `search` and a region's members
+//! leave superseded nodes out unless [`ReadOpts::include_superseded`], and
+//! each says how many it left out (`superseded_hidden`). With the option, a
+//! superseded node is listed with its `superseded_by`.
 
 use std::collections::BTreeMap;
 
@@ -44,6 +55,9 @@ pub struct ReadOpts {
     pub node_type: Option<String>,
     /// `nodes`: one state.
     pub state: Option<String>,
+    /// `nodes`, `search`, `region`: list superseded nodes too (they are
+    /// left out, and counted, by default).
+    pub include_superseded: bool,
 }
 
 impl ReadOpts {
@@ -178,6 +192,10 @@ pub fn get(t: &Target, ids: &[String], o: &ReadOpts) -> Result<Value> {
         if !edges.is_empty() {
             rec.insert("edges".into(), Value::Array(edges));
         }
+        let by = superseded_by(&snap, &pool, &n.id)?;
+        if !by.is_empty() {
+            rec.insert("superseded_by".into(), json!(by));
+        }
         records.push(Value::Object(rec));
     }
     let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "records": records});
@@ -201,6 +219,9 @@ struct Entry {
     /// The committed-commit counter at the commit that created it; `None`
     /// when the spine has no landed row for it (not expected; sorted first).
     order: Option<i64>,
+    /// The nodes whose `supersedes` edge points at it, by id; empty for a
+    /// node nothing supersedes.
+    superseded_by: Vec<String>,
 }
 
 /// Every node of the pool, newest first: by the commit that created it
@@ -220,6 +241,7 @@ fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>,
                 .map(|x| target_text(pool, &x.dst))
                 .collect();
             let created = snap.created_tx(&n.id).map_err(store)?;
+            let superseded_by = superseded_by(snap, pool, &n.id)?;
             out.push(Entry {
                 id: n.id.0.clone(),
                 node_type: n.node_type.clone(),
@@ -228,6 +250,7 @@ fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>,
                 body: text("body"),
                 regions,
                 order: created.and_then(|h| order.get(&h.to_hex()).copied()),
+                superseded_by,
             });
         }
     }
@@ -236,6 +259,47 @@ fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>,
         newest(b).cmp(&newest(a)).then_with(|| prefix(&a.id).cmp(prefix(&b.id))).then_with(|| serial(&b.id).cmp(&serial(&a.id))).then_with(|| a.id.cmp(&b.id))
     });
     Ok(out)
+}
+
+/// A listed node with its `state`, when it has one: a region and a viewer
+/// carry no state at all, so they are listed without the key (never
+/// `state: null`), as `get` prints them. A superseded node (listed only
+/// when asked for) carries its `superseded_by`.
+fn stated(mut item: Value, n: &Entry) -> Value {
+    if let Some(m) = item.as_object_mut() {
+        if let Some(s) = &n.state {
+            m.insert("state".into(), json!(s));
+        }
+        if !n.superseded_by.is_empty() {
+            m.insert("superseded_by".into(), json!(n.superseded_by));
+        }
+    }
+    item
+}
+
+/// The ids of the nodes whose `supersedes` edge points at `id`, sorted.
+fn superseded_by(snap: &spine::pool::Snapshot<'_>, pool: &PoolName, id: &NodeId) -> Result<Vec<String>> {
+    let mut by: Vec<String> = snap
+        .edges_to(&QualifiedNodeId { pool: pool.clone(), id: id.clone() }, Some("supersedes"))
+        .map_err(store)?
+        .into_iter()
+        .map(|x| x.src.0)
+        .collect();
+    by.sort_by(|a, b| prefix(a).cmp(prefix(b)).then(serial(a).cmp(&serial(b))).then(a.cmp(b)));
+    by.dedup();
+    Ok(by)
+}
+
+/// `list` without its superseded nodes, unless `keep`; and how many were
+/// left out.
+fn unsuperseded<T>(list: Vec<T>, keep: bool, entry: impl Fn(&T) -> &Entry) -> (Vec<T>, usize) {
+    if keep {
+        return (list, 0);
+    }
+    let before = list.len();
+    let kept: Vec<T> = list.into_iter().filter(|x| entry(x).superseded_by.is_empty()).collect();
+    let hidden = before - kept.len();
+    (kept, hidden)
 }
 
 /// The prefix of `<PREFIX>-<n>`, the whole id for anything else.
@@ -292,22 +356,25 @@ pub fn nodes(t: &Target, o: &ReadOpts) -> Result<Value> {
         .filter(|n| o.state.as_deref().is_none_or(|s| n.state.as_deref() == Some(s)))
         .filter(|n| region.as_ref().is_none_or(|r| n.regions.contains(r)))
         .collect();
+    let (all, hidden) = unsuperseded(all, o.include_superseded, |n| n);
     let total = all.len();
     let (shown, more) = bounded(all, o.limit.unwrap_or(NODES_LIMIT));
     let mut cut = Cut::new(o.max_chars);
     let list: Vec<Value> = shown
         .iter()
         .map(|n| {
-            json!({
-                "id": n.id,
-                "type": n.node_type,
-                "state": n.state,
-                "handle": cut.value(&n.id, "handle", &json!(n.handle)),
-                "regions": n.regions,
-            })
+            stated(
+                json!({
+                    "id": n.id,
+                    "type": n.node_type,
+                    "handle": cut.value(&n.id, "handle", &json!(n.handle)),
+                    "regions": n.regions,
+                }),
+                n,
+            )
         })
         .collect();
-    let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "total": total, "nodes": list});
+    let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "total": total, "superseded_hidden": hidden, "nodes": list});
     if more > 0 {
         doc["more"] = json!(more);
     }
@@ -413,6 +480,7 @@ pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
     }
     // Most terms matched, then the score, then newest (catalog order).
     hits.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)).then(x.2.cmp(&y.2)));
+    let (hits, hidden) = unsuperseded(hits, o.include_superseded, |h| &h.3);
     let total = hits.len();
     let (shown, more) = bounded(hits, o.limit.unwrap_or(SEARCH_LIMIT));
     let max = o.max_chars.unwrap_or(SNIPPET_CHARS);
@@ -424,21 +492,23 @@ pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
             if partial {
                 cut.note(json!({"id": n.id, "field": "body", "chars": n.body.chars().count(), "as": "snippet"}));
             }
-            json!({
-                "id": n.id,
-                "type": n.node_type,
-                "state": n.state,
-                "handle": cut.value(&n.id, "handle", &json!(n.handle)),
-                "regions": n.regions,
-                "score": score,
-                "snippet": snip,
-            })
+            stated(
+                json!({
+                    "id": n.id,
+                    "type": n.node_type,
+                    "handle": cut.value(&n.id, "handle", &json!(n.handle)),
+                    "regions": n.regions,
+                    "score": score,
+                    "snippet": snip,
+                }),
+                &n,
+            )
         })
         .collect();
     let mut doc = json!({
         "env": e.name, "cauldron": c.name, "pool": pool.as_str(), "query": query,
         "terms": wanted.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>(),
-        "total": total, "results": list,
+        "total": total, "superseded_hidden": hidden, "results": list,
     });
     if more > 0 {
         doc["more"] = json!(more);
@@ -536,16 +606,17 @@ pub fn region(t: &Target, id: &str, o: &ReadOpts) -> Result<Value> {
 
     let types = types_of(&handle, None)?;
     let members: Vec<Entry> = catalog(c, &pool, &snap, &types)?.into_iter().filter(|n| n.regions.contains(&id)).collect();
+    let (members, hidden) = unsuperseded(members, o.include_superseded, |n| n);
     let total = members.len();
     let (shown, more) = bounded(members, o.limit.unwrap_or(MEMBERS_LIMIT));
     let members: Vec<Value> = shown
         .iter()
-        .map(|n| json!({"id": n.id, "type": n.node_type, "state": n.state, "handle": cut.value(&n.id, "handle", &json!(n.handle))}))
+        .map(|n| stated(json!({"id": n.id, "type": n.node_type, "handle": cut.value(&n.id, "handle", &json!(n.handle))}), n))
         .collect();
     let mut doc = json!({
         "env": e.name, "cauldron": c.name, "pool": pool.as_str(),
         "region": record, "parents": parents, "children": children, "relates": relates,
-        "members_total": total, "members": members,
+        "members_total": total, "superseded_hidden": hidden, "members": members,
     });
     if more > 0 {
         doc["more"] = json!(more);

@@ -252,7 +252,10 @@ impl Bridge {
             return;
         }
         match relay(e, &msg) {
-            Relayed::Answer(v) => self.write(&v),
+            Relayed::Answer(mut v) => {
+                skew(e, &msg, &mut v);
+                self.write(&v)
+            }
             Relayed::Nothing => {}
             Relayed::Down(why) => {
                 if let Some(v) = answer_down(&e.name, &why, &msg) {
@@ -311,6 +314,36 @@ fn relay(e: &Environment, msg: &Value) -> Relayed {
             return Relayed::Nothing;
         }
         return Relayed::Answer(v);
+    }
+}
+
+/// **Version skew, made visible.** The service answering is another build
+/// than this bridge when the owner upgraded cauldron and the environment's
+/// `mcp` pin still names the old one. On `initialize`, the service's version
+/// (`serverInfo.version`) is compared with the bridge's: when they differ,
+/// the session's instructions say so, with the commands that upgrade it,
+/// and so does a line on stderr (Claude Code's log of this server). A
+/// refusal that says the service does not know a tool or an argument the
+/// call used is annotated the same way ([`crate::mcp_door::annotate_skew`]).
+fn skew(e: &Environment, msg: &Value, v: &mut Value) {
+    match msg.get("method").and_then(Value::as_str) {
+        Some("initialize") => {
+            let Some(sv) = v.pointer("/result/serverInfo/version").and_then(Value::as_str).map(str::to_string) else { return };
+            if let Some(note) = crate::mcp_door::skew_note(&sv, &e.name) {
+                eprintln!("cauldron mcp stdio: {note}.");
+                if let Some(r) = v.get_mut("result").and_then(Value::as_object_mut) {
+                    let before = r.get("instructions").and_then(Value::as_str).unwrap_or("").to_string();
+                    let sep = if before.is_empty() { "" } else { " " };
+                    r.insert("instructions".into(), json!(format!("{before}{sep}VERSION SKEW: {note}.")));
+                }
+            }
+        }
+        Some("tools/call") if crate::mcp_door::is_unknown_to_service(v) => {
+            if let Some(sv) = crate::mcp_door::find(e).ok().and_then(|f| crate::mcp_door::service_version(e, f.door)) {
+                crate::mcp_door::annotate_skew(v, &sv, &e.name);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -529,6 +562,33 @@ mod tests {
         // and so does the open on its own handle).
         assert!(matches!(open_transcript(&config, std::path::Path::new("/dev/null")), Err(Transcript::NotRegular(_))));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An older service's `initialize`: the session's instructions and a
+    /// stderr line name both versions and the upgrade; the same version
+    /// leaves the answer as the service gave it.
+    #[test]
+    fn an_older_service_s_initialize_tells_the_session_about_the_skew() {
+        let e = Environment {
+            root: "/nonexistent-root".into(),
+            root_source: env::paths::Source::CauldronHome,
+            name: "prod".into(),
+            name_source: env::paths::Source::CauldronEnv,
+            data_root: "/nonexistent-root/data/prod".into(),
+        };
+        let msg = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let answer = |v: &str| json!({"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": "cauldron-mcp", "version": v}, "instructions": "The door."}});
+        let mut old = answer("0.0.1");
+        skew(&e, &msg, &mut old);
+        let i = old["result"]["instructions"].as_str().unwrap();
+        assert!(i.starts_with("The door. VERSION SKEW: "), "{i}");
+        for want in ["is cauldron 0.0.1", crate::mcp_door::CLI_VERSION, "scripts/install --replace-running", "cauldron --env prod build mcp --env-copy"] {
+            assert!(i.contains(want), "{want}: {i}");
+        }
+        let mut same = answer(crate::mcp_door::CLI_VERSION);
+        let before = same.clone();
+        skew(&e, &msg, &mut same);
+        assert_eq!(same, before);
     }
 
     #[test]
@@ -812,15 +872,25 @@ fn dump_session(e: &Environment, ctx: &Ctx, msg: &Value) -> Value {
         if a.status == 401 && tries == 1 {
             continue;
         }
-        return match serde_json::from_str::<Value>(&a.body) {
+        let mut v = match serde_json::from_str::<Value>(&a.body) {
             Ok(mut v) => {
                 if v.get("error").is_some() && v.get("id").is_none_or(Value::is_null) {
                     v["id"] = id.clone();
                 }
                 v
             }
-            Err(_) => shapewire::mcp::error_body(id, shapewire::mcp::rpc::SERVER, format!("the mcp service answered HTTP {} with no JSON", a.status), None),
+            Err(_) => shapewire::mcp::error_body(id.clone(), shapewire::mcp::rpc::SERVER, format!("the mcp service answered HTTP {} with no JSON", a.status), None),
         };
+        // A service older than session dumps has no such route (404).
+        if a.status == 404 || crate::mcp_door::is_unknown_to_service(&v) {
+            if let Some(sv) = crate::mcp_door::service_version(e, found.door) {
+                if a.status == 404 && crate::mcp_door::skew_note(&sv, &e.name).is_some() {
+                    v = shapewire::mcp::error_body(id.clone(), shapewire::mcp::rpc::INVALID_PARAMS, format!("unknown tool: {DUMP_SESSION}"), None);
+                }
+                crate::mcp_door::annotate_skew(&mut v, &sv, &e.name);
+            }
+        }
+        return v;
     }
     shapewire::mcp::error_body(id, shapewire::mcp::rpc::SERVER, "the mcp service refused the door secret twice", None)
 }

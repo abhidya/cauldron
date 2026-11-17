@@ -179,7 +179,12 @@ impl Door {
             }
             "soup_region" => {
                 let id = a.required_str("id")?;
-                let o = ReadOpts { depth: a.count("depth")?, limit: a.count("limit")?, ..ReadOpts::default() };
+                let o = ReadOpts {
+                    depth: a.count("depth")?,
+                    limit: a.count("limit")?,
+                    include_superseded: a.flag("include_superseded")?,
+                    ..ReadOpts::default()
+                };
                 let mc = a.count("max_chars")?;
                 a.done()?;
                 let mut doc = reads::region(&t, &id, &o).map_err(refusal)?;
@@ -192,6 +197,7 @@ impl Door {
                     node_type: a.str("type")?,
                     state: a.str("state")?,
                     limit: a.count("limit")?,
+                    include_superseded: a.flag("include_superseded")?,
                     ..ReadOpts::default()
                 };
                 let mc = a.count("max_chars")?;
@@ -200,7 +206,13 @@ impl Door {
             }
             "soup_search" => {
                 let query = a.required_str("query")?;
-                let o = ReadOpts { region: a.str("region")?, node_type: a.str("type")?, limit: a.count("limit")?, ..ReadOpts::default() };
+                let o = ReadOpts {
+                    region: a.str("region")?,
+                    node_type: a.str("type")?,
+                    limit: a.count("limit")?,
+                    include_superseded: a.flag("include_superseded")?,
+                    ..ReadOpts::default()
+                };
                 let mc = a.count("max_chars")?;
                 a.done()?;
                 if reads::search_terms(&query).is_empty() {
@@ -281,13 +293,28 @@ impl Door {
             "soup_dump_get" => {
                 let id = a.required_str("id")?;
                 let offset = a.count("offset")?.unwrap_or(0) as u64;
+                let view = a.str("view")?;
+                let turn_offset = a.count("turn_offset")?;
                 let mc = a.count("max_chars")?;
                 a.done()?;
+                let text_view = match view.as_deref() {
+                    None | Some("raw") => false,
+                    Some("text") => true,
+                    Some(v) => return Err(usage(&format!("`view` of soup_dump_get is `raw` (the default) or `text`, not `{v}`"))),
+                };
+                if turn_offset.is_some() && !text_view {
+                    return Err(usage("`turn_offset` of soup_dump_get goes with `view: \"text\"` (it is a page's `next_turn_offset`)"));
+                }
+                soup_door::dumps::check_page_max(mc).map_err(refusal)?;
                 // The bound is the window's own: `resolved_from` and
                 // `truncated` are counted in it.
                 let reserve = budget::size(&json!({"resolved_from": from, "truncated": {"fields": [], "items_dropped": 0}}));
                 let max = budget::clamp(mc).saturating_sub(reserve).max(64);
-                let mut doc = soup_door::dumps::get(&t.cauldron, &id, offset, max).map_err(refusal)?;
+                let mut doc = if text_view {
+                    soup_door::dumps::get_text(&t.cauldron, &id, offset, turn_offset.unwrap_or(0) as u64, max).map_err(refusal)?
+                } else {
+                    soup_door::dumps::get(&t.cauldron, &id, offset, max).map_err(refusal)?
+                };
                 doc["truncated"] = json!({"fields": [], "items_dropped": 0});
                 doc
             }

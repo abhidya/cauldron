@@ -105,7 +105,7 @@ pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<Import
         if !o.allow_duplicate {
             let earlier = landed_before(&dir.0, &c.name, &digest)?;
             if !earlier.is_empty() {
-                return Ok(already_landed(t, &pool, &digest, o, earlier));
+                return Ok(already_landed(t, &pool, &digest, o, records.len(), earlier));
             }
         }
         _copy = dir;
@@ -138,7 +138,7 @@ pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<Import
         if !o.allow_duplicate {
             let earlier = landed_before(&soup, &c.name, &digest)?;
             if !earlier.is_empty() {
-                return Ok(already_landed(t, &pool, &digest, o, earlier));
+                return Ok(already_landed(t, &pool, &digest, o, records.len(), earlier));
             }
         }
         // 4. The spine's own open, checked: it must have done nothing.
@@ -189,6 +189,19 @@ pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &Imp
         Some(Landing::NothingAccepted) => ("empty", Value::Null, Value::Null),
         Some(Landing::Refused { witnesses }) => ("refused", Value::Null, to_value(witnesses)?),
     };
+    // The re-minted ids mean something only for a batch that landed or
+    // would land as it stands: on any other outcome they were never taken,
+    // and the next import may give them to other records, so neither the
+    // map nor a record's `new_id` is printed.
+    let ids_hold = outcome == "landed" || outcome == "validated";
+    let mut records_doc = to_value(&run.records)?;
+    if !ids_hold {
+        for r in records_doc.as_array_mut().into_iter().flatten() {
+            if let Some(m) = r.as_object_mut() {
+                m.remove("new_id");
+            }
+        }
+    }
     let mut doc = json!({
         "env": e.name,
         "cauldron": c.name,
@@ -199,10 +212,10 @@ pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &Imp
         "outcome": outcome,
         "accepted": accepted,
         "refused": refused,
-        "records": to_value(&run.records)?,
+        "records": records_doc,
         "batch_digest": digest,
     });
-    if o.remint {
+    if o.remint && ids_hold {
         doc["id_map"] = to_value(&run.id_map)?;
     }
     if !landed.is_null() {
@@ -210,6 +223,13 @@ pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &Imp
     }
     if !landing_refusal.is_null() {
         doc["landing_refused"] = landing_refusal;
+    }
+    // Every refused batch says why in one word, in the same place:
+    // `records-refused` (the records name their reasons), `landing-refused`
+    // (the store refused the write: `landing_refused`) or, from
+    // [`already_landed`], `batch-already-landed`.
+    if outcome == "refused" {
+        doc["refusal"] = json!(if doc.get("landing_refused").is_some() { "landing-refused" } else { "records-refused" });
     }
     Ok((doc, outcome == "landed" || outcome == "validated"))
 }
@@ -288,8 +308,11 @@ pub fn landed_before(dir: &Path, cauldron: &str, digest: &str) -> Result<Vec<Val
 }
 
 /// The refusal `batch-already-landed` for `earlier` (non-empty, from
-/// [`landed_before`]): its JSON and its sentence.
-pub fn already_landed(t: &Target, pool: &PoolName, digest: &str, o: &ImportOptions, earlier: Vec<Value>) -> ImportOutcome {
+/// [`landed_before`]) of a batch of `records` records: its JSON and its
+/// sentence. The JSON has the shape of every refused batch (see
+/// [`submit`]): `outcome`, `refusal`, `accepted`, `refused` and `records`
+/// (empty: no record was judged), plus `landed_before` and `why`.
+pub fn already_landed(t: &Target, pool: &PoolName, digest: &str, o: &ImportOptions, records: usize, earlier: Vec<Value>) -> ImportOutcome {
     let first = &earlier[0];
     let why = format!(
         "this exact batch (the same records, before any --remint, into pool `{pool}`) already landed in cauldron `{}` \
@@ -311,6 +334,9 @@ pub fn already_landed(t: &Target, pool: &PoolName, digest: &str, o: &ImportOptio
         "remint": o.remint,
         "outcome": "refused",
         "refusal": "batch-already-landed",
+        "accepted": 0,
+        "refused": records,
+        "records": [],
         "batch_digest": digest,
         "landed_before": earlier,
         "why": why,
@@ -367,7 +393,8 @@ impl ScratchDir {
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
         ));
-        std::fs::create_dir_all(&p).map_err(|err| Error::caused(Code::Store, format!("creating {}", p.display()), &err))?;
+        // The copy of the soup is the owner's only, like the soup.
+        env::private::make_dir(&p).map_err(|err| Error::caused(Code::Store, format!("creating {}", p.display()), &err))?;
         Ok(ScratchDir(p))
     }
 }

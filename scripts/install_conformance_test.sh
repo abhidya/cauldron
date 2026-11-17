@@ -91,12 +91,22 @@
 # variable aborts install / this suite with rc != 0, not the rc 0 that bash
 # 3.2 gives a `set -u` abort under an EXIT trap.
 #
-# THE MCP STEP (4c), cases 13, 14a, 17b, 21b, 26b and 29: a fresh environment
-# also gets `cauldron build mcp --json --env-copy` and `pin mcp <label>+<env>`
-# after threads; an existing env.toml is told the two commands and never
-# edited (13); a run stopped between the two pins is finished by a re-run
-# that pins only mcp, and a third run changes nothing (29a-c); an env.toml
-# edited by hand after the threads pin is refused (29d).
+# THE MCP STEP (4c), cases 12, 13, 14a, 17b, 19b', 21b, 26b, 29 and 30: a
+# fresh environment also gets `cauldron build mcp --json --env-copy` and
+# `pin mcp <label>+<env>` after threads; an existing env.toml with an mcp pin
+# is never touched (12); an existing env.toml WITHOUT one (the upgrade) gets
+# the same build and `cauldron pin mcp`, said in a line of its own, once: a
+# re-run changes nothing (13, 30); a run stopped between the two pins is
+# finished by a re-run that pins only mcp, and a third run changes nothing
+# (29a-c); an env.toml edited by hand after the threads pin keeps its edit,
+# the stale marker is cleared and mcp is added as an upgrade (29d). Case 31:
+# an EXISTING mcp pin at an older build than this checkout's is rebuilt and
+# re-pinned once under --replace-running (the supervisor moves the running
+# service; the script kills nothing), a re-run changes nothing, without the
+# flag it is left exactly as it is and the run says plainly that the mcp
+# service is still the old build with the two commands that upgrade it (12
+# too), a re-pin made by another writer during the build stands, and a
+# dirty checkout is refused at 2c.
 #
 #   INSTALL=<path> overrides the script under test (used to force it red).
 #   SUITE_UNDER_TEST=<path> overrides the suite case 28 mutates (same reason).
@@ -196,7 +206,7 @@ run() {
         STUB_GIT_DIRTY="${STUB_GIT_DIRTY:-}" STUB_GIT_FAIL="${STUB_GIT_FAIL:-0}" \
         STUB_GIT_DIRTY_AT="${STUB_GIT_DIRTY_AT:-}" STUB_WS="${STUB_WS:-${T}/repo}" STUB_PROBE="${STUB_PROBE:-}" \
         CLOG="${CLOG:-${T}/cauldron.log}" GIT_DIRS_LOG="${T}/gitdirs.log" \
-        bash "${RUN_AS:-${INSTALL}}" "$@" 2>"${T}/stderr")"
+        "${RUN_BASH:-bash}" "${RUN_AS:-${INSTALL}}" "$@" 2>"${T}/stderr")"
     RC=$?
     set -e
     ERR="$(cat "${T}/stderr")"
@@ -280,7 +290,7 @@ srun() {
     if [[ -d "${home}" ]]; then /bin/cp -Rp "${home}/." "${T}/twin/"; fi
     # REL-4.S5c stub knobs, passed to the run AND its twin. Paths here hold no
     # spaces (all under ${T}), so word splitting is safe.
-    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-} STUB_MCP_REFUSE=${STUB_MCP_REFUSE:-0}"
+    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-} STUB_MCP_REFUSE=${STUB_MCP_REFUSE:-0} STUB_MCP_REPIN_DURING=${STUB_MCP_REPIN_DURING:-0}"
     set +e
     OUT="$(cd "${T}" && /usr/bin/env -i HOME="${RUN_HOME:-${T}/home}" PATH="${SEAL}${SRUN_PATH_EXTRA:+:${SRUN_PATH_EXTRA}}" \
         ${RUN_SIGNER:+HARNESS_SIGN_SCRIPT="${RUN_SIGNER}"} \
@@ -347,6 +357,20 @@ if [[ ${RC} -eq 0 ]]; then ok "rc 0"; else bad "rc ${RC}, wanted 0" "${OUT}"; fi
 if has "no cauldron job for 'prod' is loaded"; then ok "says none loaded"; else bad "no 'none loaded' line" "${OUT}"; fi
 if ! grep -qF 'WARNING: launchctl list failed' <<<"${ERR}"; then ok "no list WARNING when list works"; else bad "list WARNING with a working list" "${ERR}"; fi
 if grep -qE '^install: \$ .*/cauldron --env prod install$' <<<"${OUT}"; then ok "step 5 runs cauldron install without --replace-running"; else bad "step 5 line wrong" "${OUT}"; fi
+# The closing lines on the bridge's PATH: the plan says them too, before its last line.
+bridge_ok() {
+    # <root> <a line that must come AFTER them> <tag> [<a line that must come BEFORE them>]
+    local n c b=0
+    n="$(grep -nF 'MCP:      Claude Code runs the plugin'"'"'s MCP server as the bare command `cauldron mcp stdio`,' <<<"${OUT}" | head -n 1 | cut -d: -f1)"
+    c="$(grep -nF "${2}" <<<"${OUT}" | tail -n 1 | cut -d: -f1)"
+    if [[ -n "${4:-}" ]]; then b="$(grep -nF "${4}" <<<"${OUT}" | head -n 1 | cut -d: -f1)"; fi
+    if [[ -n "${n}" && -n "${c}" && -n "${b}" && ${c} -gt ${n} && ${n} -gt ${b} ]] && has "so \`cauldron\` must be on the PATH that Claude Code itself sees" \
+        && has "to check: \`command -v cauldron\` in the terminal you start Claude Code from prints" \
+        && has "${1}/bin/cauldron, and \`/mcp\` inside a session lists cauldron as connected."; then
+        ok "${3}: closing lines say cauldron must be on Claude Code's PATH, and how to check"
+    else bad "${3}: no bridge PATH lines (or not at the end)" "${OUT}"; fi
+}
+bridge_ok "${T}/home/.cauldron" "DRY RUN complete" "1 (dry run)"
 
 printf '\n== 2. legacy com.broomstick.cauldron loaded -> REFUSED\n'
 run "com.broomstick.cauldron:4242" 0 --dry-run
@@ -414,6 +438,8 @@ MARK() { echo "$1/.cauldron/data/.install-threads-pending.prod"; }
 ENVT() { echo "$1/.cauldron/data/prod/env.toml"; }
 # line_no <ERE>: the first line of OUT matching it, or 0.
 line_no() { local n; n="$(grep -nE -- "$1" <<<"${OUT}" | head -n 1 | cut -d: -f1)"; echo "${n:-0}"; }
+# prefix_of <before> <after>: <after> starts with every byte of <before>.
+prefix_of() { [[ -f "$2" ]] && /usr/bin/head -c "$(/usr/bin/wc -c <"$1" | /usr/bin/tr -d ' ')" "$2" | /usr/bin/cmp -s - "$1"; }
 RE_BUILD='^install: \$ .*/cauldron --env prod build threads --json --env-copy$'
 RE_SIGN='^install: \$ bash .*/services/threads/scripts/build-threads\.sh --sign-only .*/data/prod/\.threads-image\.[0-9]+/threads$'
 RE_PIN='^install: \$ .*/cauldron --env prod pin threads [^ ]+ --addr auto$'
@@ -441,18 +467,36 @@ RUN_HOME="${T}/home11" run "" 0 --dry-run --env dev
 if [[ ${RC} -eq 0 ]] && grep -qE '^install: \$ .*/cauldron --env dev pin threads [^ ]+\+dev --addr auto$' <<<"${OUT}" && has "'dev' is not prod: it gets its OWN free loopback port"; then ok "--env dev pins its own <label>+dev with --addr auto, and says it gets its own port"; else bad "dev plan wrong (rc ${RC})" "${OUT}"; fi
 if [[ -z "$(find "${T}/home11" -mindepth 1 -print -quit)" ]]; then ok "dry run wrote nothing"; else bad "dry run wrote" "$(find "${T}/home11")"; fi
 
-printf '\n== 12. existing env.toml with threads pinned -> NOT rebuilt, NOT re-pinned\n'
+printf '\n== 12. existing env.toml with threads AND mcp pinned -> NOT rebuilt, NOT re-pinned\n'
 mkdir -p "${T}/home12/.cauldron/data/prod"
-printf '[supervisor]\nauto_restart = true\n\n[services.threads]\nversion = "aaaaaaaaaaaa-release"\naddr = "127.0.0.1:3753"\n' >"${T}/home12/.cauldron/data/prod/env.toml"
+printf '[supervisor]\nauto_restart = true\n\n[services.threads]\nversion = "threadsold-release"\naddr = "127.0.0.1:3753"\n\n[services.mcp]\nversion = "mcpold-release+prod"\n' >"${T}/home12/.cauldron/data/prod/env.toml"
 cp "${T}/home12/.cauldron/data/prod/env.toml" "${T}/env12.before"
 RUN_HOME="${T}/home12" run "" 0 --dry-run
-if [[ ${RC} -eq 0 ]] && has "threads is already pinned in"; then ok "rc 0, says the existing pin is kept"; else bad "rc ${RC}" "${OUT}"; fi
-if [[ $(line_no "${RE_BUILD}") -eq 0 ]] && ! grep -qE -- "${RE_ANYPIN}" <<<"${OUT}"; then ok "no threads build or pin in the plan"; else bad "existing env would be rebuilt/re-pinned" "${OUT}"; fi
+if [[ ${RC} -eq 0 ]] && has "threads is already pinned in" && has "mcp is already pinned in"; then ok "rc 0, says both existing pins are kept"; else bad "rc ${RC}" "${OUT}"; fi
+if [[ $(line_no "${RE_BUILD}") -eq 0 ]] && ! grep -E '^install: \$ ' <<<"${OUT}" | grep -qE -- "${RE_ANYPIN}|build mcp|pin mcp"; then ok "no build or pin of threads or mcp in the plan"; else bad "existing env would be rebuilt/re-pinned" "${OUT}"; fi
+# Its mcp pin is an older build (`mcpold-…`): without --replace-running it
+# is left as it is, and the run says so plainly with the two commands.
+old_mcp_said() {
+    # <tag> <cauldron path the commands name>
+    if has "mcp is pinned at mcpold-release+prod, which is NOT this checkout's build" \
+        && has "THE mcp SERVICE IS STILL THE OLD BUILD: it is pinned at mcpold-release+prod" \
+        && has "    ${2} --env prod build mcp --env-copy" \
+        && has "    then: ${2} --env prod pin mcp <the label that build printed>" \
+        && has "(or run this install again with --replace-running, which does both)" \
+        && has "mcp:      the mcp service is still the old build (mcpold-release+prod); to upgrade it:" \
+        && has "            ${2} --env prod pin mcp <the label that build printed>"; then
+        ok "${1}: says the mcp service is still the old build, and the two commands that upgrade it (in 4c and at the end)"
+    else bad "${1}: no plain old-build lines" "${OUT}"; fi
+}
+old_mcp_said "12 plan" "$(sed -nE 's/^install: \$ (.*\/cauldron) --env prod install$/\1/p' <<<"${OUT}")"
 # F4: the byte check, on a REAL (sealed) run whose stub cauldron's `pin`
 # really appends to env.toml — so a run that pinned WOULD change the bytes.
 # Its positive sentinel is case 14, where the same stub pin does write.
 mkdir -p "${T}/bin14"
 CLOG="${T}/cauldron.log"
+# The commit the stub git names, and so the stubs' build label for it,
+# spelt in pieces (a long hex run reads as a hash).
+TL="$(printf 'feed%s1234-release' c0de)"
 cat >"${T}/bin14/cauldron" <<'STUBC'
 #!/bin/bash
 # Stub cauldron: logs argv. `env create` writes env.toml; `pin` APPENDS the
@@ -515,7 +559,14 @@ case "$*" in
         if [[ "${STUB_MCP_REFUSE:-0}" == 1 ]]; then
             echo "Error: REFUSED to install a version of \`mcp\` (stub)" >&2; exit 1
         fi
-        b="${root}/data/shared/builds/mcp"; base="mcpstub-release"; /bin/mkdir -p "${b}"
+        # STUB_MCP_REPIN_DURING=1: another writer re-pins mcp WHILE the build runs.
+        if [[ "${STUB_MCP_REPIN_DURING:-0}" == 1 ]]; then
+            f="${root}/data/${e}/env.toml"
+            /usr/bin/sed 's/^version = "mcpold-release+prod"$/version = "otherwriter-release+prod"/' "${f}" >"${f}.stub" && /bin/mv -f "${f}.stub" "${f}"
+        fi
+        # Its label starts with the commit, as the real one's does (the stub
+        # git names it): an install compares an existing pin with it.
+        b="${root}/data/shared/builds/mcp"; base="$(git -C "${root}" rev-parse --short=12 HEAD)-release"; /bin/mkdir -p "${b}"
         k=1; l="${base}+${e}"
         until /bin/mkdir "${b}/${l}" 2>/dev/null; do
             k=$((k+1)); l="${base}+${e}.${k}"; [[ ${k} -lt 100 ]] || exit 70
@@ -526,26 +577,36 @@ case "$*" in
     "pin threads "*" --addr auto")
         printf '\n[services.threads]\nversion = "%s"\n' "$3" >>"${root}/data/${e}/env.toml" ;;
     "pin mcp "*)
-        printf '\n[services.mcp]\nversion = "%s"\n' "$3" >>"${root}/data/${e}/env.toml" ;;
+        # A first pin appends the section; a re-pin rewrites its version in
+        # place (STUB_PIN_REWRITE logs it), as the real one leaves the rest.
+        f="${root}/data/${e}/env.toml"
+        if /usr/bin/grep -qx '\[services.mcp\]' "${f}"; then
+            /usr/bin/awk -v v="$3" '/^\[/{sec=$0} sec=="[services.mcp]" && /^version = /{print "version = \"" v "\""; next} {print}' "${f}" >"${f}.stub" && /bin/mv -f "${f}.stub" "${f}"
+        else
+            printf '\n[services.mcp]\nversion = "%s"\n' "$3" >>"${f}"
+        fi ;;
     "env remove ${e} --yes") /bin/rm -rf "${root}/data/${e}" ;;
-    "install") ;;
+    "install"|"install --replace-running") ;;
     *) echo "stub cauldron: unexpected: $*" >&2; exit 64 ;;
 esac
 STUBC
 /bin/chmod +x "${T}/bin14/cauldron"; : >"${T}/bin14/tui"; /bin/chmod +x "${T}/bin14/tui"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${T}/home12" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 ]] && has "threads is already pinned in"; then ok "sealed real run: rc 0, says the existing pin is kept"; else bad "sealed real run: rc ${RC}" "${OUT}"; fi
-if [[ "$(cat "${CLOG}")" == "--env prod install" ]]; then ok "sealed real run: cauldron called for install only (no build, no pin)"; else bad "existing env was rebuilt/re-pinned" "$(cat "${CLOG}")"; fi
+if [[ ${RC} -eq 0 ]] && has "threads is already pinned in" && has "mcp is already pinned in"; then ok "sealed real run: rc 0, says both existing pins are kept"; else bad "sealed real run: rc ${RC}" "${OUT}"; fi
+if [[ "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install')" ]]; then ok "sealed real run: cauldron asked which tree it builds (read-only) and called for install only (no build, no pin)"; else bad "existing env was rebuilt/re-pinned" "$(cat "${CLOG}")"; fi
+old_mcp_said "12 sealed real run" "${T}/bin14/cauldron"
 if cmp -s "${T}/env12.before" "${T}/home12/.cauldron/data/prod/env.toml"; then ok "env.toml byte-identical after a REAL run"; else bad "env.toml changed" "$(diff "${T}/env12.before" "${T}/home12/.cauldron/data/prod/env.toml")"; fi
 sealed_ok "case 12"
 
-printf '\n== 13. existing env.toml WITHOUT threads -> told how, NOT pinned\n'
+printf '\n== 13. existing env.toml WITHOUT threads or mcp -> threads told how, NOT pinned; mcp added once (upgrade)\n'
 mkdir -p "${T}/home13/.cauldron/data/prod"
 printf '[supervisor]\nauto_restart = true\n' >"${T}/home13/.cauldron/data/prod/env.toml"
 RUN_HOME="${T}/home13" run "" 0 --dry-run
 if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing"; then ok "rc 0, says threads is not pinned"; else bad "rc ${RC}" "${OUT}"; fi
 if [[ $(line_no "${RE_BUILD}") -eq 0 && $(line_no "${RE_PIN}") -eq 0 ]]; then ok "no threads build or pin step"; else bad "existing env would be edited" "${OUT}"; fi
+bm="$(line_no '^install: \$ .*/cauldron --env prod build mcp --json --env-copy$')"; pm="$(line_no '^install: \$ .*/cauldron --env prod pin mcp \\<label\\>\+prod$')"; s5="$(line_no "${RE_STEP5}")"
+if has "mcp is NOT pinned in the existing" && has "adding it (upgrade)" && [[ ${bm} -gt 0 && ${pm} -gt ${bm} && ${s5} -gt ${pm} ]]; then ok "13 plan: says mcp is added (upgrade); build mcp --env-copy < pin mcp <label>+prod < step 5"; else bad "13: no mcp upgrade in the plan (build ${bm} pin ${pm} step5 ${s5})" "${OUT}"; fi
 # REL-4.S5c M3: the same, as a REAL (sealed) run whose stub `pin` really
 # appends to env.toml. Its positive sentinel is 17b: the same stub, with the
 # marker present, does pin and does change the bytes.
@@ -554,10 +615,16 @@ cp "${T}/home13/.cauldron/data/prod/env.toml" "${T}/env13.before"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${T}/home13" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing"; then ok "13 sealed real run: rc 0, says threads is not pinned"; else bad "13 sealed real run: rc ${RC}" "${OUT}"; fi
-if has "mcp is NOT pinned in the existing" && has "build mcp --env-copy" && has "pin mcp <the label that build printed>"; then ok "13: says mcp is not pinned, and the two commands that add it"; else bad "13: no mcp instruction" "${OUT}"; fi
-if [[ "$(cat "${CLOG}")" == "--env prod install" ]]; then ok "13 sealed real run: cauldron called for install only (no build, no pin)"; else bad "13: an env.toml without the marker was built/pinned" "$(cat "${CLOG}")"; fi
-if cmp -s "${T}/env13.before" "${T}/home13/.cauldron/data/prod/env.toml"; then ok "13: env.toml byte-identical after a REAL run"; else bad "13: env.toml changed" "$(diff "${T}/env13.before" "${T}/home13/.cauldron/data/prod/env.toml")"; fi
+if has "mcp is NOT pinned in the existing" && has "adding it (upgrade)"; then ok "13: says mcp is not pinned and is added (upgrade)"; else bad "13: no mcp upgrade line" "${OUT}"; fi
+want13="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install')"
+if [[ "$(cat "${CLOG}")" == "${want13}" ]]; then ok "13 sealed real run: no threads build or pin; mcp built --env-copy and pinned by cauldron pin; install"; else bad "13: cauldron calls wrong" "$(cat "${CLOG}")"; fi
+if prefix_of "${T}/env13.before" "$(ENVT "${T}/home13")" && [[ "$(grep -c '^\[services.mcp\]$' "$(ENVT "${T}/home13")")" == 1 ]] && ! grep -q 'services.threads' "$(ENVT "${T}/home13")"; then ok "13: env.toml keeps its bytes and gains exactly one mcp pin (and no threads pin)"; else bad "13: env.toml wrong" "$(cat "$(ENVT "${T}/home13")")"; fi
+if has "services: mcp pinned at ${TL}+prod"; then ok "13: done line names the mcp pin"; else bad "13: no mcp done line" "${OUT}"; fi
 sealed_ok "case 13"
+cp "$(ENVT "${T}/home13")" "${T}/env13.after"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${T}/home13" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install')" ]] && has "mcp is already pinned in" && cmp -s "${T}/env13.after" "$(ENVT "${T}/home13")"; then ok "13 re-run: idempotent (no build, no pin, env.toml byte-identical)"; else bad "13 re-run (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 13 re-run"
 
 printf '\n== 14. the step for real (SEALED): its own new version, signed in the env dir, shared build untouched\n'
 B14() { echo "$1/.cauldron/data/shared/builds/threads/$2"; }
@@ -568,10 +635,10 @@ RUN_HOME="${T}/home14" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]]; then ok "rc 0"; else bad "rc ${RC}, wanted 0" "${OUT}"; fi
 # The stub's threads label, spelt in pieces (a long hex run reads as a hash).
 TL="$(printf 'feed%s1234-release' c0de)"
-want="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod env create prod --auto-restart' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy' '--env prod pin mcp mcpstub-release+prod' '--env prod install')"
+want="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod env create prod --auto-restart' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install')"
 if [[ "$(cat "${CLOG}")" == "${want}" ]]; then ok "cauldron called: workspace probe, env create, build --env-copy, pin threads <label>+prod --addr auto, build mcp --env-copy, pin mcp <label>+prod, install"; else bad "cauldron calls wrong" "$(cat "${CLOG}")"; fi
-if grep -qx '\[services.mcp\]' "${T}/home14/.cauldron/data/prod/env.toml" && [[ -d "${T}/home14/.cauldron/data/shared/builds/mcp/mcpstub-release+prod" && ! -e "${T}/home14/.cauldron/data/shared/builds/mcp/mcpstub-release" ]]; then ok "14a: mcp pinned at its own new version; the shared label never created"; else bad "14a: mcp not pinned as its own version" "$(find "${T}/home14/.cauldron/data/shared/builds" 2>&1)"; fi
-if has "services: mcp pinned at mcpstub-release+prod" && has "mcp grant <cauldron> --env prod"; then ok "14a: done line names the mcp pin and the grant command"; else bad "14a: no mcp done line" "${OUT}"; fi
+if grep -qx '\[services.mcp\]' "${T}/home14/.cauldron/data/prod/env.toml" && [[ -d "${T}/home14/.cauldron/data/shared/builds/mcp/${TL}+prod" && ! -e "${T}/home14/.cauldron/data/shared/builds/mcp/${TL}" ]]; then ok "14a: mcp pinned at its own new version; the shared label never created"; else bad "14a: mcp not pinned as its own version" "$(find "${T}/home14/.cauldron/data/shared/builds" 2>&1)"; fi
+if has "services: mcp pinned at ${TL}+prod" && has "mcp grant <cauldron> --env prod"; then ok "14a: done line names the mcp pin and the grant command"; else bad "14a: no mcp done line" "${OUT}"; fi
 # REL-4.S5c M2/M4: the marker existed when env create ran (sentinel: it WAS
 # written, at the path MARK names), and a first install leaves none behind.
 if [[ "$(cat "${CLOG}.mark" 2>/dev/null)" == present ]]; then ok "14a: the marker existed when env create ran (written before it)"; else bad "14a: no marker when env create ran" "$(cat "${CLOG}.mark" 2>&1)"; fi
@@ -647,7 +714,7 @@ if [[ ${RC} -eq 2 ]] && has "install:      M README.md" && ! has "== 3. binaries
 STUB_GIT_FAIL=1 RUN_HOME="${T}/home16" run "" 0 --dry-run
 if [[ ${RC} -eq 2 ]] && has "\`git status\` failed in"; then ok "a git status that fails is refused, never read as clean"; else bad "failed git status not refused (rc ${RC})" "${OUT}"; fi
 STUB_GIT_DIRTY='?? x' RUN_HOME="${T}/home12" run "" 0 --dry-run
-if [[ ${RC} -eq 0 ]] && has "step 4b will not build threads"; then ok "opposed: a dirty tree is NOT refused when 4b builds nothing (threads already pinned)"; else bad "refused although 4b builds nothing (rc ${RC})" "${OUT}"; fi
+if [[ ${RC} -eq 0 ]] && has "steps 4b and 4c will build nothing"; then ok "opposed: a dirty tree is NOT refused when 4b and 4c build nothing (threads and mcp already pinned)"; else bad "refused although 4b and 4c build nothing (rc ${RC})" "${OUT}"; fi
 
 printf '\n== 17. a re-run COMPLETES an install that stopped before the threads pin (SEALED)\n'
 H17="${T}/home17"; mkdir -p "${H17}"; : >"${CLOG}"; : >"${EXEC_LOG}"
@@ -658,19 +725,20 @@ sealed_ok "case 17a"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H17}" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && has "finishing step 4b now"; then ok "17b re-run: rc 0, says it finishes step 4b"; else bad "17b re-run did not finish 4b (rc ${RC})" "${OUT}"; fi
-want17="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy' '--env prod pin mcp mcpstub-release+prod' '--env prod install')"
+want17="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install')"
 if [[ "$(cat "${CLOG}")" == "${want17}" ]]; then ok "17b: build --env-copy, pin <label>+prod --addr auto, install; no second env create"; else bad "17b calls" "$(cat "${CLOG}")"; fi
 if grep -qx '\[services.threads\]' "$(ENVT "${H17}")" && grep -qx 'version = "feedc0de1234-release+prod"' "$(ENVT "${H17}")"; then ok "17b: env.toml now pins threads"; else bad "17b: env.toml has no threads pin" "$(cat "$(ENVT "${H17}")")"; fi
 if [[ ! -e "$(MARK "${H17}")" ]]; then ok "17b: marker cleared after the pin"; else bad "17b: marker left after the pin"; fi
 if grep -q 'FAKESIGN:com.harness.threads' "$(B14 "${H17}" feedc0de1234-release+prod)/threads" 2>/dev/null; then ok "17b: the pinned version is the signed one"; else bad "17b: pinned version not signed"; fi
 if has "PATH:     \`cauldron\` is not on your PATH yet (it is in ${H17}/.cauldron/bin)" && has "echo 'export PATH=\"${H17}/.cauldron/bin:\$PATH\"' >> ~/.zshrc"; then ok "17b: done says exactly how to put cauldron on PATH"; else bad "17b: no PATH instruction" "${OUT}"; fi
+bridge_ok "${H17}/.cauldron" "lists cauldron as connected." "17b (real run)" "install: == done"
 sealed_ok "case 17b"
 cp "$(ENVT "${H17}")" "${T}/env17.before" 2>/dev/null || : >"${T}/env17.before"
 mkdir -p "${H17}/.cauldron/data/prod" "${H17}/.cauldron/bin"; : >"$(MARK "${H17}")"
 printf '#!/bin/bash\nexit 0\n' >"${H17}/.cauldron/bin/cauldron"; /bin/chmod +x "${H17}/.cauldron/bin/cauldron"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 SRUN_PATH_EXTRA="${H17}/.cauldron/bin" RUN_HOME="${H17}" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "--env prod install" ]]; then ok "17c third run (pinned, stale marker): no rebuild, no re-pin"; else bad "17c rebuilt or re-pinned (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install')" ]]; then ok "17c third run (pinned, stale marker): no rebuild, no re-pin"; else bad "17c rebuilt or re-pinned (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 if cmp -s "${T}/env17.before" "$(ENVT "${H17}")" && [[ ! -e "$(MARK "${H17}")" ]]; then ok "17c: env.toml byte-identical, stale marker cleared"; else bad "17c: env.toml changed or marker kept"; fi
 if ! has "is not on your PATH yet"; then ok "opposed: no PATH instruction when ${H17}/.cauldron/bin is on PATH"; else bad "PATH instruction printed although cauldron is on PATH" "${OUT}"; fi
 sealed_ok "case 17c"
@@ -710,10 +778,11 @@ if ! has "env remove"; then ok "19b opposed: no \`env remove\` offered for prod 
 if [[ ! -s "${CLOG}" ]] && cmp -s "${T}/env19.before" "$(ENVT "${H19}")" && [[ -e "$(MARK "${H19}")" ]]; then ok "19b: no cauldron call, env.toml byte-identical, marker left for the operator"; else bad "19b: called cauldron or changed env.toml" "$(cat "${CLOG}")"; fi
 sealed_ok "case 19b"
 # 19b': doing what the refusal says (remove the marker) -> an existing env
-# without threads: told the two commands, never pinned.
+# without threads: told the two commands, never pinned; mcp is added
+# (upgrade), and the bytes that were there are kept.
 /bin/rm -f "$(MARK "${H19}")"; : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H19}" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing" && [[ "$(cat "${CLOG}")" == "--env prod install" ]] && cmp -s "${T}/env19.before" "$(ENVT "${H19}")"; then ok "19b': after rm of the marker: rc 0, told how, env.toml byte-identical"; else bad "19b' (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing" && [[ "$(cat "${CLOG}")" == "${want13}" ]] && prefix_of "${T}/env19.before" "$(ENVT "${H19}")" && ! grep -q 'services.threads' "$(ENVT "${H19}")"; then ok "19b': after rm of the marker: rc 0, threads told how, mcp added, the earlier bytes kept"; else bad "19b' (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 sealed_ok "case 19b'"
 # 19c: env create FAILS -> its rc, and no marker left behind (opposes an
 # install that writes the marker and never takes it back).
@@ -958,22 +1027,128 @@ cp "$(ENVT "${H29}")" "${T}/env29.before"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H29}" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && has "pinned threads and stopped before pinning mcp"; then ok "29b re-run: rc 0, says it finishes step 4c"; else bad "29b re-run (rc ${RC})" "${OUT}"; fi
-if [[ "$(cat "${CLOG}")" == $'--env prod versions install-workspace-probe\n--env prod build mcp --json --env-copy\n--env prod pin mcp mcpstub-release+prod\n--env prod install' ]]; then ok "29b: no env create, no threads build or pin; mcp built and pinned; install"; else bad "29b calls" "$(cat "${CLOG}")"; fi
+if [[ "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install')" ]]; then ok "29b: no env create, no threads build or pin; mcp built and pinned; install"; else bad "29b calls" "$(cat "${CLOG}")"; fi
 if grep -qx '\[services.mcp\]' "$(ENVT "${H29}")" && [[ "$(grep -c '^\[services.threads\]$' "$(ENVT "${H29}")")" == 1 ]] && [[ ! -e "$(MARK "${H29}")" ]]; then ok "29b: env.toml pins mcp, threads pinned once, marker cleared"; else bad "29b: wrong end state" "$(cat "$(ENVT "${H29}")")"; fi
 sealed_ok "case 29b"
 cp "$(ENVT "${H29}")" "${T}/env29.after"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H29}" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "--env prod install" ]] && has "mcp is already pinned in" && cmp -s "${T}/env29.after" "$(ENVT "${H29}")"; then ok "29c: a third run builds and pins nothing, env.toml byte-identical"; else bad "29c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install')" ]] && has "mcp is already pinned in" && cmp -s "${T}/env29.after" "$(ENVT "${H29}")"; then ok "29c: a third run builds and pins nothing, env.toml byte-identical"; else bad "29c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 sealed_ok "case 29c"
-# 29d (opposed): an env.toml edited after the threads pin is not the one the
-# marker records, so the re-run refuses rather than pin mcp into it.
+# 29d: an env.toml edited after the threads pin is not the one the marker
+# records. The marker's own job (the threads pin) is done, so it protects
+# nothing: the re-run clears it and adds mcp as an upgrade, keeping the edit.
+# (A marker that does not match an env.toml WITHOUT threads still refuses:
+# 19b, 21, 22b, 22c, 22e.)
 H29d="${T}/home29d"; mkdir -p "${H29d}"; : >"${CLOG}"; : >"${EXEC_LOG}"
 STUB_MCP_REFUSE=1 RUN_HOME="${H29d}" srun "" --from "${T}/bin14"
 printf '# edited by hand\n' >>"$(ENVT "${H29d}")"; cp "$(ENVT "${H29d}")" "${T}/env29d.before"
 : >"${CLOG}"
 RUN_HOME="${H29d}" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 2 ]] && ! grep -q 'pin mcp' "${CLOG}" && cmp -s "${T}/env29d.before" "$(ENVT "${H29d}")"; then ok "29d: an env.toml edited after the threads pin is refused, untouched, no mcp pin"; else bad "29d (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 ]] && has "an earlier install pinned threads and stopped before clearing its marker" && [[ "$(cat "${CLOG}")" == "${want13}" ]]; then ok "29d: threads left as it is, mcp built and pinned as an upgrade"; else bad "29d (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if prefix_of "${T}/env29d.before" "$(ENVT "${H29d}")" && [[ "$(grep -c '^\[services.threads\]$' "$(ENVT "${H29d}")")" == 1 && "$(grep -c '^\[services.mcp\]$' "$(ENVT "${H29d}")")" == 1 && ! -e "$(MARK "${H29d}")" ]]; then ok "29d: the hand edit kept, one threads pin, one mcp pin, marker cleared"; else bad "29d: wrong end state" "$(cat "$(ENVT "${H29d}")")"; fi
+sealed_ok "case 29d"
+
+printf '\n== 30. the UPGRADE: an existing env with threads pinned and no mcp gets mcp, once (SEALED)\n'
+# An environment made before mcp shipped: threads pinned, no mcp pin, a
+# holder loaded, upgraded with --replace-running as the docs say.
+H30="${T}/home30"; mkdir -p "${H30}/.cauldron/data/prod"
+printf '[supervisor]\nauto_restart = true\n\n[services.threads]\nversion = "threadsold-release"\naddr = "127.0.0.1:3653"\n' >"$(ENVT "${H30}")"
+cp "$(ENVT "${H30}")" "${T}/env30.before"
+# 30a: the plan.
+RUN_HOME="${H30}" run "ai.broomstick.cauldron:4242" 0 --dry-run --replace-running
+bm="$(line_no '^install: \$ .*/cauldron --env prod build mcp --json --env-copy$')"; pm="$(line_no '^install: \$ .*/cauldron --env prod pin mcp \\<label\\>\+prod$')"; s5="$(line_no "${RE_STEP5}")"
+if [[ ${RC} -eq 0 ]] && has "mcp is NOT pinned in the existing" && has "adding it (upgrade)" && [[ ${bm} -gt 0 && ${pm} -gt ${bm} && ${s5} -gt ${pm} ]]; then ok "30a plan: says mcp is added (upgrade); build mcp < pin mcp < step 5"; else bad "30a plan (rc ${RC}, build ${bm} pin ${pm} step5 ${s5})" "${OUT}"; fi
+if [[ $(line_no "${RE_BUILD}") -eq 0 ]] && ! grep -qE -- "${RE_ANYPIN}" <<<"${OUT}" && has "threads is already pinned in"; then ok "30a plan: threads neither built nor re-pinned"; else bad "30a: threads would be touched" "${OUT}"; fi
+if cmp -s "${T}/env30.before" "$(ENVT "${H30}")"; then ok "30a: the dry run wrote nothing"; else bad "30a: the dry run changed env.toml"; fi
+# 30b: for real.
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H30}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
+want30="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install --replace-running')"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want30}" ]]; then ok "30b: mcp built --env-copy and pinned by cauldron pin, then install --replace-running"; else bad "30b calls (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if prefix_of "${T}/env30.before" "$(ENVT "${H30}")" && [[ "$(grep -c '^\[services.mcp\]$' "$(ENVT "${H30}")")" == 1 ]] && grep -qx 'version = "threadsold-release"' "$(ENVT "${H30}")"; then ok "30b: the threads pin is kept byte for byte; one mcp pin added"; else bad "30b: env.toml wrong" "$(cat "$(ENVT "${H30}")")"; fi
+if has "services: mcp pinned at ${TL}+prod" && has "mcp grant <cauldron> --env prod"; then ok "30b: done names the mcp pin and the grant command"; else bad "30b: no mcp done line" "${OUT}"; fi
+if [[ -d "${H30}/.cauldron/data/shared/builds/mcp/${TL}+prod" && ! -e "${H30}/.cauldron/data/shared/builds/mcp/${TL}" ]]; then ok "30b: its own version; the shared label never written"; else bad "30b: builds wrong" "$(find "${H30}/.cauldron/data/shared" 2>&1)"; fi
+sealed_ok "case 30b"
+# 30c: re-run: idempotent.
+cp "$(ENVT "${H30}")" "${T}/env30.after"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H30}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install --replace-running')" ]] && has "mcp is already pinned in" && has "this checkout's build" && cmp -s "${T}/env30.after" "$(ENVT "${H30}")"; then ok "30c: a re-run builds and pins nothing, env.toml byte-identical"; else bad "30c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 30c"
+# 30d: the upgrade builds, so a dirty checkout is refused at 2c, before
+# anything (the opposed arm, both pinned, is 16's last check).
+H30d="${T}/home30d"; mkdir -p "${H30d}/.cauldron/data/prod"; cp "${T}/env30.before" "$(ENVT "${H30d}")"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_GIT_DIRTY='?? notes.txt' RUN_HOME="${H30d}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 2 ]] && has "uncommitted or untracked files" && [[ ! -s "${CLOG}" ]] && cmp -s "${T}/env30.before" "$(ENVT "${H30d}")"; then ok "30d: dirty tree on an upgrade: rc 2 at 2c, cauldron never ran, env.toml byte-identical"; else bad "30d (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 30d"
+# 30e: the mcp build fails on an upgrade: env.toml untouched and nothing
+# left behind; the next run (the stop resumed) adds it.
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_MCP_REFUSE=1 RUN_HOME="${H30d}" srun "" --from "${T}/bin14"
+if [[ ${RC} -ne 0 ]] && ! grep -q 'pin mcp' "${CLOG}" && cmp -s "${T}/env30.before" "$(ENVT "${H30d}")" && [[ -z "$(find "${H30d}/.cauldron/data/shared/builds" -path '*/mcp/*' -print -quit 2>/dev/null)" ]]; then ok "30e: a failed mcp build: rc ${RC}, no pin, env.toml byte-identical, no version left"; else bad "30e (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 30e"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H30d}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want13}" ]] && [[ "$(grep -c '^\[services.mcp\]$' "$(ENVT "${H30d}")")" == 1 ]]; then ok "30e: the next run adds mcp once"; else bad "30e re-run (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 30e re-run"
+
+printf '\n== 31. the UPGRADE of an existing mcp pin: an older build is re-pinned under --replace-running, once (SEALED)\n'
+# An environment from 0.1.6/0.1.7: threads and mcp both pinned, mcp at an
+# older build than this checkout's, a holder loaded, upgraded with
+# --replace-running as the docs say.
+H31="${T}/home31"; mkdir -p "${H31}/.cauldron/data/prod"
+printf '[supervisor]\nauto_restart = true\n\n[services.threads]\nversion = "threadsold-release"\naddr = "127.0.0.1:3653"\n\n[services.mcp]\nversion = "mcpold-release+prod"\n' >"$(ENVT "${H31}")"
+cp "$(ENVT "${H31}")" "${T}/env31.before"
+# What env.toml must be after: the same bytes, the mcp version alone changed.
+/usr/bin/sed "s/^version = \"mcpold-release+prod\"\$/version = \"${TL}+prod\"/" "${T}/env31.before" >"${T}/env31.want"
+# 31a: the plan.
+RUN_HOME="${H31}" run "ai.broomstick.cauldron:4242" 0 --dry-run --replace-running
+bm="$(line_no '^install: \$ .*/cauldron --env prod build mcp --json --env-copy$')"; pm="$(line_no '^install: \$ .*/cauldron --env prod pin mcp \\<label\\>\+prod$')"; s5="$(line_no '^install: \$ .*/cauldron --env prod install --replace-running$')"
+if [[ ${RC} -eq 0 ]] && has "mcp is pinned at mcpold-release+prod, which is NOT this checkout's build" && has "--replace-running: step 4c builds mcp from this checkout and re-pins it (upgrade)" && has "re-pinning it (upgrade," && [[ ${bm} -gt 0 && ${pm} -gt ${bm} && ${s5} -gt ${pm} ]]; then ok "31a plan: says the old mcp pin is re-pinned (upgrade); build mcp < pin mcp < step 5 --replace-running"; else bad "31a plan (rc ${RC}, build ${bm} pin ${pm} step5 ${s5})" "${OUT}"; fi
+if [[ $(line_no "${RE_BUILD}") -eq 0 ]] && ! grep -qE -- "${RE_ANYPIN}" <<<"${OUT}" && has "threads is already pinned in" && ! has "STILL THE OLD BUILD"; then ok "31a plan: threads neither built nor re-pinned; no old-build warning"; else bad "31a: threads touched, or a warning" "${OUT}"; fi
+if cmp -s "${T}/env31.before" "$(ENVT "${H31}")"; then ok "31a: the dry run wrote nothing"; else bad "31a: the dry run changed env.toml"; fi
+# 31b: for real.
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H31}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
+want31="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install --replace-running')"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want31}" ]]; then ok "31b: mcp built --env-copy and re-pinned once by cauldron pin, then install --replace-running"; else bad "31b calls (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if cmp -s "${T}/env31.want" "$(ENVT "${H31}")"; then ok "31b: env.toml changed in the mcp version alone (threads pin and every other byte kept)"; else bad "31b: env.toml wrong" "$(diff "${T}/env31.want" "$(ENVT "${H31}")")"; fi
+if has "services: mcp re-pinned at ${TL}+prod (it was mcpold-release+prod); the supervisor runs that build, and every grant is kept." && ! has "STILL THE OLD BUILD"; then ok "31b: done names the re-pin, and no old-build warning"; else bad "31b: no re-pin done line" "${OUT}"; fi
+if [[ -d "${H31}/.cauldron/data/shared/builds/mcp/${TL}+prod" && ! -e "${H31}/.cauldron/data/shared/builds/mcp/${TL}" ]]; then ok "31b: its own new version; the shared label never written"; else bad "31b: builds wrong" "$(find "${H31}/.cauldron/data/shared" 2>&1)"; fi
+# The running service is moved by the supervisor (cauldron pin, then step
+# 5's restart of the holder), never stopped or killed by the script.
+if ! /usr/bin/grep -qE '^\++XTRACE (kill|pkill|killall|launchctl (bootout|kill|stop|remove))( |$)' "${T}/trace" && ! grep -q '^MUTATING' "${STUB_LOG}"; then ok "31b: the script itself stopped and killed nothing"; else bad "31b: the script signalled a process" "$(/usr/bin/grep -E 'XTRACE (kill|pkill|killall|launchctl)' "${T}/trace")"; fi
+sealed_ok "case 31b"
+# 31c: re-run: idempotent (the pin is this checkout's build now).
+cp "$(ENVT "${H31}")" "${T}/env31.after"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H31}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install --replace-running')" ]] && has "mcp is pinned at ${TL}+prod, this checkout's build" && cmp -s "${T}/env31.after" "$(ENVT "${H31}")" && ! has "STILL THE OLD BUILD"; then ok "31c: a re-run builds and pins nothing, env.toml byte-identical, no warning"; else bad "31c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 31c"
+# 31d: without the flag (no job loaded), an upgraded pin says nothing old.
+: >"${CLOG}"
+RUN_HOME="${H31}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 ]] && ! has "STILL THE OLD BUILD" && ! has "still the old build" && cmp -s "${T}/env31.after" "$(ENVT "${H31}")"; then ok "31d: no flag, current pin: no warning, nothing changed"; else bad "31d (rc ${RC})" "${OUT}"; fi
+# 31e: without the flag, an OLD pin is left exactly as it is, and said.
+H31e="${T}/home31e"; mkdir -p "${H31e}/.cauldron/data/prod"; cp "${T}/env31.before" "$(ENVT "${H31e}")"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H31e}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 ]] && cmp -s "${T}/env31.before" "$(ENVT "${H31e}")" && ! grep -q 'mcp' "${CLOG}"; then ok "31e: no flag: the old pin is untouched (no build, no pin, env.toml byte-identical)"; else bad "31e (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+old_mcp_said "31e" "${T}/bin14/cauldron"
+sealed_ok "case 31e"
+# 31f: another writer re-pins mcp while this run builds: that pin stands,
+# and the version this run built is removed.
+H31f="${T}/home31f"; mkdir -p "${H31f}/.cauldron/data/prod"; cp "${T}/env31.before" "$(ENVT "${H31f}")"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_MCP_REPIN_DURING=1 RUN_HOME="${H31f}" srun "" --from "${T}/bin14" --replace-running
+if [[ ${RC} -eq 0 ]] && has "mcp was pinned in" && has "while this run built it; that pin is left as it is" && ! grep -q 'pin mcp' "${CLOG}" && grep -qx 'version = "otherwriter-release+prod"' "$(ENVT "${H31f}")" && [[ -z "$(find "${H31f}/.cauldron/data/shared/builds" -path '*/mcp/*' -print -quit 2>/dev/null)" ]]; then ok "31f: a re-pin made during the build stands; no pin by this run; its build removed"; else bad "31f (rc ${RC})" "$(cat "${CLOG}")$(cat "$(ENVT "${H31f}")")${OUT}"; fi
+sealed_ok "case 31f"
+# 31g: the upgrade builds, so a dirty checkout is refused at 2c, before anything.
+H31g="${T}/home31g"; mkdir -p "${H31g}/.cauldron/data/prod"; cp "${T}/env31.before" "$(ENVT "${H31g}")"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_GIT_DIRTY='?? notes.txt' RUN_HOME="${H31g}" srun "" --from "${T}/bin14" --replace-running
+if [[ ${RC} -eq 2 ]] && has "uncommitted or untracked files" && ! grep -q 'mcp' "${CLOG}" && cmp -s "${T}/env31.before" "$(ENVT "${H31g}")"; then ok "31g: dirty tree on an mcp upgrade: rc 2 at 2c, nothing built, env.toml byte-identical"; else bad "31g (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 31g"
 
 printf '\n== 27. an unset variable aborts install with rc != 0 (bash 3.2 + EXIT trap, REL-4.S5e)\n'
 # A copy with an unset variable read right before 4b's staging mkdir, where
@@ -981,9 +1156,16 @@ printf '\n== 27. an unset variable aborts install with rc != 0 (bash 3.2 + EXIT 
 M27="${T}/repo/scripts/install27"
 /usr/bin/awk '$0 == "    run mkdir \"${STAGE}\"" { print "    : \"${conf_unbound_27}\"" } { print }' "${INSTALL}" >"${M27}"
 if [[ "$(/usr/bin/grep -cxF '    : "${conf_unbound_27}"' "${M27}")" == 1 ]]; then ok "27: the copy has the injected unset read"; else bad "27: injection failed"; fi
-mkdir -p "${T}/home27"; RUN_HOME="${T}/home27" RUN_AS="${M27}" run "" 0 --dry-run
+# The rc-0 abort is a property of bash 3.2 (macOS's /bin/bash), so that arm
+# runs under /bin/bash by name: the bash first on PATH may be a newer one
+# (Homebrew's 5.x), whose `set -u` abort already exits 1 and reaches the trap
+# as 1, which the trap passes through (no ABORTED line, nothing to convert).
+# The second arm asserts only what holds under any bash: rc != 0.
+mkdir -p "${T}/home27"; RUN_BASH=/bin/bash RUN_HOME="${T}/home27" RUN_AS="${M27}" run "" 0 --dry-run
 if [[ ${RC} -ne 0 ]] && grep -qF 'conf_unbound_27: unbound variable' <<<"${ERR}" && ! has "== 5. supervisor"; then ok "27: the abort exits rc ${RC}, not 0, and stops before step 5"; else bad "27: a set -u abort read as rc ${RC}" "${OUT}"; fi
-if [[ ${RC} -eq 70 ]] && has "install: ABORTED"; then ok "27: rc 70 and says ABORTED"; else bad "27: rc ${RC}, no ABORTED line" "${ERR}"; fi
+if [[ ${RC} -eq 70 ]] && has "install: ABORTED"; then ok "27: under /bin/bash (3.2): rc 70 and says ABORTED"; else bad "27: rc ${RC}, no ABORTED line" "${ERR}"; fi
+RUN_HOME="${T}/home27" RUN_AS="${M27}" run "" 0 --dry-run
+if [[ ${RC} -ne 0 ]] && grep -qF 'conf_unbound_27: unbound variable' <<<"${ERR}" && ! has "== 5. supervisor"; then ok "27: under the bash on PATH ($(bash -c 'echo ${BASH_VERSION}')): the abort exits rc ${RC}, not 0"; else bad "27: under the bash on PATH, a set -u abort read as rc ${RC}" "${OUT}"; fi
 
 printf '\n== 28. an unset variable aborts THIS suite with rc != 0 (REL-4.S5e)\n'
 M28="${T}/suite28.sh"

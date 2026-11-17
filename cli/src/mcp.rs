@@ -41,9 +41,12 @@ cauldron mcp — which cauldrons are open to the MCP door
     cauldron mcp grants [--env <env>]
         Every grant of the environment, as JSON.
     cauldron mcp status [--env <env>]
-        The `mcp` service (live or not, its pid and its door), the cauldrons it holds open
-        for writing and what opening each recovered, and per cauldron its grant and what
-        its writer lock says. JSON; writes nothing.
+        The `mcp` service (live or not, its pid, its door and its version beside this
+        cauldron's), the cauldrons it holds open for writing and what opening each
+        recovered, and per cauldron its grant and what its writer lock says. When the
+        running service is another version than this cauldron (an upgrade left the mcp pin
+        on its old build), `version_skew` and `upgrade` say so and give the two commands
+        that move it, and a line on stderr says the same. JSON; writes nothing.
     cauldron mcp stdio [--env <env>] [--cauldron <name>]
         The bridge Claude Code launches (the plugin's .mcp.json names it): JSON-RPC, one
         message per line, on stdin and stdout, relayed to the service with the door secret.
@@ -54,7 +57,10 @@ cauldron mcp — which cauldrons are open to the MCP door
         is refused as `service_down`, naming the command that starts it. Its environment
         is --env, else $CAULDRON_ENV, else prod: it does not read $ENV. When that
         environment cannot be used it still answers `initialize` and `tools/list`, and
-        every tool call is refused as `no_environment`, saying why.
+        every tool call is refused as `no_environment`, saying why. When the running
+        service is another version than this cauldron, its `initialize` instructions and
+        a line on stderr say so with the commands that upgrade it, and a refusal of a tool
+        or an argument the service does not know says the same.
     cauldron mcp help
 
   Every cauldron is closed until granted. Grants live in <root>/data/<env>/mcp/grants.json
@@ -253,7 +259,8 @@ fn list(args: &[String]) -> Result<i32> {
 
 /// **`cauldron mcp status`**: the service, what it holds open, and per
 /// cauldron its grant and its writer lock. Reads only: the seam table, the
-/// service's seam (`OPEN`), the grants and each lock file's text. It never
+/// service's seam (`OPEN`), its version (its `initialize` answer), the
+/// grants and each lock file's text. It never
 /// takes a writer lock, so it cannot get in an import's way.
 fn status(args: &[String]) -> Result<i32> {
     let a = parse("status", args, &["--env"])?;
@@ -267,10 +274,22 @@ fn status(args: &[String]) -> Result<i32> {
                 .ok()
                 .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
                 .unwrap_or_else(|| json!([]));
-            (
-                json!({"state": "live", "pid": f.pid, "seam": f.seam, "door": format!("http://{}{}", f.door, crate::mcp_door::PATH)}),
-                open,
-            )
+            let mut svc = json!({"state": "live", "pid": f.pid, "seam": f.seam, "door": format!("http://{}{}", f.door, crate::mcp_door::PATH),
+                "cauldron_version": crate::mcp_door::CLI_VERSION});
+            // Its version against this cauldron's: an upgrade that left the
+            // environment's `mcp` pin on the old build shows here.
+            match crate::mcp_door::service_version(&e, f.door) {
+                Some(sv) => {
+                    if let Some(note) = crate::mcp_door::skew_note(&sv, &e.name) {
+                        eprintln!("cauldron: VERSION SKEW: {note}.");
+                        svc["version_skew"] = json!(note);
+                        svc["upgrade"] = json!(crate::mcp_door::upgrade_commands(&e.name));
+                    }
+                    svc["version"] = json!(sv);
+                }
+                None => svc["version"] = json!(null),
+            }
+            (svc, open)
         }
         Err(why) => (
             json!({"state": "not running", "detail": why.say(), "start": crate::mcp_door::start_command(&e.name)}),

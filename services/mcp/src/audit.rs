@@ -10,6 +10,9 @@
 //! link note or the door secret: only who, which cauldron, which tool, how it
 //! came out, the transaction and counts (and a landed dump's id and size). An open adds what the open recovered (transaction hashes and
 //! id ranges, never text).
+//!
+//! Each line is appended by one write, so a reader of the file sees whole
+//! lines only.
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -77,15 +80,61 @@ impl Audit {
         if let Some(d) = l.dump {
             v["dump"] = json!(d);
         }
+        // The whole line, newline included, goes to the file in ONE write
+        // (`O_APPEND`): a reader never sees part of a line. (`writeln!` on a
+        // `File` writes each piece the formatter makes as a write of its
+        // own, which a reader could catch half done.)
+        let line = format!("{v}\n");
         let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let wrote = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(&self.path)
-            .and_then(|mut f| writeln!(f, "{v}"));
+            .and_then(|mut f| f.write_all(line.as_bytes()));
         if let Err(e) = wrote {
             tracing::warn!(path = %self.path.display(), error = %e, "could not append to the audit log");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader of `calls.jsonl` never sees part of a line: each line is
+    /// appended by one write, so the file always ends at a line's end and
+    /// every line in it parses.
+    #[test]
+    fn a_reader_never_sees_part_of_a_line() {
+        let dir = std::env::temp_dir().join(format!("mcp-audit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = std::sync::Arc::new(Audit::new(&dir));
+        let w = a.clone();
+        let writer = std::thread::spawn(move || {
+            for i in 0..3000 {
+                w.write(Line {
+                    client: Some("claude-code".into()),
+                    session: Some(format!("sess-{i}")),
+                    cauldron: Some("kb".into()),
+                    tool: "soup_put".into(),
+                    outcome: "landed".into(),
+                    counts: json!({"records": i, "accepted": i, "refused": 0, "pad": "x".repeat(200)}),
+                    ..Line::default()
+                });
+            }
+        });
+        let mut reads = 0;
+        while !writer.is_finished() || reads == 0 {
+            let text = std::fs::read_to_string(a.path()).unwrap_or_default();
+            assert!(text.is_empty() || text.ends_with('\n'), "a read saw part of a line: …{}", &text[text.len().saturating_sub(80)..]);
+            for l in text.lines() {
+                serde_json::from_str::<Value>(l).unwrap();
+            }
+            reads += 1;
+        }
+        writer.join().unwrap();
+        assert_eq!(std::fs::read_to_string(a.path()).unwrap().lines().count(), 3000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

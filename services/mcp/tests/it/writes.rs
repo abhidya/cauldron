@@ -377,3 +377,50 @@ fn w6_writes_queued_before_a_revoke_are_refused_and_none_lands_after_it() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+/// Every directory and file under `root` with its mode (links skipped).
+fn modes_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, bool, u32)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut out = vec![];
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        out.push((d.clone(), true, std::fs::symlink_metadata(&d).unwrap().permissions().mode() & 0o777));
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let md = std::fs::symlink_metadata(e.path()).unwrap();
+            if md.is_dir() {
+                todo.push(e.path());
+            } else if md.is_file() {
+                out.push((e.path(), false, md.permissions().mode() & 0o777));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A cauldron made before its data was private (directories 0755, files
+/// 0644) is tightened by the service when it opens the cauldron to write:
+/// every directory 0700, every file 0600. Reads leave it as it is.
+#[test]
+fn w7_the_service_makes_a_cauldron_it_opens_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("w6", &["kb"]);
+    s.import("kb", &example());
+    let dir = s.data().join("cauldrons").join("kb");
+    for (p, d, _) in modes_under(&dir) {
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(if d { 0o755 } else { 0o644 })).unwrap();
+    }
+    s.grant("kb", &Scope::ALL, &[]);
+    let svc = Service::start(&s);
+    let c = ctx(&s.project("p"));
+    let before = modes_under(&dir);
+    assert!(ok(&svc.call("soup_nodes", json!({"cauldron": "kb"}), &c))["total"].as_u64().unwrap() > 0);
+    assert_eq!(modes_under(&dir), before, "a read changed a mode");
+    ok(&svc.call("soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "Opened to write", "R-1")]}), &c));
+    let after = modes_under(&dir);
+    assert!(after.iter().filter(|(_, d, _)| !d).count() >= 4, "{after:?}");
+    for (p, d, m) in &after {
+        assert_eq!(*m, if *d { 0o700 } else { 0o600 }, "{}", p.display());
+    }
+    assert_eq!(svc.stop().code(), Some(0));
+}

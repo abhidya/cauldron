@@ -37,6 +37,10 @@
 //!   explicit form.
 //! - **One viewer per role** (a `LEFT_OUT` rule, kept here for this
 //!   adapter's own output as the v5 adapter keeps it for its own).
+//! - **Citations.** `meta` is open, so the grammar never looks inside it;
+//!   a `meta.cites` entry of an unknown kind, or without its kind's keys
+//!   ([`crate::grammar_v6::CITE_KINDS`]), refuses its record here
+//!   ([`REFUSE_BAD_CITE`]), in a dry run and a real import alike.
 
 use super::{
     dry_run, land, Disposition, ExistingNode, Landing, Manifest, MigrationPlan, Rejection,
@@ -74,6 +78,9 @@ pub const REFUSE_VIEWER_ROLE: &str = "viewer-role-taken";
 pub const REFUSE_TARGET_REFUSED: &str = "target-refused";
 /// Under `remint`, a batch label equals an id the destination already holds.
 pub const REFUSE_LABEL_SHADOWS: &str = "label-shadows-existing";
+/// A `meta.cites` entry of an unknown kind, or without its kind's keys
+/// ([`crate::grammar_v6::CITE_KINDS`]).
+pub const REFUSE_BAD_CITE: &str = "bad-cite";
 
 /// How to run an import.
 #[derive(Debug, Clone)]
@@ -197,7 +204,13 @@ pub fn import_records(
         };
         match parse(raw) {
             Ok(p) => {
-                if !seen.insert(p.label.clone()) {
+                if let Some((j, why)) = edge_keys(&p, &grammar, pool) {
+                    refuse(&mut d, REFUSE_SHAPE, why, Some(j));
+                    parsed.push(None);
+                } else if let Some(why) = p.fields.get(META).and_then(crate::grammar_v6::cite_problem) {
+                    refuse(&mut d, REFUSE_BAD_CITE, format!("`{}`: {why}", p.label), None);
+                    parsed.push(None);
+                } else if !seen.insert(p.label.clone()) {
                     refuse(&mut d, REFUSE_DUPLICATE, format!("`{}` is named by two records of this batch", p.label), None);
                     parsed.push(None);
                 } else {
@@ -511,6 +524,7 @@ pub fn import_records(
 const VIEWER: &str = "viewer";
 const VIEWER_ROLE: &str = "role";
 const BODY: &str = "body";
+const META: &str = "meta";
 
 fn refuse(d: &mut RecordDisposition, code: &str, detail: String, edge: Option<usize>) {
     d.disposition = REFUSED;
@@ -559,11 +573,8 @@ fn parse(raw: &Value) -> std::result::Result<Parsed, String> {
                     .filter(|(k, _)| !EDGE_KEYS.contains(&k.as_str()))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                if note.is_some() && !fields.is_empty() {
-                    return Err(format!(
-                        "`{label}` edge {j} ({kind}) carries both `note` and declared fields; the soup stores one or the other on an edge"
-                    ));
-                }
+                // A `note` beside other keys is judged against the grammar's
+                // edge table in [`edge_keys`], which can name the key.
                 edges.push(ParsedEdge { kind: kind.to_string(), to: to.to_string(), note, fields });
             }
         }
@@ -575,6 +586,52 @@ fn parse(raw: &Value) -> std::result::Result<Parsed, String> {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     Ok(Parsed { label, node_type, state, fields, edges })
+}
+
+/// An edge that carries a `note` beside other keys, judged against the
+/// pool's edge table: the first such edge's index and the reason, or `None`.
+///
+/// The soup stores a `note` OR declared fields on an edge, never both, so
+/// such an edge is refused here (the driver would refuse it as misuse). The
+/// reason names what is actually wrong: a key the kind does not declare
+/// (`weight` on `in_region`, which declares no fields), or a kind the pool
+/// does not have; only an edge whose every other key IS declared (`shows`
+/// with `cite` and `why`) is told that a note and declared fields do not go
+/// together. An edge without a note goes to the door, which names an
+/// undeclared key itself (`undeclared_edge_field`).
+fn edge_keys(p: &Parsed, grammar: &crate::schema_def::PoolGrammar, pool: &PoolName) -> Option<(usize, String)> {
+    let label = &p.label;
+    for (j, e) in p.edges.iter().enumerate() {
+        if e.note.is_none() || e.fields.is_empty() {
+            continue;
+        }
+        let kind = &e.kind;
+        let Some(def) = grammar.edge_kinds.get(kind) else {
+            return Some((j, format!("`{label}` edge {j}: `{kind}` is not an edge kind of pool `{pool}`")));
+        };
+        let unknown: Vec<&str> = e.fields.keys().map(String::as_str).filter(|k| !def.fields.contains_key(*k)).collect();
+        if let Some(first) = unknown.first() {
+            let declared = if def.fields.is_empty() {
+                "it declares none".to_string()
+            } else {
+                format!("it declares {}", def.fields.keys().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", "))
+            };
+            let what = if unknown.len() == 1 {
+                format!("`{first}` is not a field of `{kind}` edges")
+            } else {
+                format!("{} are not fields of `{kind}` edges", unknown.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", "))
+            };
+            return Some((
+                j,
+                format!("`{label}` edge {j} ({kind}): {what} ({declared}); an edge carries `kind`, `to`, and a `note` or its kind's fields"),
+            ));
+        }
+        return Some((
+            j,
+            format!("`{label}` edge {j} ({kind}) carries both `note` and declared fields; the soup stores one or the other on an edge"),
+        ));
+    }
+    None
 }
 
 /// Rewrite every `[[label]]` link whose label the batch re-minted, in one
@@ -620,8 +677,35 @@ mod tests {
         assert!(parse(&serde_json::json!([])).is_err());
         assert!(parse(&serde_json::json!({"type": "issue"})).is_err());
         assert!(parse(&serde_json::json!({"id": "IS-1", "type": "issue", "edges": [{"kind": "ref"}]})).is_err());
-        assert!(parse(&serde_json::json!({"id": "V-1", "type": "viewer", "edges": [{"kind": "shows", "to": "IS-1", "note": "x", "why": "y"}]})).is_err());
+        // A note beside other keys parses; `edge_keys` judges it.
+        assert!(parse(&serde_json::json!({"id": "V-1", "type": "viewer", "edges": [{"kind": "shows", "to": "IS-1", "note": "x", "why": "y"}]})).is_ok());
         let p = parse(&serde_json::json!({"id": "IS-1", "type": "issue", "state": "open", "handle": "h", "rev": 3})).unwrap();
         assert_eq!(p.fields.keys().collect::<Vec<_>>(), ["handle", "rev"]);
+    }
+
+    #[test]
+    fn edge_keys_names_the_unknown_key_and_keeps_the_note_rule_for_declared_ones() {
+        let g = crate::grammar_v6::workspace_v6("ws");
+        let pool = PoolName::new("ws");
+        let judge = |r: Value| edge_keys(&parse(&r).unwrap(), &g, &pool).map(|(_, why)| why);
+        // Issue #18: `weight` on an in_region edge with a note.
+        let why = judge(serde_json::json!({"id": "n1", "type": "decision",
+            "edges": [{"kind": "in_region", "to": "R-1", "note": "x", "weight": 1}]})).unwrap();
+        assert!(why.contains("`weight` is not a field of `in_region` edges") && why.contains("it declares none"), "{why}");
+        assert!(!why.contains("both `note` and declared fields"), "{why}");
+        // Two unknown keys are both named; an unknown kind is named.
+        let why = judge(serde_json::json!({"id": "n1", "type": "decision",
+            "edges": [{"kind": "ref", "to": "R-1", "note": "x", "weight": 1, "colour": "red"}]})).unwrap();
+        assert!(why.contains("`colour`, `weight` are not fields of `ref` edges"), "{why}");
+        let why = judge(serde_json::json!({"id": "n1", "type": "decision",
+            "edges": [{"kind": "nope", "to": "R-1", "note": "x", "weight": 1}]})).unwrap();
+        assert!(why.contains("`nope` is not an edge kind of pool `ws`"), "{why}");
+        // A declared field beside a note keeps the note-or-fields reason.
+        let why = judge(serde_json::json!({"id": "V-1", "type": "viewer",
+            "edges": [{"kind": "shows", "to": "IS-1", "note": "x", "why": "y"}]})).unwrap();
+        assert!(why.contains("carries both `note` and declared fields"), "{why}");
+        // Opposed: a note alone, or fields alone, are the door's to judge.
+        assert!(judge(serde_json::json!({"id": "n1", "type": "decision", "edges": [{"kind": "in_region", "to": "R-1", "note": "x"}]})).is_none());
+        assert!(judge(serde_json::json!({"id": "n1", "type": "decision", "edges": [{"kind": "in_region", "to": "R-1", "weight": 1}]})).is_none());
     }
 }

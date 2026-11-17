@@ -136,6 +136,8 @@ const VERBS: &[(&str, &str)] = &[
     ("ctl", "the coordinator's face, headless: dump | frame | node (`ctl help`)"),
     ("create", "make a cauldron (cauldrons/<name>/, with its own empty soup) in this environment"),
     ("list", "the cauldrons of this environment (the implicit legacy one marked)"),
+    ("rename", "rename a cauldron of this environment (its soup, dumps and MCP grant follow)"),
+    ("remove", "put a cauldron away in cauldrons/.removed/ (never deleted; a dry run without --yes)"),
     ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get (`soup help`)"),
     ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
     ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
@@ -158,6 +160,15 @@ cauldron — the Cauldron entry point
                                      empty soup (one pool, `ws`, grammar v6)
     cauldron list [--env <e>] [--json]
                                      the cauldrons of an environment; writes nothing
+    cauldron rename <old> <new> [--env <e>]
+                                     rename a cauldron; its soup, dumps and MCP grant
+                                     follow. Refused while a face or the mcp service
+                                     holds it. A .cauldron marker naming <old> is not
+                                     updated
+    cauldron remove <cauldron> [--env <e>] [--yes]
+                                     move a cauldron to cauldrons/.removed/<name>-<stamp>/
+                                     and drop its MCP grant; never deletes. Without
+                                     --yes, a dry run (exit 2)
     cauldron soup import|recover|regions|get|nodes|search|region|dump|dumps|dump-get ...
                                      a cauldron's soup, offline: land records in the
                                      published schema shape as one all-or-nothing
@@ -382,6 +393,8 @@ fn run() -> Result<i32> {
         Some("mcp") => mcp::verb_mcp(&argv[1..]),
         Some("create") => cauldrons::verb_create(&argv[1..]),
         Some("list") | Some("ls") => cauldrons::verb_list(&argv[1..]),
+        Some("rename") => cauldrons::verb_rename(&argv[1..]),
+        Some("remove") => cauldrons::verb_remove(&argv[1..]),
         Some("daemon") => daemon::verb_daemon(&argv[1..]),
         Some("install") => launchd::verb_install(&argv[1..]),
         Some("uninstall") => launchd::verb_uninstall(&argv[1..]),
@@ -422,7 +435,7 @@ const CONTROL_VERBS: &[&str] =
     &["daemon", "install", "uninstall", "promote", "restart", "start", "stop", "down", "pin", "rollback", "env", "test",
       // `create` writes a cauldron; `soup import` writes its
       // soup, and the soup reads share the guard; `mcp` writes the grants.
-      "create", "soup", "mcp"];
+      "create", "rename", "remove", "soup", "mcp"];
 
 /// **REL-6a5: A DAEMON-CONTROL VERB IN AN ISOLATED PROCESS ACTS ONLY ON A
 /// SCRATCH ROOT.** Isolated (`env::egress::process_isolation`: the marker,
@@ -464,7 +477,7 @@ mod rel6a5_control_verbs {
     #[test]
     fn rel6a5_a_control_verb_in_an_isolated_process_acts_only_on_a_scratch_root() {
         let real = Path::new("/Users/someone/.cauldron");
-        for v in ["start", "stop", "restart", "daemon", "install", "uninstall", "promote", "down", "pin", "rollback", "env", "test", "create", "soup", "mcp"] {
+        for v in ["start", "stop", "restart", "daemon", "install", "uninstall", "promote", "down", "pin", "rollback", "env", "test", "create", "rename", "remove", "soup", "mcp"] {
             assert!(admit_control_verb_with(v, real, Some(real), "a test").is_err(), "`{v}` admitted on his real root");
             assert!(admit_control_verb_with(v, &real.join("x"), Some(real), "a test").is_err(), "`{v}` admitted inside it");
             assert!(admit_control_verb_with(v, Path::new("/tmp/scratch/.cauldron"), Some(real), "a test").is_ok(), "`{v}` refused on scratch");

@@ -127,12 +127,15 @@ cauldron soup — a cauldron's soup, offline
         one file holding a list (or one record), or a directory of one-record files; JSON,
         or YAML for .yaml/.yml. Every record is judged by the soup's own door; the JSON
         printed gives each one's disposition (accepted, or refused with the grammar's
-        reason). Without --dry-run the whole set lands as ONE write when every record is
-        accepted, and nothing lands otherwise. Ids are carried as written and a collision
-        refuses the import; --remint treats them as batch-local, gives each record the
+        reason). A `meta.cites` entry whose kind is not in the README's table, or that lacks
+        its kind's keys, refuses its record as `bad-cite`. Without --dry-run the whole set
+        lands as ONE write when every record is accepted, and nothing lands otherwise. Ids
+        are carried as written and a collision refuses the import; --remint treats them as batch-local, gives each record the
         next free id for its type, rewrites references and [[links]] inside the batch, and
-        prints the old -> new map. Under --remint a label may not equal an id the soup
-        already holds (refused, `label-shadows-existing`), so a bare id that is not a label
+        prints the old -> new map (`id_map`) when the batch lands or a dry run validates; a
+        refused batch prints none, since its ids were never taken. Under --remint a label
+        may not equal an id the soup already holds (refused, `label-shadows-existing`), so
+        a bare id that is not a label
         always names the existing node; `<ID>@<pool>` names it explicitly. An edge to an id
         outside the batch must name a node the soup already holds. A real import is refused
         while another import or recover is writing to the same soup, while the soup is not
@@ -146,7 +149,10 @@ cauldron soup — a cauldron's soup, offline
         the carried ids would collide and the import would be refused; --allow-duplicate
         skips this check. Each import records the batch's digest in its own spine row, so
         batches landed by an earlier release are not recognised. --agent records who wrote
-        (default `outside-agent`).
+        (default `outside-agent`). Every refused batch prints one shape: `outcome`
+        `refused`, a one-word `refusal` (`records-refused`, `landing-refused` or
+        `batch-already-landed`), `accepted`, `refused` and `records` (empty when the batch
+        was refused before any record was judged).
         While the cauldron is granted to the MCP door and the `mcp` service holds its soup
         open (`cauldron mcp status`), a real import is sent to that service and lands
         through it: the same judgement, the same JSON (with `forwarded_to`), the same
@@ -172,22 +178,26 @@ cauldron soup — a cauldron's soup, offline
         Every region: id, handle, boundary, flags, the regions it narrows or relates to,
         and how many nodes sit in it.
     cauldron soup region <id> [--cauldron <name>] [--env <env>] [--depth N] [--limit N] [--max-chars N]
+                         [--include-superseded]
         One region: its record, the regions it narrows (parents) and that narrow it
         (children) to --depth levels (default 1), the regions it relates to either way, and
         its direct members (id, type, state, handle), newest first, at most --limit (50).
     cauldron soup nodes [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
-                        [--state <s>] [--limit N] [--max-chars N]
+                        [--state <s>] [--limit N] [--max-chars N] [--include-superseded]
         Nodes as {id, type, state, handle, regions}, newest first (by the spine's commit
         order; one write's nodes by id prefix, then serial, highest first), at most --limit
         (default 50); --region keeps a region's direct members.
     cauldron soup search <query> [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
-                         [--limit N] [--max-chars N]
+                         [--limit N] [--max-chars N] [--include-superseded]
         Lexical search over handles and bodies: every word of the query a term, found
         case-insensitively as a substring; ranked by how many terms match, then handle hits over body hits, then newest.
         Prints {id, type, state, handle, regions, score, snippet}, at most --limit (20);
         the snippet is --max-chars long (default 160) around the first hit.
     cauldron soup get <id>... [--cauldron <name>] [--env <env>] [--max-chars N]
-        Those nodes as records in the published shape, with their outgoing edges.
+        Those nodes as records in the published shape, with their outgoing edges. A node
+        another node supersedes (an inbound `supersedes` edge) is answered all the same, with
+        `superseded_by: [ids]`, which is read from the edges and is not a field: leave it out
+        when writing the record again.
     cauldron soup dump <file|-> [--cauldron <name>] [--env <env>] [--title <t>] [--source <s>]
         Keep the file's text (or stdin's, with -) as a dump in the cauldron's dumps store,
         beside its soup (not as a soup node): DM-<n>, in state `received`, as one write,
@@ -200,15 +210,32 @@ cauldron soup — a cauldron's soup, offline
         The cauldron's dumps, newest first: id, state, kind, title, bytes, sha256, source,
         when received. Never their text. At most --limit (50).
     cauldron soup dump-get <id> [--cauldron <name>] [--env <env>] [--offset N] [--max-chars N] [--raw]
+                               [--view raw|text] [--turn-offset N]
         One dump's content from byte --offset (default 0): JSON whose whole text is at most
-        --max-chars (default 12000, at most 50000), with `next_offset` while there is more.
+        --max-chars (default 12000, at most 50000, at least 1000: smaller is refused), with
+        `next_offset` while there is more.
         --raw prints the whole content, verbatim, and nothing else (--offset and --max-chars
         do not apply): a text dump's text, or a session dump's transcript exactly as stored.
+        --view text (a session dump only) answers only what the person typed and what the
+        assistant wrote as text, as turns with `at` (the byte its line starts at), `role` and
+        `text`. Everything else is left out and counted in `elided` by kind: tool calls and
+        results, thinking, `!` shell commands and their output, local commands' output,
+        slash-command wrappers, system reminders, other text Claude Code writes itself,
+        isMeta lines, attachments, images and other lines. The raw view (and the stored
+        blob) still holds the whole transcript. Pages end between turns and read the
+        same each time; read on with --offset <next_offset>
+        and, after a turn longer than a page (cut, with `chars` its length),
+        --turn-offset <next_turn_offset>.
     cauldron soup help
 
   Every verb prints JSON on stdout and exits non-zero on a refusal. Reads open the store
   so that they cannot write. --max-chars cuts any longer text field, and the output's
   `truncated` lists what was cut; a list cut by --limit says how many `more` there are.
+  A listed region or viewer has no `state` key: those types carry no state.
+  `nodes`, `search` and `region`'s members leave out a superseded node (one another node
+  supersedes) and say how many they left out in `superseded_hidden`; --include-superseded
+  lists them too, each with its `superseded_by`. `total` and `members_total` count what
+  is listed, before --limit.
   `--pool <p>` names another pool than `ws`.
 
   --env and --cauldron may be left out inside a project linked with `cauldron link`: the
@@ -265,11 +292,14 @@ struct Args {
     dry_run: bool,
     remint: bool,
     allow_duplicate: bool,
+    include_superseded: bool,
     title: Option<String>,
     source: Option<String>,
     kind: Option<String>,
     offset: Option<usize>,
     raw: bool,
+    view: Option<String>,
+    turn_offset: Option<usize>,
     pos: Vec<String>,
 }
 
@@ -308,11 +338,14 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--dry-run" => a.dry_run = true,
             "--remint" => a.remint = true,
             "--allow-duplicate" => a.allow_duplicate = true,
+            "--include-superseded" => a.include_superseded = true,
             "--title" => a.title = Some(take(&mut it)?),
             "--source" => a.source = Some(take(&mut it)?),
             "--kind" => a.kind = Some(take(&mut it)?),
             "--offset" => a.offset = Some(count(flag, &take(&mut it)?)?),
             "--raw" => a.raw = true,
+            "--view" => a.view = Some(take(&mut it)?),
+            "--turn-offset" => a.turn_offset = Some(count(flag, &take(&mut it)?)?),
             _ => a.pos.push(s.clone()),
         }
     }
@@ -376,6 +409,7 @@ fn read_opts(a: &Args) -> ReadOpts {
         region: a.region.clone(),
         node_type: a.node_type.clone(),
         state: a.state.clone(),
+        include_superseded: a.include_superseded,
     }
 }
 
@@ -533,7 +567,7 @@ fn forward(t: &Target, records: &[Value], o: &ImportOptions, pid: u32) -> Result
                 bail!("REFUSED ({svc} service, batch_already_landed): {message}");
             }
             let digest = soup_door::import::batch_digest(&pool, records);
-            let ImportOutcome::AlreadyLanded { mut doc, why } = soup_door::import::already_landed(t, &pool, &digest, o, earlier) else {
+            let ImportOutcome::AlreadyLanded { mut doc, why } = soup_door::import::already_landed(t, &pool, &digest, o, records.len(), earlier) else {
                 unreachable!("already_landed answers AlreadyLanded")
             };
             doc["forwarded_to"] = via;
@@ -590,7 +624,7 @@ fn nodes(args: &[String]) -> Result<i32> {
     let a = parse(
         "nodes",
         args,
-        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--state", "--limit", "--max-chars"],
+        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--state", "--limit", "--max-chars", "--include-superseded"],
     )?;
     if let Some(p) = a.pos.first() {
         bail!("`cauldron soup nodes` takes no ids (got `{p}`); `soup get` reads nodes by id");
@@ -601,7 +635,11 @@ fn nodes(args: &[String]) -> Result<i32> {
 }
 
 fn search(args: &[String]) -> Result<i32> {
-    let a = parse("search", args, &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--limit", "--max-chars"])?;
+    let a = parse(
+        "search",
+        args,
+        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--limit", "--max-chars", "--include-superseded"],
+    )?;
     let query = a.pos.join(" ");
     if soup_door::reads::search_terms(&query).is_empty() {
         bail!("`cauldron soup search` needs a query with at least one word");
@@ -612,7 +650,7 @@ fn search(args: &[String]) -> Result<i32> {
 }
 
 fn region(args: &[String]) -> Result<i32> {
-    let a = parse("region", args, &["--env", "--cauldron", "-c", "--pool", "--depth", "--limit", "--max-chars"])?;
+    let a = parse("region", args, &["--env", "--cauldron", "-c", "--pool", "--depth", "--limit", "--max-chars", "--include-superseded"])?;
     let [id] = a.pos.as_slice() else {
         bail!("`cauldron soup region` takes ONE region id (got {}); `cauldron soup regions` lists them", a.pos.len());
     };
@@ -760,11 +798,31 @@ fn dumps(args: &[String]) -> Result<i32> {
 }
 
 fn dump_get(args: &[String]) -> Result<i32> {
-    let a = parse("dump-get", args, &["--env", "--cauldron", "-c", "--offset", "--max-chars", "--raw"])?;
+    let a = parse("dump-get", args, &["--env", "--cauldron", "-c", "--offset", "--max-chars", "--raw", "--view", "--turn-offset"])?;
     let [id] = a.pos.as_slice() else {
         bail!("`cauldron soup dump-get` takes ONE dump id (got {}); `cauldron soup dumps` lists them", a.pos.len());
     };
+    let text_view = match a.view.as_deref() {
+        None | Some("raw") => false,
+        Some("text") => true,
+        Some(v) => bail!("--view is `raw` (the default) or `text`, not `{v}`"),
+    };
+    if text_view && a.raw {
+        bail!("--raw prints the content verbatim; it does not go with --view text");
+    }
+    if a.turn_offset.is_some() && !text_view {
+        bail!("--turn-offset goes with --view text (it is a page's `next_turn_offset`)");
+    }
+    if !a.raw {
+        soup_door::dumps::check_page_max(a.max_chars)?;
+    }
     let t = target("dump-get", &a, false)?;
+    if text_view {
+        let max = soup_door::budget::clamp(a.max_chars);
+        let off = a.offset.unwrap_or(0) as u64;
+        print(&soup_door::dumps::get_text(&t.cauldron, id, off, a.turn_offset.unwrap_or(0) as u64, max)?)?;
+        return Ok(0);
+    }
     if !a.raw {
         let max = soup_door::budget::clamp(a.max_chars);
         print(&soup_door::dumps::get(&t.cauldron, id, a.offset.unwrap_or(0) as u64, max)?)?;

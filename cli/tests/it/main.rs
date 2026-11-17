@@ -33,6 +33,8 @@ mod mcp_grants;
 mod mcp_reads;
 mod mcp_service;
 mod own_launch_path;
+mod plugin_marketplace;
+mod plugin_tools;
 mod owned_live_pid;
 mod permissions_cargo_built;
 mod pin_revives_parked;

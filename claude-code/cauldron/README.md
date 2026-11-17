@@ -5,8 +5,8 @@ Code session: the plugin's MCP server gives the session tools to read,
 search and write the soups their owner has opened to it, and to keep raw
 text or a whole session transcript in a cauldron as a **dump** for later
 processing; a `curator`
-subagent turns notes, a conversation excerpt or findings into schema-valid
-soup records and lands them, and the published schema ships with the plugin
+subagent turns notes, a conversation excerpt, findings or a dump into
+schema-valid soup records and lands them, and the published schema ships with the plugin
 so the session can read it.
 
 Everything runs on the same machine as the cauldron. The MCP server is
@@ -22,6 +22,8 @@ Everything runs on the same machine as the cauldron. The MCP server is
 | `commands/curate.md` | `/cauldron:curate <cauldron> [--env <env>] [what to record]` |
 | `commands/dump.md` | `/cauldron:dump [<cauldron>] [--title <t>] <file or text>`: keep text as a dump |
 | `commands/dump-session.md` | `/cauldron:dump-session [title]`: keep this session's transcript as a dump |
+| `commands/curate-dump.md` | `/cauldron:curate-dump <DM-n> [cauldron]`: turn a dump into soup records that cite it |
+| `regions.example.json` | four example regions to import into a new, empty soup |
 | `skills/soup-schema/SKILL.md` | `/cauldron:soup-schema`: the schema in brief, with a pointer to the full README |
 | `schema/` | a copy of the published schema (`schema/soup/workspace-v6/` in the Cauldron repository): `README.md`, `grammar.json`, `edges.json`, one JSON Schema per node type |
 
@@ -31,30 +33,101 @@ Do not edit it here.
 
 ## Install
 
-You need a `cauldron` binary on `PATH` that has the `soup` verbs
-(`cauldron soup help` prints them), and a cauldron with a soup. The binary
-finds its data under `$CAULDRON_HOME` (default `~/.cauldron`); set it in the
-environment Claude Code is started from if your cauldrons live elsewhere.
+Cauldron's consumers use the environment `prod`, which `scripts/install`
+makes; every command here names it. The path from a fresh machine:
 
-To make a cauldron to write into, from a shell:
+1. Install Cauldron from a checkout (`./scripts/install`; the repository's
+   README has the details). It makes `prod` and runs its `mcp` service. An
+   environment installed before that service existed gets it from
+   `./scripts/install --replace-running`, and one whose `mcp` service is an
+   older build has it rebuilt and re-pinned by the same command (without
+   the flag, the install says the service is still the old build and
+   prints the two commands that upgrade it).
+2. Put `<root>/bin` on your `PATH` (`<root>` is `~/.cauldron`, or
+   `$CAULDRON_HOME`). The plugin starts its server as the bare command
+   `cauldron mcp stdio`, so `cauldron` must be on the `PATH` Claude Code
+   itself sees: start Claude Code from a terminal where `command -v
+   cauldron` finds it. Claude Code started from the Dock, Finder or an IDE
+   may not read your shell startup file, and its sessions then have no
+   cauldron tools. If your cauldrons live under `$CAULDRON_HOME`, set it
+   there too.
+3. Make a cauldron, with an empty soup (one pool, `ws`):
 
-```sh
-cauldron env create dev            # an environment
-cauldron create kb --env dev       # a cauldron with an empty soup (pool `ws`)
-```
+   ```sh
+   cauldron create kb --env prod
+   ```
 
-To make a project directory name its cauldron, so neither you nor the
-curator has to pass `--env` and `--cauldron` inside it:
+4. Give its soup regions. A new soup has **no regions**, and the curator
+   never invents one: it files nothing it cannot place and proposes regions
+   instead. This plugin ships `regions.example.json`, four regions (the
+   code, its tests, the product, the process) whose ids are batch labels.
+   Copy it, edit the handles and boundaries to fit the project, and import
+   it:
+
+   ```sh
+   cauldron soup import regions.json --env prod --cauldron kb --remint --dry-run
+   cauldron soup import regions.json --env prod --cauldron kb --remint
+   ```
+
+5. Open the cauldron to Claude Code, at a terminal:
+
+   ```sh
+   cauldron mcp grant kb --env prod --project ~/code/proj
+   ```
+
+6. Install the plugin, inside Claude Code:
+
+   ```text
+   /plugin marketplace add broomstick-ai/cauldron
+   /plugin install cauldron@cauldron
+   ```
+
+   (From a checkout of the repository instead: `/plugin marketplace add
+   <checkout>`, then the same install.) Restart Claude Code; in a session,
+   `/mcp` lists `cauldron` as connected.
+7. In a session in `~/code/proj`, `/cauldron:curate <what to record>`.
+
+> **Two ways to say "this directory means cauldron `kb`".** They are
+> separate, and setting one does not set the other.
+>
+> | | `.cauldron` marker | grant `--project` |
+> |---|---|---|
+> | made by | `cauldron link kb --env prod` | `cauldron mcp grant kb --env prod --project <dir>` |
+> | read by | the `cauldron soup` commands (and the curator's shell fallback) | Claude Code sessions, through the MCP door |
+> | opens the cauldron to Claude Code? | no, never | the grant does; `--project` only sets the directory's default |
+> | kept in | a file in the project (keep it out of git) | `<root>/data/prod/mcp/grants.json` |
+
+> **`$ENV`.** `cauldron create`, `cauldron mcp grant` and the other
+> commands take their environment from `--env`, else `$CAULDRON_ENV`, else
+> `$ENV`, else `prod` (the `cauldron soup` commands never fall back to
+> `prod`); the plugin's bridge takes
+> `$CAULDRON_ENV`, else `prod`, and never reads `$ENV`. In a shell that
+> exports `ENV` (`ENV=development`, or a startup file's path), `cauldron
+> create kb` without `--env` aims at that environment while sessions use
+> `prod`. Name `--env prod`, or unset `ENV`.
+
+**A developer's note.** To try the plugin from a checkout for one session,
+without installing it: `claude --plugin-dir <checkout>/claude-code/cauldron`.
+To work against another environment than `prod` (`cauldron env create dev`),
+give it an `mcp` service yourself (`cauldron --env dev build mcp --env-copy`,
+then `cauldron --env dev pin mcp <the label that build printed>`), and start
+Claude Code with `CAULDRON_ENV=dev` so the bridge serves it.
+
+### A project's `.cauldron` marker
+
+To make a project directory name its cauldron for the `cauldron soup`
+commands, so neither you nor the curator's shell fallback has to pass
+`--env` and `--cauldron` inside it:
 
 ```sh
 cd <project>
-cauldron link kb --env dev         # writes <project>/.cauldron
+cauldron link kb --env prod        # writes <project>/.cauldron
 cauldron link --show               # what this directory resolves to, and from where
 ```
 
 `cauldron soup` run in that directory or any directory below it then uses
-`kb` in `dev`. The marker is a text file holding two `key = value` lines,
-`env = dev` and `cauldron = kb`, and `#` comments. An explicit `--env`,
+`kb` in `prod`. The marker is a text file holding two `key = value` lines,
+`env = prod` and `cauldron = kb`, and `#` comments. An explicit `--env`,
 `--cauldron`, `$CAULDRON_ENV`, `$ENV` or `$CAULDRON_CAULDRON` always wins over
 it; an explicit environment that
 differs from the marker's, with no cauldron named, is refused rather than
@@ -76,6 +149,18 @@ that is a symbolic link is never followed or written through. The curator
 states the target it took from a marker before its first write, and asks you
 to confirm before writing to `prod` from a marker.
 
+### Renaming or removing a cauldron
+
+`cauldron rename kb notes --env prod` renames a cauldron; its soup, its dumps
+and its grant follow (the grant keeps its scopes and projects).
+`cauldron remove kb --env prod` says what it would do; with `--yes` it moves
+the cauldron to `cauldrons/.removed/<name>-<stamp>/` (nothing is deleted) and
+drops its grant. Both are refused while the `mcp` service holds the cauldron:
+stop the service (`cauldron --env prod stop mcp`, and `start mcp` after) or
+revoke the grant (then grant it again). A `.cauldron` marker naming the old
+name is not updated: run `cauldron link notes --env prod --replace` in that
+project.
+
 ## The MCP door
 
 The plugin's `.mcp.json` starts `cauldron mcp stdio` with each session. That
@@ -86,11 +171,11 @@ listens on `127.0.0.1` only and is the one writer of every soup it holds.
 at a terminal on this machine:
 
 ```sh
-cauldron --env dev start mcp                         # once; then the supervisor keeps it
-cauldron mcp grant kb --env dev --project ~/code/proj # run it yourself, in a terminal
-cauldron mcp grants --env dev                        # what is open
-cauldron mcp revoke kb --env dev                     # close it again
-cauldron mcp status --env dev                        # the service and what it holds
+cauldron mcp grant kb --env prod --project ~/code/proj # run it yourself, in a terminal
+cauldron mcp grants --env prod                         # what is open
+cauldron mcp revoke kb --env prod                      # close it again
+cauldron mcp status --env prod                         # the service, its version, what it holds
+cauldron --env prod start mcp                          # if the service is not running
 ```
 
 - `grant` runs only with its input and output on an interactive terminal, and
@@ -113,6 +198,12 @@ cauldron mcp status --env dev                        # the service and what it h
   When the bridge cannot use its environment (no such environment, or a bad
   name), the session still lists the tools and every call is refused as
   `no_environment`, saying why.
+- `status` gives the running service's `version` beside this `cauldron`'s.
+  When they differ (an upgrade left the environment's `mcp` pin on its old
+  build), it says so under `version_skew` and gives the two commands that
+  upgrade it under `upgrade`. A session says the same: the service's
+  instructions carry the note, and a tool or an argument that the older
+  service does not know is refused with it, naming both versions.
 - `revoke` takes effect on the next call: the service closes the cauldron and
   lets go of its soup. Writes still waiting in its queue are refused
   (`not_granted`) and never land; a write already being applied when the
@@ -127,7 +218,8 @@ The tools: `soup_status` (which cauldron this session reaches and why, its
 counts and change cursor), `soup_regions`, `soup_region`, `soup_nodes`,
 `soup_search` and `soup_get` (the same answers as the `cauldron soup` reads,
 each reply's payload bounded by `max_chars`: default 12,000, floor 256,
-ceiling 50,000), `soup_put` (records in the published shape,
+ceiling 50,000; a `soup_dump_get` page is never longer than its
+`max_chars`, which is at least 1,000 and refused below it), `soup_put` (records in the published shape,
 judged and landed as one all-or-nothing write, with `dry_run`, `remint`,
 `partial`, `cite` and `allow_duplicate`; the session is cited on every record
 when Claude Code passes its id), `soup_link` (edges between nodes the soup
@@ -196,7 +288,21 @@ that came from a dump can cite it: `meta.cites: [{"kind": "dump", "id": "DM-3"}]
   the change cursor; never the text.
 - `soup_dumps` lists the dumps (`read`; never their text), and
   `soup_dump_get` reads one's content from a byte `offset`, as much as fits
-  `max_chars`, with `next_offset` while there is more. Reading a dump's
+  `max_chars`, with `next_offset` while there is more. For a session
+  transcript, `view: "text"` answers only what the person typed and what
+  the assistant wrote as text, as turns each with `at` (the byte where its
+  line starts), `role` and `text`. Everything else is left out and counted
+  in `elided` by kind: tool calls (`tool_calls`) and their results
+  (`tool_results`), thinking, `!` shell commands and their output (`shell`),
+  local commands' output (`local_command`), slash-command wrappers
+  (`commands`), system reminders (`system_reminders`; typed words around
+  one are kept), other text Claude Code writes itself such as a compaction
+  summary (`generated`), `isMeta` lines (`meta`), attachments, images and
+  other blocks (`other_blocks`), other lines (`other_lines`) and lines that
+  are not JSON (`unreadable_lines`). The raw view, like the stored blob,
+  still holds the whole transcript, all of that included. Its pages end between turns and read the same every time; a turn
+  longer than a page is cut (with `chars`, its whole length), and
+  `next_turn_offset` (passed back as `turn_offset`) goes on in it. Reading a dump's
   content needs both `read` and `dump`: a dump is raw material, and a
   transcript can hold tool output and pasted secrets, so a grant made only
   to read the knowledge graph does not hand it out.
@@ -235,28 +341,21 @@ that came from a dump can cite it: `meta.cites: [{"kind": "dump", "id": "DM-3"}]
 - From a shell: `cauldron soup dump <file|-> --env E --cauldron C [--title T]
   [--source S]`, `cauldron soup dumps --env E --cauldron C` and `cauldron
   soup dump-get <id> --env E --cauldron C [--offset N] [--max-chars N]
-  [--raw]` (`--raw` prints the content verbatim). While the service holds
+  [--raw] [--view raw|text] [--turn-offset N]` (`--raw` prints the content
+  verbatim; `--view text` is the text view above). While the service holds
   the dumps store, `soup dump` is sent to it (its JSON says `forwarded_to`);
   otherwise it writes directly.
 
-A new soup has **no regions**, and the curator never invents one. On the first
-run it files nothing it cannot place and proposes regions instead; approve
-them (or import a few region records yourself with `cauldron soup import`) and
-run it again.
-
-For one session, from a checkout of the Cauldron repository:
-
-```sh
-claude --plugin-dir <checkout>/claude-code/cauldron
-```
-
-To install it persistently, add the marketplace in `claude-code/` and install
-from it (inside Claude Code):
-
-```text
-/plugin marketplace add <checkout>/claude-code
-/plugin install cauldron@cauldron
-```
+**Curating a dump.** `/cauldron:curate-dump DM-3 [cauldron]` turns a dump
+into soup records. It checks the target and the grant's scopes (reading the
+dump needs `read` and `dump`, landing records needs `write`), asks you to
+confirm before writing to `prod`, and hands the dump's id to the curator,
+which has `soup_dumps` and `soup_dump_get` among its tools. The curator reads
+the dump in pages (a transcript through the text view), decides what is
+worth a node, judges the batch with a dry run, lands it, and reports the new
+ids. Every record it writes cites the dump: `meta.cites: [{"kind": "dump",
+"id": "DM-3"}]`, with the turn's `at` when a record rests on one turn. The
+dump itself is not changed: it stays `received`.
 
 ## The verbs
 
@@ -266,7 +365,12 @@ or by the project's `.cauldron` marker (`cauldron link`); none defaults to
 production. All
 print JSON and exit non-zero on a refusal. The reads cannot write, and each
 takes `--max-chars N` (longer text is cut and listed under `truncated`); the
-lists take `--limit N` and say how many `more` there were.
+lists take `--limit N` and say how many `more` there were. A node another
+node supersedes (an inbound `supersedes` edge: an update) is left out of
+`region`'s members, `nodes` and `search`, which say how many they left out in
+`superseded_hidden`; `--include-superseded` (`include_superseded` on the
+tools) lists it too, with its `superseded_by`. `get` always answers it, with
+`superseded_by: [ids]`.
 
 - `cauldron soup regions --env E --cauldron C`: every region with its id,
   handle, boundary, flags, the regions it narrows and relates to, and its
@@ -275,7 +379,8 @@ lists take `--limit N` and say how many `more` there were.
   regions it narrows and that narrow it (to depth N, default 1), the regions
   it relates to either way, and its members, newest first.
 - `cauldron soup nodes --env E --cauldron C [--region R] [--type T] [--state S]`:
-  `{id, type, state, handle, regions}` per node, newest first (default 50).
+  `{id, type, state, handle, regions}` per node, newest first (default 50);
+  a region or viewer has no `state` key, since those types carry no state.
 - `cauldron soup search <words> --env E --cauldron C [--region R] [--type T]`:
   each word of the query found case-insensitively, as a substring, in handles
   and bodies; ranked by terms matched, then handle over body, then newest; `{id, type, state, handle,
@@ -285,7 +390,8 @@ lists take `--limit N` and say how many `more` there were.
 - `cauldron soup import <file-or-dir> --env E --cauldron C [--dry-run] [--remint] [--allow-duplicate]`:
   judges every record with the soup's own write door and lands the batch as
   one write, all or nothing. `--remint` treats ids as batch-local labels and
-  prints the old-to-new map; a label may not equal an id the soup already
+  prints the old-to-new map (`id_map`) when the batch lands or a dry run
+  validates, never for a refused batch; a label may not equal an id the soup already
   holds (refused as `label-shadows-existing`), so a bare id that is not a
   label always means the existing node. A real import is refused while
   another import or recovery is writing to the same soup, or while an earlier
@@ -293,7 +399,11 @@ lists take `--limit N` and say how many `more` there were.
   then, judged on a read-only snapshot. A batch identical to one that already
   landed in the soup (the same records, before re-minting) is refused as
   `batch-already-landed`, saying when it landed and how many records it held;
-  `--allow-duplicate` lands a second copy on purpose. Batches landed by
+  `--allow-duplicate` lands a second copy on purpose. Every refused batch
+  prints one shape: `outcome: "refused"`, a one-word `refusal`
+  (`records-refused`, `landing-refused` or `batch-already-landed`),
+  `accepted`, `refused` and `records` (empty when the batch was refused
+  before any record was judged). Batches landed by
   0.1.4 or earlier carry no record of their content and are not recognised.
   While the `mcp` service holds the cauldron, the import is sent to it (see
   above).
@@ -313,7 +423,7 @@ lists take `--limit N` and say how many `more` there were.
 In Claude Code:
 
 ```text
-> /cauldron:curate kb --env dev The import failed because a record guessed a
+> /cauldron:curate kb --env prod The import failed because a record guessed a
   region id; we decided to always read region ids from `soup regions` first.
 ```
 
@@ -343,7 +453,7 @@ labels `n1`, `n2` to a file:
 ]
 ```
 
-It dry-runs with `cauldron soup import batch.json --env dev --cauldron kb
+It dry-runs with `cauldron soup import batch.json --env prod --cauldron kb
 --dry-run --remint`. A first draft that wrote `"state": "done"` on the decision
 and pointed the issue at a region `R-9` came back refused:
 

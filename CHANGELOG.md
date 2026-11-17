@@ -21,11 +21,194 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.7, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.8, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.7, only an
+  the disable and trigger a fresh usage reading. Through 0.1.8, only an
   explicit enable clears it.
+
+## [0.1.8] — 2026-11-16
+
+The path from install to a working session (including an upgrade that
+moves the `mcp` service to the new build), curating a dump into records,
+`cauldron rename` and `cauldron remove`, a cauldron's data private to its
+owner, and small import, read, dump and documentation fixes, most of them
+filed as issues.
+
+### Added
+
+- **Curating a dump, without the ripple engine.** `soup_dump_get` takes
+  `view: "text"` for a session-transcript dump: it answers only what the
+  person typed and what the assistant wrote as text, as turns each with
+  `at` (the byte where its line starts in the transcript), `role` and
+  `text`. Everything else is left out and counted in `elided` by kind: tool
+  calls and their results, thinking, `!` shell commands and their output
+  (`shell`), local commands' output (`local_command`), slash-command
+  wrappers (`commands`), system reminders (the typed words around one are
+  kept), other text Claude Code writes itself such as a compaction summary
+  (`generated`), `isMeta` lines, attachments, images and other lines. Its
+  pages are bounded as a whole by `max_chars` (at least 1,000), end between
+  turns, and read the same from the same cursor; a turn longer than a page
+  is cut, with `chars` its whole length, and `next_turn_offset` (passed
+  back as `turn_offset`) goes on in it. The raw view still answers the
+  whole transcript, verbatim, as the stored blob holds it; the text view
+  needs `read` and `dump`, like it. From a shell: `cauldron soup
+  dump-get <id> --view text [--turn-offset N]`. The curator subagent has
+  `soup_dumps` and `soup_dump_get`, and a new command, `/cauldron:curate-dump
+  <DM-n> [cauldron]`, has it read the dump in pages, judge its records with
+  a dry run, land them each citing the dump (`meta.cites: [{"kind": "dump",
+  "id": "DM-n"}]`) and report their ids. The dump stays `received`.
+- **A version skew is visible.** `cauldron mcp status` gives the running
+  `mcp` service's `version` beside the `cauldron` command's, and when they
+  differ says so (`version_skew`, and on stderr) with the two commands that
+  upgrade it (`upgrade`). The stdio bridge does the same for a session: the
+  service's instructions carry the note, and when an older service refuses
+  a tool or an argument it does not know (`takes no argument`, `unknown
+  tool`), the refusal names both versions and how to upgrade. A forwarded
+  `cauldron soup import` or `soup dump` refused that way says it too.
+- **An example regions file.** A new cauldron's soup starts empty, and the
+  curator places nothing without a region. The plugin ships
+  `regions.example.json`, four regions to edit and import with `cauldron
+  soup import --remint`; a test lands it in a fresh cauldron.
+- **`cauldron rename` and `cauldron remove`.** Both verbs were written but
+  never dispatched; they now are, and they are listed in the usage text.
+  Both are refused while the environment's `mcp` service holds the cauldron
+  (the soup's writer lock, or its dumps store's, names the service): the
+  refusal gives the service's pid and `cauldron mcp revoke <name> --env
+  <env>`, or stopping the service. Any other holder is refused as another
+  writer, and the earlier refusals stand (a face holding it open, a live
+  tranche, a live soup daemon, the legacy cauldron, a name taken). A rename
+  carries the cauldron's MCP grant to the new name with its scopes and
+  projects, still bound to the same cauldron; a remove drops the grant. The
+  dumps store moves with the directory. Both say that a project's
+  `.cauldron` marker naming the old name is not updated. `remove` never
+  deletes: it moves the directory to `cauldrons/.removed/<name>-<stamp>/`,
+  and without `--yes` it is a dry run.
+- **Reads hide superseded nodes, and `get` marks them** (#16). A node that
+  another node's `supersedes` edge points at is superseded. `soup get` and
+  `soup_get` still answer it, adding `superseded_by: [ids]`. `soup nodes`,
+  `soup search` and a region's members (`soup region`), and the
+  `soup_nodes`, `soup_search` and `soup_region` tools, leave it out by
+  default, and each answer says how many it left out in
+  `superseded_hidden`. `--include-superseded` (`include_superseded` on the
+  tools) lists them too, each with its `superseded_by`. `--limit`,
+  `--max-chars` and the tools' `max_chars` budget work as before.
+
+### Changed
+
+- **An upgrade brings up mcp, and moves it to the new build.**
+  `scripts/install` on an existing environment with no `mcp` pin (one made
+  before mcp shipped) now builds and pins the service, as it does for a new
+  environment (`cauldron build mcp --json --env-copy`, then `cauldron pin
+  mcp`). Under `--replace-running`, an existing `mcp` pin at an older build
+  than the checkout's (every 0.1.6 and 0.1.7 install) is rebuilt and
+  re-pinned the same way, and the supervisor moves the running service to
+  it (the install itself stops nothing); before, the pin was left on its old
+  build, so sessions kept reaching the old service. A pin at the checkout's
+  build is left as it is, so a re-run changes nothing. Without
+  `--replace-running` an older pin is left as it is, and the install says
+  plainly that the mcp service is still the old build and prints the two
+  commands that upgrade it. An install stopped after its threads pin and
+  before clearing its marker is now resumed as an upgrade, where it was
+  refused.
+- **The plugin installs from GitHub.** The marketplace moved to
+  `.claude-plugin/marketplace.json` at the repository root (source
+  `./claude-code/cauldron`), so `/plugin marketplace add
+  broomstick-ai/cauldron` finds it; a checkout is added by its root
+  directory. There is one marketplace; the copy under `claude-code/` is gone.
+- **The installer says where `cauldron` must be found.** Its closing lines
+  (and a `--dry-run`'s) say that the plugin starts its server as the bare
+  command `cauldron mcp stdio`, so `cauldron` must be on the PATH Claude
+  Code itself sees, which a Dock, Finder or IDE launch may not take from the
+  shell startup file, and how to check.
+- **`meta.cites` is checked** (#15). Each citation must be an object whose
+  `kind` is one of `session`, `file`, `commit`, `url`, `thread` and `dump`
+  and which carries that kind's keys (present, not null, and not empty when
+  a string). A record with a bad one is refused as `bad-cite`, naming the
+  record and the citation, in a dry run and a real import, through
+  `cauldron soup import` and `soup_put` alike. Other keys are still allowed.
+  The published per-type schemas describe `meta.cites` the same way.
+- **A cauldron's data is private to its owner.** The soup's directories
+  and files were readable by other local users (0755 and 0644) while the
+  dumps store was not. A cauldron's whole directory (for the legacy
+  cauldron, its soup directory) is now 0700 for every directory and 0600
+  for every file, whatever the umask: `cauldron create` makes it so, and a
+  cauldron made before this is tightened by its next writer (`cauldron soup
+  import`, `recover` or `dump`, or the `mcp` service when it opens the
+  cauldron) or by `cauldron rename`, which also writes its manifest and the
+  locks it opens 0600. Reads and dry runs change nothing. Everything that reads a
+  cauldron runs as its owner and reads it as before.
+- **First-run documentation, for `prod`.** The README and the plugin's
+  README now give one numbered path from install to a Claude Code session
+  writing into a granted cauldron, in `prod`: the plugin installed from
+  GitHub, regions from the example file, the grant, and the upgrade with
+  `scripts/install --replace-running`. They say that Claude Code must find
+  `cauldron` on its own PATH, how a `.cauldron` marker differs from a
+  grant's `--project`, that the `cauldron` command reads `$ENV` while the
+  plugin's bridge does not, and how to rename or remove a cauldron. The
+  README no longer says the soup is not in this build, or that a cauldron
+  is an environment. ROADMAP.md is refreshed.
+- **A refused batch prints one shape** (#20). `batch-already-landed` now
+  carries `accepted: 0`, `refused` (the batch's size) and `records: []`,
+  like every other import. Every refused batch names its cause in
+  `refusal`: `records-refused`, `landing-refused` or
+  `batch-already-landed`. `soup_put`'s refusal detail is the same document.
+
+### Fixed
+
+- **A refused `--remint` import printed an `id_map`** (#19) for ids it never
+  took. The map, and each record's `new_id`, are now printed only when the
+  batch landed or a dry run validated.
+- **The wrong reason for an unknown edge key** (#18). An edge with a `note`
+  and an undeclared key (`weight` on `in_region`) was refused as carrying
+  "both `note` and declared fields". The reason now names the key and the
+  edge kind. The note-or-fields reason is kept for an edge whose other keys
+  are all declared.
+- **The schema README misled a first import** (#14). It now says how to
+  change a node (a new node of the same type that `supersedes` it, with an
+  example), how to add an edge to a node that exists (supersede it, or
+  `soup_link` from a session), that regions overlap and a node may sit in
+  several (the rule "No dual home along one chain" is now "Not in a region
+  and its ancestor"), that an import needs nothing stopped (the face does
+  not matter and no soup daemon ships), that the import does not check the
+  rules the grammar leaves out, that a record pointing at a refused record
+  is refused as `target-refused`, that `get` answers edges sorted by kind
+  and target, that a dry run reports `batch-already-landed` too, and two
+  knowledge-capture conventions (a decision drawn from a case carries
+  `derived_from`; a case recorded as an `idea` is `done`).
+- **`--remint` labels fail the published schemas** (#17). The schema
+  README now says which checks to skip for a label (the `id` pattern, and
+  the `to` pattern of an edge naming a label), or to validate a copy with
+  placeholder ids. A schema variant for labels is not in this release.
+- **An audit line could be read half written.** The `mcp` service wrote
+  each `calls.jsonl` line in several writes, so a reader could see part of
+  a line (a test once failed on it). Each line is now appended in one
+  write.
+- **A dump's page could be longer than `max_chars`.** `soup_dump_get`
+  (and `cauldron soup dump-get`) answered a page whose fixed part (the
+  cauldron, the dump's summary, the cursor) did not fit a small budget: a
+  page over `max_chars` that carried none of the content and did not move
+  the cursor on. A page of a dump's content now takes `max_chars` of at
+  least 1,000 (its schema says so), refuses a smaller one as `usage`, and is
+  never longer than asked; a page whose fixed part alone does not fit (a
+  very long title) is refused the same way. Every other read keeps its
+  floor of 256.
+- **Concurrent dumps could be refused** (since 0.1.7). Two `soup_dump`
+  calls started in the same microsecond in the `mcp` service (which also
+  takes every `cauldron soup dump` sent to it while it holds the store)
+  could mint the same temporary file name for their bytes, and the second
+  was refused as `store` ("File exists"). Nothing was written for it and
+  nothing else was lost; a retry landed. The name now carries a serial
+  unique in the process, and so does the dump's write, so many dumps at
+  once, of the same text or not, all land.
+- **`state: null` for regions** (#21). `soup nodes`, `soup search` and a
+  region's members (and their tools) now list a region or viewer without a
+  `state` key, as `get` already did.
+- **The test suite under `-p cauldron`.** tui's egress guard admits the mcp
+  service's loopback listener (its `hyper` server dependency and its one
+  `hyper::` use) by narrow entries instead of failing on it. The four `ctl`
+  tests build the face themselves, so they no longer need `-p tui` in the
+  same command.
 
 ## [0.1.7] — 2026-11-16
 
@@ -575,7 +758,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/broomstick-ai/cauldron/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/broomstick-ai/cauldron/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/broomstick-ai/cauldron/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/broomstick-ai/cauldron/compare/v0.1.4...v0.1.5

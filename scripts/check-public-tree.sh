@@ -80,8 +80,13 @@ scripts/prove-alarm-hosted
 # lists libs/soup-door as a member that the `cauldron` CLI links, and
 # services/mcp as a member (the CLI's tests link it), so an archive without
 # either would not build. The plugin's MCP server is its .mcp.json, a dot
-# file an export rule could drop without breaking the build.
+# file an export rule could drop without breaking the build. The plugin is
+# installed from the repository by its root marketplace (`/plugin
+# marketplace add <owner>/<repo>` reads .claude-plugin/marketplace.json at the
+# root), another dot path, and the plugin manifest that marketplace points at.
 REQUIRED_PATHS='
+.claude-plugin/marketplace.json
+claude-code/cauldron/.claude-plugin/plugin.json
 claude-code/cauldron/.mcp.json
 docs/images/cauldron.png
 README.md

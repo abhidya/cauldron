@@ -47,6 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -329,11 +330,16 @@ fn run(t: Target, gate: Gate, ready: mpsc::Sender<Result<Value, Refusal>>, jobs:
 fn open(t: &Target) -> Result<(spine::Cauldron, File, Value), Refusal> {
     let c = &t.cauldron;
     soup_door::lock::refuse_live_soup(&t.env).map_err(refusal)?;
+    // The cauldron's data is its owner's only; a store made before that was
+    // the rule is tightened here (`env::private`).
+    env::private::tighten_cauldron(c)
+        .map_err(|e| Refusal::new("store", format!("making cauldron `{}`'s data private to its owner: {e}", c.name)))?;
     let path = c.soup().join(soup_door::lock::WRITER_LOCK);
     let mut fh = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(env::private::FILE_MODE)
         .open(&path)
         .map_err(|e| Refusal::new("store", format!("opening {}: {e}", path.display())))?;
     match fh.try_lock() {
@@ -449,7 +455,7 @@ fn put(c: &spine::Cauldron, t: &Target, p: &Put, who: &Who) -> Result<Value, Ref
     if !p.allow_duplicate {
         let earlier = import::landed_before(&t.soup(), &t.cauldron.name, &digest).map_err(refusal)?;
         if !earlier.is_empty() {
-            let ImportOutcome::AlreadyLanded { mut doc, why } = import::already_landed(t, &pool, &digest, &opts, earlier) else {
+            let ImportOutcome::AlreadyLanded { mut doc, why } = import::already_landed(t, &pool, &digest, &opts, records.len(), earlier) else {
                 unreachable!("already_landed answers AlreadyLanded")
             };
             let why = mcp_words(&why);
@@ -523,13 +529,16 @@ fn put(c: &spine::Cauldron, t: &Target, p: &Put, who: &Who) -> Result<Value, Ref
     }
     let (mut doc, ok) = land(&kept)?;
     if !ok {
+        // The second judgement, in the shape of every refused batch, with
+        // the first one beside it.
+        doc["first"] = first;
         return Err(Refusal::with_detail(
             "records_refused",
             format!(
                 "after the {} refused record(s) were dropped, the rest was refused when judged again, so nothing was written.",
                 dropped.len()
             ),
-            json!({"first": first, "second": doc}),
+            doc,
         ));
     }
     doc["partial"] = json!(true);

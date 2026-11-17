@@ -414,3 +414,165 @@ fn dm6_a_kill_while_a_transcript_streams_is_swept_at_the_next_open() {
     assert_eq!(blobs(&s, "kb"), [format!("{}.jsonl", sha256_hex(&t))]);
     assert_eq!(svc.stop().code(), Some(0));
 }
+
+/// A transcript with tool calls, their output and thinking between its
+/// text turns: `n` exchanges, and what the text view must count.
+fn tool_transcript(n: usize) -> (Vec<u8>, usize) {
+    let mut out = Vec::new();
+    let mut push = |v: Value| {
+        out.extend_from_slice(v.to_string().as_bytes());
+        out.push(b'\n');
+    };
+    for i in 0..n {
+        push(json!({"type": "user", "uuid": format!("q-{i}"), "message": {"role": "user", "content": format!("question {i}: what does part {i} do?")}}));
+        push(json!({"type": "assistant", "uuid": format!("a-{i}"), "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": format!("hidden thought {i}")},
+            {"type": "text", "text": format!("answer {i}: I will look.")},
+            {"type": "tool_use", "id": format!("call-{i}"), "name": "Read", "input": {"file_path": "/w/x.rs"}}]}}));
+        push(json!({"type": "user", "uuid": format!("r-{i}"), "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": format!("call-{i}"), "content": format!("TOOL OUTPUT {i} ").repeat(40)}]}}));
+    }
+    (out, n)
+}
+
+/// `soup_dump_get` with `view: "text"`: only the user and assistant text
+/// turns, in pages bounded as a whole by `max_chars` that read the same from
+/// the same cursor, tool calls and results counted and never shown. It
+/// needs `read` and `dump` like the raw view; the raw view is unchanged.
+#[test]
+fn dm7_the_text_view_pages_a_session_dump_s_turns() {
+    let s = Scratch::new("dm7", &["kb"]);
+    s.grant("kb", &Scope::ALL, &[]);
+    let svc = Service::start(&s);
+    let c = json!({"client": "claude-code", "cwd": s.project("p").display().to_string(), "session_id": "sess-b"});
+    let (t, n) = tool_transcript(40);
+    assert_eq!(ok(&svc.dump_session_result(json!({"cauldron": "kb", "session_id": "sess-a"}), &c, &t))["dump_id"], "DM-1");
+    assert_eq!(ok(&svc.call("soup_dump", json!({"cauldron": "kb", "text": "plain"}), &c))["dump_id"], "DM-2");
+
+    let get = |args: Value| svc.call("soup_dump_get", args, &c);
+    let mut pages = vec![];
+    let (mut off, mut k) = (0u64, 0u64);
+    loop {
+        let mut a = json!({"cauldron": "kb", "id": "DM-1", "view": "text", "offset": off, "max_chars": 1500});
+        if k > 0 {
+            a["turn_offset"] = json!(k);
+        }
+        let p = ok(&get(a));
+        let size = serde_json::to_string(&p).unwrap().chars().count();
+        assert!(size <= 1500, "a page of {size} characters");
+        pages.push(p.clone());
+        match p["next_offset"].as_u64() {
+            Some(o) => {
+                (off, k) = (o, p["next_turn_offset"].as_u64().unwrap_or(0));
+            }
+            None => break,
+        }
+    }
+    assert!(pages.len() > 3, "{} pages", pages.len());
+    let turns: Vec<Value> = pages.iter().flat_map(|p| p["turns"].as_array().unwrap().clone()).collect();
+    assert_eq!(turns.len(), 2 * n, "every question and answer, nothing else");
+    assert_eq!(turns[0]["text"], "question 0: what does part 0 do?");
+    assert_eq!((turns[1]["role"].clone(), turns[1]["text"].clone()), (json!("assistant"), json!("answer 0: I will look.")));
+    let sum = |f: &str| pages.iter().map(|p| p["elided"][f].as_u64().unwrap()).sum::<u64>();
+    assert_eq!((sum("tool_calls"), sum("tool_results"), sum("thinking")), (n as u64, n as u64, n as u64));
+    let all = serde_json::to_string(&pages).unwrap();
+    assert!(!all.contains("TOOL OUTPUT") && !all.contains("hidden thought"), "a tool's output or thinking shown");
+    // Stable: page 3 read again from its cursor is the same page.
+    let again = ok(&get(json!({"cauldron": "kb", "id": "DM-1", "view": "text", "offset": pages[2]["offset"], "max_chars": 1500})));
+    assert_eq!(again["turns"], pages[2]["turns"]);
+    assert_eq!(again["next_offset"], pages[2]["next_offset"]);
+    // The raw view is unchanged: the transcript verbatim.
+    let raw = ok(&get(json!({"cauldron": "kb", "id": "DM-1", "max_chars": 2000})));
+    assert!(t.starts_with(raw["text"].as_str().unwrap().as_bytes()));
+    // Usage refusals.
+    for (bad, why) in [
+        (json!({"cauldron": "kb", "id": "DM-1", "view": "words"}), "an unknown view"),
+        (json!({"cauldron": "kb", "id": "DM-1", "turn_offset": 3}), "turn_offset without the text view"),
+        (json!({"cauldron": "kb", "id": "DM-2", "view": "text"}), "a text dump"),
+        (json!({"cauldron": "kb", "id": "DM-1", "view": "text", "offset": 5}), "an offset inside a line"),
+    ] {
+        assert_eq!(refused(&get(bad)).0, "usage", "{why}");
+    }
+    // The scope rule: the text view needs `read` AND `dump`.
+    for scopes in [vec![Scope::Read, Scope::Write], vec![Scope::Dump]] {
+        s.grant("kb", &scopes, &[]);
+        let (code, msg, _) = refused(&get(json!({"cauldron": "kb", "id": "DM-1", "view": "text"})));
+        assert_eq!(code, "not_granted", "{scopes:?}: {msg}");
+    }
+    s.grant("kb", &[Scope::Read, Scope::Dump], &[]);
+    assert_eq!(ok(&get(json!({"cauldron": "kb", "id": "DM-1", "view": "text", "max_chars": 1500})))["turns"], pages[0]["turns"]);
+    assert_eq!(svc.stop().code(), Some(0));
+}
+
+/// **The text view shows only what the person typed and what the assistant
+/// wrote.** Through the service: a `!` command and its output, a slash
+/// command's wrapper and a local command's output, system reminders (in a
+/// block of their own and inside typed text), an attachment, a compaction
+/// summary and tool results, each holding a planted secret, are left out and
+/// counted by kind at every page size; the typed words beside a reminder
+/// stay; the raw view still holds every secret.
+#[test]
+fn dm8_the_text_view_leaves_out_what_the_person_did_not_type() {
+    let s = Scratch::new("dm8", &["kb"]);
+    s.grant("kb", &Scope::ALL, &[]);
+    let svc = Service::start(&s);
+    let c = json!({"client": "claude-code", "cwd": s.project("p").display().to_string(), "session_id": "sess-b"});
+    let user = |content: Value| json!({"type": "user", "message": {"role": "user", "content": content}});
+    let lines = [
+        user(json!("Please deploy it.")),
+        user(json!("<bash-input>cat .env PLANTED_SHELL_IN</bash-input>")),
+        user(json!("<bash-stdout>TOKEN=PLANTED_SHELL_OUT</bash-stdout><bash-stderr>PLANTED_SHELL_ERR</bash-stderr>")),
+        user(json!("<command-name>/deploy</command-name>\n<command-message>deploy</command-message>\n<command-args>PLANTED_ARGS</command-args>")),
+        user(json!("<local-command-stdout>PLANTED_LOCAL_OUT</local-command-stdout>")),
+        json!({"type": "user", "isMeta": true, "message": {"role": "user", "content": "<local-command-caveat>PLANTED_CAVEAT</local-command-caveat>"}}),
+        user(json!([{"type": "text", "text": "What changed?"}, {"type": "text", "text": "<system-reminder>PLANTED_REMINDER</system-reminder>"}])),
+        user(json!("Only these words.\n<system-reminder>PLANTED_INLINE</system-reminder>")),
+        json!({"type": "attachment", "attachment": {"type": "file", "content": "PLANTED_ATTACHMENT"}}),
+        json!({"type": "user", "isCompactSummary": true, "message": {"role": "user", "content": "PLANTED_SUMMARY"}}),
+        user(json!("<task-notification>PLANTED_NOTIFICATION</task-notification>")),
+        json!({"type": "user", "toolUseResult": {"stdout": "PLANTED_TOOL_TOP"}, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t-1", "content": [{"type": "text", "text": "PLANTED_TOOL"}]}]}}),
+        json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Deployed."}]}}),
+    ];
+    let t: Vec<u8> = lines.iter().flat_map(|l| format!("{l}\n").into_bytes()).collect();
+    assert_eq!(ok(&svc.dump_session_result(json!({"cauldron": "kb", "session_id": "sess-a"}), &c, &t))["dump_id"], "DM-1");
+    let want = json!({"tool_calls": 0, "tool_results": 1, "thinking": 0, "shell": 2, "local_command": 1, "commands": 1,
+        "system_reminders": 2, "generated": 2, "meta": 1, "attachments": 1, "other_blocks": 0, "other_lines": 0, "unreadable_lines": 0});
+    for max in [1000, 12000, 50000] {
+        let (mut off, mut turns, mut counts) = (0u64, Vec::new(), std::collections::BTreeMap::<String, u64>::new());
+        loop {
+            let p = ok(&svc.call("soup_dump_get", json!({"cauldron": "kb", "id": "DM-1", "view": "text", "offset": off, "max_chars": max}), &c));
+            assert!(serde_json::to_string(&p).unwrap().chars().count() <= max);
+            assert!(!p.to_string().contains("PLANTED"), "max {max}: {p}");
+            turns.extend(p["turns"].as_array().unwrap().iter().map(|t| (t["role"].as_str().unwrap().to_string(), t["text"].as_str().unwrap().to_string())));
+            for (k, v) in p["elided"].as_object().unwrap() {
+                *counts.entry(k.clone()).or_insert(0) += v.as_u64().unwrap();
+            }
+            match p["next_offset"].as_u64() {
+                Some(o) => off = o,
+                None => break,
+            }
+        }
+        let typed: Vec<(&str, &str)> = turns.iter().map(|(r, t)| (r.as_str(), t.as_str())).collect();
+        assert_eq!(
+            typed,
+            [("user", "Please deploy it."), ("user", "What changed?"), ("user", "Only these words."), ("assistant", "Deployed.")],
+            "max {max}"
+        );
+        assert_eq!(json!(counts), want, "max {max}");
+    }
+    let raw = ok(&svc.call("soup_dump_get", json!({"cauldron": "kb", "id": "DM-1", "max_chars": 50000}), &c));
+    assert_eq!(raw["text"].as_str().unwrap().matches("PLANTED_").count(), 13, "the stored transcript holds everything");
+    // A page has a floor of its own: under it, refused as `usage` in both
+    // views (never a page longer than asked); at it, answered within it.
+    for view in ["text", "raw"] {
+        for max in [256, 999] {
+            let (code, msg, _) = refused(&svc.call("soup_dump_get", json!({"cauldron": "kb", "id": "DM-1", "view": view, "max_chars": max}), &c));
+            assert_eq!(code, "usage", "{view} at {max}: {msg}");
+            assert!(msg.contains("1000"), "{msg}");
+        }
+        let p = ok(&svc.call("soup_dump_get", json!({"cauldron": "kb", "id": "DM-1", "view": view, "max_chars": 1000}), &c));
+        assert!(serde_json::to_string(&p).unwrap().chars().count() <= 1000, "{view}: {p}");
+    }
+    assert_eq!(svc.stop().code(), Some(0));
+}

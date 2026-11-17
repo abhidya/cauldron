@@ -11,7 +11,9 @@
 //! optional `max_chars` that bounds the WHOLE reply payload's compact JSON
 //! (the tool result's structured content; default 12,000, floor 256, ceiling
 //! 50,000, a value under the floor raised to it); what was left out is listed
-//! in `truncated`. The JSON-RPC message carries that payload twice (as text
+//! in `truncated`. `soup_dump_get` is the exception: a page of a dump's
+//! content has a floor of 1,000 (`dumps::PAGE_MIN_CHARS`), and a smaller
+//! value is refused as `usage`, so that no page is ever longer than asked. The JSON-RPC message carries that payload twice (as text
 //! and as structured content), so the message itself is about twice as long.
 
 use serde_json::{json, Value};
@@ -79,8 +81,22 @@ fn max_chars() -> Value {
     )})
 }
 
+/// `soup_dump_get`'s `max_chars`: a page of a dump's content has a floor of
+/// its own (`dumps::PAGE_MIN_CHARS`), and a smaller value is refused.
+fn page_max_chars() -> Value {
+    use crate::budget::{DEFAULT_MAX_CHARS, MAX_CHARS_CEILING};
+    use crate::dumps::PAGE_MIN_CHARS;
+    json!({"type": "integer", "minimum": PAGE_MIN_CHARS, "maximum": MAX_CHARS_CEILING, "description": format!(
+        "Bound on the page's characters (the compact JSON of the structured result; the JSON-RPC message carries it twice, as text and as structured content); no page is longer. Default {DEFAULT_MAX_CHARS}, floor {PAGE_MIN_CHARS} (a page's fixed part alone is several hundred characters, so a smaller value is refused as `usage`), ceiling {MAX_CHARS_CEILING} (a larger one is lowered to it)."
+    )})
+}
+
 fn limit(default: usize) -> Value {
     json!({"type": "integer", "minimum": 0, "description": format!("How many items, newest or best first. Default {default}.")})
+}
+
+fn include_superseded() -> Value {
+    json!({"type": "boolean", "description": "List superseded nodes too (a node another node's `supersedes` edge points at), each with its `superseded_by`. Default false: they are left out and counted in `superseded_hidden`."})
 }
 
 fn object(props: Value, required: &[&str]) -> Value {
@@ -104,12 +120,12 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "soup_region",
         needs: Needs::Scope(Scope::Read),
-        description: "One region: its record, the regions it narrows and that narrow it (to `depth` levels), the regions it relates to, and its direct members {id, type, state, handle}. There are no clusters in this schema (`clusters` is always empty).",
+        description: "One region: its record, the regions it narrows and that narrow it (to `depth` levels), the regions it relates to, and its direct members {id, type, state, handle} (no `state` for a node of a type that has none), without superseded members unless `include_superseded` (`superseded_hidden` says how many were left out). There are no clusters in this schema (`clusters` is always empty).",
         schema: || {
             object(
                 json!({"cauldron": cauldron(), "id": {"type": "string", "description": "The region's id, e.g. R-1."},
                        "depth": {"type": "integer", "minimum": 0, "description": "Levels of parents and children. Default 1."},
-                       "limit": limit(crate::reads::MEMBERS_LIMIT), "max_chars": max_chars()}),
+                       "limit": limit(crate::reads::MEMBERS_LIMIT), "max_chars": max_chars(), "include_superseded": include_superseded()}),
                 &["id"],
             )
         },
@@ -117,11 +133,11 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "soup_nodes",
         needs: Needs::Scope(Scope::Read),
-        description: "Nodes, newest first, as {id, type, state, handle, regions}, filtered by region (direct members), type and state. The same items as `cauldron soup nodes`.",
+        description: "Nodes, newest first, as {id, type, state, handle, regions} (no `state` for a region or viewer: they carry none), filtered by region (direct members), type and state. A superseded node is left out unless `include_superseded`, and `superseded_hidden` says how many were. The same items as `cauldron soup nodes`.",
         schema: || {
             object(
                 json!({"cauldron": cauldron(), "region": {"type": "string"}, "type": {"type": "string"}, "state": {"type": "string"},
-                       "limit": limit(crate::reads::NODES_LIMIT), "max_chars": max_chars()}),
+                       "limit": limit(crate::reads::NODES_LIMIT), "max_chars": max_chars(), "include_superseded": include_superseded()}),
                 &[],
             )
         },
@@ -129,11 +145,11 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "soup_search",
         needs: Needs::Scope(Scope::Read),
-        description: "Search handles and bodies for the query's words, best first, as {id, type, state, handle, regions, score, snippet}. The same items as `cauldron soup search`.",
+        description: "Search handles and bodies for the query's words, best first, as {id, type, state, handle, regions, score, snippet} (no `state` for a region or viewer: they carry none). A superseded node is left out unless `include_superseded`, and `superseded_hidden` says how many were. The same items as `cauldron soup search`.",
         schema: || {
             object(
                 json!({"cauldron": cauldron(), "query": {"type": "string"}, "region": {"type": "string"}, "type": {"type": "string"},
-                       "limit": limit(crate::reads::SEARCH_LIMIT), "max_chars": max_chars()}),
+                       "limit": limit(crate::reads::SEARCH_LIMIT), "max_chars": max_chars(), "include_superseded": include_superseded()}),
                 &["query"],
             )
         },
@@ -141,13 +157,13 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "soup_get",
         needs: Needs::Scope(Scope::Read),
-        description: "Whole records in the published shape (workspace-v6), with their outgoing edges and `meta.cites`. Ids the soup does not hold are listed in `missing`.",
+        description: "Whole records in the published shape (workspace-v6), with their outgoing edges and `meta.cites`. A superseded node is answered all the same, with `superseded_by: [ids]` (read from the inbound `supersedes` edges; not a field, so leave it out when writing the record again). Ids the soup does not hold are listed in `missing`.",
         schema: || object(json!({"cauldron": cauldron(), "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1}, "max_chars": max_chars()}), &["ids"]),
     },
     Tool {
         name: "soup_put",
         needs: Needs::Scope(Scope::Write),
-        description: "Land records written in the published shape (workspace-v6) as ONE write, all or nothing: every record is judged by the soup's grammar first. `dry_run` judges and lands nothing. `remint` treats ids as batch-local labels and answers `id_map`. `partial` lands the records that pass and lists the ones dropped (dependents of a dropped record are dropped too). `cite` (an object in `meta.cites` form) is added to every record, and so is this session. A batch identical to one that already landed is refused unless `allow_duplicate`.",
+        description: "Land records written in the published shape (workspace-v6) as ONE write, all or nothing: every record is judged by the soup's grammar first, and every `meta.cites` entry by the citation table (a kind outside it, or a citation without its kind's keys, is refused as `bad-cite`). `dry_run` judges and lands nothing. `remint` treats ids as batch-local labels and answers `id_map` when the batch lands or a dry run validates (a refused batch has none: its ids were never taken). `partial` lands the records that pass and lists the ones dropped (dependents of a dropped record are dropped too). `cite` (an object in `meta.cites` form) is added to every record, and so is this session. A batch identical to one that already landed is refused unless `allow_duplicate`. A refused batch's `detail` (and a refused dry run's answer) has one shape: `outcome: \"refused\"`, `refusal` (`records-refused`, `landing-refused` or `batch-already-landed`), `accepted`, `refused` and `records`.",
         schema: || {
             object(
                 json!({"cauldron": cauldron(),
@@ -235,12 +251,14 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "soup_dump_get",
         needs: Needs::Both(Scope::Read, Scope::Dump),
-        description: "One dump's content, from byte `offset`, as much as fits `max_chars`: a text dump's text, or a session transcript verbatim. The answer says `next_offset` when there is more; call again with it. Needs a grant of both `read` and `dump`.",
+        description: "One dump's content, from byte `offset`, as much as fits `max_chars`: a text dump's text, or a session transcript verbatim (`view: \"raw\"`, the default). For a session transcript, `view: \"text\"` answers only what the person typed and what the assistant wrote as text, as turns each with `at` (the byte where its line starts), `role` and `text`; everything else is left out and counted in `elided` by kind: tool calls and results, thinking, `!` shell commands and their output (`shell`), local commands' output (`local_command`), slash-command wrappers (`commands`), system reminders, other text Claude Code writes itself (`generated`), isMeta lines, attachments, images and other lines. The raw view still holds the whole transcript. Pages end between turns and read the same every time; a turn longer than a page is cut, with `chars` its whole length. The answer says `next_offset` (and, in the text view, `next_turn_offset`) when there is more; call again with them. No page is longer than `max_chars`, which is at least 1000 here (smaller is refused as `usage`). Needs a grant of both `read` and `dump`.",
         schema: || {
             object(
                 json!({"cauldron": cauldron(), "id": {"type": "string", "description": "The dump's id, e.g. DM-1."},
-                       "offset": {"type": "integer", "minimum": 0, "description": "The byte to start at. Default 0."},
-                       "max_chars": max_chars()}),
+                       "offset": {"type": "integer", "minimum": 0, "description": "The byte to start at. Default 0. In the text view, 0 or a `next_offset` it answered (where a line starts)."},
+                       "view": {"type": "string", "enum": ["raw", "text"], "description": "`raw` (default): the content verbatim. `text`: a session transcript's user and assistant text turns only."},
+                       "turn_offset": {"type": "integer", "minimum": 0, "description": "Text view only: a page's `next_turn_offset`, the characters of a cut turn already read. Default 0."},
+                       "max_chars": page_max_chars()}),
                 &["id"],
             )
         },
@@ -283,6 +301,14 @@ mod tests {
             let s = (t.schema)();
             let Some(m) = s["properties"].get("max_chars") else { continue };
             seen += 1;
+            if t.name == "soup_dump_get" {
+                // A page of a dump's content has a floor of its own, refused below.
+                assert_eq!(m["minimum"], json!(crate::dumps::PAGE_MIN_CHARS));
+                assert_eq!(m["maximum"], json!(crate::budget::MAX_CHARS_CEILING));
+                let d = m["description"].as_str().unwrap();
+                assert!(d.contains("floor 1000") && d.contains("refused") && d.contains("twice"), "{d}");
+                continue;
+            }
             assert_eq!(m["minimum"], json!(crate::budget::MAX_CHARS_FLOOR), "{}", t.name);
             assert_eq!(m["maximum"], json!(crate::budget::MAX_CHARS_CEILING), "{}", t.name);
             let d = m["description"].as_str().unwrap();

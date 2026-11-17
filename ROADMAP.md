@@ -1,6 +1,6 @@
 # Roadmap
 
-This is the plan after the 0.1.4 release. It is a plan, not a promise: items
+This is the plan after the 0.1.8 release. It is a plan, not a promise: items
 can move between releases, and this file changes as they do. After
 0.2.0, releases come out weekly. What each release actually contains is
 recorded in [CHANGELOG.md](CHANGELOG.md).
@@ -35,11 +35,51 @@ Shipped in 0.1.4: a cauldron's soup as a knowledge graph from Claude Code
 import | regions | get | nodes | search | region`, and the Claude Code
 plugin). No engine runs.
 
-Coming in 0.2.0. Ripples and the soup engine arrive in 0.2.0:
+Shipped in 0.1.5: fixes to the soup commands, and `cauldron link` (a
+project's `.cauldron` marker).
+
+Shipped in 0.1.6: the MCP door, a supervised service through which Claude
+Code sessions read, search and write the cauldrons their owner grants.
+
+Shipped in 0.1.7: dumps, raw text or a session transcript kept in a
+cauldron for later processing.
+
+Shipped in 0.1.8: the path from install to a working session (an upgrade
+brings up the MCP service, the plugin installs from GitHub, first-run docs
+for `prod`, an example regions file), curating a dump into records without
+the ripple engine (`/cauldron:curate-dump`), `cauldron rename` and `remove`,
+a cauldron's data private to its owner, and fixes to import and reads filed
+as issues.
+
+## Next: 0.1.9
+
+Planned, in no fixed order:
+
+- **Prebuilt binaries** for macOS, so an install need not build from source
+  (issue #22), and a launcher for the plugin's MCP server that does not
+  depend on Claude Code's `PATH`.
+- **Schemas for labels** (issue #17): a variant of the per-type schemas that
+  accepts a `--remint` batch's labels.
+- **Hardening of the MCP service:** a timeout on writing a response, JSON-RPC
+  batches, rotation of `calls.jsonl`, and `cauldron mcp status` naming the
+  dumps stores the service holds.
+
+## 0.2.0
+
+Ripples and the soup engine arrive in 0.2.0:
 
 - **Ripples live:** dumps set off ripples, and ripples write to the soup. The
-  soup engine is hardened, and the Ledger shows real ripple events. (Not in
-  0.1.0, 0.1.1, 0.1.2, 0.1.3 or 0.1.4.)
+  soup engine is hardened, and the Ledger shows real ripple events. A dump's
+  state moves on from `received` only then. (Not in any 0.1.x release.)
+
+## Later, each to its own design
+
+- **Changes as events** (issue #7): streaming what changed in a soup, and a
+  history of which write changed what.
+- **Merging cauldrons** (issue #9).
+- **A summary page in the face** (issue #11).
+- **Claiming work** through the MCP door (`soup_claim`, which needs clusters
+  in the schema).
 
 ## Weekly releases
 

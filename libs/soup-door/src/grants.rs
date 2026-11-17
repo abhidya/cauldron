@@ -550,14 +550,28 @@ pub fn revoke(e: &Environment, cauldron: &str, project: Option<&Path>) -> Result
 
 /// Follow a cauldron's rename: its grant, if any, now names `new`. Answers
 /// whether a grant was changed. Writes nothing when there is no store.
-pub fn rename(e: &Environment, old: &str, new: &str) -> Result<bool> {
+///
+/// `created_at` is the renamed cauldron's identity ([`identity`]; a rename
+/// keeps its `cauldron.toml`, so it is the same before and after). The grant
+/// keeps the identity it records, so it still opens the renamed cauldron and
+/// never one made later under either name; a grant written before grants
+/// carried one is bound to `created_at` now. A grant that already named
+/// `new` belonged to a cauldron that is gone (the caller has checked no
+/// cauldron is called `new`), and is dropped: left, it would answer for the
+/// renamed one, and one that records no identity would open it.
+pub fn rename(e: &Environment, old: &str, new: &str, created_at: Option<&str>) -> Result<bool> {
     if !store_path(e).exists() {
         return Ok(false);
     }
     update(e, |g| {
-        let mut changed = false;
+        let before = g.grants.len();
+        g.grants.retain(|x| x.cauldron != new);
+        let mut changed = g.grants.len() != before;
         for x in g.grants.iter_mut().filter(|x| x.cauldron == old) {
             x.cauldron = new.to_string();
+            if x.cauldron_created_at.is_none() {
+                x.cauldron_created_at = created_at.map(str::to_string);
+            }
             changed = true;
         }
         g.grants.sort_by(|a, b| a.cauldron.cmp(&b.cauldron));
@@ -739,17 +753,33 @@ mod tests {
         let root = scratch("follow");
         let e = env_at(&root);
         // No store: nothing is written.
-        assert!(!rename(&e, "kb", "kb2").unwrap());
+        assert!(!rename(&e, "kb", "kb2", None).unwrap());
         assert!(!forget(&e, "kb").unwrap());
         assert!(!store_path(&e).exists());
         update(&e, |g| {
             g.grants.push(super::tests::g("kb", &["/p"]));
             g.grants.push(super::tests::g("other", &[]));
+            // A stale grant under the new name (its cauldron is gone).
+            g.grants.push(super::tests::g("kb2", &["/stale"]));
             Ok(())
         })
         .unwrap();
-        assert!(rename(&e, "kb", "kb2").unwrap());
-        assert_eq!(Grants::load(&e).unwrap().get("kb2").unwrap().projects, ["/p"]);
+        assert!(rename(&e, "kb", "kb2", Some("2026-01-02T00:00:00Z")).unwrap());
+        let after = Grants::load(&e).unwrap();
+        assert_eq!(after.grants.iter().filter(|x| x.cauldron == "kb2").count(), 1, "the stale grant was kept");
+        let moved = after.get("kb2").unwrap();
+        assert_eq!(moved.projects, ["/p"]);
+        // A grant with no identity is bound to the renamed cauldron's.
+        assert_eq!(moved.cauldron_created_at.as_deref(), Some("2026-01-02T00:00:00Z"));
+        // One with an identity keeps it.
+        update(&e, |g| {
+            g.grants.iter_mut().find(|x| x.cauldron == "kb2").unwrap().cauldron_created_at = Some("2026-01-03T00:00:00Z".into());
+            Ok(())
+        })
+        .unwrap();
+        assert!(rename(&e, "kb2", "kb3", Some("2026-01-04T00:00:00Z")).unwrap());
+        assert_eq!(Grants::load(&e).unwrap().get("kb3").unwrap().cauldron_created_at.as_deref(), Some("2026-01-03T00:00:00Z"));
+        assert!(rename(&e, "kb3", "kb2", None).unwrap());
         assert!(forget(&e, "kb2").unwrap());
         assert!(!forget(&e, "kb2").unwrap());
         let left: Vec<String> = Grants::load(&e).unwrap().grants.into_iter().map(|g| g.cauldron).collect();

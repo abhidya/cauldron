@@ -61,6 +61,7 @@ pub mod hosting;
 pub mod identity;
 pub mod lock;
 pub mod paths;
+pub mod private;
 pub mod seams;
 pub mod supervisions;
 pub mod tccd;

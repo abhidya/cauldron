@@ -8,14 +8,28 @@
 //! inside `cauldrons/`:
 //!
 //! - `create` lays the directory in a temp sibling and renames it into place,
-//!   so a failure leaves no half-made cauldron.
+//!   so a failure leaves no half-made cauldron. The directory is its owner's
+//!   only (`env::private`): every directory in it 0700 and every file 0600,
+//!   whatever the umask.
 //! - `rename` / `remove` are refused while a face has the cauldron open (the
 //!   face holds `<tui>/open.lock` SHARED; we take it EXCLUSIVE, non-blocking,
 //!   and HOLD it across the check and the move — the fd follows the inode), or
 //!   while ITS OWN soup holds a live tranche (read off its own `spine.db`,
 //!   read-only, never through `Cauldron::open`, whose recovery pass writes).
+//! - `rename` / `remove` are refused while the environment's `mcp` service
+//!   holds the cauldron (its soup's or its dumps store's writer lock: both are
+//!   taken EXCLUSIVE, non-blocking, and held across the move, like the open
+//!   lock), naming `cauldron mcp revoke`.
 //! - `remove` is a dry run without `--yes`, and never deletes: it moves the
 //!   directory to `cauldrons/.removed/<name>-<UTC stamp>/`.
+//! - Everything inside the directory moves with it: its soup, its dumps
+//!   store, its face's files.
+//! - The MCP door's grants follow the move (`soup_door::grants`): a rename
+//!   carries the grant to the new name, bound to the cauldron's identity
+//!   (its `created_at`, which a rename keeps), so it still opens it and never
+//!   a cauldron made later under either name; a remove drops it.
+//! - A project's `.cauldron` marker (`cauldron link`) that names the old name
+//!   is NOT updated: markers are not tracked. Both verbs say so.
 //! - The implicit LEGACY cauldron is never renamed (`check_renamable`)
 //!   and never removed: its data lives directly in the
 //!   environment's data root, and both verbs would move or write there.
@@ -205,9 +219,14 @@ fn create_with<T>(
         std::fs::remove_dir_all(&tmp).with_context(|| format!("clearing a stale {}", tmp.display()))?;
     }
     let built = (|| -> Result<()> {
-        std::fs::create_dir(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        // Made 0700 (never open to others), whatever the umask: a cauldron's
+        // data is its owner's only (`env::private`).
+        if std::fs::symlink_metadata(&tmp).is_ok() {
+            bail!("{} appeared while the cauldron was being created", tmp.display());
+        }
+        env::private::make_dir(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         for sub in ["tui", "events", "ripples"] {
-            std::fs::create_dir(tmp.join(sub)).with_context(|| format!("creating {sub}/"))?;
+            env::private::make_dir(&tmp.join(sub)).with_context(|| format!("creating {sub}/"))?;
         }
         let meta = CauldronMeta {
             name: Some(name.to_string()),
@@ -219,6 +238,8 @@ fn create_with<T>(
         // Its OWN soup: a fresh spine `Cauldron`, one `ws` pool on grammar v6,
         // exactly what the supervisor makes for the legacy soup.
         crate::engine::ensure_soup_cauldron(&tmp.join("soup"))?;
+        // Every file in it (the manifest, the soup's databases) 0600.
+        env::private::tighten_tree(&tmp).with_context(|| format!("making {} private to its owner", tmp.display()))?;
         Ok(())
     })();
     if let Err(err) = built {
@@ -240,6 +261,7 @@ fn create_with<T>(
         undo(Some(&dir));
         return Err(err).context("the seed failed, so the new cauldron was removed; nothing was created");
     }
+    env::private::tighten_tree(&dir).with_context(|| format!("making {} private to its owner", dir.display()))?;
     Ok(dir)
 }
 
@@ -320,16 +342,19 @@ pub(crate) fn verb_list(args: &[String]) -> Result<i32> {
 /// Created if absent (the taker creates it) — only ever
 /// inside a `Dir` cauldron's `tui/`.
 pub(crate) fn take_open_lock(c: &Cauldron) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
     let path = c.open_lock();
     if let Some(p) = path.parent() {
         if !p.is_dir() {
             std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
         }
     }
+    // Made the owner's only, whatever the umask (`env::private`).
     let fh = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(env::private::FILE_MODE)
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
     match fh.try_lock() {
@@ -421,6 +446,79 @@ fn refuse_live_soup(e: &Environment, verb: &str) -> Result<()> {
     Ok(())
 }
 
+/// **The cauldron's writer locks, taken EXCLUSIVE and non-blocking**: its
+/// soup's (`<soup>/writer.lock`) and, when it has a dumps store, that store's
+/// (`<dumps>/writer.lock`). Held by the returned files until they are dropped
+/// (the fd follows the inode across the move). The `mcp` service holds both
+/// for as long as it holds a granted cauldron open, and would go on writing
+/// to the old path, so either one held refuses, naming the service when its
+/// lock text does.
+fn take_writer_locks(e: &Environment, c: &Cauldron, verb: &str) -> Result<Vec<File>> {
+    use soup_door::lock::{MCP_SERVICE, WRITER_LOCK};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut held = Vec::new();
+    let soup_lock = c.soup().join(WRITER_LOCK);
+    let dumps_lock = soup_door::dumps::dir(c).join(WRITER_LOCK);
+    // The soup's lock is made if the soup is there (as `soup import` does);
+    // the dumps store's only if the store exists (nothing is made for it).
+    let wanted = [(c.soup().is_dir(), soup_lock, "soup"), (dumps_lock.is_file(), dumps_lock, "dumps store")];
+    for (present, path, what) in wanted {
+        if !present {
+            continue;
+        }
+        let fh = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(env::private::FILE_MODE)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match fh.try_lock() {
+            Ok(()) => held.push(fh),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let says = std::fs::read_to_string(&path).unwrap_or_default();
+                let pid = says.trim().strip_prefix(MCP_SERVICE).and_then(|p| p.trim().parse::<u32>().ok());
+                match pid {
+                    Some(pid) => bail!(
+                        "REFUSED: the `{MCP_SERVICE}` service (pid {pid}) holds cauldron `{name}`'s {what} \
+                         ({lock} is held): the cauldron is granted to the MCP door and a call opened it, so \
+                         `cauldron {verb}` cannot move it. Close it first with `cauldron mcp revoke {name} --env \
+                         {env}` (which frees it; grant it again afterwards), or stop the service with \
+                         `cauldron --env {env} stop mcp`. Nothing was changed.",
+                        name = c.name,
+                        lock = path.display(),
+                        env = e.name
+                    ),
+                    None => bail!(
+                        "REFUSED: another writer is writing to cauldron `{}`'s {what} right now ({} is held), so \
+                         `cauldron {verb}` cannot move it. Try again when it has finished. Nothing was changed.",
+                        c.name,
+                        path.display()
+                    ),
+                }
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("locking {}", path.display()));
+            }
+        }
+    }
+    Ok(held)
+}
+
+/// The note both verbs print: a `.cauldron` marker naming `name` is not updated.
+fn marker_note(e: &Environment, name: &str, after: &str) -> String {
+    format!(
+        "cauldron: note: a project's `.cauldron` marker (`cauldron link`) that names `{name}` is not updated \
+         (markers are not tracked); {after}. `cauldron link --show` in a project says what its marker names. \
+         Environment: `{}`.",
+        e.name
+    )
+}
+
+fn door_err(err: soup_door::Error) -> anyhow::Error {
+    anyhow::anyhow!("{err}")
+}
+
 /// The existing `Dir` cauldron `name`, or a refusal naming what it is instead.
 fn existing(e: &Environment, name: &str, verb: &str) -> Result<Cauldron> {
     match e.find_cauldron(name)? {
@@ -458,21 +556,67 @@ pub(crate) fn verb_rename(args: &[String]) -> Result<i32> {
         bail!("REFUSED: cauldron `{new}` already exists in environment `{}`", e.name);
     }
     let from = c.dir().expect("check_renamable admits only Dir cauldrons");
-    // Order: the lock first (held to the end), then the tranche, then the soup.
+    // Order: the lock first (held to the end), then the tranche, then the
+    // soup daemon, then the writer locks (held to the end too).
     let _lock = take_open_lock(&c)?;
     refuse_held_tranche(&c)?;
     refuse_live_soup(&e, "rename")?;
+    let _writers = take_writer_locks(&e, &c, "rename")?;
+    let identity = soup_door::grants::identity(&c);
+    // Read before anything moves: a grant store that cannot be read refuses here.
+    let granted = soup_door::grants::Grants::load(&e).map_err(door_err)?.get(old).is_some();
     // The manifest's name first: a crash between the two leaves a directory
     // whose manifest names where it was going, never a moved dir with a lie.
     let mut meta = c.meta()?;
     meta.name = Some(new.clone());
     let manifest = from.join(CAULDRON_MANIFEST);
     let tmp = from.join(format!(".{CAULDRON_MANIFEST}.{}", std::process::id()));
-    std::fs::write(&tmp, meta.to_toml()?).with_context(|| format!("writing {}", tmp.display()))?;
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Written the owner's only, whatever the umask (`env::private`).
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(env::private::FILE_MODE)
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.write_all(meta.to_toml()?.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, &manifest).with_context(|| format!("replacing {}", manifest.display()))?;
     std::fs::rename(&from, &to).with_context(|| format!("renaming {} to {}", from.display(), to.display()))?;
+    // The moved cauldron is its owner's only, as `cauldron create` makes one:
+    // whatever the umask, and whatever an older release left loose in it.
+    // A failure here is said, never fatal: the cauldron has moved, and its
+    // grant must still follow it (below). Its next writer tightens it.
+    if let Err(err) = env::private::tighten_tree(&to) {
+        eprintln!(
+            "cauldron: WARNING: the renamed cauldron {} could not be made its owner's only ({err}); its next writer \
+             (`cauldron soup import`, or the `mcp` service) makes it so",
+            to.display()
+        );
+    }
     println!("{}", e.banner());
     println!("cauldron: renamed cauldron `{old}` to `{new}` in environment `{}`", e.name);
+    // The grant follows the cauldron. After the move, so a failed move never
+    // leaves a grant naming a cauldron that is not there.
+    match soup_door::grants::rename(&e, old, new, identity.as_deref()) {
+        Ok(_) if granted => println!(
+            "cauldron: its MCP grant now names `{new}` and still opens it (bound to the cauldron created {})",
+            identity.as_deref().unwrap_or("at an unknown time")
+        ),
+        Ok(_) => println!("cauldron: it has no MCP grant; nothing to carry"),
+        Err(err) => bail!(
+            "the cauldron was renamed, but its MCP grant could not be carried to `{new}`: {}. The grant under `{old}` \
+             opens nothing now. Grant it again with `cauldron mcp grant {new} --env {}`, and drop the old one with \
+             `cauldron mcp revoke {old} --env {}`.",
+            door_err(err),
+            e.name,
+            e.name
+        ),
+    }
+    println!("{}", marker_note(&e, old, &format!("re-link such a project with `cauldron link {new} --env {} --replace` there", e.name)));
     Ok(0)
 }
 
@@ -500,11 +644,16 @@ pub(crate) fn verb_remove(args: &[String]) -> Result<i32> {
     let _lock = take_open_lock(&c)?;
     refuse_held_tranche(&c)?;
     refuse_live_soup(&e, "remove")?;
+    let _writers = take_writer_locks(&e, &c, "remove")?;
+    let granted = soup_door::grants::Grants::load(&e).map_err(door_err)?.get(&name).is_some();
     println!("{}", e.banner());
     if !a.yes {
         println!("cauldron: DRY RUN — would remove cauldron `{name}` from environment `{}`:", e.name);
-        println!("  moved          {}", from.display());
+        println!("  moved          {} (its soup and dumps with it)", from.display());
         println!("  to             {} (nothing is deleted)", to.display());
+        if granted {
+            println!("  MCP grant      dropped (the MCP door no longer opens `{name}`)");
+        }
         println!("  untouched      every other cauldron, and the environment itself");
         println!("cauldron: re-run with `--yes` to do it.");
         return Ok(2);
@@ -516,6 +665,17 @@ pub(crate) fn verb_remove(args: &[String]) -> Result<i32> {
     }
     std::fs::rename(&from, &to).with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
     println!("cauldron: removed cauldron `{name}`: moved to {}", to.display());
+    match soup_door::grants::forget(&e, &name) {
+        Ok(true) => println!("cauldron: its MCP grant was dropped"),
+        Ok(false) => {}
+        Err(err) => bail!(
+            "the cauldron was removed, but its MCP grant could not be dropped: {}. It opens nothing now (the \
+             cauldron is gone); drop it with `cauldron mcp revoke {name} --env {}`.",
+            door_err(err),
+            e.name
+        ),
+    }
+    println!("{}", marker_note(&e, &name, "`cauldron soup` run in such a project now refuses it"));
     Ok(0)
 }
 

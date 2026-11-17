@@ -369,6 +369,10 @@ fn f1_an_import_is_sent_to_the_service_that_holds_the_soup() {
     assert_eq!(o.rc, 0, "{}", o.err);
     let st = o.json();
     assert_eq!((st["service"]["state"].clone(), st["service"]["pid"].clone()), (json!("live"), json!(svc.pid())), "{st}");
+    // Its version, beside this cauldron's: the same build, so no skew.
+    assert_eq!(st["service"]["version"], st["service"]["cauldron_version"], "{st}");
+    assert!(st["service"]["version"].is_string() && st["service"].get("version_skew").is_none(), "{st}");
+    assert!(!o.err.contains("VERSION SKEW"), "{}", o.err);
     assert_eq!(st["open"][0]["cauldron"], "kb", "{st}");
     assert_eq!(st["open"][0]["recovered_at_open"]["interrupted"], "none");
     let kb = st["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap();
@@ -531,6 +535,7 @@ fn b1_the_bridge_relays_with_its_own_context_and_answers_when_the_service_is_dow
     let mut b = Bridge::start(&s, &sub, &[], &[("CLAUDE_CODE_SESSION_ID", "sess-b1")], &pids);
     let i = init(&mut b);
     assert!(!i["result"]["instructions"].as_str().unwrap().contains("not running"), "{i}");
+    assert!(!i["result"]["instructions"].as_str().unwrap().contains("VERSION SKEW"), "the same build: no skew: {i}");
     let list = b.ask(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).unwrap();
     assert_eq!(list["result"]["tools"].as_array().unwrap().len(), names.len());
     assert!(list["result"]["tools"].as_array().unwrap().iter().all(|t| t["inputSchema"]["properties"].get("_ctx").is_none()));
@@ -831,4 +836,81 @@ fn d3_the_dumps_store_is_private_whatever_the_umask() {
         }
     }
     assert!(files >= 4, "spine.db, dumps.db, writer.lock and the blob: {files}");
+}
+
+// --------------------------------------------------------------------- D4
+
+/// **Many dumps at once, through the service and the command line, never
+/// collide.** While the service holds the dumps store, 8 clients send 15
+/// `soup_dump` calls each straight to its door and 12 `cauldron soup dump`
+/// commands run at the same time (each sent on to the service): half the
+/// texts are one and the same, half are each their own. Every call lands
+/// (0.1.7 refused some as `store`, `File exists`, when two temporary blob
+/// names met); the ids are DM-1..DM-132, each once; the identical texts share
+/// one blob; every dump reads back as the text that was sent.
+#[test]
+fn d4_concurrent_dumps_through_the_service_and_the_command_line_all_land() {
+    let s = std::sync::Arc::new(Scratch::new("d4", &["kb"]));
+    s.grant("kb");
+    let svc = std::sync::Arc::new(Service::start(&s));
+    let pids = [svc.pid()];
+    let same = "the same words, sent by everyone at once\n";
+    let own = |who: &str, n: usize| format!("words of {who}, number {n}, theirs alone\n");
+    // The store held by the service before the rush.
+    let first = svc.call(&s, "soup_dump", json!({"cauldron": "kb", "text": same}));
+    assert_eq!(first["structuredContent"]["dump_id"], "DM-1", "{first}");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8 + 12));
+    let mut handles = Vec::new();
+    for t in 0..8 {
+        let (s, svc, barrier) = (s.clone(), svc.clone(), barrier.clone());
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let mut got = Vec::new();
+            for n in 0..15 {
+                let text = if n % 2 == 0 { same.to_string() } else { own(&format!("door {t}"), n) };
+                let r = svc.call(&s, "soup_dump", json!({"cauldron": "kb", "text": text}));
+                got.push((r, text));
+            }
+            got
+        }));
+    }
+    for t in 0..12 {
+        let (s, barrier) = (s.clone(), barrier.clone());
+        handles.push(std::thread::spawn(move || {
+            let text = if t % 2 == 0 { same.to_string() } else { own(&format!("shell {t}"), 0) };
+            let mut c = s.command(&["soup", "dump", "-", "--env", "dev", "--cauldron", "kb"], &pids);
+            c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            barrier.wait();
+            let mut child = c.spawn().unwrap();
+            child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+            let o = child.wait_with_output().unwrap();
+            assert!(o.status.success(), "a shell dump failed: {}", String::from_utf8_lossy(&o.stderr));
+            let j: Value = serde_json::from_slice(&o.stdout).unwrap();
+            assert_eq!(j["forwarded_to"]["pid"], json!(pids[0]), "{j}");
+            vec![(json!({"isError": false, "structuredContent": j}), text)]
+        }));
+    }
+    let mut landed: Vec<(String, String)> = Vec::new();
+    for h in handles {
+        for (r, text) in h.join().unwrap() {
+            assert_eq!(r["isError"], json!(false), "a dump was refused: {r}");
+            landed.push((r["structuredContent"]["dump_id"].as_str().unwrap().to_string(), text));
+        }
+    }
+    assert_eq!(landed.len(), 8 * 15 + 12);
+    let mut ids: Vec<u64> = landed.iter().map(|(id, _)| id.strip_prefix("DM-").unwrap().parse().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, (2..=(1 + 8 * 15 + 12) as u64).collect::<Vec<_>>(), "every id once");
+    // One blob per distinct text.
+    let distinct: std::collections::HashSet<&str> = landed.iter().map(|(_, t)| t.as_str()).chain([same]).collect();
+    let blobs = std::fs::read_dir(s.data().join("cauldrons/kb/dumps/blobs")).unwrap().flatten().filter(|e| !e.file_name().to_string_lossy().starts_with('.')).count();
+    assert_eq!(blobs, distinct.len(), "the identical texts share one blob, and nothing else is left");
+    // Each reads back as what was sent.
+    for (id, text) in landed.iter().step_by(7) {
+        let g = svc.call(&s, "soup_dump_get", json!({"cauldron": "kb", "id": id}));
+        assert_eq!(g["structuredContent"]["text"].as_str(), Some(text.as_str()), "{id}: {g}");
+    }
+    let list = s.run(&["soup", "dumps", "--env", "dev", "--cauldron", "kb"], &pids).json();
+    assert_eq!(list["total"], json!(1 + 8 * 15 + 12), "{list}");
 }

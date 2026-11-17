@@ -1438,6 +1438,280 @@ fn s17_a_mark_in_an_agent_label_or_file_name_is_not_a_landing() {
     assert_eq!(o.json()["landed_before"][0]["records"], 1);
 }
 
+// ------------------------------------------------- the consumer's issues
+
+/// Issue #19: a refused `--remint` import printed an `id_map` (and each
+/// record's `new_id`) for ids that were never taken; the next import then
+/// gave one of them to another record. Now a refused batch prints neither,
+/// and a batch that lands or validates still does.
+#[test]
+fn i19_a_refused_remint_prints_no_id_map() {
+    let s = scratch("i19", &["kb"]);
+    assert_eq!(import(&s, "kb", &write_json(&s, "example.json", &example()), &[]).rc, 0);
+    // His reproduction: a case that the grammar refuses, and a pattern drawn
+    // from it (refused with it as `target-refused`).
+    let refused = vec![
+        json!({"id": "CASE-1", "type": "idea", "state": "no-such-state", "handle": "A case that will not land",
+               "edges": [{"kind": "in_region", "to": "R-1", "note": "the published schema"}]}),
+        json!({"id": "PAT-1", "type": "decision", "state": "decided", "handle": "A pattern drawn from the case",
+               "edges": [{"kind": "in_region", "to": "R-1", "note": "the published schema"}, {"kind": "derived_from", "to": "CASE-1"}]}),
+    ];
+    let input = write_json(&s, "refused.json", &refused);
+    for extra in [&["--remint"][..], &["--remint", "--dry-run"][..]] {
+        let o = import(&s, "kb", &input, extra);
+        assert_eq!(o.rc, 1, "{extra:?}: {}", o.out);
+        let d = o.json();
+        assert_eq!(d["outcome"], "refused", "{d}");
+        assert!(d.get("id_map").is_none(), "a refused batch printed an id_map: {d}");
+        assert!(d["records"].as_array().unwrap().iter().all(|r| r.get("new_id").is_none()), "a refused record carries a new_id: {d}");
+        assert_eq!(d["refused"], 2, "{d}");
+    }
+    // Opposed: the same batch without the bad state validates and lands,
+    // and both answers carry the map and each record's new id.
+    let mut good = refused.clone();
+    good[0]["state"] = json!("idea");
+    let input = write_json(&s, "good.json", &good);
+    for (extra, outcome) in [(&["--remint", "--dry-run"][..], "validated"), (&["--remint"][..], "landed")] {
+        let o = import(&s, "kb", &input, extra);
+        assert_eq!(o.rc, 0, "{extra:?}: {}\n{}", o.out, o.err);
+        let d = o.json();
+        assert_eq!(d["outcome"], outcome, "{d}");
+        assert_eq!(d["id_map"], json!({"CASE-1": "C-2", "PAT-1": "DEC-2"}), "{d}");
+        assert_eq!(d["records"][1]["new_id"], "DEC-2", "{d}");
+    }
+}
+
+/// The keys every refused batch prints, whatever refused it (#20).
+const REFUSED_SHAPE: [&str; 11] =
+    ["env", "cauldron", "pool", "dry_run", "remint", "outcome", "refusal", "accepted", "refused", "records", "batch_digest"];
+
+fn assert_refused_shape(d: &Value, refusal: &str) {
+    for k in REFUSED_SHAPE {
+        assert!(d.get(k).is_some(), "a refused batch without `{k}`: {d}");
+    }
+    assert_eq!(d["outcome"], "refused", "{d}");
+    assert_eq!(d["refusal"], refusal, "{d}");
+    assert!(d["accepted"].is_u64() && d["refused"].is_u64() && d["records"].is_array(), "{d}");
+}
+
+/// Issue #20: `batch-already-landed` printed another JSON shape than every
+/// other import (no `accepted`, `refused` or `records`). Now every refused
+/// batch prints the same keys, and says what refused it in `refusal`.
+#[test]
+fn i20_a_batch_already_landed_prints_the_shape_of_every_refused_batch() {
+    let s = scratch("i20", &["kb"]);
+    let input = write_json(&s, "example.json", &example());
+    assert_eq!(import(&s, "kb", &input, &[]).rc, 0);
+    // His reproduction: the same batch again, for real and as a dry run.
+    for extra in [&[][..], &["--dry-run"][..]] {
+        let o = import(&s, "kb", &input, extra);
+        assert_eq!(o.rc, 1, "{extra:?}: {}", o.out);
+        let d = o.json();
+        assert_refused_shape(&d, "batch-already-landed");
+        assert_eq!((d["accepted"].as_u64(), d["refused"].as_u64()), (Some(0), Some(example().len() as u64)), "{d}");
+        assert_eq!(d["records"], json!([]), "{d}");
+        assert!(d["landed_before"].is_array() && d["why"].is_string(), "{d}");
+    }
+    // The other refusal, a record the grammar refuses: the same keys.
+    let bad = write_json(&s, "bad.json", &[json!({"id": "b", "type": "task", "state": "no-such-state", "handle": "A bad task",
+                                                     "edges": [{"kind": "in_region", "to": "R-1"}]})]);
+    for extra in [&["--remint"][..], &["--remint", "--dry-run"][..]] {
+        let o = import(&s, "kb", &bad, extra);
+        assert_eq!(o.rc, 1, "{extra:?}: {}", o.out);
+        let d = o.json();
+        assert_refused_shape(&d, "records-refused");
+        assert_eq!(d["records"][0]["id"], "b", "{d}");
+    }
+    // Opposed: a batch that lands carries no `refusal`.
+    let good = write_json(&s, "good.json", &[json!({"id": "g", "type": "task", "state": "ready", "handle": "A good task",
+                                                      "edges": [{"kind": "in_region", "to": "R-1"}]})]);
+    let d = import(&s, "kb", &good, &["--remint"]).json();
+    assert_eq!(d["outcome"], "landed", "{d}");
+    assert!(d.get("refusal").is_none(), "{d}");
+}
+
+/// Issue #18: an edge with a `note` and an undeclared key (`weight`) was
+/// refused as carrying "both `note` and declared fields", though `weight` is
+/// declared for no edge. Now the reason names the key.
+#[test]
+fn i18_an_unknown_edge_key_beside_a_note_is_named() {
+    let s = scratch("i18", &["kb"]);
+    assert_eq!(import(&s, "kb", &write_json(&s, "example.json", &example()), &[]).rc, 0);
+    // His reproduction.
+    let rec = |edge: Value| json!({"id": "n1", "type": "decision", "state": "decided", "handle": "A decision with a weighted region edge", "edges": [edge]});
+    let input = write_json(&s, "weight.json", &[rec(json!({"kind": "in_region", "to": "R-1", "note": "the published schema", "weight": 1}))]);
+    for extra in [&["--remint", "--dry-run"][..], &["--remint"][..]] {
+        let o = import(&s, "kb", &input, extra);
+        assert_eq!(o.rc, 1, "{extra:?}: {}", o.out);
+        let r = &o.json()["records"][0]["reasons"][0];
+        assert_eq!(r["code"], "record-shape", "{r}");
+        assert_eq!(r["edge"], 0, "{r}");
+        let why = r["detail"].as_str().unwrap();
+        assert!(why.contains("`weight` is not a field of `in_region` edges"), "{why}");
+        assert!(!why.contains("both `note` and declared fields"), "{why}");
+    }
+    // Without the note the door names it too, as before.
+    let input = write_json(&s, "weight-only.json", &[rec(json!({"kind": "in_region", "to": "R-1", "weight": 1}))]);
+    let o = import(&s, "kb", &input, &["--remint", "--dry-run"]);
+    assert_eq!(o.rc, 1);
+    assert!(o.out.contains("edge kind `in_region` declares no field `weight`"), "{}", o.out);
+    // The note-or-fields reason is kept for a kind that declares fields.
+    let viewer = json!({"id": "v", "type": "viewer", "role": "reviewer",
+                        "edges": [{"kind": "shows", "to": "DEC-1", "note": "x", "why": "the decision under review", "cite": {"thread": "t", "msg": 1}}]});
+    let o = import(&s, "kb", &write_json(&s, "viewer.json", &[viewer]), &["--remint", "--dry-run"]);
+    assert_eq!(o.rc, 1);
+    assert!(o.json()["records"][0]["reasons"][0]["detail"].as_str().unwrap().contains("carries both `note` and declared fields"), "{}", o.out);
+    // Opposed: the same record with only its note validates.
+    let input = write_json(&s, "note.json", &[rec(json!({"kind": "in_region", "to": "R-1", "note": "the published schema"}))]);
+    let o = import(&s, "kb", &input, &["--remint", "--dry-run"]);
+    assert_eq!(o.rc, 0, "{}", o.out);
+}
+
+/// Issue #21: `nodes` printed `state: null` for regions, which carry no
+/// state at all. Now a region or viewer is listed without the key, in
+/// `nodes`, `search` and a region's members alike.
+#[test]
+fn i21_a_region_or_viewer_is_listed_without_state() {
+    let s = scratch("i21", &["kb"]);
+    assert_eq!(import(&s, "kb", &write_json(&s, "example.json", &example()), &[]).rc, 0);
+    // His reproduction.
+    let d = read(&s, "nodes", &["--type", "region"]);
+    let regions = d["nodes"].as_array().unwrap();
+    assert_eq!(regions.len(), 2, "{d}");
+    assert!(regions.iter().all(|n| n.get("state").is_none()), "{d}");
+    // Every stateless type, in every list read; every other node keeps it.
+    let all = read(&s, "nodes", &[]);
+    for n in all["nodes"].as_array().unwrap() {
+        let stateless = n["type"] == "region" || n["type"] == "viewer";
+        assert_eq!(n.get("state").is_none(), stateless, "{n}");
+        if !stateless {
+            assert!(n["state"].is_string(), "{n}");
+        }
+    }
+    let hits = read(&s, "search", &["schema"]);
+    let r1 = hits["results"].as_array().unwrap().iter().find(|n| n["id"] == "R-1").expect("R-1 matches `schema`");
+    assert!(r1.get("state").is_none(), "{hits}");
+    assert!(hits["results"].as_array().unwrap().iter().any(|n| n["state"].is_string()), "{hits}");
+    let members = read(&s, "region", &["R-1"])["members"].clone();
+    assert!(members.as_array().unwrap().iter().all(|n| n["state"].is_string()), "{members}");
+}
+
+/// An idea in R-1 with `meta`.
+fn cited(label: &str, meta: Value) -> Value {
+    json!({"id": label, "type": "idea", "state": "idea", "handle": format!("A case labelled {label}"), "meta": meta,
+           "edges": [{"kind": "in_region", "to": "R-1", "note": "the published schema"}]})
+}
+
+/// Issue #15: `meta.cites` was never checked, so a misspelled kind or a
+/// missing key landed silently. Now the import refuses such a record as
+/// `bad-cite`, naming it, in a dry run and a real import; every citation the
+/// README's table describes (with extra keys) still lands.
+#[test]
+fn i15_a_bad_citation_refuses_its_record() {
+    let s = scratch("i15", &["kb"]);
+    let soup = s.soup("kb");
+    // The README's own example carries a `file` citation and lands.
+    assert_eq!(import(&s, "kb", &write_json(&s, "example.json", &example()), &[]).rc, 0);
+    // His reproduction: a misspelled kind, and a commit without its sha.
+    let bad = vec![
+        cited("c1", json!({"kind": "case", "cites": [{"kind": "fiel", "path": "notes/run.log"}]})),
+        cited("c2", json!({"kind": "case", "cites": [{"kind": "commit", "repo": "cauldron"}]})),
+    ];
+    let input = write_json(&s, "bad.json", &bad);
+    let before = db_bytes(&soup);
+    for extra in [&["--remint", "--dry-run"][..], &["--remint"][..]] {
+        let o = import(&s, "kb", &input, extra);
+        assert_eq!(o.rc, 1, "{extra:?}: {}", o.out);
+        let d = o.json();
+        assert_eq!(d["refusal"], "records-refused", "{d}");
+        for (i, (label, says)) in [("c1", "`fiel` is not a citation kind"), ("c2", "(commit) lacks `sha`")].iter().enumerate() {
+            let r = &d["records"][i];
+            assert_eq!(r["id"], *label, "{d}");
+            assert_eq!(r["reasons"][0]["code"], "bad-cite", "{d}");
+            let why = r["reasons"][0]["detail"].as_str().unwrap();
+            assert!(why.starts_with(&format!("`{label}`: meta.cites[0]")) && why.contains(says), "{why}");
+        }
+        assert_eq!(db_bytes(&soup), before, "{extra:?} wrote");
+    }
+    // Opposed: every kind of the table, with its keys and extra ones, lands.
+    let good = vec![
+        cited("g1", json!({"cites": [{"kind": "session", "id": "s-1", "at": "turn 4"}]})),
+        cited("g2", json!({"cites": [{"kind": "file", "path": "src/lib.rs", "line": 40, "repo": "cauldron", "commit": "main"}]})),
+        cited("g3", json!({"cites": [{"kind": "commit", "repo": "cauldron", "sha": "main"}]})),
+        cited("g4", json!({"cites": [{"kind": "url", "url": "https://example.com/spec"}]})),
+        cited("g5", json!({"cites": [{"kind": "thread", "thread": "t-1", "msg": 12}]})),
+        cited("g6", json!({"cites": [{"kind": "dump", "id": "DM-3"}]})),
+        cited("g7", json!({"kind": "case"})),
+    ];
+    let o = import(&s, "kb", &write_json(&s, "good.json", &good), &["--remint"]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert_eq!(o.json()["accepted"], 7);
+}
+
+/// Issue #16: after DEC-3 superseded DEC-2, every read showed DEC-2 as a
+/// plain `decided` node. Now `get` answers it with `superseded_by`, and
+/// `nodes`, `search` and `region` leave it out, saying how many they left
+/// out, unless `--include-superseded`.
+#[test]
+fn i16_reads_mark_and_hide_a_superseded_node() {
+    let s = scratch("i16", &["kb"]);
+    assert_eq!(import(&s, "kb", &write_json(&s, "example.json", &example()), &[]).rc, 0);
+    // His reproduction: a decision, then a second one superseding it.
+    let first = json!({"id": "DEC-2", "type": "decision", "state": "decided", "handle": "Supersede test: the first version of the rule",
+                       "edges": [{"kind": "in_region", "to": "R-1", "note": "the published schema"}]});
+    let second = json!({"id": "DEC-3", "type": "decision", "state": "decided", "handle": "Supersede test: the second version of the rule",
+                        "edges": [{"kind": "in_region", "to": "R-1", "note": "the published schema"},
+                                  {"kind": "supersedes", "to": "DEC-2", "note": "replaces the first version"}]});
+    // Before the supersede, nothing is hidden and nothing is marked.
+    assert_eq!(import(&s, "kb", &write_json(&s, "first.json", &[first.clone()]), &[]).rc, 0);
+    let d = read(&s, "nodes", &["--type", "decision"]);
+    assert_eq!((d["total"].as_u64(), d["superseded_hidden"].as_u64()), (Some(2), Some(0)), "{d}");
+    assert!(read(&s, "get", &["DEC-2"])["records"][0].get("superseded_by").is_none());
+    assert_eq!(import(&s, "kb", &write_json(&s, "second.json", &[second]), &[]).rc, 0);
+
+    // get: always the node, marked.
+    let d = read(&s, "get", &["DEC-2", "DEC-3"]);
+    assert_eq!(d["records"][0]["id"], "DEC-2", "{d}");
+    assert_eq!(d["records"][0]["state"], "decided", "{d}");
+    assert_eq!(d["records"][0]["superseded_by"], json!(["DEC-3"]), "{d}");
+    assert!(d["records"][1].get("superseded_by").is_none(), "{d}");
+    // nodes, search, region: hidden and counted.
+    let ids_of = |list: &Value| -> Vec<String> { list.as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap().to_string()).collect() };
+    let d = read(&s, "nodes", &["--type", "decision"]);
+    assert_eq!(ids_of(&d["nodes"]), ["DEC-3", "DEC-1"], "{d}");
+    assert_eq!((d["total"].as_u64(), d["superseded_hidden"].as_u64()), (Some(2), Some(1)), "{d}");
+    let d = read(&s, "search", &["supersede", "test"]);
+    assert!(!ids_of(&d["results"]).contains(&"DEC-2".to_string()), "{d}");
+    assert!(ids_of(&d["results"]).contains(&"DEC-3".to_string()), "{d}");
+    assert_eq!(d["superseded_hidden"], 1, "{d}");
+    let d = read(&s, "region", &["R-1"]);
+    assert!(!ids_of(&d["members"]).contains(&"DEC-2".to_string()), "{d}");
+    assert_eq!((d["members_total"].as_u64(), d["superseded_hidden"].as_u64()), (Some(5), Some(1)), "{d}");
+    // A filter that leaves the superseded node out hides nothing.
+    assert_eq!(read(&s, "nodes", &["--type", "issue"])["superseded_hidden"], 0);
+    // --include-superseded lists it, marked, and hides nothing.
+    for (verb, extra, list) in [
+        ("nodes", &["--type", "decision"][..], "nodes"),
+        ("search", &["supersede", "test"][..], "results"),
+        ("region", &["R-1"][..], "members"),
+    ] {
+        let mut args = extra.to_vec();
+        args.push("--include-superseded");
+        let d = read(&s, verb, &args);
+        assert_eq!(d["superseded_hidden"], 0, "{verb}: {d}");
+        let dec2 = d[list].as_array().unwrap().iter().find(|n| n["id"] == "DEC-2").unwrap_or_else(|| panic!("{verb}: {d}"));
+        assert_eq!(dec2["superseded_by"], json!(["DEC-3"]), "{verb}: {d}");
+        assert!(d[list].as_array().unwrap().iter().filter(|n| n["id"] != "DEC-2").all(|n| n.get("superseded_by").is_none()), "{d}");
+    }
+    // --limit and --max-chars bound what is listed, as before.
+    let d = read(&s, "nodes", &["--type", "decision", "--limit", "1", "--max-chars", "10"]);
+    assert_eq!((d["total"].as_u64(), d["more"].as_u64(), d["superseded_hidden"].as_u64()), (Some(2), Some(1), Some(1)), "{d}");
+    assert_eq!(d["nodes"][0]["handle"].as_str().unwrap().chars().count(), 10, "{d}");
+    // The flag is refused where it means nothing.
+    let o = run(&s, &["soup", "get", "DEC-2", "--include-superseded", "--env", "dev", "--cauldron", "kb"]);
+    assert_ne!(o.rc, 0, "{}", o.out);
+}
+
 // ---------------------------------------------------------------- golden
 
 /// **The output of every soup verb, byte for byte, against a recorded
@@ -1560,4 +1834,280 @@ fn s18_every_verb_prints_exactly_the_recorded_output() {
         assert_eq!(w.len(), t.len(), "the session changed length");
         panic!("golden text differs only in formatting");
     }
+}
+
+// ---------------------------------------------------------------- dumps
+
+/// User-role lines Claude Code records that the person did not type: a
+/// `!` command and its output, a slash command's wrapper, a local command's
+/// output, system reminders, an attachment, a compaction summary, a tool
+/// result. Each holds `PLANTED` and none is a text turn.
+fn planted_lines(i: usize) -> Vec<Value> {
+    let user = |content: Value| json!({"type": "user", "message": {"role": "user", "content": content}});
+    vec![
+        user(json!(format!("<bash-input>cat .env PLANTED_SHELL_IN_{i}</bash-input>"))),
+        user(json!(format!("<bash-stdout>TOKEN=PLANTED_SHELL_OUT_{i}</bash-stdout><bash-stderr>PLANTED_SHELL_ERR_{i}</bash-stderr>"))),
+        user(json!(format!("<command-name>/deploy</command-name>\n<command-args>PLANTED_ARGS_{i}</command-args>"))),
+        user(json!(format!("<local-command-stdout>PLANTED_LOCAL_{i}</local-command-stdout>"))),
+        user(json!([{"type": "text", "text": format!("<system-reminder>PLANTED_REMINDER_{i}</system-reminder>")}])),
+        json!({"type": "attachment", "attachment": {"type": "file", "content": format!("PLANTED_ATTACHMENT_{i}")}}),
+        json!({"type": "user", "isCompactSummary": true, "message": {"role": "user", "content": format!("PLANTED_SUMMARY_{i}")}}),
+        json!({"type": "user", "toolUseResult": {"stdout": format!("PLANTED_TOOL_{i}")},
+               "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": format!("PLANTED_TOOL_{i}")}]}}),
+    ]
+}
+
+/// A session dump made in `s`'s cauldron `c` as the service makes one,
+/// from a fixture transcript with tool calls between its text turns.
+fn session_dump(s: &Scratch, c: &str) -> (env::Cauldron, Vec<u8>) {
+    use std::io::Write;
+    let e = env::Environment {
+        root: s.root(),
+        root_source: env::paths::Source::CauldronHome,
+        name: "dev".into(),
+        name_source: env::paths::Source::CauldronEnv,
+        data_root: s.data(),
+    };
+    let cauldron = e.find_cauldron(c).unwrap().expect("the cauldron");
+    let mut t = Vec::new();
+    for i in 0..30 {
+        for v in [
+            json!({"type": "user", "message": {"role": "user", "content": format!("question {i}")}}),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": format!("answer {i}")},
+                {"type": "tool_use", "id": format!("call-{i}"), "name": "Read", "input": {}}]}}),
+            json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("call-{i}"), "content": "TOOL OUTPUT"}]}}),
+        ] {
+            t.extend_from_slice(v.to_string().as_bytes());
+            t.push(b'\n');
+        }
+        // Every tenth exchange, what Claude Code records as the user's that
+        // the person did not type, each with a planted secret.
+        if i % 10 == 3 {
+            for v in planted_lines(i) {
+                t.extend_from_slice(v.to_string().as_bytes());
+                t.push(b'\n');
+            }
+        }
+    }
+    let store = soup_door::dumps::Store::open(&cauldron, "test 1").unwrap();
+    let mut w = store.blob(soup_door::dumps::Kind::Session).unwrap();
+    w.write_all(&t).unwrap();
+    let by = soup_door::dumps::By { thread: "test".into(), dispatch: "test".into(), instrument: "test".into(), version: "0".into() };
+    let make = |blob: &soup_door::dumps::Blob| {
+        Ok(soup_door::dumps::NewDump {
+            env: "dev".into(),
+            content: soup_door::dumps::Content::Session { session_id: "sess-one".into(), cwd: None, lines: 90 },
+            blob: blob.clone(),
+            title: Some("A session".into()),
+            cite: None,
+            refs: vec![],
+            client: "test".into(),
+            session: None,
+        })
+    };
+    let (_, landed) = store.commit(w, || Ok(()), make, &by, |e| e).unwrap();
+    assert_eq!(landed.id, "DM-1");
+    (cauldron, t)
+}
+
+/// `cauldron soup dump-get --view text` is the text view the MCP door
+/// answers (the same library call), page for page; `--turn-offset` and
+/// `--raw` refuse where they do not apply.
+#[test]
+fn d4_dump_get_view_text_pages_the_turns_as_the_door_does() {
+    let s = scratch("textview", &["kb"]);
+    let (c, transcript) = session_dump(&s, "kb");
+    let k = ["--env", "dev", "--cauldron", "kb"];
+    let (mut off, mut turns, mut tool_calls) = (0u64, 0usize, 0u64);
+    let mut left_out = std::collections::BTreeMap::new();
+    loop {
+        let o = off.to_string();
+        let mut args = vec!["soup", "dump-get", "DM-1", "--view", "text", "--max-chars", "1000", "--offset", &o];
+        args.extend_from_slice(&k);
+        let out = run(&s, &args);
+        assert_eq!(out.rc, 0, "{}", out.err);
+        let page = out.json();
+        assert_eq!(page, soup_door::dumps::get_text(&c, "DM-1", off, 0, 1000).unwrap(), "the CLI's page is the library's");
+        assert!(page.to_string().chars().count() <= 1000);
+        assert!(!out.out.contains("TOOL OUTPUT"));
+        assert!(!out.out.contains("PLANTED"), "a planted secret is shown: {}", out.out);
+        turns += page["turns"].as_array().unwrap().len();
+        tool_calls += page["elided"]["tool_calls"].as_u64().unwrap();
+        for f in ["shell", "commands", "local_command", "system_reminders", "attachments", "generated"] {
+            *left_out.entry(f).or_insert(0) += page["elided"][f].as_u64().unwrap();
+        }
+        assert!(page.get("next_turn_offset").is_none(), "no turn here is longer than a page");
+        match page["next_offset"].as_u64() {
+            Some(n) => off = n,
+            None => break,
+        }
+    }
+    assert_eq!((turns, tool_calls), (60, 30));
+    // Three planted groups, each counted by kind.
+    let want: std::collections::BTreeMap<&str, u64> =
+        [("shell", 6), ("commands", 3), ("local_command", 3), ("system_reminders", 3), ("attachments", 3), ("generated", 3)].into();
+    assert_eq!(left_out, want);
+    assert!(transcript.windows(7).filter(|w| w == b"PLANTED").count() >= 27, "the stored transcript holds them all");
+    for (bad, why) in [
+        (vec!["soup", "dump-get", "DM-1", "--view", "text", "--raw"], "--raw with the text view"),
+        (vec!["soup", "dump-get", "DM-1", "--turn-offset", "2"], "--turn-offset without the text view"),
+        (vec!["soup", "dump-get", "DM-1", "--view", "words"], "an unknown view"),
+        (vec!["soup", "dump-get", "DM-1", "--view", "text", "--offset", "3"], "an offset inside a line"),
+        (vec!["soup", "dump-get", "DM-1", "--view", "text", "--max-chars", "999"], "a text page under the floor"),
+        (vec!["soup", "dump-get", "DM-1", "--max-chars", "256"], "a raw page under the floor"),
+    ] {
+        let mut args = bad.clone();
+        args.extend_from_slice(&k);
+        let o = run(&s, &args);
+        assert_ne!(o.rc, 0, "{why}: {}", o.out);
+        assert!(o.out.is_empty(), "{why}: a refusal prints no JSON");
+    }
+    // The raw view is unchanged.
+    let mut args = vec!["soup", "dump-get", "DM-1", "--max-chars", "1000"];
+    args.extend_from_slice(&k);
+    let raw = run(&s, &args).json();
+    assert!(raw.to_string().chars().count() <= 1000);
+    assert!(transcript.starts_with(raw["text"].as_str().unwrap().as_bytes()) && raw["next_offset"].is_u64());
+}
+
+// ---------------------------------------------------------------- modes
+
+/// Every directory and file under `root`, with its mode (links skipped).
+fn modes_under(root: &Path) -> Vec<(String, bool, u32)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut out = vec![];
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let md = std::fs::symlink_metadata(&d).unwrap();
+        out.push((d.display().to_string(), true, md.permissions().mode() & 0o777));
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let md = std::fs::symlink_metadata(e.path()).unwrap();
+            if md.is_dir() {
+                todo.push(e.path());
+            } else if md.is_file() {
+                out.push((e.path().display().to_string(), false, md.permissions().mode() & 0o777));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn all_private(root: &Path) -> bool {
+    modes_under(root).iter().all(|(_, dir, m)| *m == if *dir { 0o700 } else { 0o600 })
+}
+
+fn loosen(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for (p, dir, _) in modes_under(root) {
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(if dir { 0o755 } else { 0o644 })).unwrap();
+    }
+}
+
+/// **A cauldron's data is its owner's only.** `cauldron create`, even under
+/// a umask that takes nothing away, makes every directory of the cauldron
+/// 0700 and every file 0600; `cauldron list` and the reads work as before.
+/// A store made before this (0755/0644) is left alone by reads and dry
+/// runs, which write nothing, and tightened by the next real import.
+#[test]
+fn p1_a_cauldron_s_data_is_private_whatever_the_umask() {
+    let s = scratch("modes", &[]);
+    let mut c = Command::new("/bin/sh");
+    c.arg("-c")
+        .arg("umask 000; exec \"$0\" \"$@\"")
+        .arg(CAULDRON)
+        .args(["create", "kb", "--env", "dev"])
+        .env("CAULDRON_HOME", s.root())
+        .env("HOME", s.0.join("home"))
+        .env_remove("CAULDRON_ENV")
+        .env_remove("ENV")
+        .env_remove("CAULDRON_CAULDRON")
+        .stdin(Stdio::null());
+    let o = c.output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let dir = s.data().join("cauldrons").join("kb");
+    let made = modes_under(&dir);
+    assert!(made.iter().filter(|(_, d, _)| !d).count() >= 3, "cauldron.toml, spine.db, ws.db: {made:?}");
+    assert!(all_private(&dir), "a new cauldron is not private: {made:?}");
+    // Its readers, as before.
+    let list = run(&s, &["list", "--env", "dev"]);
+    assert!(list.rc == 0 && list.out.contains("kb"), "{}", list.err);
+    assert_eq!(read(&s, "nodes", &[])["total"], 0);
+
+    // A store made before this release.
+    loosen(&dir);
+    assert!(!all_private(&dir));
+    let before = modes_under(&dir);
+    let input = write_json(&s, "example.json", &example());
+    assert_eq!(read(&s, "regions", &[])["regions"], json!([]));
+    assert_eq!(import(&s, "kb", &input, &["--dry-run"]).rc, 0);
+    assert_eq!(modes_under(&dir), before, "a read or a dry run changed a mode");
+    let o = import(&s, "kb", &input, &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert!(all_private(&dir), "the import did not tighten the store: {:?}", modes_under(&dir));
+    assert!(read(&s, "nodes", &[])["total"].as_u64().unwrap() > 0);
+}
+
+/// **`cauldron rename` keeps a cauldron its owner's only.** Under a umask
+/// that takes nothing away, the rewritten `cauldron.toml` and the lock files
+/// the rename opens are 0600 and every directory 0700; a store an older
+/// release left loose (0755/0644) is private once it is renamed.
+#[test]
+fn p2_a_renamed_cauldron_is_private_whatever_the_umask() {
+    let s = scratch("modes-rename", &[]);
+    let loose = |args: &[&str]| {
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c")
+            .arg("umask 000; exec \"$0\" \"$@\"")
+            .arg(CAULDRON)
+            .args(args)
+            .env("CAULDRON_HOME", s.root())
+            .env("HOME", s.0.join("home"))
+            .env_remove("CAULDRON_ENV")
+            .env_remove("ENV")
+            .env_remove("CAULDRON_CAULDRON")
+            .stdin(Stdio::null());
+        let o = c.output().unwrap();
+        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    };
+    loose(&["create", "um0", "--env", "dev"]);
+    loose(&["rename", "um0", "um1", "--env", "dev"]);
+    let dir = s.data().join("cauldrons").join("um1");
+    let made = modes_under(&dir);
+    for f in ["cauldron.toml", "tui/open.lock", "soup/writer.lock"] {
+        assert!(made.iter().any(|(p, d, _)| !d && p.ends_with(f)), "{f} is not there: {made:?}");
+    }
+    assert!(all_private(&dir), "a renamed cauldron is not private: {made:?}");
+
+    // A store an older release left loose is private once renamed.
+    loosen(&dir);
+    assert!(!all_private(&dir));
+    loose(&["rename", "um1", "um2", "--env", "dev"]);
+    let dir = s.data().join("cauldrons").join("um2");
+    assert!(all_private(&dir), "a loose store renamed is not private: {:?}", modes_under(&dir));
+    let o = run(&s, &["soup", "nodes", "--env", "dev", "--cauldron", "um2"]);
+    assert_eq!((o.rc, o.json()["total"].clone()), (0, json!(0)), "{}", o.err);
+}
+
+// ---------------------------------------------------------------- the plugin's example regions
+
+/// The plugin ships `regions.example.json` for a new soup, which starts with
+/// no regions: against a fresh cauldron it dry-runs `validated` under
+/// `--remint` (its ids are labels), and lands as four regions.
+#[test]
+fn e1_the_plugin_s_example_regions_validate_against_a_fresh_soup() {
+    let s = scratch("regions-example", &["kb"]);
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../claude-code/cauldron/regions.example.json");
+    let dry = import(&s, "kb", &file, &["--dry-run", "--remint"]);
+    assert_eq!(dry.rc, 0, "{}\n{}", dry.out, dry.err);
+    let d = dry.json();
+    assert_eq!((d["outcome"].clone(), d["accepted"].clone(), d["refused"].clone()), (json!("validated"), json!(4), json!(0)), "{d}");
+    // Without --remint its labels are not ids, and it is refused.
+    assert_ne!(import(&s, "kb", &file, &["--dry-run"]).rc, 0);
+    let real = import(&s, "kb", &file, &["--remint"]);
+    assert_eq!(real.rc, 0, "{}", real.err);
+    assert_eq!(real.json()["id_map"], json!({"r-code": "R-1", "r-tests": "R-2", "r-product": "R-3", "r-process": "R-4"}));
+    assert_eq!(read(&s, "regions", &[])["regions"].as_array().unwrap().len(), 4);
 }

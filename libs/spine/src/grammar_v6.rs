@@ -339,6 +339,65 @@ pub fn mint_alternatives(node_type: &str) -> Vec<MintAlternative> {
     ]
 }
 
+/// **External citations** (`meta.cites`): each a `{kind, ...}` object, its
+/// `kind` one of these, carrying the keys listed for it. `meta` is an OPEN
+/// object and its keys are not grammar ([`LEFT_OUT`], M1), so this is not
+/// judged by the door's grammar: the record import judges it
+/// ([`cite_problem`], refusing `bad-cite`), and the published schema
+/// describes it on `meta.cites` (`schema_publish`), so the two say the same
+/// thing. Any other key is allowed (`file`'s optional `line`, `repo`,
+/// `commit`; `session`'s optional `at`). A required key must be present and
+/// not null, and a string one must not be empty.
+pub const CITE_KINDS: &[(&str, &[&str])] = &[
+    ("session", &["id"]),
+    ("file", &["path"]),
+    ("commit", &["repo", "sha"]),
+    ("url", &["url"]),
+    ("thread", &["thread", "msg"]),
+    // A dump (`DM-<n>`) in the same cauldron's dumps store.
+    ("dump", &["id"]),
+];
+
+/// What is wrong with `meta`'s `cites`, if anything ([`CITE_KINDS`]): the
+/// first problem, as a sentence starting `meta.cites`. `None` when `meta`
+/// has no `cites` (or is not an object: the grammar judges that).
+pub fn cite_problem(meta: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    let cites = meta.as_object()?.get("cites")?;
+    let Value::Array(list) = cites else {
+        return Some("meta.cites is a list of citation objects, each {\"kind\": ..., <its keys>}".to_string());
+    };
+    let kinds = || CITE_KINDS.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(", ");
+    for (i, c) in list.iter().enumerate() {
+        let Value::Object(m) = c else {
+            return Some(format!("meta.cites[{i}] is not an object; a citation is {{\"kind\": ..., <its keys>}}"));
+        };
+        let kind = match m.get("kind") {
+            Some(Value::String(k)) => k.as_str(),
+            Some(_) => return Some(format!("meta.cites[{i}]: `kind` is a string, one of {}", kinds())),
+            None => return Some(format!("meta.cites[{i}] has no `kind` (one of {})", kinds())),
+        };
+        let Some((_, keys)) = CITE_KINDS.iter().find(|(k, _)| *k == kind) else {
+            return Some(format!("meta.cites[{i}]: `{kind}` is not a citation kind (one of {})", kinds()));
+        };
+        let missing: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| match m.get(*k) {
+                None | Some(Value::Null) => true,
+                Some(Value::String(s)) => s.is_empty(),
+                Some(_) => false,
+            })
+            .collect();
+        if !missing.is_empty() {
+            let all = keys.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(" and ");
+            let lacks = missing.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(" and ");
+            return Some(format!("meta.cites[{i}] ({kind}) lacks {lacks}; a `{kind}` citation carries {all}"));
+        }
+    }
+    None
+}
+
 /// The v5 types (`HEAD_GRAMMAR`'s `ANY`): content types first, region last.
 pub fn v5_type_names() -> Vec<&'static str> {
     CONTENT_TYPES.iter().map(|(n, _, _)| *n).chain([REGION]).collect()

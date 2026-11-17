@@ -44,6 +44,8 @@ use std::collections::BTreeSet;
 
 /// The directory, relative to the repository root, the files live in.
 pub const PUBLISH_DIR: &str = "schema/soup/workspace-v6";
+/// The open object field whose `cites` key the schema describes.
+const META: &str = "meta";
 /// The pool name the published `grammar.json` is rendered for (the soup's
 /// one pool, `SOUP_POOL` in the CLI's engine).
 pub const PUBLISH_POOL: &str = "ws";
@@ -124,6 +126,36 @@ fn field_schema(f: &FieldDef) -> Value {
         m.insert("maxLength".into(), json!(n));
     }
     Value::Object(m)
+}
+
+/// The open `meta` object's one described key, `cites`
+/// ([`grammar_v6::CITE_KINDS`]): a list of citations, each a `kind` from the
+/// set carrying that kind's keys (present, not null, a string one not
+/// empty), any other key allowed. The record import refuses the same
+/// records (`bad-cite`, [`grammar_v6::cite_problem`]).
+fn cites_schema() -> Value {
+    let kinds: Vec<&str> = grammar_v6::CITE_KINDS.iter().map(|(k, _)| *k).collect();
+    let per_kind: Vec<Value> = grammar_v6::CITE_KINDS
+        .iter()
+        .map(|(k, keys)| {
+            let props: Map<String, Value> =
+                keys.iter().map(|key| (key.to_string(), json!({"not": {"type": "null"}, "minLength": 1}))).collect();
+            json!({
+                "if": {"properties": {"kind": {"const": k}}, "required": ["kind"]},
+                "then": {"properties": props, "required": keys},
+            })
+        })
+        .collect();
+    json!({
+        "type": "array",
+        "description": "External citations: each a `kind` with the keys that locate it. See README.md, \"Conventions\".",
+        "items": {
+            "type": "object",
+            "properties": {"kind": {"enum": kinds}},
+            "required": ["kind"],
+            "allOf": per_kind,
+        },
+    })
 }
 
 /// The id pattern a `to` of edge kind `kind`, leaving a node of `src`, must
@@ -261,7 +293,11 @@ fn node_schema(g: &PoolGrammar, name: &str, file: &str) -> Value {
         props.insert("state".into(), json!({"enum": t.states}));
     }
     for (fname, f) in &t.fields {
-        props.insert(fname.clone(), field_schema(f));
+        let mut fs = field_schema(f);
+        if fname == META && f.kind == FieldKind::Object {
+            fs["properties"] = json!({"cites": cites_schema()});
+        }
+        props.insert(fname.clone(), fs);
         if f.required {
             required.push(json!(fname));
         }
@@ -453,6 +489,70 @@ mod tests {
             "claude-code/cauldron/schema drifted from schema/soup/workspace-v6:\n  {}\nrun: scripts/sync-plugin-schema",
             drift.join("\n  ")
         );
+    }
+
+    /// The published `meta.cites` schema says what the import's citation
+    /// check ([`grammar_v6::cite_problem`]) judges: both are built from
+    /// [`grammar_v6::CITE_KINDS`], the kinds as the item's `kind` enum and
+    /// each kind's keys as required, not null and (as strings) not empty,
+    /// other keys allowed. The check itself, on records each side must
+    /// accept and refuse alike, is below.
+    #[test]
+    fn the_published_cites_schema_is_the_import_check() {
+        for (_, body) in render().into_iter().filter(|(n, _)| n.starts_with("node.")) {
+            let schema: Value = serde_json::from_str(&body).unwrap();
+            let Some(meta) = schema["properties"].get("meta") else { continue };
+            let cites = &meta["properties"]["cites"];
+            assert_eq!(cites["type"], "array", "{body}");
+            let items = &cites["items"];
+            let kinds: Vec<&str> = grammar_v6::CITE_KINDS.iter().map(|(k, _)| *k).collect();
+            assert_eq!(items["properties"]["kind"]["enum"], json!(kinds));
+            assert_eq!(items["required"], json!(["kind"]));
+            assert!(items.get("additionalProperties").is_none(), "other keys are allowed");
+            let rules = items["allOf"].as_array().unwrap();
+            assert_eq!(rules.len(), grammar_v6::CITE_KINDS.len());
+            for ((kind, keys), rule) in grammar_v6::CITE_KINDS.iter().zip(rules) {
+                assert_eq!(rule["if"]["properties"]["kind"]["const"], json!(kind));
+                assert_eq!(rule["then"]["required"], json!(keys));
+                for k in *keys {
+                    assert_eq!(rule["then"]["properties"][*k], json!({"not": {"type": "null"}, "minLength": 1}));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_import_cite_check_accepts_what_the_schema_allows_and_refuses_the_rest() {
+        let good = [
+            json!({}),
+            json!({"kind": "case"}),
+            json!({"cites": []}),
+            json!({"cites": [{"kind": "session", "id": "s-1"}, {"kind": "session", "id": "s-2", "at": "turn 4"}]}),
+            json!({"cites": [{"kind": "file", "path": "src/lib.rs", "line": 40, "repo": "cauldron", "commit": "main"}]}),
+            json!({"cites": [{"kind": "commit", "repo": "cauldron", "sha": "main"}]}),
+            json!({"cites": [{"kind": "url", "url": "https://example.com/spec"}]}),
+            json!({"cites": [{"kind": "thread", "thread": "t-1", "msg": 12}, {"kind": "thread", "thread": "t-1", "msg": "12"}]}),
+            json!({"cites": [{"kind": "dump", "id": "DM-3"}]}),
+            json!("not an object: the grammar's to judge"),
+        ];
+        for meta in good {
+            assert_eq!(grammar_v6::cite_problem(&meta), None, "the import refuses {meta}");
+        }
+        let bad = [
+            (json!({"cites": [{"kind": "fiel", "path": "notes/run.log"}]}), "`fiel` is not a citation kind"),
+            (json!({"cites": [{"kind": "commit", "repo": "cauldron"}]}), "(commit) lacks `sha`"),
+            (json!({"cites": [{"kind": "url", "url": null}]}), "(url) lacks `url`"),
+            (json!({"cites": [{"kind": "dump", "id": ""}]}), "(dump) lacks `id`"),
+            (json!({"cites": [{"path": "notes/run.log"}]}), "has no `kind`"),
+            (json!({"cites": [{"kind": 3, "id": "x"}]}), "`kind` is a string"),
+            (json!({"cites": ["https://example.com/spec"]}), "meta.cites[0] is not an object"),
+            (json!({"cites": {"kind": "url", "url": "https://example.com/spec"}}), "meta.cites is a list"),
+            (json!({"cites": [{"kind": "url", "url": "u"}, {"kind": "thread", "thread": "t-1"}]}), "meta.cites[1] (thread) lacks `msg`"),
+        ];
+        for (meta, says) in bad {
+            let why = grammar_v6::cite_problem(&meta).unwrap_or_else(|| panic!("the import accepts {meta}"));
+            assert!(why.contains(says), "{meta}: {why}");
+        }
     }
 
     /// `grammar.json` parses back to the grammar it was rendered from.

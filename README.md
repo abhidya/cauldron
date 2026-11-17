@@ -18,15 +18,21 @@ release](#what-is-in-this-release) has the details.
 
 ## The picture
 
-- **The cauldron is an environment.** You can keep one for each part of your
-  mind: one for a big project, another for work, another for your family.
-  They don't mix with each other: each has its own data, its own history and
-  its own supervisor.
-- **The soup is a knowledge graph.** Everything an environment knows goes
-  into one typed graph, with structure, regions and discoverability, so
-  agents can find context without having it pasted in again. (The soup
-  engine arrives with ripples, coming in 0.2.0; it is not in this build yet.
-  See [What is in this release](#what-is-in-this-release).)
+- **A cauldron is a project's knowledge store.** You keep one for each part
+  of your mind: one for a big project, another for work, another for your
+  family. They don't mix with each other: each has its own soup, its own
+  dumps and its own history, private to you.
+- **Cauldrons live in an environment, and you use `prod`.** An environment
+  is an installed copy of the services (its own supervisor, data and
+  versions); the installer makes `prod`, and your cauldrons go there. Other
+  environments (`dev`, for example) are for developing cauldron itself. Name
+  your cauldrons after what they hold; `prod` names the environment.
+- **The soup is a knowledge graph.** Everything a cauldron knows goes into
+  one typed graph, with structure, regions and discoverability, so agents
+  can find context without having it pasted in again. You can write into it
+  and read it today, from a shell and from Claude Code (see [From install to
+  a working session](#from-install-to-a-working-session)). The engine that
+  turns dumps into soup on its own (ripples) arrives in 0.2.0.
 - **The surface is your view into the cauldron.** You dump ideas, feedback
   and half-formed thoughts into it. You collect text, pastes and references in the
   **bucket** and **dump** it onto the surface. Every dump is recorded in the
@@ -96,18 +102,30 @@ budget per cauldron from the UI is on the roadmap.
 ## Separate cauldrons for separate parts of your life
 
 Keep one big soup per project, separate from the one for your work and the one
-for your family. They don't mix: each environment's data is its own, under
-`~/.cauldron/data/<name>/`. Only installed builds and caches are shared.
+for your family. They don't mix: each cauldron's data is its own, under
+`~/.cauldron/data/prod/cauldrons/<name>/`, and only you can read it (its
+directories are mode 0700 and its files 0600).
 
 ## What is in this release
 
-This is **0.1.4**, the V1 interface: two tab bars, a first-run screen, the
-Ledger on the environment's own data, the real account pool under Status →
-Tokens, Config → Accounts, secret human actions, and `cauldron ctl`. 0.1.3
-added account polish: account settings open read-only, with a notice, when the
-install's key is wrong, and a face stops waiting on a service that never
-answers. 0.1.4 adds a cauldron's soup as a knowledge graph you can use from
-Claude Code (see [below](#using-a-soup-from-claude-code)). Ripples and the soup engine arrive in 0.2.0. [CHANGELOG.md](CHANGELOG.md) lists every change.
+This is **0.1.8**. On top of the V1 interface (two tab bars, a first-run
+screen, the Ledger, the account pool, secret human actions and `cauldron
+ctl`, from 0.1.2 and 0.1.3), the 0.1.4 to 0.1.8 releases made a cauldron's
+soup a knowledge graph you use from Claude Code:
+
+- 0.1.4 and 0.1.5: the published soup schema, `cauldron create` and `list`,
+  the `cauldron soup` verbs, `cauldron link`, and the Claude Code plugin with
+  its curator.
+- 0.1.6: the MCP door, a service through which Claude Code sessions read,
+  search and write the cauldrons you grant to them.
+- 0.1.7: dumps, raw text or a whole session transcript kept in a cauldron.
+- 0.1.8: curating a dump into records (`/cauldron:curate-dump`), `cauldron
+  rename` and `remove`, the plugin installed from GitHub, an upgrade that
+  brings up the MCP service or moves it to the new build, a cauldron's data
+  private to you, and fixes filed as issues.
+
+Ripples, the engine that acts on dumps by itself, arrive in 0.2.0.
+[CHANGELOG.md](CHANGELOG.md) lists every change.
 
 cauldron has three parts:
 
@@ -135,13 +153,16 @@ the face and each account switched on or off per cauldron; secret human
 actions, typed into a masked input and routed to an env file or the macOS
 keychain; the threads face, with persistent Claude Code conversations on the
 account pool; `cauldron ctl`, which sends a dump, prints one frame of the
-face or reads one soup node from the command line; and the `cauldron-build`
-demo environment (see below).
+face or reads one soup node from the command line; the `cauldron-build`
+demo environment (see below); and a cauldron's soup and dumps from the shell
+and from Claude Code (see [From install to a working
+session](#from-install-to-a-working-session)).
 
-**Not yet:** the engine that acts on a dump. In the design, a dump sets off
-**ripples**: agents that read it, update the soup, and turn it into tasks,
-questions and actions. Ripples and the soup engine are not in this build yet,
-so nothing processes a dump yet; they are coming in 0.2.0. Questions
+**Not yet:** the engine that acts on a dump by itself. In the design, a dump
+sets off **ripples**: agents that read it, update the soup, and turn it into
+tasks, questions and actions. Ripples are not in this build yet, so nothing
+processes a dump on its own (you can curate one into the soup with
+`/cauldron:curate-dump`); they are coming in 0.2.0. Questions
 and actions appear in the UI, but they come from the environment's data or the
 demo data. See
 [ROADMAP.md](ROADMAP.md).
@@ -163,9 +184,11 @@ cd cauldron
 ./scripts/install
 ```
 
-`./scripts/install` builds `cauldron`, `tui` and the `threads` daemon in release
-mode, pins `threads` in a new environment, and puts the
-environment's supervisor under launchd for the current user. It installs
+`./scripts/install` builds `cauldron`, `tui`, the `threads` daemon and the
+`mcp` service in release mode, makes the environment `prod`, pins `threads`
+and `mcp` in it, and puts the environment's supervisor under launchd for the
+current user. It always installs the whole stack. There are no prebuilt
+binaries: it builds from the checkout. It installs
 everything under your own home directory (`~/.cauldron`, or `$CAULDRON_HOME` if
 you set it). It checks that it is running on macOS before it does anything, and
 it prints each step it takes. It does not sign anything with a personal
@@ -180,8 +203,29 @@ then run it again. If an install stops partway, fix what it reports and run
 To see the plan without changing anything, run `./scripts/install --dry-run`.
 If a cauldron supervisor is already running for that environment, the install
 stops and prints the command to replace it
-(`./scripts/install --replace-running`). That is also how you upgrade after a
-`git pull`.
+(`./scripts/install --replace-running`).
+
+**Upgrading.** After a `git pull`, run `./scripts/install --replace-running`
+from a clean checkout (the upgrade builds the `mcp` service, and a build
+needs one). An environment installed before the MCP service existed (0.1.5
+or earlier) has no `mcp` pin; the upgrade builds the service and pins it. An
+environment whose `mcp` pin is an older build (0.1.6 or 0.1.7) has it
+rebuilt from this checkout and re-pinned; the supervisor moves the running
+service to the new build, and your grants are kept. A pin that is already
+this checkout's build is left as it is, so a second run changes nothing.
+Without `--replace-running` an older `mcp` pin is left as it is, and the
+install says plainly that the mcp service is still the old build and prints
+the two commands that upgrade it:
+
+```sh
+cauldron --env prod build mcp --env-copy
+cauldron --env prod pin mcp <the label that build printed>
+```
+
+`cauldron mcp status` shows the running service's version beside the
+`cauldron` command's, and says when they differ; so does a Claude Code
+session (the service's instructions, and any refusal of a tool or an
+argument the older service does not know). `--dry-run` shows the plan.
 
 The install puts `cauldron` in `~/.cauldron/bin` and does not change your
 `PATH`; its last lines say so. Add that directory to your `PATH` once. For zsh:
@@ -193,6 +237,13 @@ echo 'export PATH="$HOME/.cauldron/bin:$PATH"' >> ~/.zshrc
 Then open a new terminal. (For bash, use `~/.bash_profile`. If you set
 `$CAULDRON_HOME`, the directory is `$CAULDRON_HOME/bin`.) The commands below
 assume `cauldron` is on your `PATH`.
+
+Claude Code must find `cauldron` too: the plugin starts its MCP server as the
+bare command `cauldron mcp stdio`. Claude Code started from a terminal takes
+that terminal's `PATH`; started from the Dock, Finder or an IDE, it may not
+read your shell startup file, and its sessions then have no cauldron tools.
+Start it from a terminal where `command -v cauldron` prints
+`~/.cauldron/bin/cauldron`.
 
 To check that the services are up:
 
@@ -213,17 +264,16 @@ last, unless you name one. To see every part of the UI with something in it,
 open the [`cauldron-build` demo
 environment](#the-cauldron-build-demo-environment).
 
-**More environments.** Make one for each project, from the UI (`^E`, or the
-environment dropdown at the left of the environment bar, then `+`) or from the
-shell:
+**More cauldrons.** Keep one cauldron per project, all in `prod`:
 
 ```sh
-cauldron env create myproject
-cauldron --env myproject
+cauldron create myproject --env prod
+cauldron list --env prod
 ```
 
-`cauldron envs` lists your environments.
-[`docs/environments.md`](docs/environments.md) covers the whole lifecycle.
+Environments other than `prod` are for developing cauldron itself (`cauldron
+env create dev`); `cauldron envs` lists them, and
+[`docs/environments.md`](docs/environments.md) covers their lifecycle.
 
 **Your first cluster.** A cauldron with no cluster of its own opens with the
 Clusters sidebar's `+` selected: press Enter to make a cluster at the root, or
@@ -259,71 +309,164 @@ cauldron env create cauldron-build
 cauldron --env cauldron-build
 ```
 
-## Using a soup from Claude Code
+## From install to a working session
 
-`cauldron create` makes a cauldron with its own soup, and `cauldron soup
-import | regions | get | nodes | search | region` write records into it and
-read them back, with no service running (`cauldron soup recover` settles a
-soup after an interrupted import). The records follow the published
-schema in [`schema/soup/workspace-v6/`](schema/soup/workspace-v6/README.md).
-`cauldron link <cauldron> --env <env>` writes a `.cauldron` marker into a
-project directory, so `cauldron soup` run inside the project finds its
-cauldron without `--env` and `--cauldron` (explicit flags still win). The
-marker names cauldrons on this machine only, so add `.cauldron` to the
-project's `.gitignore`; writes refuse to take their target from a marker that
-git tracks.
-The Claude Code plugin in [`claude-code/cauldron/`](claude-code/cauldron/README.md)
-adds a curator subagent that writes and lands those records for you; its
-README says how to install it and walks through a session.
+This is the whole path, from a fresh Mac to a Claude Code session writing
+into a cauldron. Every command names `--env prod`: see the `$ENV` note
+below for why.
 
-**The MCP door.** The plugin also starts an MCP server, `cauldron mcp
-stdio`, which gives a Claude Code session tools to read, search and write a
-soup (`soup_status`, `soup_search`, `soup_get`, `soup_put`, `soup_link`,
-`soup_changes` and more). It is a bridge to the environment's `mcp` service,
-which you start like any other (`cauldron --env <env> start mcp`; an install
-that creates its environment pins it). **Every cauldron is closed to it until
-you grant it**, yourself, at a terminal:
+1. **Install** (see [Install](#install)): `git clone
+   https://github.com/broomstick-ai/cauldron`, then `./scripts/install` in
+   the checkout. It makes the environment `prod` and runs its `threads` and
+   `mcp` services.
+2. **Put `cauldron` on your `PATH`** (`~/.cauldron/bin`), open a new
+   terminal, and check with `command -v cauldron` and `cauldron status`.
+3. **Make a cauldron** for your project:
+
+   ```sh
+   cauldron create kb --env prod
+   ```
+
+   Its soup starts empty, with no regions, and the curator files nothing it
+   cannot place in a region.
+4. **Give it regions.** The plugin ships an example,
+   [`claude-code/cauldron/regions.example.json`](claude-code/cauldron/regions.example.json):
+   four regions (the code, its tests, the product, the process). Copy it,
+   edit the handles and boundaries to fit your project, then judge it and
+   land it:
+
+   ```sh
+   cauldron soup import regions.json --env prod --cauldron kb --remint --dry-run
+   cauldron soup import regions.json --env prod --cauldron kb --remint
+   ```
+
+   (Or skip this step: on the first run the curator proposes regions for you
+   to approve.)
+5. **Open the cauldron to Claude Code**, yourself, at a terminal (an agent
+   cannot do this):
+
+   ```sh
+   cauldron mcp grant kb --env prod --project ~/code/proj
+   ```
+
+   Every cauldron is closed to Claude Code until you grant it. `--project`
+   makes `kb` the default for sessions working in `~/code/proj`.
+6. **Install the plugin** inside Claude Code:
+
+   ```text
+   /plugin marketplace add broomstick-ai/cauldron
+   /plugin install cauldron@cauldron
+   ```
+
+   Then restart Claude Code from a terminal where `cauldron` is on the
+   `PATH`. In a session, `/mcp` lists `cauldron` as connected.
+7. **Write into the cauldron.** In a session in `~/code/proj`:
+
+   ```text
+   /cauldron:curate Always read region ids from the soup before writing records: a guessed id made an import fail.
+   ```
+
+   The command asks the MCP door which cauldron this directory means (`kb`,
+   from the grant's project), tells you, and asks you to confirm before it
+   writes to `prod`. The curator then judges its records (a dry run), lands
+   them, and reports their new ids.
+
+> **Two ways to say "this directory means cauldron `kb`".** They are
+> separate, and setting one does not set the other.
+>
+> | | `.cauldron` marker | grant `--project` |
+> |---|---|---|
+> | made by | `cauldron link kb --env prod` | `cauldron mcp grant kb --env prod --project <dir>` |
+> | read by | the `cauldron soup` commands (and the curator's shell fallback) | Claude Code sessions, through the MCP door |
+> | opens the cauldron to Claude Code? | no, never | the grant does; `--project` only sets the directory's default |
+> | kept in | a file in the project (keep it out of git) | `~/.cauldron/data/prod/mcp/grants.json` |
+>
+> A session uses the grant's project; a shell uses the marker. For both,
+> run both commands.
+
+> **`$ENV`.** `cauldron create`, `cauldron mcp grant` and the other
+> commands take their environment from `--env`, else `$CAULDRON_ENV`, else
+> `$ENV`, else `prod` (the `cauldron soup` commands never fall back to
+> `prod`: they need one of the first three, or a marker). Some shells export `ENV`
+> for their own use (`ENV=development`, or a startup file's path); then
+> `cauldron create kb` without `--env` aims at that environment (and is
+> refused when no such environment exists), while Claude Code sessions,
+> whose bridge never reads `$ENV`, use `prod`. Pass `--env prod`, as every
+> command here does, or unset `ENV`.
+
+**What the door gives a session.** The plugin's MCP server, `cauldron mcp
+stdio`, is a bridge to the environment's `mcp` service. A session gets tools
+to read, search and write a granted cauldron's soup (`soup_status`,
+`soup_regions`, `soup_region`, `soup_nodes`, `soup_search`, `soup_get`,
+`soup_put`, `soup_link`, `soup_changes`) and its dumps (below). The grants:
 
 ```sh
-cauldron mcp grant kb --env dev --project ~/code/proj   # open kb to the door; sessions in ~/code/proj use it by default
-cauldron mcp grants --env dev                          # what is open
-cauldron mcp revoke kb --env dev                       # close it again, from the next call on
+cauldron mcp grant kb --env prod --project ~/code/proj   # open kb; sessions in ~/code/proj use it by default
+cauldron mcp grants --env prod                          # what is open
+cauldron mcp revoke kb --env prod                       # close it again, from the next call on
+cauldron mcp status --env prod                          # the service and what it holds
 ```
 
 A grant opens the cauldron to the Claude Code sessions you run on this
-machine against that environment, whichever directory they work in: any of
-them can name it. `--project` only tells a session which cauldron a directory
-means when the session does not name one; it does not limit which sessions
-can reach the cauldron.
-`grant` refuses to run without an interactive terminal, so an agent cannot
-open a cauldron for itself, and no MCP tool can grant or revoke. `--scopes
-read` opens a cauldron read-only. While the service holds a granted
-cauldron it is the soup's one writer: `cauldron soup import` is sent to it,
-and `cauldron soup recover` is refused (`cauldron mcp status` shows what the
-service holds). The plugin's README has the details.
+machine, whichever directory they work in: any of them can name it.
+`--project` only tells a session which cauldron a directory means when the
+session does not name one; it does not limit which sessions can reach the
+cauldron. `grant` refuses to run without an interactive terminal, so an
+agent cannot open a cauldron for itself, and no MCP tool can grant or
+revoke. `--scopes read` opens a cauldron read-only. While the service holds
+a granted cauldron it is the soup's one writer: `cauldron soup import` is
+sent to it, and `cauldron soup recover` is refused.
 
-**Dumps.** A dump is raw text put into a cauldron for later processing: a
-note, a file, or a whole Claude Code session's transcript. It is kept in the
-cauldron's dumps store beside its soup (not in the soup), as `DM-<n>` in
-state `received`, one write per dump. From Claude Code, `/cauldron:dump`
-keeps text or a file and `/cauldron:dump-session` keeps the session's
-transcript (the grant's `dump` scope allows both); from a shell, `cauldron
-soup dump <file|-> --env <env> --cauldron <name>`, with `cauldron soup
-dumps` and `cauldron soup dump-get` to read them back. A session transcript
-holds tool output and anything pasted into the session, and it is stored
-verbatim, in your own cauldron, in a dumps store only you can read (0700
-directories, 0600 files). The grant's scopes govern Claude Code sessions
-through the MCP service; the `cauldron soup dumps` and `dump-get` verbs run
-as you and read dumps without a grant, like every other CLI read. Processing
-of dumps comes in a later release.
+**From a shell.** `cauldron soup import | regions | region | nodes | search
+| get` write records into a soup and read them back (`cauldron soup help`).
+The records follow the published schema in
+[`schema/soup/workspace-v6/`](schema/soup/workspace-v6/README.md), whose
+README also says how to change a node (supersede it), what the import checks
+and what it leaves to you. `cauldron link kb --env prod` writes a
+`.cauldron` marker into a project directory, so `cauldron soup` run inside it
+needs neither `--env` nor `--cauldron`.
+
+**Dumps, and curating them.** A dump is raw text put into a cauldron for
+later: a note, a file, or a whole Claude Code session's transcript. It is
+kept in the cauldron's dumps store beside its soup (not in the soup), as
+`DM-<n>` in state `received`. From Claude Code, `/cauldron:dump` keeps text
+or a file and `/cauldron:dump-session` keeps the session's transcript (the
+grant's `dump` scope allows both); from a shell, `cauldron soup dump <file|->
+--env prod --cauldron kb`. `/cauldron:curate-dump DM-3` has the curator read
+the dump in pages (for a transcript, only what you typed and what the
+assistant wrote as text: tool calls and their output, thinking, `!` shell
+commands and their output, local commands' output, slash-command wrappers,
+system reminders and attachments are left out and counted) and land the
+records worth keeping, each citing the dump; the dump itself stays
+`received`. `cauldron soup
+dump-get DM-3 --env prod --cauldron kb --view text` shows the same pages in
+a shell. A session transcript holds tool output, shell output and anything
+pasted into the session, and it is stored verbatim (the raw view, `dump-get`
+without `--view text`, shows all of it), in your own cauldron, readable only
+by you. The grant's scopes govern Claude Code sessions; the `cauldron soup
+dumps` and `dump-get` commands run as you and read dumps without a grant.
+
+**Renaming and removing a cauldron.** `cauldron rename kb notes --env prod`
+renames it; its soup, dumps and grant follow. `cauldron remove kb --env
+prod` is a dry run; with `--yes` it moves the cauldron to
+`cauldrons/.removed/` (it never deletes) and drops its grant. Both are
+refused while the `mcp` service holds the cauldron: stop the service
+(`cauldron --env prod stop mcp`, then `start mcp` afterwards) or revoke the
+grant first (a revoked cauldron has to be granted again). A project's `.cauldron` marker naming the old name is not
+updated; run `cauldron link notes --env prod --replace` there.
+
+The plugin's [README](claude-code/cauldron/README.md) has the details.
 
 ## Known limitations
 
 This is an early release. These are known:
 
 - **macOS only.**
-- **Nothing acts on a dump yet.** Ripples and the soup engine are coming in
-  0.2.0 (see above).
+- **Nothing acts on a dump by itself yet.** Ripples are coming in 0.2.0 (see
+  above); until then, curate a dump into records with
+  `/cauldron:curate-dump`.
+- **No prebuilt binaries.** `./scripts/install` builds everything from the
+  checkout, which needs the Rust toolchain and takes a while.
 - **A dump cannot be deleted yet.** No verb removes one. To remove a
   cauldron's dumps (all of them), stop the `mcp` service or revoke the
   cauldron, then remove `<root>/data/<env>/cauldrons/<cauldron>/dumps/` by

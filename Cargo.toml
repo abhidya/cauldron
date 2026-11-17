@@ -61,7 +61,7 @@ members = [
 # discovered by filename, so a service directory is not mistaken for one.
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 
 [workspace.dependencies]
