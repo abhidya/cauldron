@@ -1,0 +1,555 @@
+//! **The reads**: `regions`, `region`, `nodes`, `search` and `get`, each
+//! through connections that cannot write (the pool, and the spine's commit
+//! order), each answering one JSON document, bounded by a limit with a
+//! default and by an optional per-field `max_chars`; what was cut is listed
+//! in `truncated`, and a list cut by its limit says how many `more` there
+//! are.
+
+use std::collections::BTreeMap;
+
+use serde_json::{json, Value};
+use spine::pool::{NodeId, Pool, QualifiedNodeId};
+use spine::schema_def::PoolName;
+
+use crate::cut::Cut;
+use crate::target::Target;
+use crate::{refuse, Code, Error, Result};
+
+/// The soup's one pool (the engine's `SOUP_POOL`).
+pub const DEFAULT_POOL: &str = "ws";
+
+/// Default bounds.
+pub const NODES_LIMIT: usize = 50;
+pub const SEARCH_LIMIT: usize = 20;
+pub const MEMBERS_LIMIT: usize = 50;
+pub const SNIPPET_CHARS: usize = 160;
+
+const REGION_FLAGS: [&str; 5] = ["retired", "provisional", "deferred_by", "thresholds", "wake_when"];
+
+/// The options a read takes. Every field is optional; each read uses the
+/// ones it names and ignores the rest.
+#[derive(Debug, Clone, Default)]
+pub struct ReadOpts {
+    /// The pool, already checked with [`checked_pool`]; `ws` when `None`.
+    pub pool: Option<String>,
+    /// Cut any longer text field to this many chars.
+    pub max_chars: Option<usize>,
+    /// How many list items (`nodes`, `search` results, `region` members).
+    pub limit: Option<usize>,
+    /// `region`: how many levels of parents and children.
+    pub depth: Option<usize>,
+    /// `nodes`, `search`: keep a region's direct members.
+    pub region: Option<String>,
+    /// `nodes`, `search`: one node type.
+    pub node_type: Option<String>,
+    /// `nodes`: one state.
+    pub state: Option<String>,
+}
+
+impl ReadOpts {
+    pub fn pool_name(&self) -> PoolName {
+        PoolName::new(self.pool.as_deref().unwrap_or(DEFAULT_POOL))
+    }
+}
+
+/// A pool names a FILE (`<soup>/<pool>.db`), so it is held to the pool name
+/// grammar (`[a-z][a-z0-9-]*`, `spine` reserved) before it goes anywhere near
+/// a path: a slash, `..` or an absolute path would otherwise open a file
+/// outside the soup. Nothing is guessed or sanitised.
+pub fn checked_pool(name: &str) -> Result<String> {
+    let p = PoolName::new(name);
+    if !p.is_well_formed() {
+        refuse!(
+            Code::Usage,
+            "REFUSED: `--pool {name}` is not a pool name. A pool name is [a-z][a-z0-9-]* (a lowercase \
+             letter, then lowercase letters, digits or `-`); it names a file inside the soup, so a path \
+             is never accepted. Nothing was read or written."
+        );
+    }
+    if p.is_reserved() {
+        refuse!(Code::Usage, "REFUSED: `--pool {name}` names the spine's own file, not a pool. Nothing was read or written.");
+    }
+    Ok(name.to_string())
+}
+
+fn store(err: impl std::fmt::Display) -> Error {
+    Error::new(Code::Store, err.to_string())
+}
+
+/// The pool, through a connection that cannot write.
+fn read_pool(c: &env::Cauldron, pool: &PoolName) -> Result<Pool> {
+    let file = Pool::path_in(&c.soup(), pool);
+    Pool::open_read_only(&file).map_err(|err| store(format!("reading cauldron `{}`'s pool `{pool}`: {err}", c.name)))
+}
+
+/// An edge's far end as the published shape writes it: the bare id in the
+/// same pool, `<ID>@<pool>` in another.
+pub fn target_text(pool: &PoolName, dst: &QualifiedNodeId) -> String {
+    if &dst.pool == pool {
+        dst.id.0.clone()
+    } else {
+        format!("{}@{}", dst.id.0, dst.pool)
+    }
+}
+
+// ------------------------------------------------------------------ regions
+
+/// Every region: id, handle, boundary, flags, the regions it narrows or
+/// relates to, and how many nodes sit in it.
+pub fn regions(t: &Target, o: &ReadOpts) -> Result<Value> {
+    let (e, c) = (&t.env, &t.cauldron);
+    let pool = o.pool_name();
+    let handle = read_pool(c, &pool)?;
+    let snap = handle.snapshot().map_err(store)?;
+    let mut out = Vec::new();
+    let mut cut = Cut::new(o.max_chars);
+    for r in snap.nodes_of("region", None).map_err(store)? {
+        let field = |k: &str| r.fields.get(k).map(|f| f.value.clone());
+        let text = |cut: &mut Cut, k: &str| r.fields.get(k).map(|f| cut.value(&r.id.0, k, &f.value));
+        let mut flags = serde_json::Map::new();
+        for k in REGION_FLAGS {
+            if let Some(v) = field(k) {
+                flags.insert(k.to_string(), v);
+            }
+        }
+        let edges = snap.edges_from(&r.id, None).map_err(store)?;
+        let of = |kind: &str| -> Vec<String> {
+            edges.iter().filter(|x| x.kind == kind).map(|x| target_text(&pool, &x.dst)).collect()
+        };
+        let members = snap
+            .edges_to(&QualifiedNodeId { pool: pool.clone(), id: r.id.clone() }, Some("in_region"))
+            .map_err(store)?
+            .len();
+        out.push(json!({
+            "id": r.id.0,
+            "handle": text(&mut cut, "handle"),
+            "boundary": text(&mut cut, "boundary"),
+            "flags": flags,
+            "narrows": of("narrows"),
+            "relates": of("relates"),
+            "members": members,
+        }));
+    }
+    let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "regions": out});
+    cut.report(&mut doc);
+    Ok(doc)
+}
+
+// ---------------------------------------------------------------------- get
+
+/// Those nodes as records in the published shape, with their outgoing
+/// edges. Ids the pool does not hold are listed as `missing`.
+pub fn get(t: &Target, ids: &[String], o: &ReadOpts) -> Result<Value> {
+    let (e, c) = (&t.env, &t.cauldron);
+    let pool = o.pool_name();
+    let handle = read_pool(c, &pool)?;
+    let snap = handle.snapshot().map_err(store)?;
+    let mut records = Vec::new();
+    let mut missing = Vec::new();
+    let mut cut = Cut::new(o.max_chars);
+    for id in ids {
+        let Some(n) = snap.node(&NodeId(id.clone())).map_err(store)? else {
+            missing.push(id.clone());
+            continue;
+        };
+        let mut rec = serde_json::Map::new();
+        rec.insert("id".into(), json!(n.id.0));
+        rec.insert("type".into(), json!(n.node_type));
+        if let Some(s) = &n.state {
+            rec.insert("state".into(), json!(s));
+        }
+        for (k, f) in &n.fields {
+            rec.insert(k.clone(), cut.value(&n.id.0, k, &f.value));
+        }
+        let mut edges = Vec::new();
+        for x in snap.edges_from(&n.id, None).map_err(store)? {
+            let mut m = serde_json::Map::new();
+            m.insert("kind".into(), json!(x.kind));
+            m.insert("to".into(), json!(target_text(&pool, &x.dst)));
+            if let Some(note) = &x.note {
+                m.insert("note".into(), json!(note));
+            }
+            let fields: BTreeMap<String, Value> = x.fields.clone();
+            for (k, v) in fields {
+                m.insert(k, v);
+            }
+            edges.push(Value::Object(m));
+        }
+        if !edges.is_empty() {
+            rec.insert("edges".into(), Value::Array(edges));
+        }
+        records.push(Value::Object(rec));
+    }
+    let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "records": records});
+    if !missing.is_empty() {
+        doc["missing"] = json!(missing);
+    }
+    cut.report(&mut doc);
+    Ok(doc)
+}
+
+// ---------------------------------------------------- the catalog of nodes
+
+/// One node as the listing reads carry it.
+struct Entry {
+    id: String,
+    node_type: String,
+    state: Option<String>,
+    handle: String,
+    body: String,
+    regions: Vec<String>,
+    /// The committed-commit counter at the commit that created it; `None`
+    /// when the spine has no landed row for it (not expected; sorted first).
+    order: Option<i64>,
+}
+
+/// Every node of the pool, newest first: by the commit that created it
+/// (the spine's order, never a timestamp); nodes of one write by id prefix,
+/// then serial, highest first. Read through connections that cannot write.
+fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>, types: &[String]) -> Result<Vec<Entry>> {
+    let order = spine::offline::commit_order(&c.soup())
+        .map_err(|err| store(format!("reading cauldron `{}`'s commit order: {err}", c.name)))?;
+    let mut out = Vec::new();
+    for t in types {
+        for n in snap.nodes_of(t, None).map_err(store)? {
+            let text = |k: &str| n.fields.get(k).and_then(|f| f.value.as_str()).unwrap_or("").to_string();
+            let regions = snap
+                .edges_from(&n.id, Some("in_region"))
+                .map_err(store)?
+                .iter()
+                .map(|x| target_text(pool, &x.dst))
+                .collect();
+            let created = snap.created_tx(&n.id).map_err(store)?;
+            out.push(Entry {
+                id: n.id.0.clone(),
+                node_type: n.node_type.clone(),
+                state: n.state.clone(),
+                handle: text("handle"),
+                body: text("body"),
+                regions,
+                order: created.and_then(|h| order.get(&h.to_hex()).copied()),
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        let newest = |e: &Entry| e.order.map_or(i64::MAX, |o| o);
+        newest(b).cmp(&newest(a)).then_with(|| prefix(&a.id).cmp(prefix(&b.id))).then_with(|| serial(&b.id).cmp(&serial(&a.id))).then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(out)
+}
+
+/// The prefix of `<PREFIX>-<n>`, the whole id for anything else.
+pub fn prefix(id: &str) -> &str {
+    id.rsplit_once('-').map_or(id, |(p, _)| p)
+}
+
+/// The serial of `<PREFIX>-<n>`, 0 for anything else.
+pub fn serial(id: &str) -> u64 {
+    id.rsplit_once('-').and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
+}
+
+/// The node types to read: `asked` (checked against the pool's grammar), or
+/// every type the grammar declares.
+fn types_of(pool: &Pool, asked: Option<&str>) -> Result<Vec<String>> {
+    let all: Vec<String> = pool.grammar().node_types.keys().cloned().collect();
+    match asked {
+        None => Ok(all),
+        Some(t) if all.iter().any(|x| x == t) => Ok(vec![t.to_string()]),
+        Some(t) => refuse!(Code::Usage, "pool `{}` has no node type `{t}` (it has: {})", pool.name(), all.join(", ")),
+    }
+}
+
+/// A region filter, checked: it must name a region the pool holds.
+fn region_filter(snap: &spine::pool::Snapshot<'_>, asked: Option<&str>) -> Result<Option<String>> {
+    let Some(r) = asked else { return Ok(None) };
+    match snap.node(&NodeId(r.to_string())).map_err(store)? {
+        Some(n) if n.node_type == "region" => Ok(Some(r.to_string())),
+        Some(n) => refuse!(Code::Usage, "`{r}` is a {}, not a region", n.node_type),
+        None => refuse!(Code::NotFound, "there is no region `{r}`; `cauldron soup regions` lists them"),
+    }
+}
+
+/// A list cut to `limit`, with how many were left out.
+fn bounded<T>(mut v: Vec<T>, limit: usize) -> (Vec<T>, usize) {
+    let more = v.len().saturating_sub(limit);
+    v.truncate(limit);
+    (v, more)
+}
+
+// -------------------------------------------------------------------- nodes
+
+/// Nodes as `{id, type, state, handle, regions}`, newest first, filtered by
+/// region, type and state, at most `limit` (default [`NODES_LIMIT`]).
+pub fn nodes(t: &Target, o: &ReadOpts) -> Result<Value> {
+    let (e, c) = (&t.env, &t.cauldron);
+    let pool = o.pool_name();
+    let handle = read_pool(c, &pool)?;
+    let snap = handle.snapshot().map_err(store)?;
+    let types = types_of(&handle, o.node_type.as_deref())?;
+    let region = region_filter(&snap, o.region.as_deref())?;
+    let all: Vec<Entry> = catalog(c, &pool, &snap, &types)?
+        .into_iter()
+        .filter(|n| o.state.as_deref().is_none_or(|s| n.state.as_deref() == Some(s)))
+        .filter(|n| region.as_ref().is_none_or(|r| n.regions.contains(r)))
+        .collect();
+    let total = all.len();
+    let (shown, more) = bounded(all, o.limit.unwrap_or(NODES_LIMIT));
+    let mut cut = Cut::new(o.max_chars);
+    let list: Vec<Value> = shown
+        .iter()
+        .map(|n| {
+            json!({
+                "id": n.id,
+                "type": n.node_type,
+                "state": n.state,
+                "handle": cut.value(&n.id, "handle", &json!(n.handle)),
+                "regions": n.regions,
+            })
+        })
+        .collect();
+    let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "total": total, "nodes": list});
+    if more > 0 {
+        doc["more"] = json!(more);
+    }
+    cut.report(&mut doc);
+    Ok(doc)
+}
+
+// ------------------------------------------------------------------- search
+
+/// Lower-case one char to one char, so char positions in the folded text
+/// are positions in the original.
+fn fold(s: &str) -> Vec<char> {
+    s.chars().map(|ch| ch.to_lowercase().next().unwrap_or(ch)).collect()
+}
+
+/// Where `term` first occurs in `hay`, as a char index.
+fn find(hay: &[char], term: &[char]) -> Option<usize> {
+    if term.is_empty() || term.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - term.len()).find(|&i| hay[i..i + term.len()] == *term)
+}
+
+/// The query's terms: its words (runs of letters and digits), folded,
+/// without repeats, in order.
+fn terms(query: &str) -> Vec<Vec<char>> {
+    let mut out: Vec<Vec<char>> = Vec::new();
+    for w in query.split(|ch: char| !ch.is_alphanumeric()).filter(|w| !w.is_empty()) {
+        let t = fold(w);
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// The terms a search for `query` looks for; none means the query has no
+/// word to search for.
+pub fn search_terms(query: &str) -> Vec<String> {
+    terms(query).iter().map(|t| t.iter().collect()).collect()
+}
+
+/// `max` chars of `text` around char `at`, with `…` where it was cut.
+fn snippet(text: &str, at: usize, max: usize) -> (String, bool) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return (text.to_string(), false);
+    }
+    let start = at.saturating_sub(max / 4).min(chars.len() - max);
+    let mut s: String = chars[start..start + max].iter().collect();
+    if start > 0 {
+        s.insert(0, '…');
+    }
+    if start + max < chars.len() {
+        s.push('…');
+    }
+    (s, true)
+}
+
+/// Lexical search over handles and bodies: every word of the query a term,
+/// found case-insensitively as a substring; ranked by how many terms match,
+/// then handle hits over body hits, then newest. At most `limit` (default
+/// [`SEARCH_LIMIT`]); the snippet is `max_chars` long (default
+/// [`SNIPPET_CHARS`]) around the first hit.
+pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
+    let wanted = terms(query);
+    if wanted.is_empty() {
+        refuse!(Code::Usage, "a search needs a query with at least one word");
+    }
+    let (e, c) = (&t.env, &t.cauldron);
+    let pool = o.pool_name();
+    let handle = read_pool(c, &pool)?;
+    let snap = handle.snapshot().map_err(store)?;
+    let types = types_of(&handle, o.node_type.as_deref())?;
+    let region = region_filter(&snap, o.region.as_deref())?;
+    let phrase: Vec<char> = wanted.join(&' ');
+    // (matched terms, score, catalog position, entry, first body hit)
+    let mut hits = Vec::new();
+    for (pos, n) in catalog(c, &pool, &snap, &types)?.into_iter().enumerate() {
+        if region.as_ref().is_some_and(|r| !n.regions.contains(r)) {
+            continue;
+        }
+        let (h, b) = (fold(&n.handle), fold(&n.body));
+        let (mut matched, mut score, mut first) = (0usize, 0usize, None::<usize>);
+        for t in &wanted {
+            let in_h = find(&h, t).is_some();
+            let in_b = find(&b, t);
+            if in_h || in_b.is_some() {
+                matched += 1;
+            }
+            score += 3 * usize::from(in_h) + usize::from(in_b.is_some());
+            if let Some(at) = in_b {
+                first = Some(first.map_or(at, |f: usize| f.min(at)));
+            }
+        }
+        if matched == 0 {
+            continue;
+        }
+        if wanted.len() > 1 && (find(&h, &phrase).is_some() || find(&b, &phrase).is_some()) {
+            score += 2;
+        }
+        hits.push((matched, 10 * matched + score, pos, n, first));
+    }
+    // Most terms matched, then the score, then newest (catalog order).
+    hits.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)).then(x.2.cmp(&y.2)));
+    let total = hits.len();
+    let (shown, more) = bounded(hits, o.limit.unwrap_or(SEARCH_LIMIT));
+    let max = o.max_chars.unwrap_or(SNIPPET_CHARS);
+    let mut cut = Cut::new(o.max_chars);
+    let list: Vec<Value> = shown
+        .into_iter()
+        .map(|(_, score, _, n, first)| {
+            let (snip, partial) = snippet(&n.body, first.unwrap_or(0), max);
+            if partial {
+                cut.note(json!({"id": n.id, "field": "body", "chars": n.body.chars().count(), "as": "snippet"}));
+            }
+            json!({
+                "id": n.id,
+                "type": n.node_type,
+                "state": n.state,
+                "handle": cut.value(&n.id, "handle", &json!(n.handle)),
+                "regions": n.regions,
+                "score": score,
+                "snippet": snip,
+            })
+        })
+        .collect();
+    let mut doc = json!({
+        "env": e.name, "cauldron": c.name, "pool": pool.as_str(), "query": query,
+        "terms": wanted.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>(),
+        "total": total, "results": list,
+    });
+    if more > 0 {
+        doc["more"] = json!(more);
+    }
+    cut.report(&mut doc);
+    Ok(doc)
+}
+
+// ------------------------------------------------------------------- region
+
+/// One region: its record, the regions it narrows (parents) and that narrow
+/// it (children) to `depth` levels (default 1), the regions it relates to
+/// either way, and its direct members (id, type, state, handle), newest
+/// first, at most `limit` (default [`MEMBERS_LIMIT`]).
+pub fn region(t: &Target, id: &str, o: &ReadOpts) -> Result<Value> {
+    let (e, c) = (&t.env, &t.cauldron);
+    let pool = o.pool_name();
+    let handle = read_pool(c, &pool)?;
+    let snap = handle.snapshot().map_err(store)?;
+    let id = region_filter(&snap, Some(id))?.expect("asked");
+    let err = |e: spine::error::SpineError| store(e);
+    let mut cut = Cut::new(o.max_chars);
+    let depth = o.depth.unwrap_or(1);
+    let qualified = |id: &str| QualifiedNodeId { pool: pool.clone(), id: NodeId(id.to_string()) };
+    let members_of = |id: &str| -> Result<usize> { Ok(snap.edges_to(&qualified(id), Some("in_region")).map_err(err)?.len()) };
+
+    // A neighbouring region, short: id, handle, member count.
+    let brief = |cut: &mut Cut, rid: &str, extra: Option<usize>| -> Result<Value> {
+        let h = snap
+            .node(&NodeId(rid.to_string()))
+            .map_err(err)?
+            .and_then(|n| n.fields.get("handle").map(|f| f.value.clone()))
+            .unwrap_or(Value::Null);
+        let mut v = json!({"id": rid, "handle": cut.value(rid, "handle", &h), "members": members_of(rid)?});
+        if let Some(d) = extra {
+            v["depth"] = json!(d);
+        }
+        Ok(v)
+    };
+
+    // Up the narrows graph (parents) and down it (children), breadth first,
+    // each region once, to `depth` levels.
+    let walk = |cut: &mut Cut, up: bool| -> Result<Vec<Value>> {
+        let mut seen = std::collections::BTreeSet::from([id.clone()]);
+        let mut frontier = vec![id.clone()];
+        let mut out = Vec::new();
+        for level in 1..=depth {
+            let mut next = Vec::new();
+            for r in &frontier {
+                let mut far: Vec<String> = if up {
+                    snap.edges_from(&NodeId(r.clone()), Some("narrows")).map_err(err)?.iter().map(|x| target_text(&pool, &x.dst)).collect()
+                } else {
+                    snap.edges_to(&qualified(r), Some("narrows")).map_err(err)?.iter().map(|x| x.src.0.clone()).collect()
+                };
+                far.sort();
+                for f in far {
+                    if seen.insert(f.clone()) {
+                        out.push(brief(cut, &f, Some(level))?);
+                        next.push(f);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        Ok(out)
+    };
+    let parents = walk(&mut cut, true)?;
+    let children = walk(&mut cut, false)?;
+
+    let mut relates: Vec<String> = snap
+        .edges_from(&NodeId(id.clone()), Some("relates"))
+        .map_err(err)?
+        .iter()
+        .map(|x| target_text(&pool, &x.dst))
+        .chain(snap.edges_to(&qualified(&id), Some("relates")).map_err(err)?.iter().map(|x| x.src.0.clone()))
+        .collect();
+    relates.sort();
+    relates.dedup();
+    let relates = relates.iter().map(|r| brief(&mut cut, r, None)).collect::<Result<Vec<_>>>()?;
+
+    let r = snap.node(&NodeId(id.clone())).map_err(err)?.expect("checked above");
+    let mut flags = serde_json::Map::new();
+    for k in REGION_FLAGS {
+        if let Some(f) = r.fields.get(k) {
+            flags.insert(k.to_string(), f.value.clone());
+        }
+    }
+    let field = |cut: &mut Cut, k: &str| r.fields.get(k).map(|f| cut.value(&id, k, &f.value));
+    let record = json!({
+        "id": id,
+        "handle": field(&mut cut, "handle"),
+        "boundary": field(&mut cut, "boundary"),
+        "flags": flags,
+    });
+
+    let types = types_of(&handle, None)?;
+    let members: Vec<Entry> = catalog(c, &pool, &snap, &types)?.into_iter().filter(|n| n.regions.contains(&id)).collect();
+    let total = members.len();
+    let (shown, more) = bounded(members, o.limit.unwrap_or(MEMBERS_LIMIT));
+    let members: Vec<Value> = shown
+        .iter()
+        .map(|n| json!({"id": n.id, "type": n.node_type, "state": n.state, "handle": cut.value(&n.id, "handle", &json!(n.handle))}))
+        .collect();
+    let mut doc = json!({
+        "env": e.name, "cauldron": c.name, "pool": pool.as_str(),
+        "region": record, "parents": parents, "children": children, "relates": relates,
+        "members_total": total, "members": members,
+    });
+    if more > 0 {
+        doc["more"] = json!(more);
+    }
+    cut.report(&mut doc);
+    Ok(doc)
+}

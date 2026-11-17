@@ -40,6 +40,9 @@ members = [
     "services/tts",
     # Moved from substrate `lib/threads` @9cf7615 (R3.S2.M, move-and-fit).
     "services/threads",
+    # The MCP door to an environment's soups (`cauldron-mcp`): grants checked
+    # on every call, the one writer of every granted soup it holds open.
+    "services/mcp",
     # REL-3.S1: the MINIMAL soup crate on the release branch: the curated
     # `cauldron-build` dataset and its loader, until the real soup lands.
     "libs/soup",
@@ -48,6 +51,9 @@ members = [
     # reads and writes one offline. No soup daemon or other service uses it
     # in this release.
     "libs/spine",
+    # A cauldron's soup, offline, as a library: what `cauldron soup` does,
+    # without the printing. The CLI is argument parsing and printing over it.
+    "libs/soup-door",
 ]
 # `services/` holds the things that RUN — one declaration (`<name>.toml`) per
 # service, carrying its OWN build profile, and, for a service whose code lives
@@ -55,7 +61,7 @@ members = [
 # discovered by filename, so a service directory is not mistaken for one.
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 
 [workspace.dependencies]

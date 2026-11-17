@@ -76,13 +76,23 @@ scripts/prove-alarm-hosted
 '
 # Public paths the archive must contain. README.md shows the image, so an
 # export-ignore that caught it would publish a broken README; README.md links
-# CHANGELOG.md and ROADMAP.md, so the same holds for those.
+# CHANGELOG.md and ROADMAP.md, so the same holds for those. The workspace
+# lists libs/soup-door as a member that the `cauldron` CLI links, and
+# services/mcp as a member (the CLI's tests link it), so an archive without
+# either would not build. The plugin's MCP server is its .mcp.json, a dot
+# file an export rule could drop without breaking the build.
 REQUIRED_PATHS='
+claude-code/cauldron/.mcp.json
 docs/images/cauldron.png
 README.md
 CHANGELOG.md
 ROADMAP.md
 LICENSE
+libs/soup-door/Cargo.toml
+libs/soup-door/src/lib.rs
+services/mcp.toml
+services/mcp/Cargo.toml
+services/mcp/src/lib.rs
 '
 # A path every archive of this repo must contain: the positive sentinel that
 # proves the archive listing and the match below can find a path at all.

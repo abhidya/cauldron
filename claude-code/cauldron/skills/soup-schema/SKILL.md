@@ -1,6 +1,6 @@
 ---
 name: soup-schema
-description: A short orientation to the Cauldron soup schema (workspace grammar v6), the node types, edges and record shape that `cauldron soup import` accepts. Use when you need to read, write or reason about records in a Cauldron soup, or before calling the curator.
+description: A short orientation to the Cauldron soup schema (workspace grammar v6), the node types, edges and record shape that the cauldron MCP tools (`soup_put`) and `cauldron soup import` accept. Use when you need to read, write or reason about records in a Cauldron soup, or before calling the curator.
 ---
 
 A Cauldron **soup** is a knowledge graph: typed nodes joined by a closed set of
@@ -23,16 +23,20 @@ dispatched work), `milestone` (M, serves a directive), `idea` (C), `handoff`
 and `viewer` (V).
 
 **Placement.** Every content node mints with an `in_region` edge (or, rarely,
-two `rejected_by` edges and `searched`). Regions are found with
-`cauldron soup regions --env E --cauldron C`.
+two `rejected_by` edges and `searched`). Regions are found with the
+`soup_regions` MCP tool, or `cauldron soup regions --env E --cauldron C`.
 
 **Knowledge capture.** A pattern is a `decision` or `constraint` with
 `meta.kind: "pattern"`; a case is an `idea` or `issue` with
 `meta.kind: "case"`. Evidence goes in `meta.cites` as `{kind, ...}` objects.
 
-**Writing.** Use the `cauldron:curator` subagent (`/cauldron:curate`), or
+**Writing.** Use the `cauldron:curator` subagent (`/cauldron:curate`), or the
+`soup_put` MCP tool (`remint: true`, `dry_run: true` first), or
 `cauldron soup import <file> --env E --cauldron C --remint`, `--dry-run` first.
-It lands all records or none, and prints why any record was refused. Under
+Either lands all records or none, and says why any record was refused. Under
 `--remint` use labels like `n1`: a label equal to a held id is refused. Find
-what is there with `cauldron soup search <words>`, `soup nodes [--region R]`
-and `soup region <R>`, then read nodes with `cauldron soup get <id>...`.
+what is there with `soup_search`, `soup_nodes` and `soup_region` (or
+`cauldron soup search <words>`, `soup nodes [--region R]` and `soup region
+<R>`), then read nodes with `soup_get` (or `cauldron soup get <id>...`). The
+MCP tools reach a cauldron only once its owner granted it (`cauldron mcp
+grant`, at a terminal).

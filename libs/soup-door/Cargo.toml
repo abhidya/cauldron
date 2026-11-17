@@ -1,0 +1,24 @@
+[package]
+name = "soup-door"
+version.workspace = true
+edition.workspace = true
+description = "A cauldron's soup, offline, as a library: target resolution (flags, variables and the project marker), the bounded reads, the all-or-nothing import with its writer lock and live-soup check, recover, the whole-reply bound, and the grants that open a cauldron to the MCP door. Every answer is a serde_json::Value or a typed error; printing is the caller's."
+
+[dependencies]
+env = { path = "../env" }
+# Default features: the one-door gate stays closed.
+spine = { path = "../spine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Records may be written as YAML (the version spine already links).
+serde_yaml = "0.9"
+sha2 = { workspace = true }
+chrono = { workspace = true }
+# The MCP tool catalogue's `ToolDef`: shapewire's floor only (no server, no
+# tokio), the same build the `cauldron` CLI already links.
+shapewire = { path = "../shapewire", default-features = false }
+# `env` answers with anyhow errors; they are turned into this crate's own.
+anyhow = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

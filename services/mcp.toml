@@ -1,0 +1,48 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  mcp — THE MCP DOOR TO THIS ENVIRONMENT'S SOUPS.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# One per environment. It listens on 127.0.0.1 only and answers JSON-RPC on
+# `POST /mcp` (shapewire's MCP carrier). Claude Code reaches it through the
+# stdio bridge `cauldron mcp stdio`, which reads the door secret and adds the
+# session's context to every call.
+#
+# * Every cauldron is CLOSED to it until the owner runs `cauldron mcp grant`
+#   at a terminal; the grants are checked on every call, and a revoke closes
+#   the cauldron and frees its writer lock.
+# * It is the one writer of every granted soup it holds open: it opens a
+#   cauldron on the first write-scoped call (never at boot), holds
+#   `<soup>/writer.lock` until revoke or stop, and serializes every write on
+#   one thread per cauldron.
+# * Its files live in `data/<env>/mcp/`: `grants.json` (written by the CLI),
+#   `door.secret` (0600, minted at every start), `calls.jsonl` (one line per
+#   write, never record text).
+# * Port: 3654 in `prod` (the bridge dials it there); the kernel's choice in
+#   every other environment, published through the seam's `MCP` verb.
+
+name        = "mcp"
+description = "The MCP door to this environment's soups: loopback only, every cauldron closed until its owner grants it, the one writer of every granted soup it holds open. Registers its own seam."
+kind        = "daemon"
+
+# The HELLO handshake against this start's boot token.
+probe = "seam"
+
+# TERM: the service closes every open cauldron (answering what is queued,
+# then dropping each writer lock) before it exits.
+stop_signal = "TERM"
+
+start_timeout_ms = 15000
+
+[build]
+# A cargo source in this repository.
+package = "cauldron-mcp"
+bin     = "cauldron-mcp"
+# A long-lived daemon doing SQLite on every call: release, with the
+# workspace's assertions and overflow checks kept on.
+profile = "release"
+
+# Inherits cauldron's per-environment identity; nothing signs this image
+# with an identifier of its own.
+[permissions]
+responsibility = "inherit"
+identity = ""

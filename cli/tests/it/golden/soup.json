@@ -1,0 +1,631 @@
+[
+  {
+    "args": [
+      "soup",
+      "import",
+      "<S>/in/example.json",
+      "--dry-run",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"accepted\": 11,\n  \"batch_digest\": \"90cda6cd1de6d536e9badbefb4b38a44f9d7b91bb06f07d2466452c30b2220b2\",\n  \"cauldron\": \"kb\",\n  \"dry_run\": true,\n  \"env\": \"dev\",\n  \"judged_on\": \"a read-only snapshot of the soup, taken now; nothing was written\",\n  \"outcome\": \"validated\",\n  \"pool\": \"ws\",\n  \"records\": [\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"R-1\",\n      \"type\": \"region\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"R-2\",\n      \"type\": \"region\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"DIR-1\",\n      \"type\": \"directive\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"M-1\",\n      \"type\": \"milestone\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"Q-1\",\n      \"type\": \"question\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"T-1\",\n      \"type\": \"task\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"IS-1\",\n      \"type\": \"issue\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"DEC-1\",\n      \"type\": \"decision\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"CON-1\",\n      \"type\": \"constraint\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"C-1\",\n      \"type\": \"idea\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"V-1\",\n      \"type\": \"viewer\"\n    }\n  ],\n  \"refused\": 0,\n  \"remint\": false\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "import",
+      "<S>/in/example.json",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"accepted\": 11,\n  \"batch_digest\": \"90cda6cd1de6d536e9badbefb4b38a44f9d7b91bb06f07d2466452c30b2220b2\",\n  \"cauldron\": \"kb\",\n  \"dry_run\": false,\n  \"env\": \"dev\",\n  \"judged_on\": \"the soup\",\n  \"landed\": {\n    \"deduplicated\": false,\n    \"seq\": 1,\n    \"tx\": \"<V0>\"\n  },\n  \"outcome\": \"landed\",\n  \"pool\": \"ws\",\n  \"records\": [\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"R-1\",\n      \"type\": \"region\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"R-2\",\n      \"type\": \"region\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"DIR-1\",\n      \"type\": \"directive\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"M-1\",\n      \"type\": \"milestone\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"Q-1\",\n      \"type\": \"question\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"T-1\",\n      \"type\": \"task\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"IS-1\",\n      \"type\": \"issue\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"DEC-1\",\n      \"type\": \"decision\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"CON-1\",\n      \"type\": \"constraint\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"C-1\",\n      \"type\": \"idea\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"V-1\",\n      \"type\": \"viewer\"\n    }\n  ],\n  \"refused\": 0,\n  \"remint\": false\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "import",
+      "<S>/in/example.json",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron soup import: REFUSED (batch-already-landed): this exact batch (the same records, before any --remint, into pool `ws`) already landed in cauldron `kb` at <V2> as spine transaction 1 (11 records). Under --remint, importing it again would land every record a second time under new ids, and this release cannot delete nodes; without --remint, its carried ids would collide and the import would be refused. Nothing was written. If a second copy is really wanted, run the same command with --allow-duplicate.\n",
+    "stdout": "{\n  \"batch_digest\": \"90cda6cd1de6d536e9badbefb4b38a44f9d7b91bb06f07d2466452c30b2220b2\",\n  \"cauldron\": \"kb\",\n  \"dry_run\": false,\n  \"env\": \"dev\",\n  \"landed_before\": [\n    {\n      \"landed_at\": \"<V2>\",\n      \"records\": 11,\n      \"seq\": 1\n    }\n  ],\n  \"outcome\": \"refused\",\n  \"pool\": \"ws\",\n  \"refusal\": \"batch-already-landed\",\n  \"remint\": false,\n  \"why\": \"this exact batch (the same records, before any --remint, into pool `ws`) already landed in cauldron `kb` at <V2> as spine transaction 1 (11 records). Under --remint, importing it again would land every record a second time under new ids, and this release cannot delete nodes; without --remint, its carried ids would collide and the import would be refused. Nothing was written. If a second copy is really wanted, run the same command with --allow-duplicate.\"\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "import",
+      "<S>/in/example.json",
+      "--dry-run",
+      "--remint",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron soup import: REFUSED (batch-already-landed): this exact batch (the same records, before any --remint, into pool `ws`) already landed in cauldron `kb` at <V2> as spine transaction 1 (11 records). Under --remint, importing it again would land every record a second time under new ids, and this release cannot delete nodes; without --remint, its carried ids would collide and the import would be refused. Nothing was written. If a second copy is really wanted, run the same command with --allow-duplicate.\n",
+    "stdout": "{\n  \"batch_digest\": \"90cda6cd1de6d536e9badbefb4b38a44f9d7b91bb06f07d2466452c30b2220b2\",\n  \"cauldron\": \"kb\",\n  \"dry_run\": true,\n  \"env\": \"dev\",\n  \"landed_before\": [\n    {\n      \"landed_at\": \"<V2>\",\n      \"records\": 11,\n      \"seq\": 1\n    }\n  ],\n  \"outcome\": \"refused\",\n  \"pool\": \"ws\",\n  \"refusal\": \"batch-already-landed\",\n  \"remint\": true,\n  \"why\": \"this exact batch (the same records, before any --remint, into pool `ws`) already landed in cauldron `kb` at <V2> as spine transaction 1 (11 records). Under --remint, importing it again would land every record a second time under new ids, and this release cannot delete nodes; without --remint, its carried ids would collide and the import would be refused. Nothing was written. If a second copy is really wanted, run the same command with --allow-duplicate.\"\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "import",
+      "<S>/in/later.json",
+      "--remint",
+      "--agent",
+      "golden",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"accepted\": 2,\n  \"batch_digest\": \"a0d313336760839f86b8fd4a810be410c43eda20dd9f139f19d395be5a5f3201\",\n  \"cauldron\": \"kb\",\n  \"dry_run\": false,\n  \"env\": \"dev\",\n  \"id_map\": {\n    \"a\": \"IS-2\",\n    \"r\": \"R-3\"\n  },\n  \"judged_on\": \"the soup\",\n  \"landed\": {\n    \"deduplicated\": false,\n    \"seq\": 2,\n    \"tx\": \"<V1>\"\n  },\n  \"outcome\": \"landed\",\n  \"pool\": \"ws\",\n  \"records\": [\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"r\",\n      \"new_id\": \"R-3\",\n      \"type\": \"region\"\n    },\n    {\n      \"disposition\": \"accepted\",\n      \"id\": \"a\",\n      \"new_id\": \"IS-2\",\n      \"type\": \"issue\"\n    }\n  ],\n  \"refused\": 0,\n  \"remint\": true\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "import",
+      "<S>/in/bad.json",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "",
+    "stdout": "{\n  \"accepted\": 0,\n  \"batch_digest\": \"9687c5b60175008ef8ce42f11d424125f68ebf7129a18d147d7cba1164cffbd5\",\n  \"cauldron\": \"kb\",\n  \"dry_run\": false,\n  \"env\": \"dev\",\n  \"judged_on\": \"the soup\",\n  \"outcome\": \"refused\",\n  \"pool\": \"ws\",\n  \"records\": [\n    {\n      \"disposition\": \"refused\",\n      \"id\": \"IS-90\",\n      \"reasons\": [\n        {\n          \"code\": \"refused-by-destination-grammar\",\n          \"detail\": \"the destination grammar of pool `ws` refused this item's dry run\",\n          \"witnesses\": [\n            {\n              \"kind\": \"grammar_violation\",\n              \"message\": \"unknown_node_type: node type `nonsense` is not declared by this pool's grammar\",\n              \"part\": null,\n              \"pool\": \"ws\"\n            }\n          ]\n        }\n      ],\n      \"type\": \"nonsense\"\n    }\n  ],\n  \"refused\": 1,\n  \"remint\": false\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "import",
+      "<S>/in/bad.json",
+      "--dry-run",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "",
+    "stdout": "{\n  \"accepted\": 0,\n  \"batch_digest\": \"9687c5b60175008ef8ce42f11d424125f68ebf7129a18d147d7cba1164cffbd5\",\n  \"cauldron\": \"kb\",\n  \"dry_run\": true,\n  \"env\": \"dev\",\n  \"judged_on\": \"a read-only snapshot of the soup, taken now; nothing was written\",\n  \"outcome\": \"refused\",\n  \"pool\": \"ws\",\n  \"records\": [\n    {\n      \"disposition\": \"refused\",\n      \"id\": \"IS-90\",\n      \"reasons\": [\n        {\n          \"code\": \"refused-by-destination-grammar\",\n          \"detail\": \"the destination grammar of pool `ws` refused this item's dry run\",\n          \"witnesses\": [\n            {\n              \"kind\": \"grammar_violation\",\n              \"message\": \"unknown_node_type: node type `nonsense` is not declared by this pool's grammar\",\n              \"part\": null,\n              \"pool\": \"ws\"\n            }\n          ]\n        }\n      ],\n      \"type\": \"nonsense\"\n    }\n  ],\n  \"refused\": 1,\n  \"remint\": false\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "regions",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"pool\": \"ws\",\n  \"regions\": [\n    {\n      \"boundary\": \"Inside: anything about the published, machine-readable schema of the soup and how outside agents use it. Outside: the importer's code goes to R-2.\",\n      \"flags\": {},\n      \"handle\": \"Publishing the soup schema\",\n      \"id\": \"R-1\",\n      \"members\": 4,\n      \"narrows\": [],\n      \"relates\": []\n    },\n    {\n      \"boundary\": \"Inside: anything about landing externally written records in a soup: ids, collisions, validation. Outside: the schema itself goes to R-1.\",\n      \"flags\": {},\n      \"handle\": \"Importing records into a soup\",\n      \"id\": \"R-2\",\n      \"members\": 3,\n      \"narrows\": [],\n      \"relates\": [\n        \"R-1\"\n      ]\n    },\n    {\n      \"boundary\": \"Inside: tests that hold a copy of the schema to its source. Outside: the schema itself (R-1).\",\n      \"flags\": {},\n      \"handle\": \"Schema drift checks\",\n      \"id\": \"R-3\",\n      \"members\": 1,\n      \"narrows\": [\n        \"R-1\"\n      ],\n      \"relates\": []\n    }\n  ]\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "regions",
+      "--max-chars",
+      "12",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"pool\": \"ws\",\n  \"regions\": [\n    {\n      \"boundary\": \"Inside: anyt\",\n      \"flags\": {},\n      \"handle\": \"Publishing t\",\n      \"id\": \"R-1\",\n      \"members\": 4,\n      \"narrows\": [],\n      \"relates\": []\n    },\n    {\n      \"boundary\": \"Inside: anyt\",\n      \"flags\": {},\n      \"handle\": \"Importing re\",\n      \"id\": \"R-2\",\n      \"members\": 3,\n      \"narrows\": [],\n      \"relates\": [\n        \"R-1\"\n      ]\n    },\n    {\n      \"boundary\": \"Inside: test\",\n      \"flags\": {},\n      \"handle\": \"Schema drift\",\n      \"id\": \"R-3\",\n      \"members\": 1,\n      \"narrows\": [\n        \"R-1\"\n      ],\n      \"relates\": []\n    }\n  ],\n  \"truncated\": [\n    {\n      \"chars\": 26,\n      \"field\": \"handle\",\n      \"id\": \"R-1\"\n    },\n    {\n      \"chars\": 146,\n      \"field\": \"boundary\",\n      \"id\": \"R-1\"\n    },\n    {\n      \"chars\": 29,\n      \"field\": \"handle\",\n      \"id\": \"R-2\"\n    },\n    {\n      \"chars\": 137,\n      \"field\": \"boundary\",\n      \"id\": \"R-2\"\n    },\n    {\n      \"chars\": 19,\n      \"field\": \"handle\",\n      \"id\": \"R-3\"\n    },\n    {\n      \"chars\": 93,\n      \"field\": \"boundary\",\n      \"id\": \"R-3\"\n    }\n  ]\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "region",
+      "R-1",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"children\": [\n    {\n      \"depth\": 1,\n      \"handle\": \"Schema drift checks\",\n      \"id\": \"R-3\",\n      \"members\": 1\n    }\n  ],\n  \"env\": \"dev\",\n  \"members\": [\n    {\n      \"handle\": \"Schema files are generated from the grammar and never edited by hand\",\n      \"id\": \"CON-1\",\n      \"state\": \"standing\",\n      \"type\": \"constraint\"\n    },\n    {\n      \"handle\": \"Validate every record against the published schema before writing it\",\n      \"id\": \"DEC-1\",\n      \"state\": \"decided\",\n      \"type\": \"decision\"\n    },\n    {\n      \"handle\": \"Agents on other machines can write valid soup records without the cauldron source\",\n      \"id\": \"DIR-1\",\n      \"state\": \"active\",\n      \"type\": \"directive\"\n    },\n    {\n      \"handle\": \"The v6 schema is published with a drift test and a README\",\n      \"id\": \"M-1\",\n      \"state\": \"active\",\n      \"type\": \"milestone\"\n    }\n  ],\n  \"members_total\": 4,\n  \"parents\": [],\n  \"pool\": \"ws\",\n  \"region\": {\n    \"boundary\": \"Inside: anything about the published, machine-readable schema of the soup and how outside agents use it. Outside: the importer's code goes to R-2.\",\n    \"flags\": {},\n    \"handle\": \"Publishing the soup schema\",\n    \"id\": \"R-1\"\n  },\n  \"relates\": [\n    {\n      \"handle\": \"Importing records into a soup\",\n      \"id\": \"R-2\",\n      \"members\": 3\n    }\n  ]\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "region",
+      "R-1",
+      "--depth",
+      "2",
+      "--limit",
+      "1",
+      "--max-chars",
+      "8",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"children\": [\n    {\n      \"depth\": 1,\n      \"handle\": \"Schema d\",\n      \"id\": \"R-3\",\n      \"members\": 1\n    }\n  ],\n  \"env\": \"dev\",\n  \"members\": [\n    {\n      \"handle\": \"Schema f\",\n      \"id\": \"CON-1\",\n      \"state\": \"standing\",\n      \"type\": \"constraint\"\n    }\n  ],\n  \"members_total\": 4,\n  \"more\": 3,\n  \"parents\": [],\n  \"pool\": \"ws\",\n  \"region\": {\n    \"boundary\": \"Inside: \",\n    \"flags\": {},\n    \"handle\": \"Publishi\",\n    \"id\": \"R-1\"\n  },\n  \"relates\": [\n    {\n      \"handle\": \"Importin\",\n      \"id\": \"R-2\",\n      \"members\": 3\n    }\n  ],\n  \"truncated\": [\n    {\n      \"chars\": 19,\n      \"field\": \"handle\",\n      \"id\": \"R-3\"\n    },\n    {\n      \"chars\": 29,\n      \"field\": \"handle\",\n      \"id\": \"R-2\"\n    },\n    {\n      \"chars\": 26,\n      \"field\": \"handle\",\n      \"id\": \"R-1\"\n    },\n    {\n      \"chars\": 146,\n      \"field\": \"boundary\",\n      \"id\": \"R-1\"\n    },\n    {\n      \"chars\": 68,\n      \"field\": \"handle\",\n      \"id\": \"CON-1\"\n    }\n  ]\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "region",
+      "IS-1",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: `IS-1` is a issue, not a region\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "region",
+      "R-99",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: there is no region `R-99`; `cauldron soup regions` lists them\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"nodes\": [\n    {\n      \"handle\": \"The plugin's schema copy drifted from the published schema\",\n      \"id\": \"IS-2\",\n      \"regions\": [\n        \"R-3\"\n      ],\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    },\n    {\n      \"handle\": \"Schema drift checks\",\n      \"id\": \"R-3\",\n      \"regions\": [],\n      \"state\": null,\n      \"type\": \"region\"\n    },\n    {\n      \"handle\": \"A colour theme for the terminal face\",\n      \"id\": \"C-1\",\n      \"regions\": [],\n      \"state\": \"idea\",\n      \"type\": \"idea\"\n    },\n    {\n      \"handle\": \"Schema files are generated from the grammar and never edited by hand\",\n      \"id\": \"CON-1\",\n      \"regions\": [\n        \"R-1\"\n      ],\n      \"state\": \"standing\",\n      \"type\": \"constraint\"\n    },\n    {\n      \"handle\": \"Validate every record against the published schema before writing it\",\n      \"id\": \"DEC-1\",\n      \"regions\": [\n        \"R-1\"\n      ],\n      \"state\": \"decided\",\n      \"type\": \"decision\"\n    },\n    {\n      \"handle\": \"Agents on other machines can write valid soup records without the cauldron source\",\n      \"id\": \"DIR-1\",\n      \"regions\": [\n        \"R-1\"\n      ],\n      \"state\": \"active\",\n      \"type\": \"directive\"\n    },\n    {\n      \"handle\": \"A record with an unknown edge kind was refused only at import, after an hour of writing\",\n      \"id\": \"IS-1\",\n      \"regions\": [\n        \"R-2\"\n      ],\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    },\n    {\n      \"handle\": \"The v6 schema is published with a drift test and a README\",\n      \"id\": \"M-1\",\n      \"regions\": [\n        \"R-1\"\n      ],\n      \"state\": \"active\",\n      \"type\": \"milestone\"\n    },\n    {\n      \"handle\": \"Does a repeat import re-mint carried ids or refuse the collision?\",\n      \"id\": \"Q-1\",\n      \"regions\": [\n        \"R-2\"\n      ],\n      \"state\": \"open\",\n      \"type\": \"question\"\n    },\n    {\n      \"handle\": \"Importing records into a soup\",\n      \"id\": \"R-2\",\n      \"regions\": [],\n      \"state\": null,\n      \"type\": \"region\"\n    },\n    {\n      \"handle\": \"Publishing the soup schema\",\n      \"id\": \"R-1\",\n      \"regions\": [],\n      \"state\": null,\n      \"type\": \"region\"\n    },\n    {\n      \"handle\": \"Add an import verb that lands a validated record set in one tranche\",\n      \"id\": \"T-1\",\n      \"regions\": [\n        \"R-2\"\n      ],\n      \"state\": \"active\",\n      \"type\": \"task\"\n    },\n    {\n      \"handle\": \"\",\n      \"id\": \"V-1\",\n      \"regions\": [],\n      \"state\": null,\n      \"type\": \"viewer\"\n    }\n  ],\n  \"pool\": \"ws\",\n  \"total\": 13\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--type",
+      "issue",
+      "--state",
+      "open",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"nodes\": [\n    {\n      \"handle\": \"The plugin's schema copy drifted from the published schema\",\n      \"id\": \"IS-2\",\n      \"regions\": [\n        \"R-3\"\n      ],\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    },\n    {\n      \"handle\": \"A record with an unknown edge kind was refused only at import, after an hour of writing\",\n      \"id\": \"IS-1\",\n      \"regions\": [\n        \"R-2\"\n      ],\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    }\n  ],\n  \"pool\": \"ws\",\n  \"total\": 2\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--region",
+      "R-2",
+      "--limit",
+      "2",
+      "--max-chars",
+      "10",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"more\": 1,\n  \"nodes\": [\n    {\n      \"handle\": \"A record w\",\n      \"id\": \"IS-1\",\n      \"regions\": [\n        \"R-2\"\n      ],\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    },\n    {\n      \"handle\": \"Does a rep\",\n      \"id\": \"Q-1\",\n      \"regions\": [\n        \"R-2\"\n      ],\n      \"state\": \"open\",\n      \"type\": \"question\"\n    }\n  ],\n  \"pool\": \"ws\",\n  \"total\": 3,\n  \"truncated\": [\n    {\n      \"chars\": 87,\n      \"field\": \"handle\",\n      \"id\": \"IS-1\"\n    },\n    {\n      \"chars\": 65,\n      \"field\": \"handle\",\n      \"id\": \"Q-1\"\n    }\n  ]\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--type",
+      "nope",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: pool `ws` has no node type `nope` (it has: constraint, danger, decision, directive, handoff, idea, issue, milestone, question, region, task, viewer)\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "search",
+      "schema",
+      "drift",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"pool\": \"ws\",\n  \"query\": \"schema drift\",\n  \"results\": [\n    {\n      \"handle\": \"Schema drift checks\",\n      \"id\": \"R-3\",\n      \"regions\": [],\n      \"score\": 28,\n      \"snippet\": \"\",\n      \"state\": null,\n      \"type\": \"region\"\n    },\n    {\n      \"handle\": \"The plugin's schema copy drifted from the published schema\",\n      \"id\": \"IS-2\",\n      \"regions\": [\n        \"R-3\"\n      ],\n      \"score\": 27,\n      \"snippet\": \"A drift test compares the copy with its source.\",\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    },\n    {\n      \"handle\": \"The v6 schema is published with a drift test and a README\",\n      \"id\": \"M-1\",\n      \"regions\": [\n        \"R-1\"\n      ],\n      \"score\": 26,\n      \"snippet\": \"\",\n      \"state\": \"active\",\n      \"type\": \"milestone\"\n    },\n    {\n      \"handle\": \"Schema files are generated from the grammar and never edited by hand\",\n      \"id\": \"CON-1\",\n      \"regions\": [\n        \"R-1\"\n      ],\n      \"score\": 13,\n      \"snippet\": \"\",\n      \"state\": \"standing\",\n      \"type\": \"constraint\"\n    },\n    {\n      \"handle\": \"Validate every record against the published schema before writing it\",\n      \"id\": \"DEC-1\",\n      \"regions\": [\n        \"R-1\"\n      ],\n      \"score\": 13,\n      \"snippet\": \"\",\n      \"state\": \"decided\",\n      \"type\": \"decision\"\n    },\n    {\n      \"handle\": \"Publishing the soup schema\",\n      \"id\": \"R-1\",\n      \"regions\": [],\n      \"score\": 13,\n      \"snippet\": \"\",\n      \"state\": null,\n      \"type\": \"region\"\n    },\n    {\n      \"handle\": \"A record with an unknown edge kind was refused only at import, after an hour of writing\",\n      \"id\": \"IS-1\",\n      \"regions\": [\n        \"R-2\"\n      ],\n      \"score\": 11,\n      \"snippet\": \"Validating against node.task.schema.json before writing would have caught it. See [[DEC-1]].\",\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    }\n  ],\n  \"terms\": [\n    \"schema\",\n    \"drift\"\n  ],\n  \"total\": 7\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "search",
+      "schema",
+      "--limit",
+      "2",
+      "--max-chars",
+      "20",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"more\": 5,\n  \"pool\": \"ws\",\n  \"query\": \"schema\",\n  \"results\": [\n    {\n      \"handle\": \"The plugin's schema \",\n      \"id\": \"IS-2\",\n      \"regions\": [\n        \"R-3\"\n      ],\n      \"score\": 13,\n      \"snippet\": \"A drift test compare…\",\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    },\n    {\n      \"handle\": \"Schema drift checks\",\n      \"id\": \"R-3\",\n      \"regions\": [],\n      \"score\": 13,\n      \"snippet\": \"\",\n      \"state\": null,\n      \"type\": \"region\"\n    }\n  ],\n  \"terms\": [\n    \"schema\"\n  ],\n  \"total\": 7,\n  \"truncated\": [\n    {\n      \"as\": \"snippet\",\n      \"chars\": 47,\n      \"field\": \"body\",\n      \"id\": \"IS-2\"\n    },\n    {\n      \"chars\": 58,\n      \"field\": \"handle\",\n      \"id\": \"IS-2\"\n    }\n  ]\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "search",
+      "--type",
+      "issue",
+      "copy",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"pool\": \"ws\",\n  \"query\": \"copy\",\n  \"results\": [\n    {\n      \"handle\": \"The plugin's schema copy drifted from the published schema\",\n      \"id\": \"IS-2\",\n      \"regions\": [\n        \"R-3\"\n      ],\n      \"score\": 14,\n      \"snippet\": \"A drift test compares the copy with its source.\",\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    }\n  ],\n  \"terms\": [\n    \"copy\"\n  ],\n  \"total\": 1\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "search",
+      "!!",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: `cauldron soup search` needs a query with at least one word\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "get",
+      "IS-1",
+      "R-1",
+      "R-3",
+      "NOPE-1",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"missing\": [\n    \"NOPE-1\"\n  ],\n  \"pool\": \"ws\",\n  \"records\": [\n    {\n      \"body\": \"Validating against node.task.schema.json before writing would have caught it. See [[DEC-1]].\",\n      \"edges\": [\n        {\n          \"kind\": \"in_region\",\n          \"note\": \"landing externally written records in a soup\",\n          \"to\": \"R-2\"\n        },\n        {\n          \"kind\": \"ref\",\n          \"to\": \"DEC-1\"\n        }\n      ],\n      \"handle\": \"A record with an unknown edge kind was refused only at import, after an hour of writing\",\n      \"id\": \"IS-1\",\n      \"meta\": {\n        \"cites\": [\n          {\n            \"kind\": \"file\",\n            \"line\": 12,\n            \"path\": \"notes/import-run.log\"\n          }\n        ],\n        \"kind\": \"case\"\n      },\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    },\n    {\n      \"boundary\": \"Inside: anything about the published, machine-readable schema of the soup and how outside agents use it. Outside: the importer's code goes to R-2.\",\n      \"handle\": \"Publishing the soup schema\",\n      \"id\": \"R-1\",\n      \"type\": \"region\"\n    },\n    {\n      \"boundary\": \"Inside: tests that hold a copy of the schema to its source. Outside: the schema itself (R-1).\",\n      \"edges\": [\n        {\n          \"kind\": \"narrows\",\n          \"to\": \"R-1\"\n        }\n      ],\n      \"handle\": \"Schema drift checks\",\n      \"id\": \"R-3\",\n      \"type\": \"region\"\n    }\n  ]\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "get",
+      "IS-1",
+      "--max-chars",
+      "10",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"pool\": \"ws\",\n  \"records\": [\n    {\n      \"body\": \"Validating\",\n      \"edges\": [\n        {\n          \"kind\": \"in_region\",\n          \"note\": \"landing externally written records in a soup\",\n          \"to\": \"R-2\"\n        },\n        {\n          \"kind\": \"ref\",\n          \"to\": \"DEC-1\"\n        }\n      ],\n      \"handle\": \"A record w\",\n      \"id\": \"IS-1\",\n      \"meta\": {\n        \"cites\": [\n          {\n            \"kind\": \"file\",\n            \"line\": 12,\n            \"path\": \"notes/import-run.log\"\n          }\n        ],\n        \"kind\": \"case\"\n      },\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    }\n  ],\n  \"truncated\": [\n    {\n      \"chars\": 92,\n      \"field\": \"body\",\n      \"id\": \"IS-1\"\n    },\n    {\n      \"chars\": 87,\n      \"field\": \"handle\",\n      \"id\": \"IS-1\"\n    }\n  ]\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "get",
+      "IS-1",
+      "--pool",
+      "../x",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: REFUSED: `--pool ../x` is not a pool name. A pool name is [a-z][a-z0-9-]* (a lowercase letter, then lowercase letters, digits or `-`); it names a file inside the soup, so a path is never accepted. Nothing was read or written.\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "get",
+      "IS-1",
+      "--pool",
+      "spine",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: REFUSED: `--pool spine` names the spine's own file, not a pool. Nothing was read or written.\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "recover",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "cauldron soup recover: at-rest (interrupted import: none)\nNothing to recover: no interrupted import is waiting to be settled. This cannot tell you whether an import you stopped earlier landed (one stopped after it finished landed in full, one stopped before it began writing landed nothing, and an earlier recover printed its own outcome), so check with `cauldron soup nodes --env dev --cauldron kb` (newest first) before importing that batch again.\n",
+    "stdout": "{\n  \"before\": [],\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"instruction\": \"Nothing to recover: no interrupted import is waiting to be settled. This cannot tell you whether an import you stopped earlier landed (one stopped after it finished landed in full, one stopped before it began writing landed nothing, and an earlier recover printed its own outcome), so check with `cauldron soup nodes --env dev --cauldron kb` (newest first) before importing that batch again.\",\n  \"interrupted_import\": \"none\",\n  \"note\": \"the soup was already at rest; the spine was not opened and no data was written\",\n  \"outcome\": \"at-rest\"\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "recover",
+      "extra",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: `cauldron soup recover` takes no arguments (got `extra`); `cauldron soup help`\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--env",
+      "dev",
+      "--cauldron",
+      "nope"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: REFUSED: there is no cauldron `nope` in environment `dev`. `cauldron list --env dev` shows its cauldrons.\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--env",
+      "nowhere",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: REFUSED: there is no environment `nowhere` (<S>/root/data/nowhere does not exist)\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": "<S>",
+    "rc": 1,
+    "stderr": "cauldron: `cauldron soup nodes` needs --env <name>: it never defaults to prod, and no project marker (`.cauldron`, written by `cauldron link`) was found in <S> or above it\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--bogus",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: unknown option `--bogus` for `cauldron soup nodes`\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--limit",
+      "many",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 1,
+    "stderr": "cauldron: --limit takes a count, not `many`: invalid digit found in string\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "frobnicate",
+      "--env",
+      "dev",
+      "--cauldron",
+      "kb"
+    ],
+    "cwd": null,
+    "rc": 2,
+    "stderr": "cauldron soup: no verb `frobnicate` (import | recover | regions | region | nodes | search | get | help)\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup"
+    ],
+    "cwd": null,
+    "rc": 2,
+    "stderr": "cauldron soup — a cauldron's soup, offline\n\n    cauldron soup import <file-or-dir> [--cauldron <name>] [--env <env>] [--dry-run] [--remint]\n                         [--allow-duplicate] [--agent <label>]\n        Land records written in the published shape (schema/soup/workspace-v6/README.md):\n        one file holding a list (or one record), or a directory of one-record files; JSON,\n        or YAML for .yaml/.yml. Every record is judged by the soup's own door; the JSON\n        printed gives each one's disposition (accepted, or refused with the grammar's\n        reason). Without --dry-run the whole set lands as ONE write when every record is\n        accepted, and nothing lands otherwise. Ids are carried as written and a collision\n        refuses the import; --remint treats them as batch-local, gives each record the\n        next free id for its type, rewrites references and [[links]] inside the batch, and\n        prints the old -> new map. Under --remint a label may not equal an id the soup\n        already holds (refused, `label-shadows-existing`), so a bare id that is not a label\n        always names the existing node; `<ID>@<pool>` names it explicitly. An edge to an id\n        outside the batch must name a node the soup already holds. A real import is refused\n        while another import or recover is writing to the same soup, while the soup is not\n        at rest (an earlier import was interrupted: see `recover`), and when the\n        environment's seam table cannot be read or lists a running `soup` service (this\n        release ships no soup service, so in practice that means only an unreadable seam\n        table); --dry-run is then judged against a read-only snapshot. A batch whose records\n        (as read, before any --remint) are identical to one that already landed in this\n        pool is refused as `batch-already-landed`, with when it landed and how many records\n        it held: under --remint every record would land again under new ids, and without it\n        the carried ids would collide and the import would be refused; --allow-duplicate\n        skips this check. Each import records the batch's digest in its own spine row, so\n        batches landed by an earlier release are not recognised. --agent records who wrote\n        (default `outside-agent`).\n        While the cauldron is granted to the MCP door and the `mcp` service holds its soup\n        open (`cauldron mcp status`), a real import is sent to that service and lands\n        through it: the same judgement, the same JSON (with `forwarded_to`), the same\n        batch-already-landed check and --allow-duplicate; the service records the writer\n        as `mcp:cli`, not --agent, and writes only the `ws` pool. A dry run is never sent.\n        A batch over the 16 MiB the service reads in one request is refused before it is\n        sent (never split): import it in smaller files, or revoke the grant (or stop the\n        service) and import directly.\n    cauldron soup recover [--cauldron <name>] [--env <env>]\n        Settle a soup that an interrupted import left not at rest: an import that never\n        reached its commit decision is rolled back (none of it lands), one that did is\n        finished (all of it lands, once). Refused while another import or recover is\n        writing to the soup, and on the same seam-table check as import; a soup already at\n        rest is not touched. Prints (JSON on stdout, the same in words on stderr) which of\n        the two happened: `interrupted_import` is `landed` (with how many records and their\n        ids: do NOT import that batch again; under --remint every record would land twice),\n        `rolled-back`\n        (none of it landed: importing it again is safe) or `none` (nothing to recover).\n        Also says what still stands in the way if anything does. Refused while the `mcp`\n        service holds the soup: it recovers the soup itself when it opens it, and\n        `cauldron mcp status` shows what that recovered.\n    cauldron soup regions [--cauldron <name>] [--env <env>] [--max-chars N]\n        Every region: id, handle, boundary, flags, the regions it narrows or relates to,\n        and how many nodes sit in it.\n    cauldron soup region <id> [--cauldron <name>] [--env <env>] [--depth N] [--limit N] [--max-chars N]\n        One region: its record, the regions it narrows (parents) and that narrow it\n        (children) to --depth levels (default 1), the regions it relates to either way, and\n        its direct members (id, type, state, handle), newest first, at most --limit (50).\n    cauldron soup nodes [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]\n                        [--state <s>] [--limit N] [--max-chars N]\n        Nodes as {id, type, state, handle, regions}, newest first (by the spine's commit\n        order; one write's nodes by id prefix, then serial, highest first), at most --limit\n        (default 50); --region keeps a region's direct members.\n    cauldron soup search <query> [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]\n                         [--limit N] [--max-chars N]\n        Lexical search over handles and bodies: every word of the query a term, found\n        case-insensitively as a substring; ranked by how many terms match, then handle hits over body hits, then newest.\n        Prints {id, type, state, handle, regions, score, snippet}, at most --limit (20);\n        the snippet is --max-chars long (default 160) around the first hit.\n    cauldron soup get <id>... [--cauldron <name>] [--env <env>] [--max-chars N]\n        Those nodes as records in the published shape, with their outgoing edges.\n    cauldron soup help\n\n  Every verb prints JSON on stdout and exits non-zero on a refusal. Reads open the store\n  so that they cannot write. --max-chars cuts any longer text field, and the output's\n  `truncated` lists what was cut; a list cut by --limit says how many `more` there are.\n  `--pool <p>` names another pool than `ws`.\n\n  --env and --cauldron may be left out inside a project linked with `cauldron link`: the\n  nearest `.cauldron` marker file in the current directory or a parent names both. A flag\n  or variable ($CAULDRON_ENV, $ENV, $CAULDRON_CAULDRON) always wins over the marker. When\n  the marker supplied either value, stderr says so and the JSON carries\n  `resolved_from: \"marker:<path>\"`. A write (import without --dry-run, recover) refuses\n  to take its target from a marker that is tracked by git or owned by another user: the\n  marker is per-machine and belongs in .gitignore (`cauldron link help`).\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "soup",
+      "help"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "cauldron soup — a cauldron's soup, offline\n\n    cauldron soup import <file-or-dir> [--cauldron <name>] [--env <env>] [--dry-run] [--remint]\n                         [--allow-duplicate] [--agent <label>]\n        Land records written in the published shape (schema/soup/workspace-v6/README.md):\n        one file holding a list (or one record), or a directory of one-record files; JSON,\n        or YAML for .yaml/.yml. Every record is judged by the soup's own door; the JSON\n        printed gives each one's disposition (accepted, or refused with the grammar's\n        reason). Without --dry-run the whole set lands as ONE write when every record is\n        accepted, and nothing lands otherwise. Ids are carried as written and a collision\n        refuses the import; --remint treats them as batch-local, gives each record the\n        next free id for its type, rewrites references and [[links]] inside the batch, and\n        prints the old -> new map. Under --remint a label may not equal an id the soup\n        already holds (refused, `label-shadows-existing`), so a bare id that is not a label\n        always names the existing node; `<ID>@<pool>` names it explicitly. An edge to an id\n        outside the batch must name a node the soup already holds. A real import is refused\n        while another import or recover is writing to the same soup, while the soup is not\n        at rest (an earlier import was interrupted: see `recover`), and when the\n        environment's seam table cannot be read or lists a running `soup` service (this\n        release ships no soup service, so in practice that means only an unreadable seam\n        table); --dry-run is then judged against a read-only snapshot. A batch whose records\n        (as read, before any --remint) are identical to one that already landed in this\n        pool is refused as `batch-already-landed`, with when it landed and how many records\n        it held: under --remint every record would land again under new ids, and without it\n        the carried ids would collide and the import would be refused; --allow-duplicate\n        skips this check. Each import records the batch's digest in its own spine row, so\n        batches landed by an earlier release are not recognised. --agent records who wrote\n        (default `outside-agent`).\n        While the cauldron is granted to the MCP door and the `mcp` service holds its soup\n        open (`cauldron mcp status`), a real import is sent to that service and lands\n        through it: the same judgement, the same JSON (with `forwarded_to`), the same\n        batch-already-landed check and --allow-duplicate; the service records the writer\n        as `mcp:cli`, not --agent, and writes only the `ws` pool. A dry run is never sent.\n        A batch over the 16 MiB the service reads in one request is refused before it is\n        sent (never split): import it in smaller files, or revoke the grant (or stop the\n        service) and import directly.\n    cauldron soup recover [--cauldron <name>] [--env <env>]\n        Settle a soup that an interrupted import left not at rest: an import that never\n        reached its commit decision is rolled back (none of it lands), one that did is\n        finished (all of it lands, once). Refused while another import or recover is\n        writing to the soup, and on the same seam-table check as import; a soup already at\n        rest is not touched. Prints (JSON on stdout, the same in words on stderr) which of\n        the two happened: `interrupted_import` is `landed` (with how many records and their\n        ids: do NOT import that batch again; under --remint every record would land twice),\n        `rolled-back`\n        (none of it landed: importing it again is safe) or `none` (nothing to recover).\n        Also says what still stands in the way if anything does. Refused while the `mcp`\n        service holds the soup: it recovers the soup itself when it opens it, and\n        `cauldron mcp status` shows what that recovered.\n    cauldron soup regions [--cauldron <name>] [--env <env>] [--max-chars N]\n        Every region: id, handle, boundary, flags, the regions it narrows or relates to,\n        and how many nodes sit in it.\n    cauldron soup region <id> [--cauldron <name>] [--env <env>] [--depth N] [--limit N] [--max-chars N]\n        One region: its record, the regions it narrows (parents) and that narrow it\n        (children) to --depth levels (default 1), the regions it relates to either way, and\n        its direct members (id, type, state, handle), newest first, at most --limit (50).\n    cauldron soup nodes [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]\n                        [--state <s>] [--limit N] [--max-chars N]\n        Nodes as {id, type, state, handle, regions}, newest first (by the spine's commit\n        order; one write's nodes by id prefix, then serial, highest first), at most --limit\n        (default 50); --region keeps a region's direct members.\n    cauldron soup search <query> [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]\n                         [--limit N] [--max-chars N]\n        Lexical search over handles and bodies: every word of the query a term, found\n        case-insensitively as a substring; ranked by how many terms match, then handle hits over body hits, then newest.\n        Prints {id, type, state, handle, regions, score, snippet}, at most --limit (20);\n        the snippet is --max-chars long (default 160) around the first hit.\n    cauldron soup get <id>... [--cauldron <name>] [--env <env>] [--max-chars N]\n        Those nodes as records in the published shape, with their outgoing edges.\n    cauldron soup help\n\n  Every verb prints JSON on stdout and exits non-zero on a refusal. Reads open the store\n  so that they cannot write. --max-chars cuts any longer text field, and the output's\n  `truncated` lists what was cut; a list cut by --limit says how many `more` there are.\n  `--pool <p>` names another pool than `ws`.\n\n  --env and --cauldron may be left out inside a project linked with `cauldron link`: the\n  nearest `.cauldron` marker file in the current directory or a parent names both. A flag\n  or variable ($CAULDRON_ENV, $ENV, $CAULDRON_CAULDRON) always wins over the marker. When\n  the marker supplied either value, stderr says so and the JSON carries\n  `resolved_from: \"marker:<path>\"`. A write (import without --dry-run, recover) refuses\n  to take its target from a marker that is tracked by git or owned by another user: the\n  marker is per-machine and belongs in .gitignore (`cauldron link help`).\n"
+  },
+  {
+    "args": [
+      "link",
+      "kb",
+      "--env",
+      "dev",
+      "--dir",
+      "<S>/proj"
+    ],
+    "cwd": null,
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"marker\": \"<S>/proj/.cauldron\",\n  \"outcome\": \"linked\"\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--limit",
+      "1"
+    ],
+    "cwd": "<S>/proj",
+    "rc": 0,
+    "stderr": "cauldron soup nodes: cauldron `kb` (from the project marker) in environment `dev` (from the project marker); marker <S>/proj/.cauldron\n",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"more\": 12,\n  \"nodes\": [\n    {\n      \"handle\": \"The plugin's schema copy drifted from the published schema\",\n      \"id\": \"IS-2\",\n      \"regions\": [\n        \"R-3\"\n      ],\n      \"state\": \"open\",\n      \"type\": \"issue\"\n    }\n  ],\n  \"pool\": \"ws\",\n  \"resolved_from\": \"marker:<S>/proj/.cauldron\",\n  \"total\": 13\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--limit",
+      "1",
+      "--cauldron",
+      "other"
+    ],
+    "cwd": "<S>/proj",
+    "rc": 0,
+    "stderr": "cauldron soup nodes: cauldron `other` (from --cauldron) in environment `dev` (from the project marker); marker <S>/proj/.cauldron\n",
+    "stdout": "{\n  \"cauldron\": \"other\",\n  \"env\": \"dev\",\n  \"nodes\": [],\n  \"pool\": \"ws\",\n  \"resolved_from\": \"marker:<S>/proj/.cauldron\",\n  \"total\": 0\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "import",
+      "<S>/in/example.json",
+      "--dry-run"
+    ],
+    "cwd": "<S>/proj",
+    "rc": 1,
+    "stderr": "cauldron soup import: cauldron `kb` (from the project marker) in environment `dev` (from the project marker); marker <S>/proj/.cauldron\ncauldron soup import: REFUSED (batch-already-landed): this exact batch (the same records, before any --remint, into pool `ws`) already landed in cauldron `kb` at <V2> as spine transaction 1 (11 records). Under --remint, importing it again would land every record a second time under new ids, and this release cannot delete nodes; without --remint, its carried ids would collide and the import would be refused. Nothing was written. If a second copy is really wanted, run the same command with --allow-duplicate.\n",
+    "stdout": "{\n  \"batch_digest\": \"90cda6cd1de6d536e9badbefb4b38a44f9d7b91bb06f07d2466452c30b2220b2\",\n  \"cauldron\": \"kb\",\n  \"dry_run\": true,\n  \"env\": \"dev\",\n  \"landed_before\": [\n    {\n      \"landed_at\": \"<V2>\",\n      \"records\": 11,\n      \"seq\": 1\n    }\n  ],\n  \"outcome\": \"refused\",\n  \"pool\": \"ws\",\n  \"refusal\": \"batch-already-landed\",\n  \"remint\": false,\n  \"resolved_from\": \"marker:<S>/proj/.cauldron\",\n  \"why\": \"this exact batch (the same records, before any --remint, into pool `ws`) already landed in cauldron `kb` at <V2> as spine transaction 1 (11 records). Under --remint, importing it again would land every record a second time under new ids, and this release cannot delete nodes; without --remint, its carried ids would collide and the import would be refused. Nothing was written. If a second copy is really wanted, run the same command with --allow-duplicate.\"\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "recover"
+    ],
+    "cwd": "<S>/proj",
+    "rc": 0,
+    "stderr": "cauldron soup recover: cauldron `kb` (from the project marker) in environment `dev` (from the project marker); marker <S>/proj/.cauldron\ncauldron soup recover: at-rest (interrupted import: none)\nNothing to recover: no interrupted import is waiting to be settled. This cannot tell you whether an import you stopped earlier landed (one stopped after it finished landed in full, one stopped before it began writing landed nothing, and an earlier recover printed its own outcome), so check with `cauldron soup nodes --env dev --cauldron kb` (newest first) before importing that batch again.\n",
+    "stdout": "{\n  \"before\": [],\n  \"cauldron\": \"kb\",\n  \"env\": \"dev\",\n  \"instruction\": \"Nothing to recover: no interrupted import is waiting to be settled. This cannot tell you whether an import you stopped earlier landed (one stopped after it finished landed in full, one stopped before it began writing landed nothing, and an earlier recover printed its own outcome), so check with `cauldron soup nodes --env dev --cauldron kb` (newest first) before importing that batch again.\",\n  \"interrupted_import\": \"none\",\n  \"note\": \"the soup was already at rest; the spine was not opened and no data was written\",\n  \"outcome\": \"at-rest\",\n  \"resolved_from\": \"marker:<S>/proj/.cauldron\"\n}\n"
+  },
+  {
+    "args": [
+      "soup",
+      "nodes",
+      "--env",
+      "other-env"
+    ],
+    "cwd": "<S>/proj",
+    "rc": 1,
+    "stderr": "cauldron: REFUSED: the project marker <S>/proj/.cauldron names cauldron `kb` in environment `dev`, but environment `other-env` was named (--env). The marker's cauldron is not looked for in another environment: name the cauldron too (--cauldron), or drop the environment to use the marker's.\n",
+    "stdout": ""
+  },
+  {
+    "args": [
+      "link",
+      "--show"
+    ],
+    "cwd": "<S>/proj",
+    "rc": 0,
+    "stderr": "",
+    "stdout": "{\n  \"cauldron\": \"kb\",\n  \"cauldron_exists\": true,\n  \"cauldron_from\": \"the project marker <S>/proj/.cauldron\",\n  \"dir\": \"<S>/proj\",\n  \"env\": \"dev\",\n  \"env_from\": \"the project marker <S>/proj/.cauldron\",\n  \"marker\": \"<S>/proj/.cauldron\",\n  \"writes_refused\": null\n}\n"
+  }
+]

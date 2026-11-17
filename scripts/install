@@ -81,6 +81,20 @@
 #      `cauldron env remove` deleted the env around it) is stale and removed.
 #      An env.toml without the marker (made by `cauldron env create`, or by
 #      an install that finished) is never touched.
+#   4c. Brings up the MCP door, the `mcp` service (Claude Code's way to this
+#      environment's soups; every cauldron stays closed to it until its owner
+#      runs `cauldron mcp grant` at a terminal), under the same rules as 4b:
+#      `cauldron --env <name> build mcp --json --env-copy`, a release build
+#      from this tree installed as a NEW version `<label>+<env>` (the shared
+#      `<label>` is never written), then `cauldron --env <name> pin mcp
+#      <label>+<env>`. Nothing is signed: the service runs under cauldron's
+#      own identity. Done ONLY for an environment this run creates (or
+#      resumes, below): an existing env.toml is never edited, an existing
+#      pin is untouched, and an existing env with no mcp pin is told the two
+#      commands that add one. The marker of 4b stays until BOTH services are
+#      pinned, and is re-bound to env.toml after the threads pin (which
+#      edits it), so a run stopped between the two pins is finished by a
+#      re-run: threads, already pinned, is left as it is, and mcp is pinned.
 #   5. Runs `cauldron --env <name> install`: copies the binary to
 #      <root>/bin/cauldron (and `tui` beside it), writes
 #      ~/Library/LaunchAgents/<label>.plist, and bootstraps it into this user's
@@ -90,8 +104,8 @@
 # $CAULDRON_HOME if set, else $HOME/.cauldron. Nothing is signed with an
 # identity (`cauldron install` prints how to do that deliberately).
 #
-# RE-RUNNING: rebuilds, keeps env.toml (finishing step 4b first if an
-# earlier run stopped before the threads pin), re-places the binaries (the previous
+# RE-RUNNING: rebuilds, keeps env.toml (finishing steps 4b and 4c first if
+# an earlier run stopped before the threads or the mcp pin), re-places the binaries (the previous
 # one is kept as `.prev`), and reloads the job — which RESTARTS this user's
 # holder, so a re-run over a loaded job needs `--replace-running` (2b). Run
 # `scripts/install --replace-running` after a `git pull` to upgrade.
@@ -266,6 +280,7 @@ fi
 # env.toml (REL-4.S5 D3). Which case applies is re-stated in step 4b.
 THREADS_PENDING="${ROOT}/data/.install-threads-pending.${ENV_NAME}"
 threads_pinned() { grep -qE '^[[:space:]]*\[services\.threads\][[:space:]]*$' "${MANIFEST}"; }
+mcp_pinned() { grep -qE '^[[:space:]]*\[services\.mcp\][[:space:]]*$' "${MANIFEST}"; }
 # THE MARKER PROVES OWNERSHIP (REL-4.S5d). It is written `state=creating`
 # before `env create`, and rewritten `state=created` with the FINGERPRINT of
 # the env.toml that create wrote — `<device>:<inode>:<birth time>` and the
@@ -336,7 +351,7 @@ if [[ -e "${THREADS_PENDING}" && ! -e "${MANIFEST}" ]]; then
 fi
 if [[ ! -e "${MANIFEST}" ]]; then
     NEED_THREADS=1
-elif [[ -e "${THREADS_PENDING}" ]] && ! threads_pinned; then
+elif [[ -e "${THREADS_PENDING}" ]] && ! { threads_pinned && mcp_pinned; }; then
     if ! marker_owns_manifest; then
         # REL-4.S5e M2: written to the person who ran install, who is most
         # often the one who stopped the earlier run (a Ctrl-C right after
@@ -538,6 +553,9 @@ if [[ ${CREATED_ENV} -eq 0 && ${RESUME_THREADS} -eq 0 ]]; then
         say "  to host it:  ${CAULDRON} --env ${ENV_NAME} build threads --env-copy"
         say "         then: ${CAULDRON} --env ${ENV_NAME} pin threads <the label that build printed> --addr auto"
     fi
+elif [[ ${RESUME_THREADS} -eq 1 ]] && threads_pinned; then
+    say "an earlier install created ${MANIFEST}, pinned threads and stopped before pinning mcp"
+    say "  (${THREADS_PENDING} is still there); threads is left as it is, and step 4c finishes now"
 else
     if [[ ${RESUME_THREADS} -eq 1 ]]; then
         say "an earlier install created ${MANIFEST} and stopped before pinning threads"
@@ -614,6 +632,61 @@ else
     fi
     run "${CAULDRON}" --env "${ENV_NAME}" pin threads "${ENV_LABEL}" --addr auto
     THREADS_PINNED="${ENV_LABEL}"
+    # The pin edited env.toml: bind the marker to it again, so a run stopped
+    # before step 4c's pin is resumed by the next one (and only for this file).
+    if [[ ${DRY} -eq 0 ]]; then
+        fp="$(manifest_fingerprint)" \
+            || die "threads is pinned, but ${MANIFEST} cannot be read to record it in ${THREADS_PENDING}; mcp was not built or pinned."
+        write_marker created "${fp}"
+    else
+        write_marker created "<fingerprint of ${MANIFEST}>"
+    fi
+fi
+
+# ── 4c. the mcp service ─────────────────────────────────────────────────────
+step "4c. mcp service for '${ENV_NAME}'"
+MCP_PINNED=""
+if [[ ${CREATED_ENV} -eq 0 && ${RESUME_THREADS} -eq 0 ]]; then
+    if mcp_pinned; then
+        say "mcp is already pinned in ${MANIFEST}; left exactly as it is (its version is not changed)"
+    else
+        say "mcp is NOT pinned in the existing ${MANIFEST}, and install never edits an existing env.toml."
+        say "  to host it:  ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy"
+        say "         then: ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
+    fi
+elif mcp_pinned; then
+    say "mcp is already pinned in ${MANIFEST}; left exactly as it is (its version is not changed)"
+else
+    if [[ ${DRY} -eq 0 ]]; then
+        command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH, and \`cauldron build mcp\` compiles it from ${REPO}. Install Rust (https://rustup.rs) and re-run."
+    fi
+    # The same NEW-version build as threads (`--env-copy`): the shared
+    # `<label>` another environment may be pinned to is never written.
+    printf 'install: $'; printf ' %q' "${CAULDRON}" --env "${ENV_NAME}" build mcp --json --env-copy; printf '\n'
+    MCP_BUILDS="${ROOT}/data/shared/builds/mcp"
+    if [[ ${DRY} -eq 1 ]]; then
+        MCP_LABEL="<label>+${ENV_NAME}"
+    else
+        build_json="$("${CAULDRON}" --env "${ENV_NAME}" build mcp --json --env-copy)"
+        labels="$(grep -oE '"label"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"${build_json}" | sed -E 's/.*"([^"]*)"$/\1/')"
+        [[ -n "${labels}" && "$(wc -l <<<"${labels}" | tr -d ' ')" == 1 ]] \
+            || die "\`cauldron build mcp --json --env-copy\` did not name exactly one version label; it printed: ${build_json}"
+        [[ "${labels}" =~ ^[^+/]+\+${ENV_NAME}(\.[0-9]+)?$ ]] \
+            || die "\`cauldron build mcp --env-copy\` returned version '${labels}', which is not a copy of its own for '${ENV_NAME}' (<label>+${ENV_NAME}); nothing was pinned."
+        MCP_LABEL="${labels}"
+        CLAIMED="${MCP_BUILDS}/${MCP_LABEL}"
+        say "built mcp as this environment's own version ${MCP_LABEL}"
+    fi
+    # The pin edits env.toml: re-check, right before it, that the file is
+    # still the one this install created (or the one it resumes).
+    if [[ ${DRY} -eq 0 ]] && ! marker_owns_manifest; then
+        die "${MANIFEST} is no longer the env.toml this install created (its marker ${THREADS_PENDING} records another identity or other bytes, or is gone), so mcp is NOT pinned into it, and the version this run built is removed. To host it there: ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy, then ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
+    fi
+    run "${CAULDRON}" --env "${ENV_NAME}" pin mcp "${MCP_LABEL}"
+    CLAIMED=""
+    MCP_PINNED="${MCP_LABEL}"
+fi
+if [[ ${CREATED_ENV} -eq 1 || ${RESUME_THREADS} -eq 1 ]]; then
     run rm -f "${THREADS_PENDING}"
 fi
 
@@ -642,6 +715,10 @@ say "installed cauldron for $(id -un): ${ROOT}/bin/$( [[ "${ENV_NAME}" == prod ]
 say "status:   ${ROOT}/bin/cauldron --env ${ENV_NAME} status"
 if [[ -n "${THREADS_PINNED}" ]]; then
     say "services: threads pinned at ${THREADS_PINNED}; the supervisor launches it (its address: ${ROOT}/bin/cauldron --env ${ENV_NAME} status)."
+fi
+if [[ -n "${MCP_PINNED}" ]]; then
+    say "services: mcp pinned at ${MCP_PINNED}; every cauldron is closed to it until you run, in a terminal:"
+    say "            ${ROOT}/bin/cauldron mcp grant <cauldron> --env ${ENV_NAME} --project <dir>"
 fi
 say "more:     cauldron build <service>   then   cauldron pin <service> <label>"
 # `cauldron` is only a bare command once ${ROOT}/bin is on PATH; install

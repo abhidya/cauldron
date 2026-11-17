@@ -276,6 +276,32 @@ The Claude Code plugin in [`claude-code/cauldron/`](claude-code/cauldron/README.
 adds a curator subagent that writes and lands those records for you; its
 README says how to install it and walks through a session.
 
+**The MCP door.** The plugin also starts an MCP server, `cauldron mcp
+stdio`, which gives a Claude Code session tools to read, search and write a
+soup (`soup_status`, `soup_search`, `soup_get`, `soup_put`, `soup_link`,
+`soup_changes` and more). It is a bridge to the environment's `mcp` service,
+which you start like any other (`cauldron --env <env> start mcp`; an install
+that creates its environment pins it). **Every cauldron is closed to it until
+you grant it**, yourself, at a terminal:
+
+```sh
+cauldron mcp grant kb --env dev --project ~/code/proj   # open kb to the door; sessions in ~/code/proj use it by default
+cauldron mcp grants --env dev                          # what is open
+cauldron mcp revoke kb --env dev                       # close it again, from the next call on
+```
+
+A grant opens the cauldron to the Claude Code sessions you run on this
+machine against that environment, whichever directory they work in: any of
+them can name it. `--project` only tells a session which cauldron a directory
+means when the session does not name one; it does not limit which sessions
+can reach the cauldron.
+`grant` refuses to run without an interactive terminal, so an agent cannot
+open a cauldron for itself, and no MCP tool can grant or revoke. `--scopes
+read` opens a cauldron read-only. While the service holds a granted
+cauldron it is the soup's one writer: `cauldron soup import` is sent to it,
+and `cauldron soup recover` is refused (`cauldron mcp status` shows what the
+service holds). The plugin's README has the details.
+
 ## Known limitations
 
 This is an early release. These are known:

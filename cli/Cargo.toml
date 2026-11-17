@@ -44,6 +44,8 @@ soup = { package = "soup-seed", path = "../libs/soup" }
 # and `cauldron soup` opens it offline. Default features: the one-door gate
 # stays closed.
 spine = { path = "../libs/spine" }
+# `cauldron soup` and `cauldron link` are argument parsing and printing over it.
+soup-door = { path = "../libs/soup-door" }
 # `rename` / `remove` read a cauldron's own `spine.db` READ-ONLY for a
 # live tranche. The version and features spine already links.
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -78,6 +80,10 @@ shapewire = { path = "../libs/shapewire", default-features = false }
 # launchd domain and his live ports (env::egress).
 [dev-dependencies]
 test-isolation = { path = "../testkit/test-isolation" }
+# `mcp_reads`: the MCP door's read tools, called in process, against the
+# `cauldron soup` verbs this crate builds, on one fixture. Dev only: the door
+# is a separate service and never linked into this binary.
+cauldron-mcp = { path = "../services/mcp" }
 
 [lints.rust]
 unsafe_code = "forbid"

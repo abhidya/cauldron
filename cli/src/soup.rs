@@ -79,26 +79,33 @@
 //! earlier release opens unchanged; its earlier imports carry no digest and
 //! are not recognised.
 //!
+//! # While the `mcp` service holds the soup
+//!
+//! A cauldron granted to the MCP door with `write` is held open by the
+//! environment's `mcp` service, which keeps the soup's writer lock and
+//! writes `mcp <pid>` into it. A real import that finds the lock held so,
+//! and the service's seam row live with that pid, sends its records to the
+//! service as one `soup_put` and prints the answer in the import's own
+//! shape (plus `forwarded_to`); a refused batch and a batch that already
+//! landed print exactly as a direct import's do. `recover` is refused,
+//! naming the service, which recovers the soup itself when it opens it. An
+//! ungranted cauldron is never held, and the import runs directly as before.
+//!
+//! The logic lives in the `soup-door` library (`libs/soup-door`), which
+//! answers every verb as JSON or a typed error; this module parses the
+//! arguments and prints.
+//!
 //! Like `ctl`, every verb needs the environment NAMED (`--env`, a leading
 //! `--env`, or `$CAULDRON_ENV`): it never defaults to prod. The cauldron is
 //! always named too.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use env::seams::{self, Table};
-use env::Environment;
 use serde_json::{json, Value};
-use spine::migrate::records::{import_records, RecordsOptions};
-use spine::migrate::{Landing, MigrationPlan};
-use spine::pool::{NodeId, Pool, QualifiedNodeId};
-use spine::schema_def::PoolName;
-
-/// The soup's one pool (`engine.rs` `SOUP_POOL`).
-const DEFAULT_POOL: &str = "ws";
-/// The soup's seam name in an environment's seam table.
-const SOUP_SEAM: &str = "soup";
+use soup_door::import::{ImportOptions, ImportOutcome};
+use soup_door::reads::ReadOpts;
+use soup_door::Target;
 
 const USAGE: &str = "\
 cauldron soup — a cauldron's soup, offline
@@ -129,6 +136,14 @@ cauldron soup — a cauldron's soup, offline
         skips this check. Each import records the batch's digest in its own spine row, so
         batches landed by an earlier release are not recognised. --agent records who wrote
         (default `outside-agent`).
+        While the cauldron is granted to the MCP door and the `mcp` service holds its soup
+        open (`cauldron mcp status`), a real import is sent to that service and lands
+        through it: the same judgement, the same JSON (with `forwarded_to`), the same
+        batch-already-landed check and --allow-duplicate; the service records the writer
+        as `mcp:cli`, not --agent, and writes only the `ws` pool. A dry run is never sent.
+        A batch over the 16 MiB the service reads in one request is refused before it is
+        sent (never split): import it in smaller files, or revoke the grant (or stop the
+        service) and import directly.
     cauldron soup recover [--cauldron <name>] [--env <env>]
         Settle a soup that an interrupted import left not at rest: an import that never
         reached its commit decision is rolled back (none of it lands), one that did is
@@ -139,7 +154,9 @@ cauldron soup — a cauldron's soup, offline
         ids: do NOT import that batch again; under --remint every record would land twice),
         `rolled-back`
         (none of it landed: importing it again is safe) or `none` (nothing to recover).
-        Also says what still stands in the way if anything does.
+        Also says what still stands in the way if anything does. Refused while the `mcp`
+        service holds the soup: it recovers the soup itself when it opens it, and
+        `cauldron mcp status` shows what that recovered.
     cauldron soup regions [--cauldron <name>] [--env <env>] [--max-chars N]
         Every region: id, handle, boundary, flags, the regions it narrows or relates to,
         and how many nodes sit in it.
@@ -242,7 +259,7 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
         match flag {
             "--env" => a.env = Some(take(&mut it)?),
             "--cauldron" | "-c" => a.cauldron = Some(take(&mut it)?),
-            "--pool" => a.pool = Some(checked_pool(&take(&mut it)?)?),
+            "--pool" => a.pool = Some(soup_door::reads::checked_pool(&take(&mut it)?)?),
             "--agent" => a.agent = Some(take(&mut it)?),
             "--max-chars" => a.max_chars = Some(count(flag, &take(&mut it)?)?),
             "--limit" => a.limit = Some(count(flag, &take(&mut it)?)?),
@@ -266,14 +283,15 @@ fn count(flag: &str, v: &str) -> Result<usize> {
 /// The environment, named (never the default — a forgotten `--env` must not
 /// land in prod), and the named cauldron in it. Either may come from the
 /// project marker (`.cauldron`, `cauldron link`) found from the current
-/// directory, but only where no flag or variable names it (`link.rs`).
-/// When it does, the JSON the verb prints says so (`resolved_from`), and a
-/// verb that `writes` refuses a marker that is tracked by git or owned by
-/// another user.
-fn target(verb: &str, a: &Args, writes: bool) -> Result<(Environment, env::Cauldron)> {
+/// directory, but only where no flag or variable names it
+/// (`soup_door::marker`). When it does, stderr says so, the JSON the verb
+/// prints says so (`resolved_from`), and a verb that `writes` refuses a
+/// marker that is tracked by git or owned by another user.
+fn target(verb: &str, a: &Args, writes: bool) -> Result<Target> {
     // The current directory is read only if the marker is needed: given both
     // --env and --cauldron, a verb works from a directory that was deleted.
-    let r = crate::link::resolve(&format!("`cauldron soup {verb}`"), None, a.env.as_deref(), a.cauldron.as_deref())?;
+    let label = format!("`cauldron soup {verb}`");
+    let r = soup_door::marker::resolve(&label, None, a.env.as_deref(), a.cauldron.as_deref())?;
     if let Some(m) = &r.marker {
         eprintln!(
             "cauldron soup {verb}: cauldron `{}` (from {}) in environment `{}` (from {}); marker {}",
@@ -284,54 +302,11 @@ fn target(verb: &str, a: &Args, writes: bool) -> Result<(Environment, env::Cauld
             m.display()
         );
     }
-    let e = Environment::resolve()?.for_name(&r.env)?;
-    if !e.data_root.is_dir() {
-        bail!("REFUSED: there is no environment `{}` ({} does not exist)", e.name, e.data_root.display());
+    let t = soup_door::target::locate(&label, &r, writes)?;
+    if let Some(from) = &t.resolved_from {
+        let _ = RESOLVED_FROM.set(from.clone());
     }
-    if let Some(m) = &r.marker {
-        if writes {
-            crate::link::refuse_untrusted_marker_for_write(&format!("`cauldron soup {verb}`"), &r, &e.data_root)?;
-        }
-        let _ = RESOLVED_FROM.set(format!("marker:{}", m.display()));
-    }
-    let name = r.cauldron;
-    let Some(c) = e.find_cauldron(&name)? else {
-        bail!(
-            "REFUSED: there is no cauldron `{name}` in environment `{}`. `cauldron list --env {}` shows its cauldrons.",
-            e.name,
-            e.name
-        );
-    };
-    let soup = c.soup();
-    if !soup.join(spine::spine_db::SPINE_FILE).is_file() {
-        bail!("REFUSED: cauldron `{name}` has no soup yet ({} holds no spine.db)", soup.display());
-    }
-    Ok((e, c))
-}
-
-/// `--pool` names a pool FILE (`<soup>/<pool>.db`), so it is held to the
-/// pool name grammar (`[a-z][a-z0-9-]*`, `spine` reserved) before it goes
-/// anywhere near a path: a slash, `..` or an absolute path would otherwise
-/// open a file outside the soup. Nothing is guessed or sanitised.
-fn checked_pool(name: &str) -> Result<String> {
-    let p = PoolName::new(name);
-    if !p.is_well_formed() {
-        bail!(
-            "REFUSED: `--pool {name}` is not a pool name. A pool name is [a-z][a-z0-9-]* (a lowercase \
-             letter, then lowercase letters, digits or `-`); it names a file inside the soup, so a path \
-             is never accepted. Nothing was read or written."
-        );
-    }
-    if p.is_reserved() {
-        bail!(
-            "REFUSED: `--pool {name}` names the spine's own file, not a pool. Nothing was read or written."
-        );
-    }
-    Ok(name.to_string())
-}
-
-fn pool_name(a: &Args) -> PoolName {
-    PoolName::new(a.pool.as_deref().unwrap_or(DEFAULT_POOL))
+    Ok(t)
 }
 
 /// Set by [`target`] when the project marker supplied the environment or the
@@ -349,6 +324,18 @@ fn print(v: &Value) -> Result<()> {
     Ok(())
 }
 
+fn read_opts(a: &Args) -> ReadOpts {
+    ReadOpts {
+        pool: a.pool.clone(),
+        max_chars: a.max_chars,
+        limit: a.limit,
+        depth: a.depth,
+        region: a.region.clone(),
+        node_type: a.node_type.clone(),
+        state: a.state.clone(),
+    }
+}
+
 // ------------------------------------------------------------------- import
 
 fn import(args: &[String]) -> Result<i32> {
@@ -360,587 +347,188 @@ fn import(args: &[String]) -> Result<i32> {
     let [input] = a.pos.as_slice() else {
         bail!("`cauldron soup import` takes ONE file or directory (got {}); `cauldron soup help`", a.pos.len());
     };
-    let records = read_records(Path::new(input))?;
-    let (e, c) = target("import", &a, !a.dry_run)?;
-    let soup = c.soup();
-    let pool = pool_name(&a);
-    let digest = batch_digest(&pool, &records);
-
-    // A dry run never opens the live store with the spine's writing open:
-    // it is judged on a snapshot copy (see the module docs), so it needs no
-    // proof that no daemon holds the soup, nor that the soup is at rest.
-    let _copy;
-    let mut writer_lock = None;
-    let cauldron = if a.dry_run {
-        let dir = ScratchDir::new()?;
-        spine::offline::snapshot_copy(&soup, &dir.0).map_err(|err| {
-            anyhow::anyhow!("cannot take a read-only snapshot of cauldron `{}`'s soup to judge the dry run on: {err}", c.name)
-        })?;
-        let opened = spine::Cauldron::open(&dir.0, spine::config::SpineConfig::default())
-            .map_err(|err| anyhow::anyhow!("opening the snapshot of cauldron `{}`'s soup: {err}", c.name))?;
-        // The same duplicate-batch judgement the real import makes, on the copy.
-        if let Some(refused) = refuse_landed_batch(&e, &c, &dir.0, &pool, &digest, &a)? {
-            return Ok(refused);
-        }
-        _copy = dir;
-        opened
-    } else {
-        // 1. No running soup daemon may hold it, provably; and no other
-        //    import or recover may be writing it (held to the end of `import`).
-        refuse_live_soup(&e)?;
-        writer_lock = Some(take_writer_lock(&c, "import")?);
-        // 2. At rest, so the open-time passes have nothing to do.
-        let unrest = spine::offline::rest_check(&soup).map_err(|err| {
-            anyhow::anyhow!("REFUSED: cannot read {}'s spine, so cannot prove it is at rest: {err}", c.name)
-        })?;
-        if !unrest.is_empty() {
-            bail!(
-                "REFUSED: cauldron `{}`'s soup is not at rest, and an outside import writes only to a soup at rest: {}. \
-                 An import that was interrupted (killed, or its machine stopped) leaves a soup like this. \
-                 Run `cauldron soup recover --env {} --cauldron {}` first and read what it prints: it either \
-                 FINISHES the interrupted import (it landed in full: do NOT import that batch again; under \
-                 --remint every record would land twice) or ROLLS IT BACK (none of it landed: importing it again is safe). \
-                 Nothing was written.",
-                c.name,
-                unrest.join("; "),
-                e.name,
-                c.name
-            );
-        }
-        // 3. Not a batch that already landed (unless --allow-duplicate).
-        if let Some(refused) = refuse_landed_batch(&e, &c, &soup, &pool, &digest, &a)? {
-            return Ok(refused);
-        }
-        // 4. The spine's own open, checked: it must have done nothing.
-        let cauldron = spine::Cauldron::open(&soup, spine::config::SpineConfig::default())
-            .map_err(|err| anyhow::anyhow!("opening cauldron `{}`'s soup: {err}", c.name))?;
-        let rec = cauldron.recovered_at_open();
-        if !rec.rolled_forward.is_empty() || !rec.cleared_only.is_empty() || !rec.aborted.is_empty() || !cauldron.tranches_at_open().tranches.is_empty() {
-            bail!(
-                "REFUSED: another writer touched cauldron `{}`'s soup between the rest check and the open (the open \
-                 recovered work); nothing was imported. Try again once it is quiet.",
-                c.name
-            );
-        }
-        cauldron
-    };
-
-    let agent = a.agent.clone().unwrap_or_else(|| "outside-agent".to_string());
-    let mut plan = MigrationPlan::new(spine::envelope::Initiator::Agent {
-        thread: agent,
+    let records = soup_door::import::read_records(Path::new(input))?;
+    let t = target("import", &a, !a.dry_run)?;
+    let opts = ImportOptions {
+        pool: a.pool.clone(),
+        dry_run: a.dry_run,
+        remint: a.remint,
+        allow_duplicate: a.allow_duplicate,
+        agent: a.agent.clone().unwrap_or_else(|| "outside-agent".to_string()),
         dispatch: format!(
-            "cauldron soup import {} [{}]",
-            Path::new(input).file_name().and_then(|n| n.to_str()).unwrap_or("records"),
-            batch_mark(&digest, records.len())
+            "cauldron soup import {}",
+            Path::new(input).file_name().and_then(|n| n.to_str()).unwrap_or("records")
         ),
-    });
-    // Two imports of the same text are two writes, never one replayed.
-    plan.idempotency_nonce = Some(format!(
-        "soup-import:{}:{}",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
-    ));
-    let opts = RecordsOptions { pool, remint: a.remint, commit: !a.dry_run };
-    let run = import_records(&cauldron, &plan, &records, &opts).map_err(|err| anyhow::anyhow!("{err}"))?;
-
-    let accepted = run.records.iter().filter(|r| r.disposition == "accepted").count();
-    let refused = run.records.len() - accepted;
-    let (outcome, landed, landing_refusal) = match &run.landing {
-        None if a.dry_run && refused == 0 => ("validated", Value::Null, Value::Null),
-        None => ("refused", Value::Null, Value::Null),
-        Some(Landing::Committed { tx, seq, deduplicated, .. }) => {
-            ("landed", json!({"tx": tx.to_hex(), "seq": seq, "deduplicated": deduplicated}), Value::Null)
-        }
-        Some(Landing::NothingAccepted) => ("empty", Value::Null, Value::Null),
-        Some(Landing::Refused { witnesses }) => ("refused", Value::Null, serde_json::to_value(witnesses)?),
     };
-    let mut doc = json!({
-        "env": e.name,
-        "cauldron": c.name,
-        "pool": opts.pool.as_str(),
-        "dry_run": a.dry_run,
-        "remint": a.remint,
-        "judged_on": if a.dry_run { "a read-only snapshot of the soup, taken now; nothing was written" } else { "the soup" },
-        "outcome": outcome,
-        "accepted": accepted,
-        "refused": refused,
-        "records": serde_json::to_value(&run.records)?,
-        "batch_digest": digest,
-    });
-    if a.remint {
-        doc["id_map"] = serde_json::to_value(&run.id_map)?;
-    }
-    if !landed.is_null() {
-        doc["landed"] = landed;
-    }
-    if !landing_refusal.is_null() {
-        doc["landing_refused"] = landing_refusal;
-    }
-    print(&doc)?;
-    drop(writer_lock);
-    Ok(if outcome == "landed" || outcome == "validated" { 0 } else { 1 })
-}
-
-// ------------------------------------------------- a batch that already landed
-
-/// **The batch's content digest**: SHA-256 over the pool name and the
-/// records exactly as read (before any `--remint`), each object's keys
-/// sorted, so the same records give the same digest whether they came as
-/// one JSON file or a directory of YAML files.
-fn batch_digest(pool: &PoolName, records: &[Value]) -> String {
-    use sha2::{Digest, Sha256};
-    fn canonical(v: &Value) -> Value {
-        match v {
-            Value::Object(m) => {
-                let sorted: BTreeMap<&String, Value> = m.iter().map(|(k, v)| (k, canonical(v))).collect();
-                Value::Object(sorted.into_iter().map(|(k, v)| (k.clone(), v)).collect())
-            }
-            Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
-            other => other.clone(),
+    let outcome = match soup_door::import::import(&t, &records, &opts) {
+        Err(e) if e.code == soup_door::Code::Locked && !opts.dry_run => match soup_door::lock::held_by_service(&t.cauldron) {
+            Some(pid) => match forward(&t, &records, &opts, pid)? {
+                Forwarded::Done(rc) => return Ok(rc),
+                // The service let the cauldron go between the lock and the
+                // call (a revoke): the soup is free again, so import directly.
+                Forwarded::Released => soup_door::import::import(&t, &records, &opts)?,
+            },
+            None => return Err(e.into()),
+        },
+        other => other?,
+    };
+    match outcome {
+        ImportOutcome::Judged { doc, ok } => {
+            print(&doc)?;
+            Ok(if ok { 0 } else { 1 })
+        }
+        ImportOutcome::AlreadyLanded { doc, why } => {
+            print(&doc)?;
+            eprintln!("cauldron soup import: REFUSED (batch-already-landed): {why}");
+            Ok(1)
         }
     }
-    let mut h = Sha256::new();
-    h.update(pool.as_str().as_bytes());
-    h.update([0u8]);
-    h.update(serde_json::to_string(&canonical(&Value::Array(records.to_vec()))).unwrap_or_default().as_bytes());
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The mark an import writes into its transaction row's provenance (the
-/// `dispatch` text of its `agent` initiator), and so into the spine's own
-/// record of every write. No new table or column: a store from an earlier
-/// release opens unchanged, and its earlier imports simply carry no mark.
-fn batch_mark(digest: &str, records: usize) -> String {
-    format!("batch sha256:{digest}, {records} records")
+enum Forwarded {
+    /// Answered and printed; the exit code.
+    Done(i32),
+    /// The service no longer holds the cauldron.
+    Released,
 }
 
-/// **Refuse a batch that already landed** in this soup, unless
-/// `--allow-duplicate`. Reads `spine.db` under `dir` read-only for a
-/// DECIDED transaction row (one that landed, or that recovery finished)
-/// whose provenance carries this batch's mark. On a match prints the named
-/// refusal `batch-already-landed` as JSON (with when each earlier landing
-/// was written and how many records it held) and returns the exit code.
-fn refuse_landed_batch(
-    e: &Environment,
-    c: &env::Cauldron,
-    dir: &Path,
-    pool: &PoolName,
-    digest: &str,
-    a: &Args,
-) -> Result<Option<i32>> {
-    if a.allow_duplicate {
-        return Ok(None);
+/// **The import, sent to the `mcp` service** that holds the soup (its pid
+/// is in the writer lock): the same records as one `soup_put`, with
+/// `remint` and `allow_duplicate` as given, under the same batch digest, so
+/// the batch-already-landed guard sees the same batch whichever way it
+/// landed. Printed in the import's own shape, plus `forwarded_to`. Only when
+/// the service's `mcp` seam row is LIVE and names the pid the lock names.
+fn forward(t: &Target, records: &[Value], o: &ImportOptions, pid: u32) -> Result<Forwarded> {
+    let svc = crate::mcp_door::SERVICE;
+    let holder = format!("the `{svc}` service (pid {pid})");
+    let found = match crate::mcp_door::find(&t.env) {
+        Ok(f) if f.pid == pid => f,
+        Ok(f) => bail!(
+            "REFUSED: {holder} holds cauldron `{}`'s soup, but the running `{svc}` service is pid {}. Nothing was \
+             written. See `cauldron mcp status --env {}`.",
+            t.cauldron.name,
+            f.pid,
+            t.env.name
+        ),
+        Err(why) => bail!(
+            "REFUSED: {holder} holds cauldron `{}`'s soup, so this import would be sent to it, but {}. Nothing was \
+             written. Try again in a moment, or see `cauldron mcp status --env {}`.",
+            t.cauldron.name,
+            why.say(),
+            t.env.name
+        ),
+    };
+    let pool = o.pool_name();
+    if pool.as_str() != soup_door::reads::DEFAULT_POOL {
+        bail!(
+            "REFUSED: {holder} holds cauldron `{}`'s soup and writes only its `{}` pool, so an import into `{pool}` \
+             cannot be sent to it. Nothing was written.",
+            t.cauldron.name,
+            soup_door::reads::DEFAULT_POOL
+        );
     }
-    let conn = spine::offline::read_only_connection(&dir.join(spine::spine_db::SPINE_FILE))
-        .map_err(|err| anyhow::anyhow!("REFUSED: cannot read {}'s spine to check for an earlier landing of this batch: {err}", c.name))?;
-    let needle = format!("batch sha256:{digest}, ");
-    let mut stmt = conn
-        .prepare("SELECT seq, ts, initiator FROM transactions WHERE decided = 1 AND instr(initiator, ?1) > 0 ORDER BY seq")
-        .context("reading the spine's transaction rows")?;
-    let rows = stmt
-        .query_map([&needle], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
-        .context("reading the spine's transaction rows")?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("reading the spine's transaction rows")?;
-    // The SQL only narrows the rows; the match is made here, on the mark an
-    // import itself writes: the END of the `dispatch` text, exactly
-    // ` [batch sha256:<digest>, <n> records]`. A mark copied into an --agent
-    // label (`thread`) or into a file name earlier in `dispatch` never counts.
-    let earlier: Vec<Value> = rows
-        .into_iter()
-        .filter_map(|(seq, ts, initiator)| {
-            let v: Value = serde_json::from_str(&initiator).ok()?;
-            let dispatch = v.get("dispatch")?.as_str()?;
-            let (_, tail) = dispatch.rsplit_once(" [batch sha256:")?;
-            let n = tail.strip_prefix(digest)?.strip_prefix(", ")?.strip_suffix(" records]")?;
-            let records = (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| n.parse::<u64>().ok()).flatten()?;
-            Some(json!({"seq": seq, "landed_at": ts, "records": records}))
-        })
-        .collect();
-    if earlier.is_empty() {
-        return Ok(None);
+    let mut args = json!({
+        "cauldron": t.cauldron.name,
+        "records": records,
+        "remint": o.remint,
+        "allow_duplicate": o.allow_duplicate,
+        "_ctx": {"client": "cli"},
+    });
+    if let Ok(cwd) = std::env::current_dir() {
+        args["_ctx"]["cwd"] = json!(cwd.display().to_string());
     }
-    let first = &earlier[0];
-    let why = format!(
-        "this exact batch (the same records, before any --remint, into pool `{pool}`) already landed in cauldron `{}` \
-         at {} as spine transaction {} ({} records){}. Under --remint, importing it again would land every \
-         record a second time under new ids, and this release cannot delete nodes; without --remint, its carried \
-         ids would collide and the import would be refused. Nothing was written. If a second copy is really wanted, run the same \
-         command with --allow-duplicate.",
-        c.name,
-        first["landed_at"].as_str().unwrap_or("?"),
-        first["seq"],
-        first["records"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "?".to_string()),
-        if earlier.len() > 1 { format!(", and {} more time(s) after that", earlier.len() - 1) } else { String::new() },
+    // One request, all or nothing: a batch the door would not read is
+    // refused here, before anything is sent, and never split.
+    let size = crate::mcp_door::call_body("soup_put", args.clone()).len();
+    if size > crate::mcp_door::BODY_LIMIT {
+        let (c, e) = (&t.cauldron.name, &t.env.name);
+        bail!(
+            "REFUSED: {holder} holds cauldron `{c}`'s soup, so this import would be sent to it as one request, and it \
+             is {} ({} records), over the {} the service reads in one request. It is not sent in parts, because an \
+             import lands all of it or none of it. Nothing was written. Either split the file into imports under that \
+             size (each then lands all or nothing on its own, and under --remint a record's edges can name only \
+             labels in its own file or ids already in the soup), or close the cauldron to the service and import \
+             directly: `cauldron mcp revoke {c} --env {e}` (grant it again afterwards) or `cauldron --env {e} stop \
+             {svc}`.",
+            crate::mcp_door::mib(size),
+            records.len(),
+            crate::mcp_door::mib(crate::mcp_door::BODY_LIMIT)
+        );
+    }
+    eprintln!(
+        "cauldron soup import: {holder} holds cauldron `{}`'s soup; the import is sent to it and lands through it",
+        t.cauldron.name
     );
-    print(&json!({
-        "env": e.name,
-        "cauldron": c.name,
-        "pool": pool.as_str(),
-        "dry_run": a.dry_run,
-        "remint": a.remint,
-        "outcome": "refused",
-        "refusal": "batch-already-landed",
-        "batch_digest": digest,
-        "landed_before": earlier,
-        "why": why,
-    }))?;
-    eprintln!("cauldron soup import: REFUSED (batch-already-landed): {why}");
-    Ok(Some(1))
+    let result = crate::mcp_door::call(&t.env, found.door, "soup_put", args)
+        .with_context(|| format!("sending the import to {holder}; nothing is known to have been written, check `cauldron soup nodes`"))?;
+    let via = json!({"service": svc, "pid": pid});
+    if result["isError"] != json!(true) {
+        let mut doc = result["structuredContent"].clone();
+        if let Some(m) = doc.as_object_mut() {
+            m.remove("resolved_from");
+            m.remove("cursor");
+            m.insert("forwarded_to".into(), via);
+        }
+        print(&doc)?;
+        return Ok(Forwarded::Done(0));
+    }
+    let refused = &result["structuredContent"]["refused"];
+    let code = refused["code"].as_str().unwrap_or("");
+    let message = refused["message"].as_str().unwrap_or("");
+    match code {
+        "records_refused" => {
+            let mut doc = refused["detail"].clone();
+            if let Some(m) = doc.as_object_mut() {
+                m.insert("forwarded_to".into(), via);
+            }
+            print(&doc)?;
+            Ok(Forwarded::Done(1))
+        }
+        "batch_already_landed" => {
+            let earlier = refused["detail"]["landed_before"].as_array().cloned().unwrap_or_default();
+            if earlier.is_empty() {
+                bail!("REFUSED ({svc} service, batch_already_landed): {message}");
+            }
+            let digest = soup_door::import::batch_digest(&pool, records);
+            let ImportOutcome::AlreadyLanded { mut doc, why } = soup_door::import::already_landed(t, &pool, &digest, o, earlier) else {
+                unreachable!("already_landed answers AlreadyLanded")
+            };
+            doc["forwarded_to"] = via;
+            print(&doc)?;
+            eprintln!("cauldron soup import: REFUSED (batch-already-landed): {why}");
+            Ok(Forwarded::Done(1))
+        }
+        "not_granted" | "locked" => Ok(Forwarded::Released),
+        _ => bail!("REFUSED ({holder} answered `{code}`): {message}"),
+    }
 }
 
 // ------------------------------------------------------------------ recover
 
-/// The file a writer of this soup locks EXCLUSIVE for as long as it writes:
-/// `<soup>/writer.lock`. `import` and `recover` both take it, non-blocking,
-/// after the soup-daemon check; the kernel drops it when the holder exits,
-/// however it exits, so a killed import never leaves it held.
-const WRITER_LOCK: &str = "writer.lock";
-
-/// **The soup's writer lock, taken EXCLUSIVE and non-blocking.** Held until
-/// the returned file is dropped. Another `cauldron soup import` or
-/// `cauldron soup recover` holding it makes this refuse.
-fn take_writer_lock(c: &env::Cauldron, verb: &str) -> Result<std::fs::File> {
-    let path = c.soup().join(WRITER_LOCK);
-    let fh = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    match fh.try_lock() {
-        Ok(()) => Ok(fh),
-        Err(std::fs::TryLockError::WouldBlock) => bail!(
-            "REFUSED: another `cauldron soup import` or `cauldron soup recover` is writing to cauldron `{}`'s soup \
-             right now ({} is held), so `cauldron soup {verb}` did not touch it. Nothing was written. Try again \
-             when it has finished.",
-            c.name,
-            path.display()
-        ),
-        Err(std::fs::TryLockError::Error(err)) => Err(err).with_context(|| format!("locking {}", path.display())),
-    }
-}
-
 /// **`cauldron soup recover`**: settle a soup an interrupted import left
-/// not at rest. An import killed part way (Ctrl-C, a crash, a machine that
-/// stopped) leaves its transaction row un-cleared and its locks held; the
-/// spine's own recovery pass, which `spine::Cauldron::open` runs, settles
-/// that from the row alone: a row that was never decided is ABORTED
-/// (nothing of it landed, nothing lands), a decided row is ROLLED FORWARD
-/// (all of it lands, exactly once), and orphaned locks are released.
-///
-/// It runs that open only when it can prove no other process holds the
-/// store: no live soup daemon in the environment (the seam table, as for
-/// `import`), and the soup's writer lock, which every import holds while it
-/// writes, taken exclusive. A soup already at rest is not opened at all.
+/// not at rest (`soup_door::recover`). Prints the outcome as JSON on stdout
+/// and in words on stderr.
 fn recover(args: &[String]) -> Result<i32> {
     let a = parse("recover", args, &["--env", "--cauldron", "-c"])?;
     if !a.pos.is_empty() {
         bail!("`cauldron soup recover` takes no arguments (got `{}`); `cauldron soup help`", a.pos.join(" "));
     }
-    let (e, c) = target("recover", &a, true)?;
-    let soup = c.soup();
-    refuse_live_soup(&e)?;
-    let _lock = take_writer_lock(&c, "recover")?;
-    let before = spine::offline::rest_check(&soup)
-        .map_err(|err| anyhow::anyhow!("REFUSED: cannot read {}'s spine: {err}", c.name))?;
-    let mut doc = json!({
-        "env": e.name,
-        "cauldron": c.name,
-        "before": before,
-    });
-    let nodes_cmd = format!("cauldron soup nodes --env {} --cauldron {}", e.name, c.name);
-    if before.is_empty() {
-        doc["outcome"] = json!("at-rest");
-        doc["interrupted_import"] = json!("none");
-        doc["note"] = json!("the soup was already at rest; the spine was not opened and no data was written");
-        doc["instruction"] = json!(format!(
-            "Nothing to recover: no interrupted import is waiting to be settled. This cannot tell you whether an \
-             import you stopped earlier landed (one stopped after it finished landed in full, one stopped before \
-             it began writing landed nothing, and an earlier recover printed its own outcome), so check with \
-             `{nodes_cmd}` (newest first) before importing that batch again."
-        ));
-        say(&doc);
-        print(&doc)?;
-        return Ok(0);
-    }
-    let cauldron = spine::Cauldron::open(&soup, spine::config::SpineConfig::default())
-        .map_err(|err| anyhow::anyhow!("recovering cauldron `{}`'s soup: {err}", c.name))?;
-    let rec = cauldron.recovered_at_open();
-    let hexes = |v: &[spine::envelope::TxHash]| v.iter().map(|h| h.to_hex()).collect::<Vec<_>>();
-    doc["rolled_forward"] = json!(hexes(&rec.rolled_forward));
-    doc["cleared"] = json!(hexes(&rec.cleared_only));
-    doc["aborted"] = json!(hexes(&rec.aborted));
-    doc["live_tranches"] = json!(cauldron.tranches_at_open().tranches.len());
-    // A row rolled forward, or found landed and only cleared, is an import
-    // that LANDED; a row aborted (here, or by another recovery) landed
-    // nothing.
-    let landed_tx: Vec<String> = hexes(&rec.rolled_forward).into_iter().chain(hexes(&rec.cleared_only)).collect();
-    let rolled_back = rec.aborted.len() + rec.aborted_elsewhere.len();
-    drop(cauldron);
-    let after = spine::offline::rest_check(&soup)
-        .map_err(|err| anyhow::anyhow!("cannot read {}'s spine after recovery: {err}", c.name))?;
-    let settled = after.is_empty();
-    doc["after"] = json!(after);
-    doc["outcome"] = json!(if settled { "recovered" } else { "not-at-rest" });
-
-    let landed = landed_nodes(&soup, &landed_tx)
-        .map_err(|err| anyhow::anyhow!("cannot read which records landed in {}'s soup: {err}", c.name))?;
-    let mut steps = Vec::new();
-    match (landed_tx.is_empty(), rolled_back) {
-        (false, 0) => doc["interrupted_import"] = json!("landed"),
-        (true, n) if n > 0 => doc["interrupted_import"] = json!("rolled-back"),
-        (false, _) => doc["interrupted_import"] = json!("landed-and-rolled-back"),
-        (true, _) => doc["interrupted_import"] = json!("none"),
-    }
-    if !landed_tx.is_empty() {
-        doc["landed_records"] = json!(landed.len());
-        doc["landed_ids"] = landed_summary(&landed);
-        steps.push(format!(
-            "The interrupted import LANDED: recover finished it, and its {} record(s) are now in the soup ({}). \
-             Do NOT import that batch again: under --remint every record would land a second time under new \
-             ids, and this release cannot delete nodes. An import run with --remint printed no id map; `{nodes_cmd}` lists the landed nodes \
-             newest first.",
-            landed.len(),
-            id_ranges_text(&landed)
-        ));
-    }
-    if rolled_back > 0 {
-        steps.push(
-            "The interrupted import was ROLLED BACK: none of its records landed. It is safe to import that batch \
-             again."
-                .to_string(),
-        );
-    }
-    if landed_tx.is_empty() && rolled_back == 0 {
-        steps.push("No interrupted import was found to finish or roll back.".to_string());
-    }
-    if !settled {
-        steps.push(format!(
-            "The soup is still NOT at rest ({}); do not import anything until a recover reports `recovered`.",
-            doc["after"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("; ")).unwrap_or_default()
-        ));
-    }
-    doc["instruction"] = json!(steps.join(" "));
-    say(&doc);
-    print(&doc)?;
-    Ok(if settled { 0 } else { 1 })
-}
-
-/// The human text of a `recover` result, on stderr (stdout carries the
-/// JSON): the outcome and its instruction.
-fn say(doc: &Value) {
-    eprintln!(
-        "cauldron soup recover: {} (interrupted import: {})\n{}",
-        doc["outcome"].as_str().unwrap_or("?"),
-        doc["interrupted_import"].as_str().unwrap_or("?"),
-        doc["instruction"].as_str().unwrap_or("")
-    );
-}
-
-/// Every node, `(pool, id)`, that one of the transactions `tx` (hex hashes)
-/// created, read through read-only connections to each pool file of the
-/// soup at `soup`; sorted by pool, id prefix, then serial.
-fn landed_nodes(soup: &Path, tx: &[String]) -> Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    if tx.is_empty() {
-        return Ok(out);
-    }
-    for entry in std::fs::read_dir(soup).with_context(|| format!("listing {}", soup.display()))? {
-        let p = entry.with_context(|| format!("listing {}", soup.display()))?.path();
-        let stem = p.file_stem().and_then(|n| n.to_str()).unwrap_or("").to_string();
-        if p.extension().and_then(|x| x.to_str()) != Some("db") || stem == "spine" {
-            continue;
-        }
-        let conn = spine::offline::read_only_connection(&p).map_err(|err| anyhow::anyhow!("{err}"))?;
-        let mut stmt = conn.prepare("SELECT id FROM nodes WHERE created_tx = ?1")?;
-        for h in tx {
-            for id in stmt.query_map([h], |r| r.get::<_, String>(0))? {
-                out.push((stem.clone(), id?));
-            }
-        }
-    }
-    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| prefix(&a.1).cmp(prefix(&b.1))).then_with(|| serial(&a.1).cmp(&serial(&b.1))).then_with(|| a.1.cmp(&b.1)));
-    Ok(out)
-}
-
-/// Per pool and id prefix: how many landed, the first and last id, and
-/// whether the serials between them are all present (a contiguous range).
-fn landed_groups(landed: &[(String, String)]) -> Vec<(String, String, usize, String, String, bool)> {
-    let mut groups: Vec<(String, String, usize, String, String, bool)> = Vec::new();
-    for (pool, id) in landed {
-        match groups.last_mut() {
-            Some(g) if g.0 == *pool && g.1 == prefix(id) => {
-                g.5 &= serial(id) == serial(&g.4) + 1;
-                g.2 += 1;
-                g.4 = id.clone();
-            }
-            _ => groups.push((pool.clone(), prefix(id).to_string(), 1, id.clone(), id.clone(), true)),
-        }
-    }
-    groups
-}
-
-/// The JSON form of [`landed_groups`].
-fn landed_summary(landed: &[(String, String)]) -> Value {
-    Value::Array(
-        landed_groups(landed)
-            .into_iter()
-            .map(|(pool, prefix, count, first, last, contiguous)| {
-                json!({"pool": pool, "prefix": prefix, "count": count, "first": first, "last": last, "contiguous": contiguous})
-            })
-            .collect(),
-    )
-}
-
-/// The text form of [`landed_groups`]: `IS-2..IS-5001 (5000) in ws`.
-fn id_ranges_text(landed: &[(String, String)]) -> String {
-    if landed.is_empty() {
-        return "no node ids found for it".to_string();
-    }
-    landed_groups(landed)
-        .into_iter()
-        .map(|(pool, _, count, first, last, contiguous)| {
-            let span = if count == 1 { first } else { format!("{first}..{last}") };
-            let gaps = if contiguous { "" } else { ", not contiguous" };
-            format!("{span} ({count}{gaps}) in {pool}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// A running soup daemon in the environment may hold any of its cauldrons,
-/// so its live `soup` row refuses a real import; a seam table that cannot be
-/// read refuses too (no proof). Reads the seam table only.
-fn refuse_live_soup(e: &Environment) -> Result<()> {
-    let table = Table::load(&e.name, &e.data_root, &e.seams()).with_context(|| {
-        format!("REFUSED: cannot read environment `{}`'s seam table, so cannot prove no soup daemon holds the cauldron", e.name)
-    })?;
-    if let Some(s) = table.seams.get(SOUP_SEAM) {
-        if !seams::probe(s).process_gone(s) {
-            bail!(
-                "REFUSED: environment `{}`'s soup daemon is running (pid {}, {}) and may hold this cauldron's \
-                 soup. `cauldron soup import` and `cauldron soup recover` write only to a soup no daemon holds, \
-                 because they open the store directly. Nothing was written. While it runs, `import --dry-run` \
-                 still judges a batch against a read-only snapshot, and the reads (`soup regions | region | \
-                 nodes | search | get`) still work.",
-                e.name,
-                s.pid,
-                s.addr
-            );
-        }
-    }
-    Ok(())
-}
-
-/// A private temporary directory, removed with everything in it on drop.
-struct ScratchDir(PathBuf);
-impl ScratchDir {
-    fn new() -> Result<ScratchDir> {
-        let p = std::env::temp_dir().join(format!(
-            "cauldron-soup-dry-run-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
-        Ok(ScratchDir(p))
-    }
-}
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Records from one file (a list, or one record) or a directory of
-/// one-record files (`*.json`, `*.yaml`, `*.yml`, in name order).
-fn read_records(path: &Path) -> Result<Vec<Value>> {
-    if path.is_dir() {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
-            .with_context(|| format!("listing {}", path.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| matches!(p.extension().and_then(|x| x.to_str()), Some("json" | "yaml" | "yml")))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            bail!("{} holds no .json, .yaml or .yml record files", path.display());
-        }
-        let mut out = Vec::new();
-        for f in files {
-            match read_file(&f)? {
-                Value::Array(list) => out.extend(list),
-                one => out.push(one),
-            }
-        }
-        return Ok(out);
-    }
-    match read_file(path)? {
-        Value::Array(list) => Ok(list),
-        one => Ok(vec![one]),
-    }
-}
-
-fn read_file(path: &Path) -> Result<Value> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    match path.extension().and_then(|x| x.to_str()) {
-        Some("yaml" | "yml") => {
-            serde_yaml::from_str::<Value>(&text).with_context(|| format!("{} is not YAML", path.display()))
-        }
-        _ => serde_json::from_str::<Value>(&text).with_context(|| format!("{} is not JSON", path.display())),
-    }
+    let t = target("recover", &a, true)?;
+    let report = soup_door::recover::recover(&t)?;
+    eprintln!("cauldron soup recover: {}", soup_door::recover::say(&report.doc));
+    print(&report.doc)?;
+    Ok(if report.settled { 0 } else { 1 })
 }
 
 // -------------------------------------------------------------------- reads
-
-/// The pool, through a connection that cannot write.
-fn read_pool(c: &env::Cauldron, pool: &PoolName) -> Result<Pool> {
-    let file = Pool::path_in(&c.soup(), pool);
-    Pool::open_read_only(&file).map_err(|err| anyhow::anyhow!("reading cauldron `{}`'s pool `{pool}`: {err}", c.name))
-}
-
-const REGION_FLAGS: [&str; 5] = ["retired", "provisional", "deferred_by", "thresholds", "wake_when"];
 
 fn regions(args: &[String]) -> Result<i32> {
     let a = parse("regions", args, &["--env", "--cauldron", "-c", "--pool", "--max-chars"])?;
     if let Some(p) = a.pos.first() {
         bail!("`cauldron soup regions` takes no ids (got `{p}`); `soup get` reads nodes");
     }
-    let (e, c) = target("regions", &a, false)?;
-    let pool = pool_name(&a);
-    let handle = read_pool(&c, &pool)?;
-    let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;
-    let mut out = Vec::new();
-    let mut cut = Cut::new(a.max_chars);
-    for r in snap.nodes_of("region", None).map_err(|err| anyhow::anyhow!("{err}"))? {
-        let field = |k: &str| r.fields.get(k).map(|f| f.value.clone());
-        let text = |cut: &mut Cut, k: &str| r.fields.get(k).map(|f| cut.value(&r.id.0, k, &f.value));
-        let mut flags = serde_json::Map::new();
-        for k in REGION_FLAGS {
-            if let Some(v) = field(k) {
-                flags.insert(k.to_string(), v);
-            }
-        }
-        let edges = snap.edges_from(&r.id, None).map_err(|err| anyhow::anyhow!("{err}"))?;
-        let of = |kind: &str| -> Vec<String> {
-            edges.iter().filter(|x| x.kind == kind).map(|x| target_text(&pool, &x.dst)).collect()
-        };
-        let members = snap
-            .edges_to(&QualifiedNodeId { pool: pool.clone(), id: r.id.clone() }, Some("in_region"))
-            .map_err(|err| anyhow::anyhow!("{err}"))?
-            .len();
-        out.push(json!({
-            "id": r.id.0,
-            "handle": text(&mut cut, "handle"),
-            "boundary": text(&mut cut, "boundary"),
-            "flags": flags,
-            "narrows": of("narrows"),
-            "relates": of("relates"),
-            "members": members,
-        }));
-    }
-    let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "regions": out});
-    cut.report(&mut doc);
-    print(&doc)?;
+    let t = target("regions", &a, false)?;
+    print(&soup_door::reads::regions(&t, &read_opts(&a))?)?;
     Ok(0)
 }
 
@@ -949,195 +537,11 @@ fn get(args: &[String]) -> Result<i32> {
     if a.pos.is_empty() {
         bail!("`cauldron soup get` needs at least one id");
     }
-    let (e, c) = target("get", &a, false)?;
-    let pool = pool_name(&a);
-    let handle = read_pool(&c, &pool)?;
-    let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;
-    let mut records = Vec::new();
-    let mut missing = Vec::new();
-    let mut cut = Cut::new(a.max_chars);
-    for id in &a.pos {
-        let Some(n) = snap.node(&NodeId(id.clone())).map_err(|err| anyhow::anyhow!("{err}"))? else {
-            missing.push(id.clone());
-            continue;
-        };
-        let mut rec = serde_json::Map::new();
-        rec.insert("id".into(), json!(n.id.0));
-        rec.insert("type".into(), json!(n.node_type));
-        if let Some(s) = &n.state {
-            rec.insert("state".into(), json!(s));
-        }
-        for (k, f) in &n.fields {
-            rec.insert(k.clone(), cut.value(&n.id.0, k, &f.value));
-        }
-        let mut edges = Vec::new();
-        for x in snap.edges_from(&n.id, None).map_err(|err| anyhow::anyhow!("{err}"))? {
-            let mut m = serde_json::Map::new();
-            m.insert("kind".into(), json!(x.kind));
-            m.insert("to".into(), json!(target_text(&pool, &x.dst)));
-            if let Some(note) = &x.note {
-                m.insert("note".into(), json!(note));
-            }
-            let fields: BTreeMap<String, Value> = x.fields.clone();
-            for (k, v) in fields {
-                m.insert(k, v);
-            }
-            edges.push(Value::Object(m));
-        }
-        if !edges.is_empty() {
-            rec.insert("edges".into(), Value::Array(edges));
-        }
-        records.push(Value::Object(rec));
-    }
-    let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "records": records});
-    if !missing.is_empty() {
-        doc["missing"] = json!(missing);
-    }
-    cut.report(&mut doc);
+    let t = target("get", &a, false)?;
+    let doc = soup_door::reads::get(&t, &a.pos, &read_opts(&a))?;
     print(&doc)?;
-    Ok(if missing.is_empty() { 0 } else { 1 })
+    Ok(if doc.get("missing").is_none() { 0 } else { 1 })
 }
-
-/// An edge's far end as the published shape writes it: the bare id in the
-/// same pool, `<ID>@<pool>` in another.
-fn target_text(pool: &PoolName, dst: &QualifiedNodeId) -> String {
-    if &dst.pool == pool {
-        dst.id.0.clone()
-    } else {
-        format!("{}@{}", dst.id.0, dst.pool)
-    }
-}
-
-// ------------------------------------------------------- truncation, shared
-
-/// `--max-chars`: cuts any longer string value and remembers what it cut,
-/// for the output's `truncated` list (`{id, field, chars}`, `chars` the
-/// whole length).
-struct Cut {
-    max: Option<usize>,
-    cut: Vec<Value>,
-}
-
-impl Cut {
-    fn new(max: Option<usize>) -> Cut {
-        Cut { max, cut: Vec::new() }
-    }
-
-    fn value(&mut self, id: &str, field: &str, v: &Value) -> Value {
-        match (self.max, v) {
-            (Some(max), Value::String(s)) => Value::String(self.text(id, field, s, max)),
-            _ => v.clone(),
-        }
-    }
-
-    fn text(&mut self, id: &str, field: &str, s: &str, max: usize) -> String {
-        let chars = s.chars().count();
-        if chars <= max {
-            return s.to_string();
-        }
-        self.cut.push(json!({"id": id, "field": field, "chars": chars}));
-        s.chars().take(max).collect()
-    }
-
-    fn report(self, doc: &mut Value) {
-        if !self.cut.is_empty() {
-            doc["truncated"] = Value::Array(self.cut);
-        }
-    }
-}
-
-// ---------------------------------------------------- the catalog of nodes
-
-/// One node as the listing reads carry it.
-struct Entry {
-    id: String,
-    node_type: String,
-    state: Option<String>,
-    handle: String,
-    body: String,
-    regions: Vec<String>,
-    /// The committed-commit counter at the commit that created it; `None`
-    /// when the spine has no landed row for it (not expected; sorted first).
-    order: Option<i64>,
-}
-
-/// Every node of the pool, newest first: by the commit that created it
-/// (the spine's order, never a timestamp); nodes of one write by id prefix,
-/// then serial, highest first. Read through connections that cannot write.
-fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>, types: &[String]) -> Result<Vec<Entry>> {
-    let order = spine::offline::commit_order(&c.soup())
-        .map_err(|err| anyhow::anyhow!("reading cauldron `{}`'s commit order: {err}", c.name))?;
-    let mut out = Vec::new();
-    for t in types {
-        for n in snap.nodes_of(t, None).map_err(|err| anyhow::anyhow!("{err}"))? {
-            let text = |k: &str| n.fields.get(k).and_then(|f| f.value.as_str()).unwrap_or("").to_string();
-            let regions = snap
-                .edges_from(&n.id, Some("in_region"))
-                .map_err(|err| anyhow::anyhow!("{err}"))?
-                .iter()
-                .map(|x| target_text(pool, &x.dst))
-                .collect();
-            let created = snap.created_tx(&n.id).map_err(|err| anyhow::anyhow!("{err}"))?;
-            out.push(Entry {
-                id: n.id.0.clone(),
-                node_type: n.node_type.clone(),
-                state: n.state.clone(),
-                handle: text("handle"),
-                body: text("body"),
-                regions,
-                order: created.and_then(|h| order.get(&h.to_hex()).copied()),
-            });
-        }
-    }
-    out.sort_by(|a, b| {
-        let newest = |e: &Entry| e.order.map_or(i64::MAX, |o| o);
-        newest(b).cmp(&newest(a)).then_with(|| prefix(&a.id).cmp(prefix(&b.id))).then_with(|| serial(&b.id).cmp(&serial(&a.id))).then_with(|| a.id.cmp(&b.id))
-    });
-    Ok(out)
-}
-
-/// The prefix of `<PREFIX>-<n>`, the whole id for anything else.
-fn prefix(id: &str) -> &str {
-    id.rsplit_once('-').map_or(id, |(p, _)| p)
-}
-
-/// The serial of `<PREFIX>-<n>`, 0 for anything else.
-fn serial(id: &str) -> u64 {
-    id.rsplit_once('-').and_then(|(_, n)| n.parse().ok()).unwrap_or(0)
-}
-
-/// The node types to read: `--type` (checked against the pool's grammar),
-/// or every type the grammar declares.
-fn types_of(pool: &Pool, asked: Option<&str>) -> Result<Vec<String>> {
-    let all: Vec<String> = pool.grammar().node_types.keys().cloned().collect();
-    match asked {
-        None => Ok(all),
-        Some(t) if all.iter().any(|x| x == t) => Ok(vec![t.to_string()]),
-        Some(t) => bail!("pool `{}` has no node type `{t}` (it has: {})", pool.name(), all.join(", ")),
-    }
-}
-
-/// `--region`, checked: it must name a region the pool holds.
-fn region_filter(snap: &spine::pool::Snapshot<'_>, asked: Option<&str>) -> Result<Option<String>> {
-    let Some(r) = asked else { return Ok(None) };
-    match snap.node(&NodeId(r.to_string())).map_err(|err| anyhow::anyhow!("{err}"))? {
-        Some(n) if n.node_type == "region" => Ok(Some(r.to_string())),
-        Some(n) => bail!("`{r}` is a {}, not a region", n.node_type),
-        None => bail!("there is no region `{r}`; `cauldron soup regions` lists them"),
-    }
-}
-
-/// A list cut to `limit`, with how many were left out.
-fn bounded<T>(mut v: Vec<T>, limit: usize) -> (Vec<T>, usize) {
-    let more = v.len().saturating_sub(limit);
-    v.truncate(limit);
-    (v, more)
-}
-
-const NODES_LIMIT: usize = 50;
-const SEARCH_LIMIT: usize = 20;
-const MEMBERS_LIMIT: usize = 50;
-const SNIPPET_CHARS: usize = 160;
 
 fn nodes(args: &[String]) -> Result<i32> {
     let a = parse(
@@ -1148,160 +552,19 @@ fn nodes(args: &[String]) -> Result<i32> {
     if let Some(p) = a.pos.first() {
         bail!("`cauldron soup nodes` takes no ids (got `{p}`); `soup get` reads nodes by id");
     }
-    let (e, c) = target("nodes", &a, false)?;
-    let pool = pool_name(&a);
-    let handle = read_pool(&c, &pool)?;
-    let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;
-    let types = types_of(&handle, a.node_type.as_deref())?;
-    let region = region_filter(&snap, a.region.as_deref())?;
-    let all: Vec<Entry> = catalog(&c, &pool, &snap, &types)?
-        .into_iter()
-        .filter(|n| a.state.as_deref().is_none_or(|s| n.state.as_deref() == Some(s)))
-        .filter(|n| region.as_ref().is_none_or(|r| n.regions.contains(r)))
-        .collect();
-    let total = all.len();
-    let (shown, more) = bounded(all, a.limit.unwrap_or(NODES_LIMIT));
-    let mut cut = Cut::new(a.max_chars);
-    let list: Vec<Value> = shown
-        .iter()
-        .map(|n| {
-            json!({
-                "id": n.id,
-                "type": n.node_type,
-                "state": n.state,
-                "handle": cut.value(&n.id, "handle", &json!(n.handle)),
-                "regions": n.regions,
-            })
-        })
-        .collect();
-    let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "total": total, "nodes": list});
-    if more > 0 {
-        doc["more"] = json!(more);
-    }
-    cut.report(&mut doc);
-    print(&doc)?;
+    let t = target("nodes", &a, false)?;
+    print(&soup_door::reads::nodes(&t, &read_opts(&a))?)?;
     Ok(0)
-}
-
-/// Lower-case one char to one char, so char positions in the folded text
-/// are positions in the original.
-fn fold(s: &str) -> Vec<char> {
-    s.chars().map(|ch| ch.to_lowercase().next().unwrap_or(ch)).collect()
-}
-
-/// Where `term` first occurs in `hay`, as a char index.
-fn find(hay: &[char], term: &[char]) -> Option<usize> {
-    if term.is_empty() || term.len() > hay.len() {
-        return None;
-    }
-    (0..=hay.len() - term.len()).find(|&i| hay[i..i + term.len()] == *term)
-}
-
-/// The query's terms: its words (runs of letters and digits), folded,
-/// without repeats, in order.
-fn terms(query: &str) -> Vec<Vec<char>> {
-    let mut out: Vec<Vec<char>> = Vec::new();
-    for w in query.split(|ch: char| !ch.is_alphanumeric()).filter(|w| !w.is_empty()) {
-        let t = fold(w);
-        if !out.contains(&t) {
-            out.push(t);
-        }
-    }
-    out
-}
-
-/// `max` chars of `text` around char `at`, with `…` where it was cut.
-fn snippet(text: &str, at: usize, max: usize) -> (String, bool) {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
-        return (text.to_string(), false);
-    }
-    let start = at.saturating_sub(max / 4).min(chars.len() - max);
-    let mut s: String = chars[start..start + max].iter().collect();
-    if start > 0 {
-        s.insert(0, '…');
-    }
-    if start + max < chars.len() {
-        s.push('…');
-    }
-    (s, true)
 }
 
 fn search(args: &[String]) -> Result<i32> {
     let a = parse("search", args, &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--limit", "--max-chars"])?;
     let query = a.pos.join(" ");
-    let wanted = terms(&query);
-    if wanted.is_empty() {
+    if soup_door::reads::search_terms(&query).is_empty() {
         bail!("`cauldron soup search` needs a query with at least one word");
     }
-    let (e, c) = target("search", &a, false)?;
-    let pool = pool_name(&a);
-    let handle = read_pool(&c, &pool)?;
-    let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;
-    let types = types_of(&handle, a.node_type.as_deref())?;
-    let region = region_filter(&snap, a.region.as_deref())?;
-    let phrase: Vec<char> = wanted.join(&' ');
-    // (matched terms, score, catalog position, entry, first body hit)
-    let mut hits = Vec::new();
-    for (pos, n) in catalog(&c, &pool, &snap, &types)?.into_iter().enumerate() {
-        if region.as_ref().is_some_and(|r| !n.regions.contains(r)) {
-            continue;
-        }
-        let (h, b) = (fold(&n.handle), fold(&n.body));
-        let (mut matched, mut score, mut first) = (0usize, 0usize, None::<usize>);
-        for t in &wanted {
-            let in_h = find(&h, t).is_some();
-            let in_b = find(&b, t);
-            if in_h || in_b.is_some() {
-                matched += 1;
-            }
-            score += 3 * usize::from(in_h) + usize::from(in_b.is_some());
-            if let Some(at) = in_b {
-                first = Some(first.map_or(at, |f: usize| f.min(at)));
-            }
-        }
-        if matched == 0 {
-            continue;
-        }
-        if wanted.len() > 1 && (find(&h, &phrase).is_some() || find(&b, &phrase).is_some()) {
-            score += 2;
-        }
-        hits.push((matched, 10 * matched + score, pos, n, first));
-    }
-    // Most terms matched, then the score, then newest (catalog order).
-    hits.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)).then(x.2.cmp(&y.2)));
-    let total = hits.len();
-    let (shown, more) = bounded(hits, a.limit.unwrap_or(SEARCH_LIMIT));
-    let max = a.max_chars.unwrap_or(SNIPPET_CHARS);
-    let mut cut = Cut::new(a.max_chars);
-    let list: Vec<Value> = shown
-        .into_iter()
-        .map(|(_, score, _, n, first)| {
-            let (snip, partial) = snippet(&n.body, first.unwrap_or(0), max);
-            if partial {
-                cut.cut.push(json!({"id": n.id, "field": "body", "chars": n.body.chars().count(), "as": "snippet"}));
-            }
-            json!({
-                "id": n.id,
-                "type": n.node_type,
-                "state": n.state,
-                "handle": cut.value(&n.id, "handle", &json!(n.handle)),
-                "regions": n.regions,
-                "score": score,
-                "snippet": snip,
-            })
-        })
-        .collect();
-    let mut doc = json!({
-        "env": e.name, "cauldron": c.name, "pool": pool.as_str(), "query": query,
-        "terms": wanted.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>(),
-        "total": total, "results": list,
-    });
-    if more > 0 {
-        doc["more"] = json!(more);
-    }
-    cut.report(&mut doc);
-    print(&doc)?;
+    let t = target("search", &a, false)?;
+    print(&soup_door::reads::search(&t, &query, &read_opts(&a))?)?;
     Ok(0)
 }
 
@@ -1310,103 +573,7 @@ fn region(args: &[String]) -> Result<i32> {
     let [id] = a.pos.as_slice() else {
         bail!("`cauldron soup region` takes ONE region id (got {}); `cauldron soup regions` lists them", a.pos.len());
     };
-    let (e, c) = target("region", &a, false)?;
-    let pool = pool_name(&a);
-    let handle = read_pool(&c, &pool)?;
-    let snap = handle.snapshot().map_err(|err| anyhow::anyhow!("{err}"))?;
-    let id = region_filter(&snap, Some(id))?.expect("asked");
-    let err = |e: spine::error::SpineError| anyhow::anyhow!("{e}");
-    let mut cut = Cut::new(a.max_chars);
-    let depth = a.depth.unwrap_or(1);
-    let qualified = |id: &str| QualifiedNodeId { pool: pool.clone(), id: NodeId(id.to_string()) };
-    let members_of = |id: &str| -> Result<usize> { Ok(snap.edges_to(&qualified(id), Some("in_region")).map_err(err)?.len()) };
-
-    // A neighbouring region, short: id, handle, member count.
-    let brief = |cut: &mut Cut, rid: &str, extra: Option<usize>| -> Result<Value> {
-        let h = snap
-            .node(&NodeId(rid.to_string()))
-            .map_err(err)?
-            .and_then(|n| n.fields.get("handle").map(|f| f.value.clone()))
-            .unwrap_or(Value::Null);
-        let mut v = json!({"id": rid, "handle": cut.value(rid, "handle", &h), "members": members_of(rid)?});
-        if let Some(d) = extra {
-            v["depth"] = json!(d);
-        }
-        Ok(v)
-    };
-
-    // Up the narrows graph (parents) and down it (children), breadth first,
-    // each region once, to `depth` levels.
-    let walk = |cut: &mut Cut, up: bool| -> Result<Vec<Value>> {
-        let mut seen = std::collections::BTreeSet::from([id.clone()]);
-        let mut frontier = vec![id.clone()];
-        let mut out = Vec::new();
-        for level in 1..=depth {
-            let mut next = Vec::new();
-            for r in &frontier {
-                let mut far: Vec<String> = if up {
-                    snap.edges_from(&NodeId(r.clone()), Some("narrows")).map_err(err)?.iter().map(|x| target_text(&pool, &x.dst)).collect()
-                } else {
-                    snap.edges_to(&qualified(r), Some("narrows")).map_err(err)?.iter().map(|x| x.src.0.clone()).collect()
-                };
-                far.sort();
-                for f in far {
-                    if seen.insert(f.clone()) {
-                        out.push(brief(cut, &f, Some(level))?);
-                        next.push(f);
-                    }
-                }
-            }
-            frontier = next;
-        }
-        Ok(out)
-    };
-    let parents = walk(&mut cut, true)?;
-    let children = walk(&mut cut, false)?;
-
-    let mut relates: Vec<String> = snap
-        .edges_from(&NodeId(id.clone()), Some("relates"))
-        .map_err(err)?
-        .iter()
-        .map(|x| target_text(&pool, &x.dst))
-        .chain(snap.edges_to(&qualified(&id), Some("relates")).map_err(err)?.iter().map(|x| x.src.0.clone()))
-        .collect();
-    relates.sort();
-    relates.dedup();
-    let relates = relates.iter().map(|r| brief(&mut cut, r, None)).collect::<Result<Vec<_>>>()?;
-
-    let r = snap.node(&NodeId(id.clone())).map_err(err)?.expect("checked above");
-    let mut flags = serde_json::Map::new();
-    for k in REGION_FLAGS {
-        if let Some(f) = r.fields.get(k) {
-            flags.insert(k.to_string(), f.value.clone());
-        }
-    }
-    let field = |cut: &mut Cut, k: &str| r.fields.get(k).map(|f| cut.value(&id, k, &f.value));
-    let record = json!({
-        "id": id,
-        "handle": field(&mut cut, "handle"),
-        "boundary": field(&mut cut, "boundary"),
-        "flags": flags,
-    });
-
-    let types = types_of(&handle, None)?;
-    let members: Vec<Entry> = catalog(&c, &pool, &snap, &types)?.into_iter().filter(|n| n.regions.contains(&id)).collect();
-    let total = members.len();
-    let (shown, more) = bounded(members, a.limit.unwrap_or(MEMBERS_LIMIT));
-    let members: Vec<Value> = shown
-        .iter()
-        .map(|n| json!({"id": n.id, "type": n.node_type, "state": n.state, "handle": cut.value(&n.id, "handle", &json!(n.handle))}))
-        .collect();
-    let mut doc = json!({
-        "env": e.name, "cauldron": c.name, "pool": pool.as_str(),
-        "region": record, "parents": parents, "children": children, "relates": relates,
-        "members_total": total, "members": members,
-    });
-    if more > 0 {
-        doc["more"] = json!(more);
-    }
-    cut.report(&mut doc);
-    print(&doc)?;
+    let t = target("region", &a, false)?;
+    print(&soup_door::reads::region(&t, id, &read_opts(&a))?)?;
     Ok(0)
 }

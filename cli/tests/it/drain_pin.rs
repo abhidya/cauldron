@@ -645,7 +645,7 @@ fn c7c_threads_alone_declares_a_drain_and_every_other_service_does_not() {
     assert!(d["cap_secs"].as_integer().unwrap() <= 600, "E18-15: a drain blocks intake for at most 10 min");
     assert_eq!(d["at_cap"].as_str(), Some("handoff"));
     assert_eq!(d["turn_ids"].as_str(), Some("/restart_gate/turn_threads"));
-    assert_eq!(none, ["claude-account-expiry-alarm", "echo", "soup-backup", "tally", "tts", "ui-server"]);
+    assert_eq!(none, ["claude-account-expiry-alarm", "echo", "mcp", "soup-backup", "tally", "tts", "ui-server"]);
 }
 
 // ═══════════════════════════════════════════════ R9.C7d: restart drains ═══

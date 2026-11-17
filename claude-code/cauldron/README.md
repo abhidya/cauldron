@@ -1,19 +1,21 @@
 # Cauldron for Claude Code
 
 Use a Cauldron **soup** (a cauldron's typed knowledge graph) from a Claude
-Code session: a `curator` subagent turns notes, a conversation excerpt or
-findings into schema-valid soup records and lands them, and the published
-schema ships with the plugin so the session can read it.
+Code session: the plugin's MCP server gives the session tools to read,
+search and write the soups their owner has opened to it, a `curator`
+subagent turns notes, a conversation excerpt or findings into schema-valid
+soup records and lands them, and the published schema ships with the plugin
+so the session can read it.
 
-Reads work at any time, and so do imports: this release runs no soup daemon,
-so nothing else holds a cauldron's soup. All
-access goes through the `cauldron` CLI on the same machine as the cauldron;
-the plugin has no MCP server.
+Everything runs on the same machine as the cauldron. The MCP server is
+`cauldron mcp stdio`, a bridge to the environment's `mcp` service; the
+`cauldron` CLI works beside it and is the curator's fallback.
 
 ## Contents
 
 | path | what |
 |---|---|
+| `.mcp.json` | the MCP server `cauldron`: `cauldron mcp stdio` |
 | `agents/curator.md` | the curator subagent (`cauldron:curator`) |
 | `commands/curate.md` | `/cauldron:curate <cauldron> [--env <env>] [what to record]` |
 | `skills/soup-schema/SKILL.md` | `/cauldron:soup-schema`: the schema in brief, with a pointer to the full README |
@@ -70,6 +72,84 @@ that is a symbolic link is never followed or written through. The curator
 states the target it took from a marker before its first write, and asks you
 to confirm before writing to `prod` from a marker.
 
+## The MCP door
+
+The plugin's `.mcp.json` starts `cauldron mcp stdio` with each session. That
+bridge talks to the environment's `mcp` service, a supervised service that
+listens on `127.0.0.1` only and is the one writer of every soup it holds.
+
+**Every cauldron is closed to it until you grant it.** Granting is your act,
+at a terminal on this machine:
+
+```sh
+cauldron --env dev start mcp                         # once; then the supervisor keeps it
+cauldron mcp grant kb --env dev --project ~/code/proj # run it yourself, in a terminal
+cauldron mcp grants --env dev                        # what is open
+cauldron mcp revoke kb --env dev                     # close it again
+cauldron mcp status --env dev                        # the service and what it holds
+```
+
+- `grant` runs only with its input and output on an interactive terminal, and
+  no option skips that: an agent, whose shell has no terminal, cannot open a
+  cauldron for itself, and no MCP tool can grant, revoke or list grants. The
+  default scopes are `read,write,dump` (`--scopes read` opens it read-only;
+  `dump` is not used by any tool in this release).
+- A grant opens the cauldron to the Claude Code sessions you run on this
+  machine against that environment, whichever directory they work in: any
+  session can reach it by naming it (a call's `cauldron` argument, or
+  `$CAULDRON_CAULDRON`, or `cauldron mcp stdio --cauldron`, for every call).
+- `--project <dir>` (repeatable) only tells a session which cauldron a
+  directory means when the session does not name one: a session working in
+  that directory, or below it, uses this cauldron by default. It does not
+  limit which sessions can reach the cauldron. Nothing else chooses one: the
+  `.cauldron` marker never opens anything to the MCP door.
+- The environment is the one Claude Code was started in: `$CAULDRON_ENV`,
+  else `prod`. `$ENV` is not read by the bridge (a shell's `ENV=development`
+  names no cauldron environment). The door serves that environment only.
+  When the bridge cannot use its environment (no such environment, or a bad
+  name), the session still lists the tools and every call is refused as
+  `no_environment`, saying why.
+- `revoke` takes effect on the next call: the service closes the cauldron and
+  lets go of its soup. Writes still waiting in its queue are refused
+  (`not_granted`) and never land; a write already being applied when the
+  revoke comes finishes, all of it or none of it. `revoke --project <dir>`
+  removes only that binding.
+- A grant is for the cauldron it was made for, not only its name: if that
+  cauldron is removed and another is made under the same name, calls are
+  refused as `cauldron_gone` until you grant the new one.
+- The grants are kept in `<root>/data/<env>/mcp/grants.json`, owner-only.
+
+The tools: `soup_status` (which cauldron this session reaches and why, its
+counts and change cursor), `soup_regions`, `soup_region`, `soup_nodes`,
+`soup_search` and `soup_get` (the same answers as the `cauldron soup` reads,
+each reply's payload bounded by `max_chars`: default 12,000, floor 256,
+ceiling 50,000), `soup_put` (records in the published shape,
+judged and landed as one all-or-nothing write, with `dry_run`, `remint`,
+`partial`, `cite` and `allow_duplicate`; the session is cited on every record
+when Claude Code passes its id), `soup_link` (edges between nodes the soup
+holds) and `soup_changes` (what landed since a cursor). `soup_claim`,
+`soup_dump` and `soup_dump_session` are listed and refuse
+(`unsupported`, `not_available_yet`). A refusal is a tool result with a
+typed `code` (`not_granted`, `no_cauldron_for_project`, `records_refused`,
+`batch_already_landed`, …) and a message that says what to do.
+
+While the service is not running, the bridge still lists the tools, and every
+call is refused as `service_down` with the command that starts it.
+
+**The CLI beside it.** While the service holds a cauldron, `cauldron soup
+import` is sent to the service and lands through it (its JSON says
+`forwarded_to`), with the same batch-already-landed check, and `cauldron soup
+recover` is refused, because the service recovers the soup itself when it
+opens it (`cauldron mcp status` shows what that recovered). The service reads
+at most 16 MiB in one request, so a larger import is refused before it is sent
+(never split, so it stays all or nothing): import it in smaller files, or
+revoke the grant (or stop the service) and import directly. An ungranted
+cauldron is never held, and the CLI works on it as before.
+
+Every write through the door adds a line to `<root>/data/<env>/mcp/calls.jsonl`
+(when, which client and session, which tool, the outcome and counts; never
+record text).
+
 A new soup has **no regions**, and the curator never invents one. On the first
 run it files nothing it cannot place and proposes regions instead; approve
 them (or import a few region records yourself with `cauldron soup import`) and
@@ -91,7 +171,8 @@ from it (inside Claude Code):
 
 ## The verbs
 
-All need the environment and the cauldron named, by `--env` and `--cauldron`
+The curator falls back to these when the session has no MCP tools or the
+`mcp` service is down. All need the environment and the cauldron named, by `--env` and `--cauldron`
 or by the project's `.cauldron` marker (`cauldron link`); none defaults to
 production. All
 print JSON and exit non-zero on a refusal. The reads cannot write, and each
@@ -125,6 +206,8 @@ lists take `--limit N` and say how many `more` there were.
   `batch-already-landed`, saying when it landed and how many records it held;
   `--allow-duplicate` lands a second copy on purpose. Batches landed by
   0.1.4 or earlier carry no record of their content and are not recognised.
+  While the `mcp` service holds the cauldron, the import is sent to it (see
+  above).
 - `cauldron soup recover --env E --cauldron C`: settles a soup an interrupted
   import left unsettled, by the soup's own record, and says which way it went
   in `interrupted_import`. `landed` means the interrupted import was finished
@@ -133,6 +216,8 @@ lists take `--limit N` and say how many `more` there were.
   second time, and nodes cannot be deleted. `rolled-back` means none of it landed:
   importing it again is safe. `none` means there was nothing to settle; check
   `cauldron soup nodes` before importing a batch whose fate you do not know.
+  Refused while the `mcp` service holds the cauldron: it recovers the soup
+  when it opens it.
 
 ## A worked session
 
@@ -142,6 +227,12 @@ In Claude Code:
 > /cauldron:curate kb --env dev The import failed because a record guessed a
   region id; we decided to always read region ids from `soup regions` first.
 ```
+
+This session takes the CLI route (no MCP tools in the session, or the `mcp`
+service down). Through the MCP tools the curator does the same with
+`soup_status`, `soup_regions`, `soup_search` and `soup_put` (`dry_run: true`
+first), passing the records in the call instead of a file; the answers have
+the same shape.
 
 The curator reads `schema/README.md`, lists the regions, searches the soup
 for what it already says (`soup search region id`), and writes a batch with

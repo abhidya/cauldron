@@ -21,11 +21,139 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.5, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.6, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.5, only an
+  the disable and trigger a fresh usage reading. Through 0.1.6, only an
   explicit enable clears it.
+
+## [0.1.6] — 2026-11-16
+
+The MCP door: a Claude Code session can read, search and write the soups
+their owner has opened to it, through a new supervised service. Every
+cauldron is closed to it until the owner grants it at a terminal. Stores made
+by 0.1.5 open unchanged.
+
+### Added
+
+- **The `mcp` service** (`services/mcp.toml`), one per environment, started
+  like any other: `cauldron --env <env> start mcp`. It listens on
+  `127.0.0.1` only (port 3654 in `prod`, a port the kernel chooses in every
+  other environment, published through its seam) and answers MCP's JSON-RPC
+  on `POST /mcp`. A request must carry the door secret, which the service
+  mints at every start into `<root>/data/<env>/mcp/door.secret`
+  (owner-only); a request with an `Origin` header, or with a `Host` that does
+  not name the loopback door, is refused. These three are checked from the
+  request's headers before any of its body is read. The door serves at most
+  64 connections at once (the next waits to be accepted), reads only a body
+  with a `Content-Length`, at most 16 MiB in one request (a larger one is
+  refused as `too_large` from its `Content-Length`, unread) and 64 MiB of
+  request bodies at once (a body's share is held until its answer is ready,
+  and a request that cannot get its share within 10 seconds is answered
+  `busy`), closes a connection that does not send a request's
+  head within 5 seconds, and answers 408 to a body that does not arrive
+  within 10.
+- **Grants: every cauldron is closed until its owner opens it.** `cauldron
+  mcp grant <cauldron> [--env <env>] [--scopes read,write,dump] [--project
+  <dir>]...` runs only with its input and output on an interactive terminal,
+  and no option skips that, so an agent cannot open a cauldron for itself.
+  `cauldron mcp revoke <cauldron> [--project <dir>]` closes it again (or
+  unbinds one project), and `cauldron mcp grants` lists them. The grants are
+  kept in `<root>/data/<env>/mcp/grants.json` and checked on every call; no
+  MCP tool can grant, revoke or list them. A grant opens the cauldron to the
+  Claude Code sessions run by this user on this machine against that
+  environment, whichever directory they work in. `--project` only tells a
+  session which cauldron a directory means when it does not name one: a
+  call's cauldron is its `cauldron` argument, else `$CAULDRON_CAULDRON`, else
+  the grant whose project holds the session's working directory. The
+  `.cauldron` marker never opens anything to the door. A grant is bound to
+  the cauldron it was made for (its `created_at`, to the second), not only
+  to its name: a cauldron removed and made again under the same name is
+  refused as `cauldron_gone` until the owner grants it again. (A grant
+  written by a pre-release build of 0.1.6 has no such binding and opens by
+  name until it is granted again.)
+- **The tools.** `soup_status` (which cauldron, how it was chosen, its
+  grant's scopes, counts, the change cursor, and whether the service holds
+  it open); `soup_regions`, `soup_region`, `soup_nodes`, `soup_search` and
+  `soup_get`, which answer the same items as the `cauldron soup` reads, each
+  reply's payload bounded as a whole by `max_chars` (default 12,000, floor
+  256, ceiling 50,000; a value outside them is raised or lowered to the
+  nearer) and saying what it left out; `soup_put`, records in the published
+  shape judged and landed as one all-or-nothing write, with `dry_run`, `remint`,
+  `partial`, `cite` and `allow_duplicate`, and the session cited on every
+  record that has `meta` when the bridge knows the session's id; `soup_link`,
+  edges between nodes the soup holds, all or nothing; `soup_changes`, what
+  landed since a cursor (with no cursor, only the current one; a cursor of
+  another cauldron, or of one removed and made again under the same name, is
+  refused as `cursor_unknown`, and one ahead of the soup as `cursor_stale`).
+  `soup_claim` is listed and always refused as `unsupported` (this schema
+  has no clusters); `soup_dump` and `soup_dump_session` are listed and
+  refused as `not_available_yet`. A refusal is a tool result with a typed
+  code and a message that says what to do.
+- **One writer per soup.** The service opens a granted cauldron for writing
+  on its first write call, never at start, under the same proofs as an
+  import, holds its soup's writer lock until the grant is revoked or loses
+  `write` or the service stops, and runs every write on one thread per
+  cauldron: concurrent sessions wait their turn and are never refused for
+  it, except by the door's own limits above. Opening a soup an interrupted write left unsettled recovers it, and
+  `soup_status` and `cauldron mcp status` say what that recovered
+  (`recovered_at_open`). A revoke closes the cauldron and frees the lock
+  even when no call follows it. The writer re-reads the grant immediately
+  before it applies each write, so once a revoke (or the loss of `write`) is
+  seen, every write still queued is refused as `not_granted` and nothing
+  more lands; a write already being applied when the revoke comes finishes,
+  all of it or none of it.
+- **An audit line per write call** in `<root>/data/<env>/mcp/calls.jsonl`:
+  when, which client and session, which cauldron and tool, the outcome and
+  counts. Never record text.
+- **`cauldron mcp stdio`**, the bridge Claude Code launches: JSON-RPC, one
+  message per line, relayed to the service with the door secret, which it
+  never prints. It adds the session's context to every tool call (its
+  working directory, `$CLAUDE_CODE_SESSION_ID` when set, and `--cauldron` or
+  `$CAULDRON_CAULDRON`) and replaces any context a caller put in the
+  arguments. While the service is not running it still answers
+  `initialize` and `tools/list`, and refuses every call as `service_down`
+  with the command that starts it. Its environment is `--env`, else
+  `$CAULDRON_ENV`, else `prod`; unlike the other verbs it does not read
+  `$ENV`. When that environment cannot be used it still answers
+  `initialize` and `tools/list`, and refuses every call as `no_environment`,
+  saying why.
+- **`cauldron mcp status`**: the service, the cauldrons it holds open and
+  what opening each recovered, and per cauldron its grant and what its
+  writer lock says.
+- **The plugin's MCP server.** `claude-code/cauldron/.mcp.json` names
+  `cauldron mcp stdio`. The curator and `/cauldron:curate` use the MCP
+  tools first and the `cauldron` CLI as the fallback when the session has no
+  MCP tools or the service is down; they never use the CLI to get round a
+  refusal. The curator still states its target before its first write, and
+  asks before writing to `prod` when the user did not name it.
+- **`scripts/install` pins `mcp`** in an environment it creates, beside
+  `threads`: a release build installed as the environment's own new version,
+  then the pin. An existing `env.toml` is never edited; one without an `mcp`
+  pin is told the two commands that add it. An install stopped between the
+  two pins is finished by running it again.
+
+### Changed
+
+- **`cauldron soup import` while the service holds the soup.** A real import
+  into a cauldron the `mcp` service holds is sent to the service and lands
+  through it: the same judgement, the same JSON plus `forwarded_to`, and the
+  same batch-already-landed check across both ways of landing, with
+  `--allow-duplicate` and `--remint` carried. The service records the writer
+  as `mcp:cli`, not `--agent`, and writes only the `ws` pool. A dry run is
+  never sent. A batch larger than the 16 MiB the service reads in one request
+  is refused before it is sent, naming the limit and the two ways on (smaller
+  files, or revoking the grant or stopping the service and importing
+  directly); it is never sent in parts, so an import still lands all of it or
+  none of it. An ungranted cauldron, and every cauldron once the service has
+  stopped, imports directly as before.
+- **`cauldron soup recover` is refused while the service holds the soup,**
+  naming it and its pid: the service recovers the soup itself when it opens
+  it.
+- **The soup logic is a library** (`libs/soup-door`), shared by the CLI and
+  the service. A recorded session of every `cauldron soup` verb (imports,
+  reads, refusals and help) prints the same bytes as 0.1.5 did, apart from
+  the help text, which now describes the two changes above.
 
 ## [0.1.5] — 2026-11-16
 
@@ -313,7 +441,9 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/broomstick-ai/cauldron/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/broomstick-ai/cauldron/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/broomstick-ai/cauldron/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/broomstick-ai/cauldron/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/broomstick-ai/cauldron/compare/v0.1.1...v0.1.2

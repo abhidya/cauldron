@@ -51,6 +51,9 @@
 //!   need neither `--env` nor `--cauldron`; a flag or variable always wins;
 //!   an explicit env that differs from the marker's refuses; a broken marker
 //!   refuses; a directory named `.cauldron` is never a marker.
+//! - **S18** every verb's stdout, stderr and exit code over a fixed session
+//!   equal a recorded copy (`golden/soup.json`), so the soup logic can move
+//!   between crates without changing a byte of what a caller reads.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
@@ -1433,4 +1436,128 @@ fn s17_a_mark_in_an_agent_label_or_file_name_is_not_a_landing() {
     let o = import(&s, "kb", &c, &[]);
     assert_eq!((o.rc, o.json()["refusal"].as_str()), (1, Some("batch-already-landed")), "{}", o.out);
     assert_eq!(o.json()["landed_before"][0]["records"], 1);
+}
+
+// ---------------------------------------------------------------- golden
+
+/// **The output of every soup verb, byte for byte, against a recorded
+/// copy** (`golden/soup.json`): stdout, stderr and the exit code of a fixed
+/// session that imports, refuses, reads, bounds and resolves through a
+/// project marker. Only what differs from run to run is replaced before the
+/// comparison: the scratch directory, transaction hashes and timestamps.
+/// `SOUP_GOLDEN_WRITE=1` rewrites the recorded copy; the copy was first
+/// recorded from the binary in which the soup logic still lived in the CLI.
+#[test]
+fn s18_every_verb_prints_exactly_the_recorded_output() {
+    let s = scratch("golden", &["kb", "other"]);
+    let example = write_json(&s, "example.json", &example());
+    let later = write_json(
+        &s,
+        "later.json",
+        &[
+            json!({"id": "r", "type": "region", "handle": "Schema drift checks",
+                   "boundary": "Inside: tests that hold a copy of the schema to its source. Outside: the schema itself (R-1).",
+                   "edges": [{"kind": "narrows", "to": "R-1"}]}),
+            json!({"id": "a", "type": "issue", "state": "open", "handle": "The plugin's schema copy drifted from the published schema",
+                   "body": "A drift test compares the copy with its source.",
+                   "edges": [{"kind": "in_region", "to": "r"}]}),
+        ],
+    );
+    let bad = write_json(&s, "bad.json", &[json!({"id": "IS-90", "type": "nonsense", "handle": "x"})]);
+    let proj = s.0.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let (ex, la, ba) = (example.to_str().unwrap(), later.to_str().unwrap(), bad.to_str().unwrap());
+    let k: &[&str] = &["--env", "dev", "--cauldron", "kb"];
+    let with = |v: &[&str]| -> Vec<String> { v.iter().chain(k.iter()).map(|x| x.to_string()).collect() };
+    let plain = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    let session: Vec<(Option<&Path>, Vec<String>)> = vec![
+        (None, with(&["soup", "import", ex, "--dry-run"])),
+        (None, with(&["soup", "import", ex])),
+        (None, with(&["soup", "import", ex])),
+        (None, with(&["soup", "import", ex, "--dry-run", "--remint"])),
+        (None, with(&["soup", "import", la, "--remint", "--agent", "golden"])),
+        (None, with(&["soup", "import", ba])),
+        (None, with(&["soup", "import", ba, "--dry-run"])),
+        (None, with(&["soup", "regions"])),
+        (None, with(&["soup", "regions", "--max-chars", "12"])),
+        (None, with(&["soup", "region", "R-1"])),
+        (None, with(&["soup", "region", "R-1", "--depth", "2", "--limit", "1", "--max-chars", "8"])),
+        (None, with(&["soup", "region", "IS-1"])),
+        (None, with(&["soup", "region", "R-99"])),
+        (None, with(&["soup", "nodes"])),
+        (None, with(&["soup", "nodes", "--type", "issue", "--state", "open"])),
+        (None, with(&["soup", "nodes", "--region", "R-2", "--limit", "2", "--max-chars", "10"])),
+        (None, with(&["soup", "nodes", "--type", "nope"])),
+        (None, with(&["soup", "search", "schema", "drift"])),
+        (None, with(&["soup", "search", "schema", "--limit", "2", "--max-chars", "20"])),
+        (None, with(&["soup", "search", "--type", "issue", "copy"])),
+        (None, with(&["soup", "search", "!!"])),
+        (None, with(&["soup", "get", "IS-1", "R-1", "R-3", "NOPE-1"])),
+        (None, with(&["soup", "get", "IS-1", "--max-chars", "10"])),
+        (None, with(&["soup", "get", "IS-1", "--pool", "../x"])),
+        (None, with(&["soup", "get", "IS-1", "--pool", "spine"])),
+        (None, with(&["soup", "recover"])),
+        (None, with(&["soup", "recover", "extra"])),
+        (None, plain(&["soup", "nodes", "--env", "dev", "--cauldron", "nope"])),
+        (None, plain(&["soup", "nodes", "--env", "nowhere", "--cauldron", "kb"])),
+        (Some(&s.0), plain(&["soup", "nodes", "--cauldron", "kb"])),
+        (None, with(&["soup", "nodes", "--bogus"])),
+        (None, with(&["soup", "nodes", "--limit", "many"])),
+        (None, with(&["soup", "frobnicate"])),
+        (None, plain(&["soup"])),
+        (None, plain(&["soup", "help"])),
+        (None, plain(&["link", "kb", "--env", "dev", "--dir", proj.to_str().unwrap()])),
+        (Some(&proj), plain(&["soup", "nodes", "--limit", "1"])),
+        (Some(&proj), plain(&["soup", "nodes", "--limit", "1", "--cauldron", "other"])),
+        (Some(&proj), plain(&["soup", "import", ex, "--dry-run"])),
+        (Some(&proj), plain(&["soup", "recover"])),
+        (Some(&proj), plain(&["soup", "nodes", "--env", "other-env"])),
+        (Some(&proj), plain(&["link", "--show"])),
+    ];
+    let root = s.0.display().to_string();
+    let mut volatile: Vec<String> = Vec::new();
+    let mut doc = Vec::new();
+    for (cwd, args) in &session {
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let o = match cwd {
+            Some(d) => run_in(&s, d, &[], &argv),
+            None => run(&s, &argv),
+        };
+        // What legitimately differs per run: hashes and timestamps.
+        if let Ok(v) = serde_json::from_str::<Value>(&o.out) {
+            if let Some(tx) = v["landed"]["tx"].as_str() {
+                volatile.push(tx.to_string());
+            }
+            for l in v["landed_before"].as_array().into_iter().flatten() {
+                if let Some(ts) = l["landed_at"].as_str() {
+                    volatile.push(ts.to_string());
+                }
+            }
+        }
+        doc.push(json!({
+            "args": argv.iter().map(|a| a.replace(&root, "<S>")).collect::<Vec<_>>(),
+            "cwd": cwd.map(|d| d.display().to_string().replace(&root, "<S>")),
+            "rc": o.rc, "stdout": o.out, "stderr": o.err,
+        }));
+    }
+    let mut text = serde_json::to_string_pretty(&doc).unwrap().replace(&root, "<S>");
+    volatile.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    for (i, v) in volatile.iter().enumerate() {
+        text = text.replace(v.as_str(), &format!("<V{i}>"));
+    }
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/it/golden/soup.json");
+    if std::env::var_os("SOUP_GOLDEN_WRITE").is_some() {
+        std::fs::create_dir_all(golden.parent().unwrap()).unwrap();
+        std::fs::write(&golden, &text).unwrap();
+        return;
+    }
+    let want = std::fs::read_to_string(&golden).expect("golden/soup.json (record it with SOUP_GOLDEN_WRITE=1)");
+    if want != text {
+        let (w, t): (Vec<Value>, Vec<Value>) = (serde_json::from_str(&want).unwrap(), serde_json::from_str(&text).unwrap());
+        for (a, b) in w.iter().zip(t.iter()) {
+            assert_eq!(a, b, "a soup verb's output changed");
+        }
+        assert_eq!(w.len(), t.len(), "the session changed length");
+        panic!("golden text differs only in formatting");
+    }
 }

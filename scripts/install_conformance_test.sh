@@ -91,6 +91,13 @@
 # variable aborts install / this suite with rc != 0, not the rc 0 that bash
 # 3.2 gives a `set -u` abort under an EXIT trap.
 #
+# THE MCP STEP (4c), cases 13, 14a, 17b, 21b, 26b and 29: a fresh environment
+# also gets `cauldron build mcp --json --env-copy` and `pin mcp <label>+<env>`
+# after threads; an existing env.toml is told the two commands and never
+# edited (13); a run stopped between the two pins is finished by a re-run
+# that pins only mcp, and a third run changes nothing (29a-c); an env.toml
+# edited by hand after the threads pin is refused (29d).
+#
 #   INSTALL=<path> overrides the script under test (used to force it red).
 #   SUITE_UNDER_TEST=<path> overrides the suite case 28 mutates (same reason).
 set -euo pipefail
@@ -273,7 +280,7 @@ srun() {
     if [[ -d "${home}" ]]; then /bin/cp -Rp "${home}/." "${T}/twin/"; fi
     # REL-4.S5c stub knobs, passed to the run AND its twin. Paths here hold no
     # spaces (all under ${T}), so word splitting is safe.
-    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-}"
+    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-} STUB_MCP_REFUSE=${STUB_MCP_REFUSE:-0}"
     set +e
     OUT="$(cd "${T}" && /usr/bin/env -i HOME="${RUN_HOME:-${T}/home}" PATH="${SEAL}${SRUN_PATH_EXTRA:+:${SRUN_PATH_EXTRA}}" \
         ${RUN_SIGNER:+HARNESS_SIGN_SCRIPT="${RUN_SIGNER}"} \
@@ -502,8 +509,24 @@ case "$*" in
         printf 'name = "threads"\n' >"${d}/declaration.toml"
         echo "cargo noise on stderr" >&2
         printf '[\n  {\n    "service": "threads",\n    "label": "%s",\n    "bin": "threads"\n  }\n]\n' "${l}" ;;
+    "build mcp --json --env-copy")
+        # As `build threads --env-copy`: a NEW `<label>+<env>` claimed with a
+        # plain mkdir. STUB_MCP_REFUSE=1 refuses it, as a dirty tree would.
+        if [[ "${STUB_MCP_REFUSE:-0}" == 1 ]]; then
+            echo "Error: REFUSED to install a version of \`mcp\` (stub)" >&2; exit 1
+        fi
+        b="${root}/data/shared/builds/mcp"; base="mcpstub-release"; /bin/mkdir -p "${b}"
+        k=1; l="${base}+${e}"
+        until /bin/mkdir "${b}/${l}" 2>/dev/null; do
+            k=$((k+1)); l="${base}+${e}.${k}"; [[ ${k} -lt 100 ]] || exit 70
+        done
+        /bin/cp /bin/ls "${b}/${l}/cauldron-mcp"
+        printf '{\n  "service": "mcp",\n  "label": "%s",\n  "bin": "cauldron-mcp"\n}\n' "${l}" >"${b}/${l}/build.json"
+        printf '[\n  {\n    "service": "mcp",\n    "label": "%s",\n    "bin": "cauldron-mcp"\n  }\n]\n' "${l}" ;;
     "pin threads "*" --addr auto")
         printf '\n[services.threads]\nversion = "%s"\n' "$3" >>"${root}/data/${e}/env.toml" ;;
+    "pin mcp "*)
+        printf '\n[services.mcp]\nversion = "%s"\n' "$3" >>"${root}/data/${e}/env.toml" ;;
     "env remove ${e} --yes") /bin/rm -rf "${root}/data/${e}" ;;
     "install") ;;
     *) echo "stub cauldron: unexpected: $*" >&2; exit 64 ;;
@@ -531,6 +554,7 @@ cp "${T}/home13/.cauldron/data/prod/env.toml" "${T}/env13.before"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${T}/home13" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing"; then ok "13 sealed real run: rc 0, says threads is not pinned"; else bad "13 sealed real run: rc ${RC}" "${OUT}"; fi
+if has "mcp is NOT pinned in the existing" && has "build mcp --env-copy" && has "pin mcp <the label that build printed>"; then ok "13: says mcp is not pinned, and the two commands that add it"; else bad "13: no mcp instruction" "${OUT}"; fi
 if [[ "$(cat "${CLOG}")" == "--env prod install" ]]; then ok "13 sealed real run: cauldron called for install only (no build, no pin)"; else bad "13: an env.toml without the marker was built/pinned" "$(cat "${CLOG}")"; fi
 if cmp -s "${T}/env13.before" "${T}/home13/.cauldron/data/prod/env.toml"; then ok "13: env.toml byte-identical after a REAL run"; else bad "13: env.toml changed" "$(diff "${T}/env13.before" "${T}/home13/.cauldron/data/prod/env.toml")"; fi
 sealed_ok "case 13"
@@ -542,8 +566,12 @@ sha() { /usr/bin/shasum -a 256 "$1" 2>/dev/null | /usr/bin/awk '{print $1}'; }
 : >"${CLOG}"; : >"${EXEC_LOG}"; : >"${SIGN_LOG}"; mkdir -p "${T}/home14"
 RUN_HOME="${T}/home14" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]]; then ok "rc 0"; else bad "rc ${RC}, wanted 0" "${OUT}"; fi
-want=$'--env prod versions install-workspace-probe\n--env prod env create prod --auto-restart\n--env prod build threads --json --env-copy\n--env prod pin threads feedc0de1234-release+prod --addr auto\n--env prod install'
-if [[ "$(cat "${CLOG}")" == "${want}" ]]; then ok "cauldron called: workspace probe, env create, build --env-copy, pin threads <label>+prod --addr auto, install"; else bad "cauldron calls wrong" "$(cat "${CLOG}")"; fi
+# The stub's threads label, spelt in pieces (a long hex run reads as a hash).
+TL="$(printf 'feed%s1234-release' c0de)"
+want="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod env create prod --auto-restart' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy' '--env prod pin mcp mcpstub-release+prod' '--env prod install')"
+if [[ "$(cat "${CLOG}")" == "${want}" ]]; then ok "cauldron called: workspace probe, env create, build --env-copy, pin threads <label>+prod --addr auto, build mcp --env-copy, pin mcp <label>+prod, install"; else bad "cauldron calls wrong" "$(cat "${CLOG}")"; fi
+if grep -qx '\[services.mcp\]' "${T}/home14/.cauldron/data/prod/env.toml" && [[ -d "${T}/home14/.cauldron/data/shared/builds/mcp/mcpstub-release+prod" && ! -e "${T}/home14/.cauldron/data/shared/builds/mcp/mcpstub-release" ]]; then ok "14a: mcp pinned at its own new version; the shared label never created"; else bad "14a: mcp not pinned as its own version" "$(find "${T}/home14/.cauldron/data/shared/builds" 2>&1)"; fi
+if has "services: mcp pinned at mcpstub-release+prod" && has "mcp grant <cauldron> --env prod"; then ok "14a: done line names the mcp pin and the grant command"; else bad "14a: no mcp done line" "${OUT}"; fi
 # REL-4.S5c M2/M4: the marker existed when env create ran (sentinel: it WAS
 # written, at the path MARK names), and a first install leaves none behind.
 if [[ "$(cat "${CLOG}.mark" 2>/dev/null)" == present ]]; then ok "14a: the marker existed when env create ran (written before it)"; else bad "14a: no marker when env create ran" "$(cat "${CLOG}.mark" 2>&1)"; fi
@@ -630,7 +658,7 @@ sealed_ok "case 17a"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H17}" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && has "finishing step 4b now"; then ok "17b re-run: rc 0, says it finishes step 4b"; else bad "17b re-run did not finish 4b (rc ${RC})" "${OUT}"; fi
-want17=$'--env prod versions install-workspace-probe\n--env prod build threads --json --env-copy\n--env prod pin threads feedc0de1234-release+prod --addr auto\n--env prod install'
+want17="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy' '--env prod pin mcp mcpstub-release+prod' '--env prod install')"
 if [[ "$(cat "${CLOG}")" == "${want17}" ]]; then ok "17b: build --env-copy, pin <label>+prod --addr auto, install; no second env create"; else bad "17b calls" "$(cat "${CLOG}")"; fi
 if grep -qx '\[services.threads\]' "$(ENVT "${H17}")" && grep -qx 'version = "feedc0de1234-release+prod"' "$(ENVT "${H17}")"; then ok "17b: env.toml now pins threads"; else bad "17b: env.toml has no threads pin" "$(cat "$(ENVT "${H17}")")"; fi
 if [[ ! -e "$(MARK "${H17}")" ]]; then ok "17b: marker cleared after the pin"; else bad "17b: marker left after the pin"; fi
@@ -914,6 +942,38 @@ printf 'state=creating\n' >"${H26c}/.cauldron/data/.install-threads-pending.prod
 RUN_HOME="${H26c}" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 && -f "${H26c}/.cauldron/data/.install-threads-pending.prod.tmp.$$" && -f "${H26c}/.cauldron/data/.install-threads-pending.prod.tmp.x1" ]] && ! has "a temp marker an install"; then ok "26c: a live install's temp marker and a non-pid one are left alone; the run completes"; else bad "26c: removed a temp marker that was not stale (rc ${RC})" "$(find "${H26c}/.cauldron/data" -maxdepth 1)${OUT}"; fi
 sealed_ok "case 26c"
+
+printf '\n== 29. a re-run COMPLETES an install that stopped between the threads pin and the mcp pin (SEALED)\n'
+# The stub's `build mcp` refuses (as on a dirty tree): env.toml then holds
+# the threads pin (an edit AFTER the marker's first fingerprint), so the
+# marker must have been bound to it again for the re-run to resume.
+H29="${T}/home29"; mkdir -p "${H29}"; : >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_MCP_REFUSE=1 RUN_HOME="${H29}" srun "" --from "${T}/bin14"
+if [[ ${RC} -ne 0 ]] && grep -qx '\[services.threads\]' "$(ENVT "${H29}")" && ! grep -q 'services.mcp' "$(ENVT "${H29}")" && [[ -e "$(MARK "${H29}")" ]]; then ok "29a partial: rc ${RC}, threads pinned, no mcp pin, marker left"; else bad "29a: not the partial state (rc ${RC})" "$(cat "$(ENVT "${H29}")" 2>&1)${OUT}"; fi
+want29a="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod env create prod --auto-restart' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy')"
+if [[ "$(cat "${CLOG}")" == "${want29a}" ]]; then ok "29a: threads built and pinned, mcp build refused, no install"; else bad "29a calls" "$(cat "${CLOG}")"; fi
+if [[ -z "$(find "${H29}/.cauldron/data/shared/builds" -path '*/mcp/*' -print -quit 2>/dev/null)" ]]; then ok "29a: no mcp version left behind"; else bad "29a: an mcp version left" "$(find "${H29}/.cauldron/data/shared/builds")"; fi
+sealed_ok "case 29a"
+cp "$(ENVT "${H29}")" "${T}/env29.before"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H29}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 ]] && has "pinned threads and stopped before pinning mcp"; then ok "29b re-run: rc 0, says it finishes step 4c"; else bad "29b re-run (rc ${RC})" "${OUT}"; fi
+if [[ "$(cat "${CLOG}")" == $'--env prod versions install-workspace-probe\n--env prod build mcp --json --env-copy\n--env prod pin mcp mcpstub-release+prod\n--env prod install' ]]; then ok "29b: no env create, no threads build or pin; mcp built and pinned; install"; else bad "29b calls" "$(cat "${CLOG}")"; fi
+if grep -qx '\[services.mcp\]' "$(ENVT "${H29}")" && [[ "$(grep -c '^\[services.threads\]$' "$(ENVT "${H29}")")" == 1 ]] && [[ ! -e "$(MARK "${H29}")" ]]; then ok "29b: env.toml pins mcp, threads pinned once, marker cleared"; else bad "29b: wrong end state" "$(cat "$(ENVT "${H29}")")"; fi
+sealed_ok "case 29b"
+cp "$(ENVT "${H29}")" "${T}/env29.after"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H29}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "--env prod install" ]] && has "mcp is already pinned in" && cmp -s "${T}/env29.after" "$(ENVT "${H29}")"; then ok "29c: a third run builds and pins nothing, env.toml byte-identical"; else bad "29c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 29c"
+# 29d (opposed): an env.toml edited after the threads pin is not the one the
+# marker records, so the re-run refuses rather than pin mcp into it.
+H29d="${T}/home29d"; mkdir -p "${H29d}"; : >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_MCP_REFUSE=1 RUN_HOME="${H29d}" srun "" --from "${T}/bin14"
+printf '# edited by hand\n' >>"$(ENVT "${H29d}")"; cp "$(ENVT "${H29d}")" "${T}/env29d.before"
+: >"${CLOG}"
+RUN_HOME="${H29d}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 2 ]] && ! grep -q 'pin mcp' "${CLOG}" && cmp -s "${T}/env29d.before" "$(ENVT "${H29d}")"; then ok "29d: an env.toml edited after the threads pin is refused, untouched, no mcp pin"; else bad "29d (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 
 printf '\n== 27. an unset variable aborts install with rc != 0 (bash 3.2 + EXIT trap, REL-4.S5e)\n'
 # A copy with an unset variable read right before 4b's staging mkdir, where

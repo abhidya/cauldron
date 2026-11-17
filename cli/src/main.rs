@@ -82,6 +82,14 @@ mod ctl;
 mod soup;
 // `cauldron link` and the `.cauldron` project marker the soup verbs read.
 mod link;
+// `cauldron mcp grant | revoke | grants | status | stdio`: which cauldrons the
+// MCP door may open, the service, and the stdio bridge Claude Code launches.
+mod mcp;
+// The way from the command line to the `mcp` service (bridge, forwarded
+// import, status).
+mod mcp_door;
+// `cauldron mcp stdio`: the bridge Claude Code launches.
+mod mcp_bridge;
 // `ensure_soup_cauldron` only; this release has no engine.
 mod engine;
 mod daemon;
@@ -129,6 +137,7 @@ const VERBS: &[(&str, &str)] = &[
     ("list", "the cauldrons of this environment (the implicit legacy one marked)"),
     ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region (`soup help`)"),
     ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
+    ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
 ];
 
 const USAGE: &str = "\
@@ -368,6 +377,7 @@ fn run() -> Result<i32> {
         Some("ctl") => ctl::verb_ctl(&argv[1..]),
         Some("soup") => soup::verb_soup(&argv[1..]),
         Some("link") => link::verb_link(&argv[1..]),
+        Some("mcp") => mcp::verb_mcp(&argv[1..]),
         Some("create") => cauldrons::verb_create(&argv[1..]),
         Some("list") | Some("ls") => cauldrons::verb_list(&argv[1..]),
         Some("daemon") => daemon::verb_daemon(&argv[1..]),
@@ -409,8 +419,8 @@ fn run() -> Result<i32> {
 const CONTROL_VERBS: &[&str] =
     &["daemon", "install", "uninstall", "promote", "restart", "start", "stop", "down", "pin", "rollback", "env", "test",
       // `create` writes a cauldron; `soup import` writes its
-      // soup, and the soup reads share the guard.
-      "create", "soup"];
+      // soup, and the soup reads share the guard; `mcp` writes the grants.
+      "create", "soup", "mcp"];
 
 /// **REL-6a5: A DAEMON-CONTROL VERB IN AN ISOLATED PROCESS ACTS ONLY ON A
 /// SCRATCH ROOT.** Isolated (`env::egress::process_isolation`: the marker,
@@ -452,7 +462,7 @@ mod rel6a5_control_verbs {
     #[test]
     fn rel6a5_a_control_verb_in_an_isolated_process_acts_only_on_a_scratch_root() {
         let real = Path::new("/Users/someone/.cauldron");
-        for v in ["start", "stop", "restart", "daemon", "install", "uninstall", "promote", "down", "pin", "rollback", "env", "test", "create", "soup"] {
+        for v in ["start", "stop", "restart", "daemon", "install", "uninstall", "promote", "down", "pin", "rollback", "env", "test", "create", "soup", "mcp"] {
             assert!(admit_control_verb_with(v, real, Some(real), "a test").is_err(), "`{v}` admitted on his real root");
             assert!(admit_control_verb_with(v, &real.join("x"), Some(real), "a test").is_err(), "`{v}` admitted inside it");
             assert!(admit_control_verb_with(v, Path::new("/tmp/scratch/.cauldron"), Some(real), "a test").is_ok(), "`{v}` refused on scratch");
