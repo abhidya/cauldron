@@ -25,7 +25,7 @@ Everything runs on the same machine as the cauldron. The MCP server is
 | `commands/curate-dump.md` | `/cauldron:curate-dump <DM-n> [cauldron]`: turn a dump into soup records that cite it |
 | `regions.example.json` | four example regions to import into a new, empty soup |
 | `skills/soup-schema/SKILL.md` | `/cauldron:soup-schema`: the schema in brief, with a pointer to the full README |
-| `schema/` | a copy of the published schema (`schema/soup/workspace-v6/` in the Cauldron repository): `README.md`, `grammar.json`, `edges.json`, one JSON Schema per node type |
+| `schema/` | a copy of the published schema (`schema/soup/workspace-v6/` in the Cauldron repository): `README.md`, `grammar.json`, `edges.json`, one JSON Schema per node type, and its `--remint` variant (batch labels for ids) |
 
 `schema/` is generated: `scripts/sync-plugin-schema` copies it from the
 published directory, and a test in the spine crate fails when the copy drifts.
@@ -211,7 +211,13 @@ cauldron --env prod start mcp                          # if the service is not r
   removes only that binding.
 - A grant is for the cauldron it was made for, not only its name: if that
   cauldron is removed and another is made under the same name, calls are
-  refused as `cauldron_gone` until you grant the new one.
+  refused as `cauldron_gone` until you grant the new one. A grant written by
+  a pre-release build, which names its cauldron only by name, is refused as
+  `not_granted` with the `cauldron mcp grant` command that makes it again.
+  It is named before that first refusal too: `cauldron mcp status`
+  (`grant_note`, `regrant`), `cauldron mcp grants` (`warnings`) and the
+  closing lines of `scripts/install` on an upgrade each say so, with that
+  command.
 - The grants are kept in `<root>/data/<env>/mcp/grants.json`, owner-only.
 
 The tools: `soup_status` (which cauldron this session reaches and why, its
@@ -243,9 +249,12 @@ at most 16 MiB in one request, so a larger import is refused before it is sent
 revoke the grant (or stop the service) and import directly. An ungranted
 cauldron is never held, and the CLI works on it as before.
 
-Every write through the door adds a line to `<root>/data/<env>/mcp/calls.jsonl`
-(when, which client and session, which tool, the outcome and counts; never
-record text, and never a dump's text or transcript).
+Every write through the door, and every `soup_dump_get` (which dump, the
+offset and how many bytes were read), adds a line to
+`<root>/data/<env>/mcp/calls.jsonl` (when, which client and session, which
+tool, the outcome and counts; never record text, and never a dump's text or
+transcript). Once it reaches 8 MiB it is moved to `calls.jsonl.1`, replacing
+an older one.
 
 ## Dumps
 
@@ -321,23 +330,38 @@ that came from a dump can cite it: `meta.cites: [{"kind": "dump", "id": "DM-3"}]
   bytes: its partly written file is removed, and so is any blob no dump
   names. If a writer is killed while a dump is written, what it left is
   removed the next time that dumps store is opened for writing.
-- **A dump cannot be deleted in this release.** There is no verb and no tool
-  that removes one dump. If a dump holds something it must not (a secret in
-  a transcript), remove the cauldron's whole dumps store by hand:
-  1. Stop the service (`cauldron --env <env> stop mcp`) or revoke the
-     cauldron (`cauldron mcp revoke <cauldron> --env <env>`), so nothing
-     holds the store.
-  2. Remove the directory `<root>/data/<env>/cauldrons/<cauldron>/dumps/`
-     (`<root>` is `~/.cauldron`, or `$CAULDRON_HOME`; for the implicit
-     legacy cauldron, `<root>/data/<env>/soup/dumps/`).
+- **Removing a dump.** If a dump holds something it must not (a secret in a
+  transcript), remove it from a shell; there is no MCP tool for it, by
+  design:
+  1. Revoke the cauldron (`cauldron mcp revoke <cauldron> --env <env>`) or
+     stop the service (`cauldron --env <env> stop mcp`): while the service
+     holds the dumps store, a removal is refused and is not sent to it,
+     because it needs the store's databases to itself.
+  2. `cauldron soup dump-remove <DM-n> --env <env> --cauldron <cauldron>`
+     is a dry run: it removes nothing and says what it would do (exit 2).
+     Add `--yes` to do it. `--env` and `--cauldron` must be flags.
+  3. Grant the cauldron again (or start the service).
 
-  That removes every dump of that cauldron, not just one; the soup is not
-  touched, and the next dump starts a new, empty store at `DM-1`. Removing a
-  blob alone is not enough: a text dump's text is also in the store's two
-  databases. A change cursor taken before the removal no longer fits the
-  new store (it is refused as `cursor_stale`, or misses dumps): call
-  `soup_changes` without `since` for a new one. Treat a secret that was
-  dumped as exposed, and change it.
+  The dump stays as a tombstone, so a record that cites it still finds it:
+  state `removed`, with its id, kind, size and when it was received and
+  removed. Everything else goes: its blob is deleted, its title, source,
+  cites, refs and sha256 are dropped, and its text is erased from the dumps
+  store's record of its writes, whose databases are then compacted, so
+  nothing of it is left in the cauldron's directory. If another dump holds
+  the same bytes, the blob is kept and that dump is named
+  (`same_bytes_in`): remove it too. Copies made elsewhere (a backup, a
+  cauldron put away with `cauldron remove`) are not touched. Treat a secret
+  that was dumped as exposed, and change it.
+
+  A removal runs in two phases. It first marks the dump `removing`, and from
+  then on nothing reads its content. It then erases, and only once the
+  erasure has finished does it record `removed`. A removal cut short (a
+  kill, a crash, a reader holding the database) leaves the dump `removing`:
+  `soup dumps` and `soup dump-get` say `erasure: unfinished` and print the
+  command that finishes it (`finish_with`). Running the removal again
+  finishes it, and so does the next open of the dumps store for writing (a
+  `soup dump` from a shell, or the service's first dump once it holds the
+  store).
 - From a shell: `cauldron soup dump <file|-> --env E --cauldron C [--title T]
   [--source S]`, `cauldron soup dumps --env E --cauldron C` and `cauldron
   soup dump-get <id> --env E --cauldron C [--offset N] [--max-chars N]

@@ -26,6 +26,7 @@ test_isolation::install!();
 
 mod support;
 
+mod build_stamp;
 mod changes;
 mod door;
 mod dumps;

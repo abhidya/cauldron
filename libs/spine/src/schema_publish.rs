@@ -79,7 +79,44 @@ pub fn render() -> Vec<(String, String)> {
         let doc = node_schema(&g, name, &file);
         out.push((file, pretty(&doc)));
     }
+    for name in g.node_types.keys() {
+        let file = format!("remint.{name}.schema.json");
+        let doc = remint_schema(node_schema(&g, name, &file), name);
+        out.push((file, pretty(&doc)));
+    }
     out
+}
+
+/// A batch label under `--remint` (`migrate::records`): a non-blank string
+/// with no `@` and no `#`.
+pub const LABEL: &str = "[^@#]*[^@#\\s][^@#]*";
+
+/// The same record checked as one of a `--remint` batch: its `id` is a batch
+/// label ([`LABEL`]), and every edge's `to` may be a label of the batch as
+/// well as an id (an id is a label too, as far as a pattern can tell; the
+/// import refuses a label that is an id the soup already holds, as
+/// `label-shadows-existing`, which no schema can see). Everything else is
+/// the node schema's.
+fn remint_schema(mut doc: Value, name: &str) -> Value {
+    doc["properties"]["id"] = json!({"type": "string", "pattern": format!("^{LABEL}$")});
+    if let Some(rules) = doc.pointer_mut("/properties/edges/items/allOf").and_then(Value::as_array_mut) {
+        for r in rules {
+            if let Some(to) = r.pointer_mut("/then/properties/to") {
+                let p = to["pattern"].as_str().unwrap_or("^(?:)$").to_string();
+                let inner = p.strip_prefix("^(?:").and_then(|x| x.strip_suffix(")$")).unwrap_or(&p).to_string();
+                to["pattern"] = json!(format!("^(?:{LABEL}|{inner})$"));
+            }
+        }
+    }
+    doc["title"] = json!(format!("{KIND} v{PIN} node: {name}, in a --remint batch"));
+    doc["description"] = json!(format!(
+        "One `{name}` record of a `soup import --remint` batch (`soup_put` with `remint`): as node.{name}.schema.json, \
+         except that `id` is a batch label (any non-blank string without `@` or `#`) and an edge's `to` may name a label \
+         of the batch. A label equal to an id the soup already holds is refused at import (`label-shadows-existing`), \
+         which this schema cannot check; see README.md."
+    ));
+    doc["x-cauldron"]["remint"] = json!(true);
+    doc
 }
 
 fn pretty(v: &Value) -> String {
@@ -552,6 +589,34 @@ mod tests {
         for (meta, says) in bad {
             let why = grammar_v6::cite_problem(&meta).unwrap_or_else(|| panic!("the import accepts {meta}"));
             assert!(why.contains(says), "{meta}: {why}");
+        }
+    }
+
+    /// The `--remint` variant of each type: the node schema with only the
+    /// id and the edge targets widened to batch labels.
+    #[test]
+    fn the_remint_variant_widens_only_ids_and_targets_to_labels() {
+        let files = render();
+        let get = |n: &str| -> Value { serde_json::from_str(&files.iter().find(|(f, _)| f == n).unwrap().1).unwrap() };
+        let remints = files.iter().filter(|(n, _)| n.starts_with("remint.")).count();
+        assert_eq!(remints, grammar_v6::TYPE_COUNT);
+        for t in grammar_v6::workspace_v6(PUBLISH_POOL).node_types.keys() {
+            let (node, mut remint) = (get(&format!("node.{t}.schema.json")), get(&format!("remint.{t}.schema.json")));
+            assert_eq!(remint["properties"]["id"]["pattern"], json!(format!("^{LABEL}$")));
+            let rules = remint["properties"]["edges"]["items"]["allOf"].as_array().unwrap().clone();
+            let base = node["properties"]["edges"]["items"]["allOf"].as_array().unwrap();
+            for (r, b) in rules.iter().zip(base) {
+                let (rp, bp) = (r["then"]["properties"]["to"]["pattern"].as_str().unwrap(), b["then"]["properties"]["to"]["pattern"].as_str().unwrap());
+                assert!(rp.starts_with(&format!("^(?:{LABEL}|")) && rp.ends_with(&bp[4..]), "{rp} / {bp}");
+            }
+            // Put back what the variant changed: the rest is the node schema.
+            remint["properties"]["id"] = node["properties"]["id"].clone();
+            remint["properties"]["edges"] = node["properties"]["edges"].clone();
+            for k in ["title", "description", "$id"] {
+                remint[k] = node[k].clone();
+            }
+            remint["x-cauldron"].as_object_mut().unwrap().remove("remint");
+            assert_eq!(remint, node, "{t}");
         }
     }
 

@@ -16,6 +16,7 @@ Version: `workspace@6`.
 |---|---|
 | `grammar.json` | the grammar itself, exactly as the soup pins it (the serialized `PoolGrammar` for the pool `ws`) |
 | `node.<type>.schema.json` | one JSON Schema (draft 2020-12) per node type, twelve in all: id pattern, state vocabulary, fields with their character limits, the edges that may leave the type and the ids they may target, and the edges required at mint |
+| `remint.<type>.schema.json` | the same schema for a record of a `--remint` batch: `id` is a batch label (any non-blank string without `@` or `#`), and an edge's `to` may name a label of the batch; nothing else differs |
 | `edges.json` | the twelve edge kinds: legal sources and targets, declared edge fields, and every type's required-at-mint rule |
 | `README.md` | this file: what each type and edge means, and the rules a JSON Schema cannot express |
 
@@ -458,14 +459,14 @@ any new record can carry it. From a Claude Code session, the MCP tool
 **Edge order.** `get` answers a node's edges sorted by kind, then by target,
 not in the order they were written; compare records as sets of edges.
 
-**Validating a `--remint` batch against the per-type schemas.** The schemas
+**Validating a `--remint` batch.** The `node.<type>.schema.json` schemas
 check `id` and every edge's `to` against the `<PREFIX>-<n>` id pattern, so a
-batch label such as `n1` fails them, though the import accepts it. Skip those
-two checks for labels: the `id` pattern of every record, and the `to` pattern
-of an edge that names a label of the batch. Or validate a copy in which each
-label is replaced by a placeholder id with its record's prefix (`DEC-1001` for
-a decision, `R-1001` for a region): every other check still applies. The
-import itself judges labels (`label-shadows-existing`, `unknown-target`).
+batch label such as `n1` fails them, though the import accepts it. Validate a
+`--remint` batch's records against `remint.<type>.schema.json` instead: the
+same schema, with `id` a batch label and an edge's `to` a label or an id.
+What no schema can see is still the import's to judge: a label equal to an id
+the soup already holds (`label-shadows-existing`), and a `to` that names
+neither a record of the batch nor a node the soup holds (`unknown-target`).
 
 - An edge's `to` names a record of the same batch when one carries that id;
   otherwise it must name a node the soup already holds, or the record is
@@ -502,9 +503,11 @@ Pick the schema by the record's `type`:
 ```python
 import json, jsonschema  # pip install jsonschema
 schema = json.load(open(f"node.{record['type']}.schema.json"))
+# a record of a --remint batch: f"remint.{record['type']}.schema.json"
 jsonschema.Draft202012Validator(schema).validate(record)
 ```
 
 The schemas check one record. The rules under "Rules the grammar leaves out"
-need the whole pool and are not checked by them. A `--remint` batch's labels
-fail the `id` and `to` patterns: see "Validating a `--remint` batch" above.
+need the whole pool and are not checked by them. A `--remint` batch's
+records are checked against `remint.<type>.schema.json`: see "Validating a
+`--remint` batch" above.

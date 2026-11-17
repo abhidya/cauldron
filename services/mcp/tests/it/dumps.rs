@@ -131,6 +131,12 @@ fn dm1_a_text_dump_lands_received_beside_the_soup_and_reads_back() {
     assert_eq!(dumps[0]["counts"]["bytes"], json!(text.len()));
     assert!(dumps[0]["tx"].as_str().is_some_and(|t| t.len() == 64));
     assert!(calls.iter().any(|l| l["tool"] == "open-dumps"));
+    // Reading a dump's content is audited too: which dump and how much.
+    let reads: Vec<&Value> = calls.iter().filter(|l| l["tool"] == "soup_dump_get").collect();
+    assert_eq!(reads[0]["dump"], "DM-1");
+    assert_eq!((reads[0]["outcome"].clone(), reads[0]["counts"]["text_bytes"].clone()), (json!("read"), json!(text.len())));
+    assert_eq!(reads.last().unwrap()["outcome"], "not_found");
+    assert!(reads.iter().all(|l| l.get("tx").is_none_or(Value::is_null)));
     let raw = std::fs::read_to_string(s.mcp_dir().join("calls.jsonl")).unwrap();
     assert!(!raw.contains("worth keeping") && !raw.contains("example.org") && !raw.contains("xxxxxxxx"), "text in the audit");
     // The side effect ran after the write: a log line, nothing else.

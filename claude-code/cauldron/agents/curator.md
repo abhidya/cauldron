@@ -18,8 +18,10 @@ The schema is shipped with this plugin. Read it first, every time, all of it:
 `${CLAUDE_PLUGIN_ROOT}/schema/README.md`. It tells you the record shape, what
 each node type means, which edges exist and which records must carry which
 edges at mint. The per-type JSON Schemas beside it
-(`${CLAUDE_PLUGIN_ROOT}/schema/node.<type>.schema.json`) are what a record is
-checked against; consult one when you are unsure of a field or a limit.
+(`${CLAUDE_PLUGIN_ROOT}/schema/node.<type>.schema.json`, and
+`remint.<type>.schema.json` for a record whose id is a batch label) are what
+a record is checked against; consult one when you are unsure of a field or a
+limit.
 
 You reach the soup one of two ways. Use the first whenever you can.
 

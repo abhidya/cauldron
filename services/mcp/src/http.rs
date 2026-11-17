@@ -44,6 +44,10 @@
 //!   ready.
 //! - [`BODY_TIMEOUT`] (10 s) for a whole body, [`BUDGET_WAIT`] (10 s) for a
 //!   share of the budget: 16 MiB crosses loopback in milliseconds.
+//! - [`WRITE_TIMEOUT`] (10 s): an answer the client does not read (a write
+//!   that makes no progress for that long) closes the connection, and the
+//!   log says so. A call is applied before its answer is written, so a
+//!   write closed this way has landed whole or not at all.
 //!
 //! # `POST /mcp/dump-session`
 //!
@@ -107,6 +111,10 @@ pub const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a request waits for its share of [`INFLIGHT_BODY_BYTES`].
 pub const BUDGET_WAIT: Duration = Duration::from_secs(10);
+
+/// A connection whose answer cannot be written for this long (its client
+/// stopped reading) is closed, so it cannot hold a connection slot forever.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Each connection's read buffer (the head must fit in it).
 pub const READ_BUFFER: usize = 64 * 1024;
@@ -189,7 +197,7 @@ pub async fn serve(listener: tokio::net::TcpListener, app: Router, stop: impl Fu
             let _slot = slot;
             let mut b = hyper::server::conn::http1::Builder::new();
             b.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(READ_BUFFER).keep_alive(true);
-            let conn = b.serve_connection(TokioIo::new(stream), svc);
+            let conn = b.serve_connection(TokioIo::new(WriteTimeout::new(stream, WRITE_TIMEOUT)), svc);
             tokio::pin!(conn);
             let mut asked = false;
             loop {
@@ -209,6 +217,65 @@ pub async fn serve(listener: tokio::net::TcpListener, app: Router, stop: impl Fu
     // Every connection holds a slot until it is closed: holding them all
     // means every connection has finished.
     let _ = slots.acquire_many(MAX_CONNECTIONS as u32).await;
+}
+
+/// A connection whose writes fail once one has made no progress for
+/// `limit`: hyper has a timeout for reading a head, none for writing an
+/// answer, and a client that stops reading would otherwise hold its
+/// connection slot for as long as it likes.
+struct WriteTimeout<S> {
+    io: S,
+    limit: Duration,
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteTimeout<S> {
+    fn new(io: S, limit: Duration) -> Self {
+        WriteTimeout { io, limit, stalled: None }
+    }
+
+    /// `r` from the inner write: progress clears the stall, a pending write
+    /// starts (or keeps) its clock, and a stall past the limit fails.
+    fn judge<T>(&mut self, cx: &mut std::task::Context<'_>, r: std::task::Poll<std::io::Result<T>>) -> std::task::Poll<std::io::Result<T>> {
+        use std::task::Poll;
+        if r.is_ready() {
+            self.stalled = None;
+            return r;
+        }
+        let limit = self.limit;
+        let clock = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        if clock.as_mut().poll(cx).is_ready() {
+            tracing::info!("closing a connection: the client stopped reading its answer ({} s without progress)", limit.as_secs_f64());
+            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the client stopped reading its answer")));
+        }
+        Poll::Pending
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteTimeout<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteTimeout<S> {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.io).poll_write(cx, buf);
+        self.judge(cx, r)
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.io).poll_flush(cx);
+        self.judge(cx, r)
+    }
+
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 fn refuse(status: StatusCode, code: i64, message: &str, data: Option<Value>) -> Response {
@@ -472,4 +539,77 @@ async fn session(State(h): State<Arc<Http>>, req: Request) -> Response {
         .await
         .unwrap_or_else(|e| Err(shapewire::envelope::Refusal::new("store", format!("the call failed inside the service: {e}"))));
     answer(id, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::time::Instant;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    /// Write `buf` through `w` until it is all written or a write fails.
+    async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, mut buf: &[u8]) -> std::io::Result<u64> {
+        let mut n = 0u64;
+        while !buf.is_empty() {
+            let k = std::future::poll_fn(|cx| Pin::new(&mut *w).poll_write(cx, buf)).await?;
+            n += k as u64;
+            buf = &buf[k..];
+        }
+        Ok(n)
+    }
+
+    /// A peer that never reads: the socket's buffers fill (a Unix socket
+    /// pair's are a few KiB, so nothing here depends on how much loopback
+    /// TCP would buffer), the next write makes no progress, and it fails
+    /// `TimedOut` once the limit has passed, not before.
+    #[tokio::test]
+    async fn a_write_that_makes_no_progress_fails_once_the_limit_has_passed() {
+        let (a, _peer) = tokio::net::UnixStream::pair().unwrap();
+        let limit = Duration::from_millis(400);
+        let mut w = WriteTimeout::new(a, limit);
+        let t = Instant::now();
+        let mut sent = 0u64;
+        let err = loop {
+            match write_all(&mut w, &[7u8; 64 * 1024]).await {
+                Ok(n) => sent += n,
+                Err(e) => break e,
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "64 KiB chunks kept being taken: {sent} bytes");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(t.elapsed() >= limit, "failed before the limit: {:?}", t.elapsed());
+        assert!(t.elapsed() < limit + Duration::from_secs(3), "failed long after the limit: {:?}", t.elapsed());
+    }
+
+    /// Opposed: a slow peer that keeps reading, a little at a time, for
+    /// three times the limit: every write that makes progress restarts the
+    /// clock, so nothing fails.
+    #[tokio::test]
+    async fn a_slow_reader_that_keeps_reading_is_never_timed_out() {
+        let (a, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let limit = Duration::from_millis(400);
+        let reader = tokio::spawn(async move {
+            let mut got = 0u64;
+            let mut buf = [0u8; 4096];
+            loop {
+                tokio::time::sleep(limit / 4).await;
+                let mut rb = ReadBuf::new(&mut buf);
+                match std::future::poll_fn(|cx| Pin::new(&mut peer).poll_read(cx, &mut rb)).await {
+                    Ok(()) if rb.filled().is_empty() => return got,
+                    Ok(()) => got += rb.filled().len() as u64,
+                    Err(_) => return got,
+                }
+            }
+        });
+        let mut w = WriteTimeout::new(a, limit);
+        let t = Instant::now();
+        let mut sent = 0u64;
+        while t.elapsed() < limit * 3 {
+            sent += write_all(&mut w, &[1u8; 1024]).await.expect("a write with progress failed");
+        }
+        drop(w);
+        let got = reader.await.unwrap();
+        assert!(sent > 0 && got > 0, "sent {sent}, read {got}");
+    }
 }

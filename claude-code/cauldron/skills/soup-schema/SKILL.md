@@ -34,7 +34,9 @@ two `rejected_by` edges and `searched`). Regions are found with the
 `soup_put` MCP tool (`remint: true`, `dry_run: true` first), or
 `cauldron soup import <file> --env E --cauldron C --remint`, `--dry-run` first.
 Either lands all records or none, and says why any record was refused. Under
-`--remint` use labels like `n1`: a label equal to a held id is refused. Find
+`--remint` use labels like `n1`: a label equal to a held id is refused, and
+such a record is checked against `remint.<type>.schema.json`, not
+`node.<type>.schema.json`. Find
 what is there with `soup_search`, `soup_nodes` and `soup_region` (or
 `cauldron soup search <words>`, `soup nodes [--region R]` and `soup region
 <R>`), then read nodes with `soup_get` (or `cauldron soup get <id>...`). The

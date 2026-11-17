@@ -32,9 +32,13 @@ path = "tests/it/main.rs"
 # Test-only: builds the spine's fault-injection seam into this crate's
 # binaries, so a test can stop a real `cauldron soup import` at a named
 # commit stage (`SPINE_FAULT=decided`) instead of racing a kill against the
-# clock. Off in every normal build, where a set SPINE_FAULT is refused.
+# clock; and the dump removal's seam, so a test can stop `cauldron soup
+# dump-remove` after any of its steps (`CAULDRON_REMOVE_FAULT=marked`). Off in
+# every normal build, where a set SPINE_FAULT or CAULDRON_REMOVE_FAULT is
+# refused.
 #   cargo test -p cauldron --features fault-injection --test it soup
-fault-injection = ["spine/fault-injection"]
+#   cargo test -p cauldron --features fault-injection --test it d7
+fault-injection = ["spine/fault-injection", "soup-door/fault-injection"]
 
 [dependencies]
 env = { path = "../libs/env" }

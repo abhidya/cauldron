@@ -7,7 +7,8 @@
 //!   kernel chose;
 //! - `OPEN` answers, as one JSON line, the cauldrons this service holds open
 //!   for writing (`[{cauldron, opened_at, recovered_at_open}]`), for
-//!   `cauldron mcp status`. Names and times only, never soup content.
+//!   `cauldron mcp status`. Names and times only, never soup content;
+//! - `DUMPS` answers the same for the dumps stores it holds.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,7 +41,12 @@ impl ServesWarnings for McpSeam {
 }
 
 impl Service for McpSeam {
-    const VERBS: &'static [Verb<McpSeam>] = &[Verb::new("MCP", McpSeam::v_mcp), Verb::new("OPEN", McpSeam::v_open), Verb::new("PING", McpSeam::v_ping)];
+    const VERBS: &'static [Verb<McpSeam>] = &[
+        Verb::new("MCP", McpSeam::v_mcp),
+        Verb::new("OPEN", McpSeam::v_open),
+        Verb::new("DUMPS", McpSeam::v_dumps),
+        Verb::new("PING", McpSeam::v_ping),
+    ];
 
     fn service_env(&self) -> &ServiceEnv {
         &self.se
@@ -59,6 +65,11 @@ impl McpSeam {
 
     fn v_open(&self, c: &mut Conn<'_>, _rest: &str) -> Result<()> {
         c.line(&serde_json::to_string(&self.state.writers.snapshot())?)?;
+        Ok(())
+    }
+
+    fn v_dumps(&self, c: &mut Conn<'_>, _rest: &str) -> Result<()> {
+        c.line(&serde_json::to_string(&self.state.dumps.snapshot())?)?;
         Ok(())
     }
 

@@ -135,7 +135,10 @@
 #
 # Its closing lines (and a --dry-run's) say that `cauldron` must be on the
 # PATH Claude Code itself sees, since the plugin's MCP server is the bare
-# command `cauldron mcp stdio`, and how to check.
+# command `cauldron mcp stdio`, and how to check. On an upgrade (an existing
+# environment), they also name any MCP grant that names its cauldron only by
+# name, which every call refuses until it is granted again, with the command
+# that grants it again (read-only: `cauldron --env <name> mcp grants`).
 #
 # --dry-run prints the plan and runs nothing that writes: no build, no
 # env create, no install. If a built `cauldron` is already available it also
@@ -221,6 +224,18 @@ old_mcp_note() {
     say "mcp:      the mcp service is still the old build (${MCP_PIN}); to upgrade it:"
     say "            ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy"
     say "            ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
+}
+# The closing lines for a grant that names its cauldron only by name (a
+# pre-release build's), on an upgrade only: `mcp grants` names each on stderr
+# with the command that grants it again. Read-only; a failure says nothing.
+name_only_note() {
+    [[ ${CREATED_ENV:-1} -eq 0 && ${RESUME_THREADS:-0} -eq 0 ]] || return 0
+    local w
+    w="$("${CAULDRON}" --env "${ENV_NAME}" mcp grants 2>&1 >/dev/null | grep '^cauldron: WARNING: the grant of cauldron' || true)"
+    [[ -n "${w}" ]] || return 0
+    say ""
+    say "grants:   an MCP grant names its cauldron only by name, so every call to it is refused:"
+    while IFS= read -r line; do say "            ${line#cauldron: WARNING: }"; done <<<"${w}"
 }
 bridge_note() {
     say ""
@@ -903,6 +918,7 @@ elif [[ -n "${MCP_PINNED}" ]]; then
 fi
 say "more:     cauldron build <service>   then   cauldron pin <service> <label>"
 old_mcp_note
+name_only_note
 # `cauldron` is only a bare command once ${ROOT}/bin is on PATH; install
 # never edits a shell startup file, so it says exactly how (REL-4.S5 D1).
 if [[ "$(command -v cauldron 2>/dev/null || true)" != "${ROOT}/bin/cauldron" ]]; then

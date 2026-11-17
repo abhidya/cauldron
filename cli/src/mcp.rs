@@ -39,14 +39,22 @@ cauldron mcp — which cauldrons are open to the MCP door
     cauldron mcp revoke <cauldron> [--env <env>] [--project <dir>]
         Close the cauldron to the MCP door; with --project, only unbind that directory.
     cauldron mcp grants [--env <env>]
-        Every grant of the environment, as JSON.
+        Every grant of the environment, as JSON. A grant that names its cauldron only by
+        name (written by a pre-release build, before a grant recorded which cauldron it
+        was made for) is refused on its first call; `warnings` lists each, with the
+        command that grants it again (`regrant`), and a line on stderr says the same.
     cauldron mcp status [--env <env>]
         The `mcp` service (live or not, its pid, its door and its version beside this
         cauldron's), the cauldrons it holds open for writing and what opening each
-        recovered, and per cauldron its grant and what its writer lock says. When the
+        recovered, the dumps stores it holds (`open_dumps`), and per cauldron its grant,
+        what its writer lock says and its dumps store (`dumps`: held by the service or
+        not, and how many dumps by state; never their text). When the
         running service is another version than this cauldron (an upgrade left the mcp pin
         on its old build), `version_skew` and `upgrade` say so and give the two commands
-        that move it, and a line on stderr says the same. JSON; writes nothing.
+        that move it, and a line on stderr says the same. A cauldron whose grant names it
+        only by name has `grant_note` and `regrant` (the command that grants it again),
+        and a line on stderr says the same: every call to it is refused until then.
+        JSON; writes nothing.
     cauldron mcp stdio [--env <env>] [--cauldron <name>]
         The bridge Claude Code launches (the plugin's .mcp.json names it): JSON-RPC, one
         message per line, on stdin and stdout, relayed to the service with the door secret.
@@ -244,22 +252,43 @@ fn list(args: &[String]) -> Result<i32> {
     }
     let e = environment(a.env.as_deref())?;
     let g = Grants::load(&e)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "env": e.name,
-            "store": grants::store_path(&e).display().to_string(),
-            "grants": g.grants,
-        }))?
-    );
+    let mut doc = json!({
+        "env": e.name,
+        "store": grants::store_path(&e).display().to_string(),
+        "grants": g.grants,
+    });
+    let warnings = grants::name_only(&e, &g);
+    for w in &warnings {
+        eprintln!("cauldron: WARNING: {}", w["note"].as_str().unwrap_or_default());
+    }
+    if !warnings.is_empty() {
+        doc["warnings"] = json!(warnings);
+    }
+    println!("{}", serde_json::to_string_pretty(&doc)?);
     Ok(0)
 }
 
 // ------------------------------------------------------------------- status
 
+/// A cauldron's dumps store for `mcp status`: whether the service holds it
+/// (`held` names what it holds; `None`: it cannot say), and how many dumps
+/// it keeps by state, read without writing. Never a dump's text.
+fn dumps_status(c: &env::Cauldron, held: Option<&[String]>) -> serde_json::Value {
+    let mut d = match soup_door::dumps::counts(c) {
+        Ok(v) => v,
+        Err(err) => json!({"store": "unreadable", "error": err.to_string()}),
+    };
+    d["held_by_service"] = match held {
+        Some(h) => json!(h.contains(&c.name)),
+        None => serde_json::Value::Null,
+    };
+    d
+}
+
 /// **`cauldron mcp status`**: the service, what it holds open, and per
-/// cauldron its grant and its writer lock. Reads only: the seam table, the
-/// service's seam (`OPEN`), its version (its `initialize` answer), the
+/// cauldron its grant, its writer lock and its dumps store. Reads only: the
+/// seam table, the service's seam (`OPEN`, `DUMPS`), the dumps stores'
+/// counts through connections that cannot write, its version (its `initialize` answer), the
 /// grants and each lock file's text. It never
 /// takes a writer lock, so it cannot get in an import's way.
 fn status(args: &[String]) -> Result<i32> {
@@ -268,12 +297,18 @@ fn status(args: &[String]) -> Result<i32> {
         bail!("`cauldron mcp status` takes no arguments (got `{p}`)");
     }
     let e = environment(a.env.as_deref())?;
-    let (service, open) = match crate::mcp_door::find(&e) {
+    let (service, open, open_dumps) = match crate::mcp_door::find(&e) {
         Ok(f) => {
             let open = crate::mcp_door::seam_ask(&f.seam, "OPEN")
                 .ok()
                 .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
                 .unwrap_or_else(|| json!([]));
+            // A service from before `DUMPS` cannot say: null, not "none".
+            let open_dumps = crate::mcp_door::seam_ask(&f.seam, "DUMPS")
+                .ok()
+                .and_then(|l| serde_json::from_str::<serde_json::Value>(&l).ok())
+                .filter(serde_json::Value::is_array)
+                .unwrap_or(serde_json::Value::Null);
             let mut svc = json!({"state": "live", "pid": f.pid, "seam": f.seam, "door": format!("http://{}{}", f.door, crate::mcp_door::PATH),
                 "cauldron_version": crate::mcp_door::CLI_VERSION});
             // Its version against this cauldron's: an upgrade that left the
@@ -289,29 +324,43 @@ fn status(args: &[String]) -> Result<i32> {
                 }
                 None => svc["version"] = json!(null),
             }
-            (svc, open)
+            (svc, open, open_dumps)
         }
         Err(why) => (
             json!({"state": "not running", "detail": why.say(), "start": crate::mcp_door::start_command(&e.name)}),
             json!([]),
+            json!([]),
         ),
     };
+    let dumps_held: Option<Vec<String>> = open_dumps
+        .as_array()
+        .map(|a| a.iter().filter_map(|o| o["cauldron"].as_str().map(str::to_string)).collect());
     let held: Vec<String> = open.as_array().into_iter().flatten().filter_map(|o| o["cauldron"].as_str().map(str::to_string)).collect();
     let g = Grants::load(&e)?;
+    let name_only = grants::name_only(&e, &g);
+    for w in &name_only {
+        eprintln!("cauldron: WARNING: {}", w["note"].as_str().unwrap_or_default());
+    }
     let mut cauldrons = Vec::new();
     for c in e.cauldrons()? {
         if !c.soup().join(spine::spine_db::SPINE_FILE).exists() {
             continue;
         }
         let grant = g.get(&c.name);
-        cauldrons.push(json!({
+        let mut row = json!({
             "cauldron": c.name,
             "granted": grant.map(|gr| gr.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
             "projects": grant.map(|gr| gr.projects.clone()).unwrap_or_default(),
             "held_by_service": held.contains(&c.name),
             "writer_lock_says": soup_door::lock::lock_says(&c),
             "dumps_lock_says": soup_door::dumps::lock_says(&c),
-        }));
+            "dumps": dumps_status(&c, dumps_held.as_deref()),
+        });
+        if let Some(w) = name_only.iter().find(|w| w["cauldron"] == c.name.as_str()) {
+            row["grant_note"] = w["note"].clone();
+            row["regrant"] = w["regrant"].clone();
+        }
+        cauldrons.push(row);
     }
     println!(
         "{}",
@@ -319,10 +368,12 @@ fn status(args: &[String]) -> Result<i32> {
             "env": e.name,
             "service": service,
             "open": open,
+            "open_dumps": open_dumps,
             "cauldrons": cauldrons,
             "note": "`writer_lock_says` is the text the last holder wrote into <soup>/writer.lock (and `dumps_lock_says` \
                      into <cauldron>/dumps/writer.lock); the lock itself, not the text, says who holds it now, and \
-                     `held_by_service` is the service's own answer for the soup",
+                     `held_by_service` is the service's own answer for the soup (`dumps.held_by_service` for the dumps \
+                     store; null when the running service is too old to say)",
         }))?
     );
     Ok(0)

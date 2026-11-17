@@ -21,11 +21,118 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.8, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.9, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.8, only an
+  the disable and trigger a fresh usage reading. Through 0.1.9, only an
   explicit enable clears it.
+
+## [0.1.9] — 2026-11-17
+
+Removing one dump for good, the `mcp` service hardened in several places,
+the dumps store in `cauldron mcp status`, a schema for `--remint` batches
+(#17), and name-only grants refused and named before they are.
+
+### Added
+
+- **`cauldron soup dump-remove <DM-n> --env E --cauldron C [--yes]`.** It
+  removes one dump's content from the cauldron for good, for a dump that
+  holds something it must not (a secret in a transcript). Without `--yes`
+  it is a dry run that removes nothing, says what it would do and exits 2
+  (it takes the store's writer lock like the removal, so it too is refused
+  while the `mcp` service holds the store). With it,
+  the removal runs in two phases. First one commit makes the dump a
+  tombstone in state `removing`: its id, kind, size and when it was
+  received and removed are kept, its title, source, cites, refs and sha256
+  are dropped, and from then on no read answers its content. Then its blob
+  is deleted unless another dump holds the same bytes (named in
+  `same_bytes_in`), its text, title, source note and sha256 are erased from
+  the dumps store's record of its writes, the store's databases are
+  checkpointed and vacuumed, so none of it is left in the cauldron's
+  directory, and only then a second commit records `removed`. The tests
+  plant text and scan every file for it afterwards, including after a
+  removal stopped after each of its steps.
+  - **A removal cut short** (a kill, a crash, a reader holding the
+    database) leaves the dump `removing`, never `removed`. `soup dumps`,
+    `soup dump-get` and `soup_dump_get` then say `erasure: unfinished` and
+    give the command that finishes it (`finish_with`), and `--raw` is
+    refused with that command. Running the removal again finishes it, and so
+    does the next open of the dumps store for writing, by the CLI or the
+    `mcp` service.
+  - Reading a removed dump answers its tombstone (`soup dump-get`,
+    `soup_dump_get`), `--raw` is refused, and a soup record that cites it
+    still finds it. The first removal re-pins the store's grammar from
+    `dump@1` to `dump@2`, which adds only the states `removing` and
+    `removed`.
+  - It is a CLI verb only, never an MCP tool. It is refused while the `mcp`
+    service holds the cauldron's dumps store and is not sent to it, because
+    it needs the store's databases to itself: revoke the grant or stop the
+    service first. `--env` and `--cauldron` must be given as flags. Copies
+    made elsewhere (a backup, a cauldron put away with `cauldron remove`)
+    are not touched. This replaces the 0.1.7 advice to remove a cauldron's
+    whole dumps store by hand.
+  - **With 0.1.8.** A store with a removed dump still opens under 0.1.8,
+    which lists the tombstone with its state (`removed` or `removing`) and
+    no size, shows it as a text dump whose text is `removed` (`--raw`
+    included), and refuses `soup dumps --state removed`. 0.1.8 still takes
+    new dumps into that store, but it does not finish a removal left
+    `removing`: that waits for 0.1.9 to open the store for writing, or for
+    the removal to be run again.
+- **`cauldron mcp status` shows the dumps store.** Each cauldron has a
+  `dumps` entry: whether the service holds its dumps store, and its dumps
+  counted by state. `open_dumps` lists the stores the service holds, with
+  when it opened each. A service older than this release cannot say which
+  stores it holds, and `held_by_service` is then null.
+- **A schema for `--remint` batches (#17).** `remint.<type>.schema.json`
+  beside each `node.<type>.schema.json`: the same schema, except that `id`
+  is a batch label (a non-blank string without `@` or `#`) and an edge's
+  `to` may name a label of the batch. The import still judges what no
+  schema can see (`label-shadows-existing`, `unknown-target`). The plugin
+  ships the new files with its copy of the schema.
+- **`cauldron-mcp --build-stamp`** prints the commit the binary was built
+  from, as the other services do, so an `artifact` declaration of the `mcp`
+  service can be started.
+
+### Changed
+
+- **A grant that names its cauldron only by name is refused.** Such a grant
+  was written only by pre-release builds of 0.1.6, before a grant recorded
+  the cauldron it was made for. It is now refused as `not_granted`, naming
+  the `cauldron mcp grant` command that makes it again with its scopes and
+  projects. It is not bound on first use, because it cannot tell the
+  cauldron it was made for from one made since under the same name. A
+  cauldron that has no identity of its own (no `created_at`) keeps its
+  grant honoured by name, since there is nothing to bind to. Such a grant
+  is also named before its first call is refused: `cauldron mcp status`
+  (`grant_note`, `regrant`), `cauldron mcp grants` (`warnings`) and the
+  closing lines of `scripts/install` on an upgrade each say so, with the
+  command that makes it again.
+- **`soup_dump_get` is audited.** Each call adds a line to `calls.jsonl`
+  with which dump, the offset and how many bytes were read; never the text.
+- **`calls.jsonl` is rotated.** At 8 MiB it is moved to `calls.jsonl.1`,
+  replacing an older one.
+
+### Fixed
+
+- **A client that stops reading no longer holds a connection.** The door
+  closes a connection whose answer has made no progress for 10 seconds, and
+  says so in its log. A call is applied before its answer is written, so a
+  write on a connection closed this way has landed whole or not at all.
+- **A JSON-RPC batch gets an answer.** The bridge answers a line that is an
+  array (or anything but an object) itself, with `-32600`, instead of
+  relaying it and writing nothing.
+- **A slow open no longer stalls other calls.** Opening a cauldron for
+  writing, or its dumps store, no longer holds the list of open ones, so
+  calls to a cauldron already open, the grant poll and `mcp status` do not
+  wait on it.
+- **`/cauldron:dump-session` works if `${CLAUDE_SESSION_ID}` is not
+  substituted.** A `session_id` that is still a `${...}` placeholder is
+  taken as absent, so the bridge uses the session id it was started with
+  (`$CLAUDE_CODE_SESSION_ID`).
+- **Docs.** The README's line that only you can read a cauldron's data now
+  says that a cauldron made by 0.1.7 or earlier is set so by its next
+  write. The plugin README says what `calls.jsonl` records and when it is
+  rotated.
 
 ## [0.1.8] — 2026-11-16
 
@@ -758,7 +865,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/broomstick-ai/cauldron/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/broomstick-ai/cauldron/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/broomstick-ai/cauldron/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/broomstick-ai/cauldron/compare/v0.1.5...v0.1.6

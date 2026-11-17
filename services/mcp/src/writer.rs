@@ -117,6 +117,10 @@ pub struct Writers {
     audit: Arc<Audit>,
     access: Arc<Access>,
     open: Mutex<HashMap<String, Arc<Writer>>>,
+    /// Held while a cauldron is being opened (its recovery can take a
+    /// while), so opens run one at a time WITHOUT holding `open`: a call to
+    /// a cauldron already open, the grant poll and `status` never wait on it.
+    opening: Mutex<()>,
 }
 
 fn closed() -> Refusal {
@@ -129,7 +133,7 @@ fn closed() -> Refusal {
 
 impl Writers {
     pub fn new(audit: Arc<Audit>, access: Arc<Access>) -> Writers {
-        Writers { audit, access, open: Mutex::new(HashMap::new()) }
+        Writers { audit, access, open: Mutex::new(HashMap::new()), opening: Mutex::new(()) }
     }
 
     /// The open writer of `cauldron`, if any.
@@ -174,9 +178,13 @@ impl Writers {
     }
 
     fn get_or_open(&self, t: &Target, who: &Who) -> Result<Arc<Writer>, Refusal> {
-        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(w) = open.get(&t.cauldron.name) {
-            return Ok(w.clone());
+        if let Some(w) = self.get(&t.cauldron.name) {
+            return Ok(w);
+        }
+        let _opening = self.opening.lock().unwrap_or_else(|p| p.into_inner());
+        // Another call may have opened it while this one waited.
+        if let Some(w) = self.get(&t.cauldron.name) {
+            return Ok(w);
         }
         // A call authorized just before a revoke does not open the cauldron
         // just after it.
@@ -211,8 +219,7 @@ impl Writers {
             thread: Mutex::new(Some(thread)),
             closed,
         });
-        open.insert(t.cauldron.name.clone(), w.clone());
-        drop(open);
+        self.open.lock().unwrap_or_else(|p| p.into_inner()).insert(t.cauldron.name.clone(), w.clone());
         tracing::info!(cauldron = %t.cauldron.name, interrupted = %recovered["interrupted"], "opened a cauldron for writing");
         self.audit.write(Line {
             client: Some(who.client.clone()),

@@ -290,7 +290,7 @@ srun() {
     if [[ -d "${home}" ]]; then /bin/cp -Rp "${home}/." "${T}/twin/"; fi
     # REL-4.S5c stub knobs, passed to the run AND its twin. Paths here hold no
     # spaces (all under ${T}), so word splitting is safe.
-    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-} STUB_MCP_REFUSE=${STUB_MCP_REFUSE:-0} STUB_MCP_REPIN_DURING=${STUB_MCP_REPIN_DURING:-0}"
+    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-} STUB_MCP_REFUSE=${STUB_MCP_REFUSE:-0} STUB_MCP_REPIN_DURING=${STUB_MCP_REPIN_DURING:-0} STUB_NAME_ONLY=${STUB_NAME_ONLY:-0}"
     set +e
     OUT="$(cd "${T}" && /usr/bin/env -i HOME="${RUN_HOME:-${T}/home}" PATH="${SEAL}${SRUN_PATH_EXTRA:+:${SRUN_PATH_EXTRA}}" \
         ${RUN_SIGNER:+HARNESS_SIGN_SCRIPT="${RUN_SIGNER}"} \
@@ -587,6 +587,13 @@ case "$*" in
         fi ;;
     "env remove ${e} --yes") /bin/rm -rf "${root}/data/${e}" ;;
     "install"|"install --replace-running") ;;
+    "mcp grants")
+        # Read-only, as the real one. STUB_NAME_ONLY=1: one grant names its
+        # cauldron only by name, said on stderr as the real one says it.
+        if [[ "${STUB_NAME_ONLY:-0}" == 1 ]]; then
+            echo "cauldron: WARNING: the grant of cauldron \`kb\` in environment \`${e}\` names it only by name (it was written by a pre-release build), so every call to it through the MCP door is refused until it is granted again, in a terminal: cauldron mcp grant kb --env ${e} --scopes read,dump" >&2
+        fi
+        printf '{"env": "%s", "grants": []}\n' "${e}" ;;
     *) echo "stub cauldron: unexpected: $*" >&2; exit 64 ;;
 esac
 STUBC
@@ -594,7 +601,7 @@ STUBC
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${T}/home12" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && has "threads is already pinned in" && has "mcp is already pinned in"; then ok "sealed real run: rc 0, says both existing pins are kept"; else bad "sealed real run: rc ${RC}" "${OUT}"; fi
-if [[ "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install')" ]]; then ok "sealed real run: cauldron asked which tree it builds (read-only) and called for install only (no build, no pin)"; else bad "existing env was rebuilt/re-pinned" "$(cat "${CLOG}")"; fi
+if [[ "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]]; then ok "sealed real run: cauldron asked which tree it builds (read-only) and called for install only (no build, no pin)"; else bad "existing env was rebuilt/re-pinned" "$(cat "${CLOG}")"; fi
 old_mcp_said "12 sealed real run" "${T}/bin14/cauldron"
 if cmp -s "${T}/env12.before" "${T}/home12/.cauldron/data/prod/env.toml"; then ok "env.toml byte-identical after a REAL run"; else bad "env.toml changed" "$(diff "${T}/env12.before" "${T}/home12/.cauldron/data/prod/env.toml")"; fi
 sealed_ok "case 12"
@@ -616,14 +623,14 @@ cp "${T}/home13/.cauldron/data/prod/env.toml" "${T}/env13.before"
 RUN_HOME="${T}/home13" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing"; then ok "13 sealed real run: rc 0, says threads is not pinned"; else bad "13 sealed real run: rc ${RC}" "${OUT}"; fi
 if has "mcp is NOT pinned in the existing" && has "adding it (upgrade)"; then ok "13: says mcp is not pinned and is added (upgrade)"; else bad "13: no mcp upgrade line" "${OUT}"; fi
-want13="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install')"
+want13="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install' '--env prod mcp grants')"
 if [[ "$(cat "${CLOG}")" == "${want13}" ]]; then ok "13 sealed real run: no threads build or pin; mcp built --env-copy and pinned by cauldron pin; install"; else bad "13: cauldron calls wrong" "$(cat "${CLOG}")"; fi
 if prefix_of "${T}/env13.before" "$(ENVT "${T}/home13")" && [[ "$(grep -c '^\[services.mcp\]$' "$(ENVT "${T}/home13")")" == 1 ]] && ! grep -q 'services.threads' "$(ENVT "${T}/home13")"; then ok "13: env.toml keeps its bytes and gains exactly one mcp pin (and no threads pin)"; else bad "13: env.toml wrong" "$(cat "$(ENVT "${T}/home13")")"; fi
 if has "services: mcp pinned at ${TL}+prod"; then ok "13: done line names the mcp pin"; else bad "13: no mcp done line" "${OUT}"; fi
 sealed_ok "case 13"
 cp "$(ENVT "${T}/home13")" "${T}/env13.after"; : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${T}/home13" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install')" ]] && has "mcp is already pinned in" && cmp -s "${T}/env13.after" "$(ENVT "${T}/home13")"; then ok "13 re-run: idempotent (no build, no pin, env.toml byte-identical)"; else bad "13 re-run (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]] && has "mcp is already pinned in" && cmp -s "${T}/env13.after" "$(ENVT "${T}/home13")"; then ok "13 re-run: idempotent (no build, no pin, env.toml byte-identical)"; else bad "13 re-run (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 sealed_ok "case 13 re-run"
 
 printf '\n== 14. the step for real (SEALED): its own new version, signed in the env dir, shared build untouched\n'
@@ -738,7 +745,7 @@ mkdir -p "${H17}/.cauldron/data/prod" "${H17}/.cauldron/bin"; : >"$(MARK "${H17}
 printf '#!/bin/bash\nexit 0\n' >"${H17}/.cauldron/bin/cauldron"; /bin/chmod +x "${H17}/.cauldron/bin/cauldron"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 SRUN_PATH_EXTRA="${H17}/.cauldron/bin" RUN_HOME="${H17}" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install')" ]]; then ok "17c third run (pinned, stale marker): no rebuild, no re-pin"; else bad "17c rebuilt or re-pinned (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]]; then ok "17c third run (pinned, stale marker): no rebuild, no re-pin"; else bad "17c rebuilt or re-pinned (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 if cmp -s "${T}/env17.before" "$(ENVT "${H17}")" && [[ ! -e "$(MARK "${H17}")" ]]; then ok "17c: env.toml byte-identical, stale marker cleared"; else bad "17c: env.toml changed or marker kept"; fi
 if ! has "is not on your PATH yet"; then ok "opposed: no PATH instruction when ${H17}/.cauldron/bin is on PATH"; else bad "PATH instruction printed although cauldron is on PATH" "${OUT}"; fi
 sealed_ok "case 17c"
@@ -1033,7 +1040,7 @@ sealed_ok "case 29b"
 cp "$(ENVT "${H29}")" "${T}/env29.after"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H29}" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install')" ]] && has "mcp is already pinned in" && cmp -s "${T}/env29.after" "$(ENVT "${H29}")"; then ok "29c: a third run builds and pins nothing, env.toml byte-identical"; else bad "29c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]] && has "mcp is already pinned in" && cmp -s "${T}/env29.after" "$(ENVT "${H29}")"; then ok "29c: a third run builds and pins nothing, env.toml byte-identical"; else bad "29c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 sealed_ok "case 29c"
 # 29d: an env.toml edited after the threads pin is not the one the marker
 # records. The marker's own job (the threads pin) is done, so it protects
@@ -1064,7 +1071,7 @@ if cmp -s "${T}/env30.before" "$(ENVT "${H30}")"; then ok "30a: the dry run wrot
 # 30b: for real.
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H30}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
-want30="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install --replace-running')"
+want30="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install --replace-running' '--env prod mcp grants')"
 if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want30}" ]]; then ok "30b: mcp built --env-copy and pinned by cauldron pin, then install --replace-running"; else bad "30b calls (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 if prefix_of "${T}/env30.before" "$(ENVT "${H30}")" && [[ "$(grep -c '^\[services.mcp\]$' "$(ENVT "${H30}")")" == 1 ]] && grep -qx 'version = "threadsold-release"' "$(ENVT "${H30}")"; then ok "30b: the threads pin is kept byte for byte; one mcp pin added"; else bad "30b: env.toml wrong" "$(cat "$(ENVT "${H30}")")"; fi
 if has "services: mcp pinned at ${TL}+prod" && has "mcp grant <cauldron> --env prod"; then ok "30b: done names the mcp pin and the grant command"; else bad "30b: no mcp done line" "${OUT}"; fi
@@ -1073,7 +1080,7 @@ sealed_ok "case 30b"
 # 30c: re-run: idempotent.
 cp "$(ENVT "${H30}")" "${T}/env30.after"; : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H30}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
-if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install --replace-running')" ]] && has "mcp is already pinned in" && has "this checkout's build" && cmp -s "${T}/env30.after" "$(ENVT "${H30}")"; then ok "30c: a re-run builds and pins nothing, env.toml byte-identical"; else bad "30c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install --replace-running' '--env prod mcp grants')" ]] && has "mcp is already pinned in" && has "this checkout's build" && cmp -s "${T}/env30.after" "$(ENVT "${H30}")"; then ok "30c: a re-run builds and pins nothing, env.toml byte-identical"; else bad "30c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 sealed_ok "case 30c"
 # 30d: the upgrade builds, so a dirty checkout is refused at 2c, before
 # anything (the opposed arm, both pinned, is 16's last check).
@@ -1111,7 +1118,7 @@ if cmp -s "${T}/env31.before" "$(ENVT "${H31}")"; then ok "31a: the dry run wrot
 # 31b: for real.
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H31}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
-want31="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install --replace-running')"
+want31="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install --replace-running' '--env prod mcp grants')"
 if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want31}" ]]; then ok "31b: mcp built --env-copy and re-pinned once by cauldron pin, then install --replace-running"; else bad "31b calls (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 if cmp -s "${T}/env31.want" "$(ENVT "${H31}")"; then ok "31b: env.toml changed in the mcp version alone (threads pin and every other byte kept)"; else bad "31b: env.toml wrong" "$(diff "${T}/env31.want" "$(ENVT "${H31}")")"; fi
 if has "services: mcp re-pinned at ${TL}+prod (it was mcpold-release+prod); the supervisor runs that build, and every grant is kept." && ! has "STILL THE OLD BUILD"; then ok "31b: done names the re-pin, and no old-build warning"; else bad "31b: no re-pin done line" "${OUT}"; fi
@@ -1123,7 +1130,7 @@ sealed_ok "case 31b"
 # 31c: re-run: idempotent (the pin is this checkout's build now).
 cp "$(ENVT "${H31}")" "${T}/env31.after"; : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H31}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
-if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install --replace-running')" ]] && has "mcp is pinned at ${TL}+prod, this checkout's build" && cmp -s "${T}/env31.after" "$(ENVT "${H31}")" && ! has "STILL THE OLD BUILD"; then ok "31c: a re-run builds and pins nothing, env.toml byte-identical, no warning"; else bad "31c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install --replace-running' '--env prod mcp grants')" ]] && has "mcp is pinned at ${TL}+prod, this checkout's build" && cmp -s "${T}/env31.after" "$(ENVT "${H31}")" && ! has "STILL THE OLD BUILD"; then ok "31c: a re-run builds and pins nothing, env.toml byte-identical, no warning"; else bad "31c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 sealed_ok "case 31c"
 # 31d: without the flag (no job loaded), an upgraded pin says nothing old.
 : >"${CLOG}"
@@ -1133,7 +1140,7 @@ if [[ ${RC} -eq 0 ]] && ! has "STILL THE OLD BUILD" && ! has "still the old buil
 H31e="${T}/home31e"; mkdir -p "${H31e}/.cauldron/data/prod"; cp "${T}/env31.before" "$(ENVT "${H31e}")"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H31e}" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 ]] && cmp -s "${T}/env31.before" "$(ENVT "${H31e}")" && ! grep -q 'mcp' "${CLOG}"; then ok "31e: no flag: the old pin is untouched (no build, no pin, env.toml byte-identical)"; else bad "31e (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 ]] && cmp -s "${T}/env31.before" "$(ENVT "${H31e}")" && ! grep -qE 'build mcp|pin mcp' "${CLOG}"; then ok "31e: no flag: the old pin is untouched (no build, no pin, env.toml byte-identical)"; else bad "31e (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 old_mcp_said "31e" "${T}/bin14/cauldron"
 sealed_ok "case 31e"
 # 31f: another writer re-pins mcp while this run builds: that pin stands,
@@ -1149,6 +1156,22 @@ H31g="${T}/home31g"; mkdir -p "${H31g}/.cauldron/data/prod"; cp "${T}/env31.befo
 STUB_GIT_DIRTY='?? notes.txt' RUN_HOME="${H31g}" srun "" --from "${T}/bin14" --replace-running
 if [[ ${RC} -eq 2 ]] && has "uncommitted or untracked files" && ! grep -q 'mcp' "${CLOG}" && cmp -s "${T}/env31.before" "$(ENVT "${H31g}")"; then ok "31g: dirty tree on an mcp upgrade: rc 2 at 2c, nothing built, env.toml byte-identical"; else bad "31g (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 sealed_ok "case 31g"
+
+printf '\n== 32. an upgrade names a grant that names its cauldron only by name, in its closing lines (SEALED)\n'
+# The env of case 31 (upgraded, current pin). The stub's `mcp grants` says on
+# stderr, as the real one does, that `kb`'s grant names it only by name.
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_NAME_ONLY=1 RUN_HOME="${H31}" srun "" --from "${T}/bin14"
+more="$(line_no '^install: more: ')"; gl="$(line_no '^install: grants:   an MCP grant names its cauldron only by name')"
+if [[ ${RC} -eq 0 ]] && [[ ${gl} -gt ${more} && ${more} -gt 0 ]] && has "the grant of cauldron \`kb\` in environment \`prod\` names it only by name" && has "terminal: cauldron mcp grant kb --env prod --scopes read,dump"; then ok "32: the closing lines name the grant and the command that grants it again"; else bad "32 (rc ${RC}, more ${more}, grants ${gl})" "${OUT}"; fi
+if [[ "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]] && cmp -s "${T}/env31.after" "$(ENVT "${H31}")"; then ok "32: only a read-only \`mcp grants\` was added, and env.toml is byte-identical"; else bad "32 calls" "$(cat "${CLOG}")"; fi
+sealed_ok "case 32"
+# Opposed: with no such grant, nothing is said (case 31d's run said nothing
+# either), and a FIRST install never asks (case 14's call list has no
+# `mcp grants`).
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H31}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 ]] && ! has "only by name" && ! has "install: grants:"; then ok "32: no name-only grant, no grants line"; else bad "32: a grants line with nothing to name" "${OUT}"; fi
 
 printf '\n== 27. an unset variable aborts install with rc != 0 (bash 3.2 + EXIT trap, REL-4.S5e)\n'
 # A copy with an unset variable read right before 4b's staging mkdir, where

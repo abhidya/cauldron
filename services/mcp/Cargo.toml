@@ -16,8 +16,9 @@ path = "src/main.rs"
 
 [features]
 # Test-only, as `cauldron`'s own: builds the spine's fault-injection seam into
-# this binary. Off in every normal build, where a set SPINE_FAULT is refused.
-fault-injection = ["spine/fault-injection"]
+# this binary, and the dump removal's (`CAULDRON_REMOVE_FAULT`). Off in every
+# normal build, where a set SPINE_FAULT or CAULDRON_REMOVE_FAULT is refused.
+fault-injection = ["spine/fault-injection", "soup-door/fault-injection"]
 
 [dependencies]
 env = { path = "../../libs/env" }

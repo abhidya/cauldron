@@ -142,13 +142,8 @@ pub(crate) fn verb_create(args: &[String]) -> Result<i32> {
 
 /// Make `cauldrons/<name>/` with its manifest and its own soup. Returns the
 /// directory. Refuses a bad or reserved name, the legacy cauldron's name, and
-/// any name already taken; writes nothing when it refuses.
-pub(crate) fn create(e: &Environment, name: &str) -> Result<PathBuf> {
-    create_seeded(e, name, None)
-}
-
-/// [`create`], with a `seed` (already checked by `parse_seed`) written
-/// into `cauldron.toml`. The seed is installed by `cauldron_seed::
+/// any name already taken; writes nothing when it refuses. A `seed`
+/// (already checked by `parse_seed`) is written into `cauldron.toml`. The seed is installed by `cauldron_seed::
 /// seed_created` AFTER the directory is in place (its paths are the final
 /// ones) and INSIDE the rollback: a seed that fails removes the whole new
 /// cauldron, so a failed `create --seed` leaves nothing behind.

@@ -13,6 +13,10 @@
 //!
 //! Each line is appended by one write, so a reader of the file sees whole
 //! lines only.
+//!
+//! It is rotated: once it holds [`ROTATE_AT`] bytes, the next line first
+//! moves it to `calls.jsonl.1` (replacing an older one), so the audit never
+//! holds more than about twice that.
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -24,10 +28,14 @@ use serde_json::{json, Value};
 /// The file's name under the service's directory.
 pub const FILE: &str = "calls.jsonl";
 
+/// The size at which the file is moved aside to `calls.jsonl.1`.
+pub const ROTATE_AT: u64 = 8 * 1024 * 1024;
+
 /// The audit log of one environment.
 pub struct Audit {
     path: PathBuf,
     lock: Mutex<()>,
+    rotate_at: u64,
 }
 
 /// One line's fields (`at` is added on write).
@@ -50,7 +58,19 @@ pub struct Line {
 
 impl Audit {
     pub fn new(dir: &Path) -> Audit {
-        Audit { path: dir.join(FILE), lock: Mutex::new(()) }
+        Audit::rotating_at(dir, ROTATE_AT)
+    }
+
+    /// An audit log moved aside at `rotate_at` bytes.
+    pub fn rotating_at(dir: &Path, rotate_at: u64) -> Audit {
+        Audit { path: dir.join(FILE), lock: Mutex::new(()), rotate_at }
+    }
+
+    /// The file a full log is moved to.
+    pub fn previous(&self) -> PathBuf {
+        let mut p = self.path.as_os_str().to_owned();
+        p.push(".1");
+        PathBuf::from(p)
     }
 
     pub fn path(&self) -> &Path {
@@ -86,6 +106,11 @@ impl Audit {
         // own, which a reader could catch half done.)
         let line = format!("{v}\n");
         let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        if std::fs::metadata(&self.path).is_ok_and(|m| m.len() >= self.rotate_at) {
+            if let Err(e) = std::fs::rename(&self.path, self.previous()) {
+                tracing::warn!(path = %self.path.display(), error = %e, "could not rotate the audit log");
+            }
+        }
         let wrote = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -135,6 +160,28 @@ mod tests {
         }
         writer.join().unwrap();
         assert_eq!(std::fs::read_to_string(a.path()).unwrap().lines().count(), 3000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past its size the log is moved aside once, keeping one previous file,
+    /// and every line is in one of the two.
+    #[test]
+    fn a_full_log_is_moved_aside_and_one_previous_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mcp-audit-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = Audit::rotating_at(&dir, 2000);
+        let line = |i: usize| Line { tool: "soup_put".into(), outcome: "landed".into(), counts: json!({"n": i}), ..Line::default() };
+        for i in 0..100 {
+            a.write(line(i));
+        }
+        let now = std::fs::read_to_string(a.path()).unwrap();
+        let prev = std::fs::read_to_string(a.previous()).unwrap();
+        assert!(now.len() < 2200 && prev.len() < 2200, "{} {}", now.len(), prev.len());
+        let last: Vec<i64> = now.lines().chain(prev.lines()).map(|l| serde_json::from_str::<Value>(l).unwrap()["counts"]["n"].as_i64().unwrap()).collect();
+        assert!(last.contains(&99) && !last.contains(&0), "older lines went with the older file");
+        assert_eq!(std::fs::metadata(a.previous()).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!dir.join(format!("{FILE}.2")).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -24,9 +24,19 @@
 //! it records that cauldron's `created_at` (from its `cauldron.toml`, the
 //! same identity the change cursor uses). A cauldron removed and made again
 //! under the same name has another, and its predecessor's grant does not
-//! open it ([`Code::CauldronGone`]); the owner grants the new one. A grant
-//! written before grants carried this field has none, and is honoured by
-//! name as it was until it is made again.
+//! open it ([`Code::CauldronGone`]); the owner grants the new one.
+//!
+//! A grant that records no identity (written before grants carried this
+//! field, which every release that made grants has done) is NOT honoured
+//! when the cauldron of its name has an identity: it is refused as
+//! [`Code::NotGranted`], naming the `cauldron mcp grant` that makes it
+//! again with its scopes and projects. It is never bound on first use,
+//! because a name-only grant cannot tell the cauldron it was made for from
+//! one made since under the same name, and binding it then would adopt the
+//! newcomer for good; only the owner, at a terminal, binds a grant. A
+//! cauldron that has no identity itself (the implicit legacy cauldron, or a
+//! `cauldron.toml` without `created_at`) has nothing to bind to, and its
+//! grant is honoured by name.
 //!
 //! The command line's project marker (`.cauldron`) plays no part here: a
 //! marker never opens a cauldron to the MCP door, and is never read by it.
@@ -128,12 +138,20 @@ impl Grant {
     }
 
     /// Was this grant made for `c` (the cauldron that has this name now)?
-    /// A grant that recorded no identity is taken to be.
+    /// A grant that recorded no identity is, only when `c` has none either
+    /// (module docs).
     pub fn is_for(&self, c: &env::Cauldron) -> bool {
-        match &self.cauldron_created_at {
-            None => true,
-            Some(want) => identity(c).as_deref() == Some(want.as_str()),
+        match (&self.cauldron_created_at, identity(c)) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(want), have) => have.as_deref() == Some(want.as_str()),
         }
+    }
+
+    /// Does this grant name its cauldron only by name, while that cauldron
+    /// has an identity (a grant to make again)?
+    pub fn name_only_for(&self, c: &env::Cauldron) -> bool {
+        self.cauldron_created_at.is_none() && identity(c).is_some()
     }
 }
 
@@ -345,6 +363,16 @@ impl Grants {
                  was read or written. The owner drops the grant with `cauldron mcp revoke {cauldron} --env {env}`."
             );
         };
+        if g.name_only_for(&c) {
+            refuse!(
+                Code::NotGranted,
+                "Cauldron `{cauldron}` in environment `{env}` has a grant that names it only by name: it was written by \
+                 an older build, before a grant recorded which cauldron it was made for, so it cannot tell this cauldron \
+                 from one made since under the same name, and it is not honoured. Nothing was read or written. The owner \
+                 grants it again from a terminal on this machine with `{}`.",
+                grant_command(env, cauldron, &g.scopes, &g.projects)
+            );
+        }
         if !g.is_for(&c) {
             refuse!(
                 Code::CauldronGone,
@@ -447,6 +475,38 @@ pub fn require_cauldron(e: &Environment, cauldron: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// **The grants that name their cauldron only by name**, while that
+/// cauldron has an identity: each is refused on its first call
+/// ([`Grant::name_only_for`]). Answers `[{cauldron, note, regrant}]`, one
+/// per such grant, so `cauldron mcp status`, `cauldron mcp grants` and the
+/// installer can say so before that first refusal. A grant whose cauldron
+/// is gone is not listed here (its call is refused as gone).
+pub fn name_only(e: &env::Environment, g: &Grants) -> Vec<serde_json::Value> {
+    g.grants
+        .iter()
+        .filter_map(|gr| {
+            let c = e.find_cauldron(&gr.cauldron).ok().flatten()?;
+            gr.name_only_for(&c).then(|| {
+                let regrant = grant_command(&e.name, &gr.cauldron, &gr.scopes, &gr.projects);
+                serde_json::json!({
+                    "cauldron": gr.cauldron,
+                    "note": name_only_note(&gr.cauldron, &e.name, &regrant),
+                    "regrant": regrant,
+                })
+            })
+        })
+        .collect()
+}
+
+/// What is said of a grant that names its cauldron only by name.
+pub fn name_only_note(cauldron: &str, env: &str, regrant: &str) -> String {
+    format!(
+        "the grant of cauldron `{cauldron}` in environment `{env}` names it only by name (it was written by a \
+         pre-release build), so every call to it through the MCP door is refused until it is granted again, in a \
+         terminal: {regrant}"
+    )
 }
 
 /// The command that makes a grant, as a person types it.
@@ -821,13 +881,33 @@ mod tests {
         // Granting again binds the grant to the new one.
         grant(&e, "kb", &Scope::ALL, &[], "tty").unwrap();
         assert!(Grants::load(&e).unwrap().authorize(&e, "kb", Scope::Read).is_ok());
-        // A store written before grants carried the field still loads, and
-        // its grant is honoured by name.
-        let old = r#"{"version":1,"grants":[{"cauldron":"kb","scopes":["read"],"projects":[],"granted_at":"2026-01-01T00:00:00Z","by":"tty"}]}"#;
+        // A store written before grants carried the field still loads; its
+        // grant is refused (never bound on use), naming the grant to make.
+        let old = r#"{"version":1,"grants":[{"cauldron":"kb","scopes":["read"],"projects":["/p"],"granted_at":"2026-01-01T00:00:00Z","by":"tty"}]}"#;
         std::fs::write(store_path(&e), old).unwrap();
         let store = Grants::load(&e).unwrap();
         assert_eq!(store.get("kb").unwrap().cauldron_created_at, None);
-        assert!(store.authorize(&e, "kb", Scope::Read).is_ok());
+        // It is named before any call is made, with the same command.
+        let w = name_only(&e, &store);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!((w[0]["cauldron"].as_str(), w[0]["regrant"].as_str()), (Some("kb"), Some("cauldron mcp grant kb --env dev --scopes read --project /p")));
+        assert!(w[0]["note"].as_str().unwrap().contains("only by name") && w[0]["note"].as_str().unwrap().ends_with("--project /p"), "{w:?}");
+        let err = store.authorize(&e, "kb", Scope::Read).unwrap_err();
+        assert_eq!(err.code, Code::NotGranted, "{err}");
+        assert!(err.message.contains("only by name") && err.message.contains("cauldron mcp grant kb --env dev --scopes read --project /p"), "{err}");
+        assert!(!store.get("kb").unwrap().is_for(&e.find_cauldron("kb").unwrap().unwrap()));
+        assert_eq!(Grants::load(&e).unwrap().get("kb").unwrap().cauldron_created_at, None, "nothing was bound");
+        // Granting again binds it, and it is no longer named.
+        grant(&e, "kb", &[Scope::Read], &[], "tty").unwrap();
+        assert!(Grants::load(&e).unwrap().authorize(&e, "kb", Scope::Read).is_ok());
+        assert!(name_only(&e, &Grants::load(&e).unwrap()).is_empty());
+        // A cauldron with no identity of its own: a name-only grant is honoured,
+        // and not named.
+        let dir = e.data_root.join("cauldrons").join("kb");
+        std::fs::write(dir.join("cauldron.toml"), "name = \"kb\"\nenabled = true\n").unwrap();
+        std::fs::write(store_path(&e), old).unwrap();
+        assert!(Grants::load(&e).unwrap().authorize(&e, "kb", Scope::Read).is_ok());
+        assert!(name_only(&e, &Grants::load(&e).unwrap()).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

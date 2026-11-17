@@ -104,7 +104,8 @@ budget per cauldron from the UI is on the roadmap.
 Keep one big soup per project, separate from the one for your work and the one
 for your family. They don't mix: each cauldron's data is its own, under
 `~/.cauldron/data/prod/cauldrons/<name>/`, and only you can read it (its
-directories are mode 0700 and its files 0600).
+directories are mode 0700 and its files 0600; a cauldron made by 0.1.7 or
+earlier is set so by its next write).
 
 ## What is in this release
 
@@ -467,10 +468,11 @@ This is an early release. These are known:
   `/cauldron:curate-dump`.
 - **No prebuilt binaries.** `./scripts/install` builds everything from the
   checkout, which needs the Rust toolchain and takes a while.
-- **A dump cannot be deleted yet.** No verb removes one. To remove a
-  cauldron's dumps (all of them), stop the `mcp` service or revoke the
-  cauldron, then remove `<root>/data/<env>/cauldrons/<cauldron>/dumps/` by
-  hand; the plugin's README has the steps.
+- **A dump is removed from a shell only.** `cauldron soup dump-remove
+  <DM-n> --env <env> --cauldron <cauldron> --yes` erases one dump's content
+  from the cauldron's directory and leaves a tombstone; it is refused while
+  the `mcp` service holds the dumps store (revoke or stop it first). The
+  plugin's README has the details.
 - **Claude Code is the only inference provider that runs.** Config shows the
   other token sources, endpoints and templates greyed out, and refuses to act
   on them.

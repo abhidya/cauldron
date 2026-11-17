@@ -32,6 +32,7 @@ pub mod checkers;
 pub mod config;
 pub mod delta;
 pub mod envelope;
+pub mod erase;
 pub mod exec;
 pub mod fault;
 pub mod flags;

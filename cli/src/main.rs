@@ -70,15 +70,13 @@
 //! supervisor process. See [`verb_status`].
 
 mod bundle;
-// The `--seed` hook `cauldrons::create` calls; refuses here.
+// The `--seed` hook `cauldrons::create_seeded` calls; refuses here.
 mod cauldron_seed;
-// `create` and `list` are wired; rename / remove stay unwired
-// in this release, so their code is unused here.
-#[allow(dead_code)]
+// `cauldron create | list | rename | remove`.
 mod cauldrons;
 mod ctl;
 // `cauldron soup import | recover | regions | get | nodes |
-// search | region | dump | dumps | dump-get`, the soup offline, and the
+// search | region | dump | dumps | dump-get | dump-remove`, the soup offline, and the
 // dumps kept beside it.
 mod soup;
 // `cauldron link` and the `.cauldron` project marker the soup verbs read.
@@ -138,7 +136,7 @@ const VERBS: &[(&str, &str)] = &[
     ("list", "the cauldrons of this environment (the implicit legacy one marked)"),
     ("rename", "rename a cauldron of this environment (its soup, dumps and MCP grant follow)"),
     ("remove", "put a cauldron away in cauldrons/.removed/ (never deleted; a dry run without --yes)"),
-    ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get (`soup help`)"),
+    ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get | dump-remove (`soup help`)"),
     ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
     ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
 ];
@@ -169,7 +167,7 @@ cauldron — the Cauldron entry point
                                      move a cauldron to cauldrons/.removed/<name>-<stamp>/
                                      and drop its MCP grant; never deletes. Without
                                      --yes, a dry run (exit 2)
-    cauldron soup import|recover|regions|get|nodes|search|region|dump|dumps|dump-get ...
+    cauldron soup import|recover|regions|get|nodes|search|region|dump|dumps|dump-get|dump-remove ...
                                      a cauldron's soup, offline: land records in the
                                      published schema shape as one all-or-nothing
                                      write; settle an interrupted import; list

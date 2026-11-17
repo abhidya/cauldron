@@ -36,6 +36,10 @@
 //!   reaches the service.
 //! - **D3** the dumps store is private whatever the umask: directories
 //!   0700, files 0600.
+//! - **D7** (only under `--features fault-injection`) a dump removal stopped
+//!   after each of its steps reads `removing`, never `removed`, until one
+//!   re-run or one writer's open finishes it, after which no byte of the
+//!   cauldron holds its text.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -722,7 +726,15 @@ fn d1_sessions_and_text_are_dumped_through_the_bridge_and_the_command_line() {
     let w = s.run(&["soup", "dump-get", "DM-1", "--env", "dev", "--cauldron", "kb", "--max-chars", "2000"], &pids).json();
     assert!(serde_json::to_string(&w).unwrap().chars().count() <= 2000);
     assert!(w["next_offset"].as_u64().is_some(), "{w}");
+    // status: the dumps store beside the soup, held by the service, counted.
+    let st = s.run(&["mcp", "status", "--env", "dev"], &pids).json();
+    assert_eq!(st["open_dumps"][0]["cauldron"], "kb", "{st}");
+    let kb = st["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap().clone();
+    assert_eq!(kb["dumps"], json!({"store": "present", "total": 5, "by_state": {"received": 5}, "held_by_service": true}), "{st}");
     svc.stop();
+    let st = s.run(&["mcp", "status", "--env", "dev"], &[]).json();
+    let kb = st["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap().clone();
+    assert_eq!((kb["dumps"]["held_by_service"].clone(), kb["dumps"]["total"].clone()), (json!(false), json!(5)), "{st}");
 
     // Stopped: the dumps lock is free, the command line writes directly.
     let o = s.command(&["soup", "dump", "-", "--env", "dev", "--cauldron", "kb"], &[]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -913,4 +925,252 @@ fn d4_concurrent_dumps_through_the_service_and_the_command_line_all_land() {
     }
     let list = s.run(&["soup", "dumps", "--env", "dev", "--cauldron", "kb"], &pids).json();
     assert_eq!(list["total"], json!(1 + 8 * 15 + 12), "{list}");
+}
+
+/// Every file under `root` that holds `needle`, by path.
+fn files_holding(root: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut hits = vec![];
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else if std::fs::read(e.path()).unwrap().windows(needle.len()).any(|w| w == needle.as_bytes()) {
+                hits.push(e.path());
+            }
+        }
+    }
+    hits
+}
+
+/// `soup dump-remove`: refused while the service holds the dumps store (and
+/// never sent to it), refused without its flags, a dry run that changes
+/// nothing (exit 2), then the removal: the planted text is in no file of
+/// the cauldron, and the dump reads back as a tombstone, from the command
+/// line and through the door.
+#[test]
+fn d5_a_removed_dump_leaves_no_byte_and_reads_as_a_tombstone() {
+    let s = Scratch::new("d5", &["kb"]);
+    s.grant("kb");
+    let marker = "PLANTED-DUMP-MARKER-WIBBLE";
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let r = svc.call(&s, "soup_dump", json!({"cauldron": "kb", "text": format!("token {marker}\nmore"), "title": format!("t {marker}")}));
+    assert_eq!(r["structuredContent"]["dump_id"], "DM-1", "{r}");
+    let r = svc.call(&s, "soup_dump", json!({"cauldron": "kb", "text": "nothing secret here"}));
+    assert_eq!(r["structuredContent"]["dump_id"], "DM-2", "{r}");
+    let cauldron_dir = s.data().join("cauldrons").join("kb");
+    assert!(!files_holding(&cauldron_dir, marker).is_empty(), "planted");
+
+    let o = s.run(&["soup", "dump-remove", "DM-1", "--env", "dev", "--cauldron", "kb", "--yes"], &pids);
+    assert_eq!(o.rc, 1, "{}", o.out);
+    assert!(o.err.contains("holds cauldron `kb`'s dumps store") && o.err.contains("cauldron mcp revoke kb --env dev"), "{}", o.err);
+    assert!(!s.calls().iter().any(|l| l["tool"].as_str().is_some_and(|t| t.contains("remove"))), "nothing was sent to the service");
+    svc.stop();
+
+    let o = s.run(&["soup", "dump-remove", "DM-1", "--cauldron", "kb", "--yes"], &[]);
+    assert_eq!(o.rc, 1);
+    assert!(o.err.contains("only as flags"), "{}", o.err);
+    let o = s.run(&["soup", "dump-remove", "DM-1", "--env", "dev", "--cauldron", "kb"], &[]);
+    assert_eq!(o.rc, 2, "{}", o.err);
+    assert_eq!(o.json()["dry_run"], true);
+    assert!(!files_holding(&cauldron_dir, marker).is_empty(), "a dry run changes nothing");
+
+    let o = s.run(&["soup", "dump-remove", "DM-1", "--env", "dev", "--cauldron", "kb", "--yes"], &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let j = o.json();
+    assert_eq!((j["state"].clone(), j["blob"].clone()), (json!("removed"), json!("deleted")), "{j}");
+    let left = files_holding(&cauldron_dir, marker);
+    assert!(left.is_empty(), "left behind: {left:?}");
+
+    let g = s.run(&["soup", "dump-get", "DM-1", "--env", "dev", "--cauldron", "kb"], &[]).json();
+    assert_eq!((g["removed"].clone(), g["dump"]["state"].clone()), (json!(true), json!("removed")), "{g}");
+    let raw = s.run(&["soup", "dump-get", "DM-1", "--env", "dev", "--cauldron", "kb", "--raw"], &[]);
+    assert_eq!(raw.rc, 1);
+    assert!(raw.err.contains("was removed"), "{}", raw.err);
+    // Through the door, after the service opens the store again.
+    let svc = Service::start(&s);
+    let g = svc.call(&s, "soup_dump_get", json!({"cauldron": "kb", "id": "DM-1"}));
+    assert_eq!((g["isError"].clone(), g["structuredContent"]["dump"]["state"].clone()), (json!(false), json!("removed")), "{g}");
+    let g = svc.call(&s, "soup_dump_get", json!({"cauldron": "kb", "id": "DM-2"}));
+    assert_eq!(g["structuredContent"]["text"], "nothing secret here", "{g}");
+    let r = svc.call(&s, "soup_dump", json!({"cauldron": "kb", "text": "after"}));
+    assert_eq!(r["structuredContent"]["dump_id"], "DM-3", "{r}");
+    svc.stop();
+}
+
+/// Every step a removal can be stopped after, in order (the `dumps.db` and
+/// `spine.db` steps are each database file's compaction).
+#[cfg(feature = "fault-injection")]
+const REMOVAL_STEPS: [&str; 11] = [
+    "marked",
+    "blob-deleted",
+    "history-erased",
+    "checkpointed:dumps.db",
+    "vacuumed:dumps.db",
+    "compacted:dumps.db",
+    "checkpointed:spine.db",
+    "vacuumed:spine.db",
+    "compacted:spine.db",
+    "erased",
+    "recorded",
+];
+
+/// A cauldron holding DM-1 (text and title carrying `marker`) and DM-2.
+#[cfg(feature = "fault-injection")]
+fn two_dumps(tag: &str, marker: &str) -> Scratch {
+    let s = Scratch::new(tag, &["kb"]);
+    let f = s.0.join("note.txt");
+    std::fs::write(&f, format!("line with {marker}\n").repeat(200)).unwrap();
+    let title = format!("title {marker}");
+    let o = s.run(&["soup", "dump", f.to_str().unwrap(), "--env", "dev", "--cauldron", "kb", "--title", &title], &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    std::fs::write(&f, "a note that stays").unwrap();
+    let o = s.run(&["soup", "dump", f.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"], &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    s
+}
+
+/// `soup dump-remove DM-1`, stopped by the removal's seam right after `step`.
+#[cfg(feature = "fault-injection")]
+fn remove_stopped_after(s: &Scratch, step: &str) -> Out {
+    let o = s
+        .command(&["soup", "dump-remove", "DM-1", "--env", "dev", "--cauldron", "kb", "--yes"], &[])
+        .env("CAULDRON_REMOVE_FAULT", step)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    Out { rc: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into_owned(), err: String::from_utf8_lossy(&o.stderr).into_owned() }
+}
+
+#[cfg(feature = "fault-injection")]
+fn dump_state(s: &Scratch, id: &str) -> Value {
+    let o = s.run(&["soup", "dump-get", id, "--env", "dev", "--cauldron", "kb"], &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    o.json()
+}
+
+/// **D7** a removal stopped after EVERY one of its steps (the mark, the
+/// blob, the rewrite of the record, each database file's checkpoint, VACUUM
+/// and last checkpoint, the end of the erasure, and the final commit; the
+/// seam aborts the process there, as a kill would): until it is finished
+/// the dump reads `removing` with `erasure: unfinished` and the command that
+/// finishes it, never `removed`; after ONE re-run of the removal, or ONE
+/// open of the store by a writer (a `soup dump` from the command line, or
+/// the `mcp` service's first dump), the planted text is in no byte of the
+/// cauldron's directory and the dump reads `removed`. A finish that is
+/// itself stopped is finished by the next open.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn d7_a_removal_stopped_after_any_step_says_unfinished_and_one_rerun_or_reopen_finishes_it() {
+    let cmd = "cauldron soup dump-remove DM-1 --env dev --cauldron kb --yes";
+    for (i, step) in REMOVAL_STEPS.iter().enumerate() {
+        for finish in ["rerun", "reopen"] {
+            let marker = format!("PLANTED-STOPPED-REMOVAL-{i}-{}", if finish == "rerun" { "RR" } else { "RO" });
+            let s = two_dumps(&format!("d7-{i}-{finish}"), &marker);
+            let dir = s.data().join("cauldrons").join("kb");
+            assert!(!files_holding(&dir, &marker).is_empty(), "planted");
+            let o = remove_stopped_after(&s, step);
+            assert_ne!(o.rc, 0, "{step}: the seam did not stop the removal: {}", o.out);
+            assert!(o.err.contains(&format!("aborting after `{step}`")), "{step}: {}", o.err);
+            let g = dump_state(&s, "DM-1");
+            if *step == "recorded" {
+                assert_eq!((g["dump"]["state"].clone(), g["erasure"].clone()), (json!("removed"), json!("finished")), "{step}: {g}");
+                let left = files_holding(&dir, &marker);
+                assert!(left.is_empty(), "{step}: `removed` recorded with text left: {left:?}");
+            } else {
+                assert_eq!((g["dump"]["state"].clone(), g["erasure"].clone()), (json!("removing"), json!("unfinished")), "{step}: {g}");
+                assert_eq!(g["finish_with"], cmd, "{step}: {g}");
+                assert_eq!(g["text"], "", "{step}: no read answers the content");
+                let l = s.run(&["soup", "dumps", "--env", "dev", "--cauldron", "kb"], &[]).json();
+                assert_eq!(l["dumps"][1]["state"], "removing", "{step}: {l}");
+            }
+            match finish {
+                "rerun" => {
+                    let o = s.run(&["soup", "dump-remove", "DM-1", "--env", "dev", "--cauldron", "kb", "--yes"], &[]);
+                    assert_eq!(o.rc, 0, "{step}: {}", o.err);
+                    assert_eq!(o.json()["state"], "removed", "{step}");
+                }
+                _ => {
+                    let f = s.0.join("after.txt");
+                    std::fs::write(&f, "written after the stop").unwrap();
+                    let o = s.run(&["soup", "dump", f.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"], &[]);
+                    assert_eq!(o.rc, 0, "{step}: {}", o.err);
+                    assert_eq!(o.json()["dump_id"], "DM-3", "{step}");
+                }
+            }
+            let left = files_holding(&dir, &marker);
+            assert!(left.is_empty(), "{step}/{finish}: left behind: {left:?}");
+            let g = dump_state(&s, "DM-1");
+            assert_eq!((g["dump"]["state"].clone(), g["erasure"].clone()), (json!("removed"), json!("finished")), "{step}/{finish}: {g}");
+            assert_eq!(dump_state(&s, "DM-2")["text"], "a note that stays", "{step}/{finish}");
+        }
+    }
+
+    // The finish at an open, itself stopped mid-way, then finished by the
+    // next open: the `mcp` service's, on its first dump.
+    let marker = "PLANTED-STOPPED-TWICE";
+    let s = two_dumps("d7-twice", marker);
+    let dir = s.data().join("cauldrons").join("kb");
+    assert_ne!(remove_stopped_after(&s, "marked").rc, 0);
+    let f = s.0.join("after.txt");
+    std::fs::write(&f, "written after the stop").unwrap();
+    let o = s
+        .command(&["soup", "dump", f.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"], &[])
+        .env("CAULDRON_REMOVE_FAULT", "vacuumed:spine.db")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_ne!(o.status.code(), Some(0), "the open's finish was not stopped");
+    assert_eq!(dump_state(&s, "DM-1")["dump"]["state"], "removing");
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let r = svc.call(&s, "soup_dump", json!({"cauldron": "kb", "text": "through the door"}));
+    assert_eq!(r["structuredContent"]["dump_id"], "DM-3", "{r}");
+    let g = svc.call(&s, "soup_dump_get", json!({"cauldron": "kb", "id": "DM-1"}));
+    assert_eq!((g["structuredContent"]["dump"]["state"].clone(), g["structuredContent"]["erasure"].clone()), (json!("removed"), json!("finished")), "{g}");
+    svc.stop();
+    let left = files_holding(&dir, marker);
+    assert!(left.is_empty(), "left behind: {left:?}");
+
+    // Without the seam in the build, a set variable is refused; here it is
+    // in the build, so an unknown step is refused before anything changes.
+    let s = two_dumps("d7-unknown", "PLANTED-UNKNOWN-STEP");
+    let o = remove_stopped_after(&s, "no-such-step");
+    assert_eq!(o.rc, 1, "{}", o.err);
+    assert!(o.err.contains("names no step"), "{}", o.err);
+    assert_eq!(dump_state(&s, "DM-1")["dump"]["state"], "received");
+}
+
+/// The bridge answers a JSON-RPC batch itself (`-32600`, nothing relayed),
+/// and a `session_id` left as an unsubstituted `${...}` names this session.
+#[test]
+fn d6_a_batch_is_answered_by_the_bridge_and_a_placeholder_session_id_is_this_session() {
+    let s = Scratch::new("d6", &["kb"]);
+    s.grant("kb");
+    let config = s.0.join("claude-config");
+    let dir = config.join("projects").join("-work-c");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tc = transcript(3, "/work/c", "gamma");
+    std::fs::write(dir.join("sess-c.jsonl"), &tc).unwrap();
+    let cfg = config.display().to_string();
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let mut b = Bridge::start(&s, &s.project(), &[], &[("CLAUDE_CONFIG_DIR", cfg.as_str()), ("CLAUDE_CODE_SESSION_ID", "sess-c")], &pids);
+    init(&mut b);
+    {
+        let w = b.stdin.as_mut().unwrap();
+        writeln!(w, "{}", json!([{"jsonrpc": "2.0", "id": 7, "method": "tools/list"}])).unwrap();
+        w.flush().unwrap();
+        let mut line = String::new();
+        b.stdout.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!((v["error"]["code"].clone(), v["id"].clone()), (json!(-32600), Value::Null), "{v}");
+    }
+    let r = b.call(8, "soup_dump_session", json!({"session_id": "${CLAUDE_SESSION_ID}"}));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert_eq!((r["structuredContent"]["session_id"].clone(), r["structuredContent"]["sha256"].clone()), (json!("sess-c"), json!(sha256_hex(&tc))));
+    let (rc, _, err) = b.finish();
+    assert_eq!(rc, 0, "{err}");
+    svc.stop();
 }

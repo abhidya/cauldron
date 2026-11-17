@@ -30,6 +30,11 @@
 //!   grant kept, and it says the grant would be dropped); with `--yes` it
 //!   moves the cauldron to `cauldrons/.removed/` and drops its grant, and a
 //!   cauldron made again under the name is not opened by anything.
+//! - **G8** a grant that names its cauldron only by name (the pre-release
+//!   shape) is named BEFORE any call is refused: `mcp grants` lists it under
+//!   `warnings` and `mcp status` on its cauldron (`grant_note`), each with
+//!   the command that grants it again, and each says so on stderr; a bound
+//!   grant beside it is not named, and nothing is written.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -490,4 +495,46 @@ fn g7_remove_is_a_dry_run_without_yes_and_never_deletes() {
     // Opposed: removing a cauldron that does not exist is refused.
     let o = run(&s, &["remove", "nope", "--env", "dev", "--yes"]);
     assert!(o.rc != 0 && o.err.contains("no cauldron `nope`"), "{}", o.err);
+}
+
+#[test]
+fn g8_a_name_only_grant_is_named_before_its_first_call_with_its_regrant() {
+    let s = scratch("g8", &["kb", "kb2"]);
+    let e = env_dev(&s);
+    let proj = s.dir("a dir");
+    let p = soup_door::grants::canonical_project(&proj).unwrap();
+    let scopes = [soup_door::grants::Scope::Read, soup_door::grants::Scope::Dump];
+    soup_door::grants::grant(&e, "kb", &scopes, std::slice::from_ref(&p), "tty").unwrap();
+    soup_door::grants::grant(&e, "kb2", &scopes, &[], "tty").unwrap();
+    // `kb`'s grant as a pre-release build wrote it: no cauldron identity.
+    let mut store = store_json(&s);
+    for g in store["grants"].as_array_mut().unwrap() {
+        if g["cauldron"] == "kb" {
+            g.as_object_mut().unwrap().remove("cauldron_created_at");
+        }
+    }
+    std::fs::write(s.store(), serde_json::to_string_pretty(&store).unwrap()).unwrap();
+    let before = std::fs::read(s.store()).unwrap();
+    let regrant = format!("cauldron mcp grant kb --env dev --scopes read,dump --project '{}'", p);
+
+    let o = run(&s, &["mcp", "grants", "--env", "dev"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let w = o.json()["warnings"].clone();
+    assert_eq!(w.as_array().map(Vec::len), Some(1), "{w}");
+    assert_eq!((w[0]["cauldron"].as_str(), w[0]["regrant"].as_str()), (Some("kb"), Some(regrant.as_str())), "{w}");
+    assert!(o.err.contains("WARNING") && o.err.contains("only by name") && o.err.contains(&regrant), "{}", o.err);
+    assert!(!o.err.contains("kb2"), "{}", o.err);
+
+    let o = run(&s, &["mcp", "status", "--env", "dev"]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let d = o.json();
+    let row = |name: &str| d["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == name).cloned().unwrap();
+    assert!(row("kb")["grant_note"].as_str().is_some_and(|n| n.contains("refused until it is granted again")), "{d}");
+    assert_eq!(row("kb")["regrant"].as_str(), Some(regrant.as_str()));
+    assert!(row("kb2").get("grant_note").is_none(), "{d}");
+    assert!(o.err.contains("WARNING") && o.err.contains(&regrant), "{}", o.err);
+    // The refusal it warns of.
+    assert_eq!(opens(&s, "kb"), Err("NotGranted".into()));
+    assert_eq!(opens(&s, "kb2"), Ok(()));
+    assert_eq!(std::fs::read(s.store()).unwrap(), before, "nothing was written");
 }

@@ -127,7 +127,9 @@ impl Door {
         let (ctx, args) = ctx::split(arguments)?;
         let mut target_name = None;
         let out = self.call_scoped(tool, scope, also, &ctx, args, &mut target_name);
-        if scope != Scope::Read {
+        // Writes are audited, and so is reading a dump's content (which
+        // needs `dump` beside `read`): which dump, how much, never the text.
+        if scope != Scope::Read || also.is_some() {
             self.audit.write(audit_line(tool.name, &ctx, target_name, &out));
         }
         out
@@ -591,8 +593,25 @@ fn audit_line(tool: &str, ctx: &Ctx, cauldron: Option<String>, out: &Result<Valu
             }
         }
     }
+    let mut read = false;
+    if let Ok(d) = out {
+        if let Some(id) = d.pointer("/dump/id").and_then(Value::as_str).filter(|_| d.get("dump_id").is_none()) {
+            read = true;
+            dump = Some(id.to_string());
+            for k in ["offset", "text_bytes", "total_bytes", "turn_offset"] {
+                if let Some(n) = d.get(k).filter(|v| v.is_u64()) {
+                    counts.insert(k.into(), n.clone());
+                }
+            }
+            if let Some(t) = d.get("turns").and_then(Value::as_array) {
+                counts.insert("turns".into(), json!(t.len()));
+            }
+        }
+    }
     let outcome = match out {
         Ok(d) if d.get("dump_id").is_some() => "received".to_string(),
+        Ok(d) if read && d.get("removed") == Some(&json!(true)) => "removed".to_string(),
+        Ok(_) if read => "read".to_string(),
         Ok(d) => d.get("outcome").and_then(Value::as_str).unwrap_or("ok").to_string(),
         Err(r) => r.code.to_string(),
     };

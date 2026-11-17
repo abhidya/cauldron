@@ -1,5 +1,5 @@
 //! **`cauldron soup import | regions | region | nodes | search | get | dump |
-//! dumps | dump-get`** — a cauldron's soup, offline, for an agent that is not
+//! dumps | dump-get | dump-remove`** — a cauldron's soup, offline, for an agent that is not
 //! the soup daemon, and the dumps kept beside it.
 //!
 //! - `import` lands records written in the PUBLISHED shape
@@ -226,6 +226,26 @@ cauldron soup — a cauldron's soup, offline
         same each time; read on with --offset <next_offset>
         and, after a turn longer than a page (cut, with `chars` its length),
         --turn-offset <next_turn_offset>.
+    cauldron soup dump-remove <id> --env <env> --cauldron <name> [--yes]
+        Remove one dump's content for good (a dump holding a secret, say). Without --yes it
+        is a dry run: it removes nothing, prints what it would do and exits 2. With --yes,
+        in two phases. First the dump becomes a tombstone in state `removing` (its id,
+        kind, size and when it was received and removed are kept; its title, source,
+        cites, refs and sha256 are dropped), and from then on no read answers its
+        content. Then its blob is deleted unless another dump holds the same bytes (named
+        in `same_bytes_in`; remove those too), its text, title, source note and sha256 are
+        erased from the dumps store's record of its writes, the store's databases are
+        compacted, so nothing of it is left in the cauldron's directory, and only then is
+        its state `removed`. Reading it afterwards answers the tombstone; a soup record
+        that cites it still finds it, as removed. A removal cut short (a kill, a crash)
+        leaves the dump `removing`, and reading it says the erasure is unfinished and
+        prints the command that finishes it: running this again finishes it, and so does
+        the next open of the dumps store for writing (a `soup dump`, or the `mcp`
+        service's). Copies made elsewhere (backups, a moved-aside cauldron) are not
+        touched. --env and --cauldron must be given as flags (not a variable or a marker).
+        Refused while the `mcp` service holds the cauldron's dumps store: revoke its
+        grant (`cauldron mcp revoke <name> --env <env>`) or stop the service, run this,
+        then grant again. Never an MCP tool.
     cauldron soup help
 
   Every verb prints JSON on stdout and exits non-zero on a refusal. Reads open the store
@@ -264,13 +284,14 @@ pub(crate) fn verb_soup(args: &[String]) -> Result<i32> {
         Some("dump") => dump(&args[1..]),
         Some("dumps") => dumps(&args[1..]),
         Some("dump-get") => dump_get(&args[1..]),
+        Some("dump-remove") => dump_remove(&args[1..]),
         None => {
             eprint!("{USAGE}");
             Ok(2)
         }
         Some(other) => {
             eprintln!(
-                "cauldron soup: no verb `{other}` (import | recover | regions | region | nodes | search | get | dump | dumps | dump-get | help)"
+                "cauldron soup: no verb `{other}` (import | recover | regions | region | nodes | search | get | dump | dumps | dump-get | dump-remove | help)"
             );
             Ok(2)
         }
@@ -298,6 +319,7 @@ struct Args {
     kind: Option<String>,
     offset: Option<usize>,
     raw: bool,
+    yes: bool,
     view: Option<String>,
     turn_offset: Option<usize>,
     pos: Vec<String>,
@@ -344,6 +366,7 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--kind" => a.kind = Some(take(&mut it)?),
             "--offset" => a.offset = Some(count(flag, &take(&mut it)?)?),
             "--raw" => a.raw = true,
+            "--yes" => a.yes = true,
             "--view" => a.view = Some(take(&mut it)?),
             "--turn-offset" => a.turn_offset = Some(count(flag, &take(&mut it)?)?),
             _ => a.pos.push(s.clone()),
@@ -783,6 +806,53 @@ fn dump_forward(t: &Target, text: &str, a: &Args, pid: u32) -> Result<Option<i32
     match code {
         "not_granted" | "locked" => Ok(None),
         _ => bail!("REFUSED ({holder} answered `{code}`): {}", refused["message"].as_str().unwrap_or("")),
+    }
+}
+
+/// **`cauldron soup dump-remove <id> --env <e> --cauldron <c> [--yes]`**:
+/// remove one dump's content for good (`soup_door::dumps::remove`). CLI
+/// only: never forwarded to the `mcp` service, which is refused instead,
+/// because the erasure needs the store's databases to itself (it rewrites
+/// and compacts them) and the service keeps them open while it holds them.
+fn dump_remove(args: &[String]) -> Result<i32> {
+    let a = parse("dump-remove", args, &["--env", "--cauldron", "-c", "--yes"])?;
+    let [id] = a.pos.as_slice() else {
+        bail!("`cauldron soup dump-remove` takes ONE dump id (got {}); `cauldron soup dumps` lists them", a.pos.len());
+    };
+    if a.env.is_none() || a.cauldron.is_none() {
+        bail!(
+            "REFUSED: `cauldron soup dump-remove` cannot be undone, so it takes the environment and the cauldron only as \
+             flags: --env <env> --cauldron <name>. Nothing was changed."
+        );
+    }
+    let t = target("dump-remove", &a, true)?;
+    let by = soup_door::dumps::By {
+        thread: "cli".into(),
+        dispatch: "cauldron soup dump-remove".into(),
+        instrument: "cauldron".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+    };
+    match soup_door::dumps::remove(&t.cauldron, id, a.yes, &by) {
+        Ok(doc) => {
+            print(&doc)?;
+            Ok(if a.yes { 0 } else { 2 })
+        }
+        Err(e) if e.code == soup_door::Code::Locked => match soup_door::dumps::held_by_service(&t.cauldron) {
+            Some(pid) => bail!(
+                "REFUSED: the `{}` service (pid {pid}) holds cauldron `{}`'s dumps store, and a removal needs the store to \
+                 itself (it rewrites and compacts its databases), so it is not sent to the service. Nothing was changed. \
+                 Revoke the grant (`cauldron mcp revoke {} --env {}`) or stop the service (`cauldron --env {} stop {}`), \
+                 run this again, then grant again.",
+                crate::mcp_door::SERVICE,
+                t.cauldron.name,
+                t.cauldron.name,
+                t.env.name,
+                t.env.name,
+                crate::mcp_door::SERVICE
+            ),
+            None => Err(e.into()),
+        },
+        Err(e) => Err(e.into()),
     }
 }
 

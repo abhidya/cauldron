@@ -82,6 +82,9 @@ pub struct Dumps {
     access: Arc<Access>,
     effects: Arc<dyn SideEffects>,
     open: Mutex<HashMap<String, Arc<Held>>>,
+    /// Held while a store is being opened, so opens run one at a time
+    /// without holding `open` (see `writer::Writers`).
+    opening: Mutex<()>,
 }
 
 fn closed() -> Refusal {
@@ -104,7 +107,7 @@ fn revoked(cauldron: &str, why: &str) -> Refusal {
 
 impl Dumps {
     pub fn new(audit: Arc<Audit>, access: Arc<Access>, effects: Arc<dyn SideEffects>) -> Dumps {
-        Dumps { audit, access, effects, open: Mutex::new(HashMap::new()) }
+        Dumps { audit, access, effects, open: Mutex::new(HashMap::new()), opening: Mutex::new(()) }
     }
 
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Held>>> {
@@ -118,14 +121,30 @@ impl Dumps {
         v
     }
 
+    /// Every held dumps store, as `cauldron mcp status` shows it:
+    /// `[{cauldron, opened_at, recovered_at_open}]`, by name.
+    pub fn snapshot(&self) -> Value {
+        let open = self.map();
+        let mut v: Vec<(&String, &Arc<Held>)> = open.iter().collect();
+        v.sort_by(|a, b| a.0.cmp(b.0));
+        Value::Array(
+            v.into_iter()
+                .map(|(name, h)| serde_json::json!({"cauldron": name, "opened_at": h.opened_at, "recovered_at_open": h.recovered}))
+                .collect(),
+        )
+    }
+
     /// Is `cauldron`'s dumps store held here?
     pub fn holds(&self, cauldron: &str) -> bool {
         self.map().contains_key(cauldron)
     }
 
     fn get_or_open(&self, t: &Target, who: &Who) -> Result<Arc<Held>, Refusal> {
-        let mut open = self.map();
-        if let Some(h) = open.get(&t.cauldron.name) {
+        if let Some(h) = self.map().get(&t.cauldron.name) {
+            return Ok(h.clone());
+        }
+        let _opening = self.opening.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(h) = self.map().get(&t.cauldron.name) {
             return Ok(h.clone());
         }
         if let Some(why) = self.access.why_not_dumpable(&t.cauldron) {
@@ -137,8 +156,7 @@ impl Dumps {
             recovered: store.recovered.clone(),
             store: Mutex::new(Some(store)),
         });
-        open.insert(t.cauldron.name.clone(), h.clone());
-        drop(open);
+        self.map().insert(t.cauldron.name.clone(), h.clone());
         tracing::info!(cauldron = %t.cauldron.name, "opened a cauldron's dumps store");
         self.audit.write(Line {
             client: Some(who.client.clone()),

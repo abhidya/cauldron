@@ -20,5 +20,16 @@ shapewire = { path = "../shapewire", default-features = false }
 # `env` answers with anyhow errors; they are turned into this crate's own.
 anyhow = { workspace = true }
 
+[features]
+# Test-only: the removal's seam (`dumps::fault`, `CAULDRON_REMOVE_FAULT`),
+# which aborts the process after a named step. Off in every normal build,
+# where a set CAULDRON_REMOVE_FAULT is refused.
+fault-injection = []
+
+[dev-dependencies]
+# A plain reader holding the store's log open, for the erasure tests (the
+# version spine already links).
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 [lints.rust]
 unsafe_code = "forbid"

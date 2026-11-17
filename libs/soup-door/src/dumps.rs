@@ -262,8 +262,10 @@ impl Store {
     /// another writer holds it), writing `holder` into it, and open the
     /// store, making it first when this cauldron has none. The open runs the
     /// spine's recovery: a dump interrupted before its decision is rolled
-    /// back, one interrupted after it lands. Then the blob store is swept
-    /// of what a killed or refused dump left (module docs).
+    /// back, one interrupted after it lands. A removal cut short (a dump in
+    /// state `removing`) is finished, and `recovered.removals` says which
+    /// (`{finished, unfinished}`, only when there were any). Then the blob
+    /// store is swept of what a killed or refused dump left (module docs).
     pub fn open(c: &env::Cauldron, holder: &str) -> Result<Store> {
         let lock = take_lock(c, holder)?;
         let d = dir(c);
@@ -290,6 +292,24 @@ impl Store {
         };
         // The databases SQLite made (with its own default mode) set private.
         private_store(c, &d)?;
+        // A removal cut short is finished here, under the writer lock, before
+        // anything else is written.
+        let (spine, recovered) = if created {
+            (spine, recovered)
+        } else {
+            let by = By {
+                thread: holder.split(' ').next().unwrap_or(holder).to_string(),
+                dispatch: "finish cauldron soup dump-remove".into(),
+                instrument: "soup-door".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            };
+            let (spine, removals) = finish_pending(c, spine, &by)?;
+            let mut recovered = recovered;
+            if removals["finished"].as_array().is_some_and(|a| !a.is_empty()) || removals["unfinished"].as_array().is_some_and(|a| !a.is_empty()) {
+                recovered["removals"] = removals;
+            }
+            (spine, recovered)
+        };
         let mut store = Store { cauldron: c.clone(), dir: d, spine, _lock: lock, created, recovered };
         let swept = store.sweep()?;
         store.recovered["swept"] = swept;
@@ -824,6 +844,455 @@ pub fn transcript_facts(path: &Path) -> std::io::Result<(u64, Option<String>)> {
     Ok((lines, cwd))
 }
 
+// ----------------------------------------------------------------- removal
+
+/// A removed dump's `body`: the tombstone's whole text.
+pub const REMOVED_BODY: &str = "removed";
+
+/// What replaces erased text in the store's record of a write.
+const ERASED: &str = "[removed]";
+
+/// Is `n` a tombstone: state `removed`, or `removing` (its content can no
+/// longer be read, and erasing it from the store's files is unfinished)?
+fn is_tombstone(n: &NodeRecord) -> bool {
+    matches!(n.state.as_deref(), Some(grammar_dump::REMOVED) | Some(grammar_dump::REMOVING))
+}
+
+/// Is `n` a dump whose removal is unfinished (state `removing`)?
+fn is_removing(n: &NodeRecord) -> bool {
+    n.state.as_deref() == Some(grammar_dump::REMOVING)
+}
+
+/// **The removal's test seam**: `CAULDRON_REMOVE_FAULT=<step>` aborts the
+/// process right after that step of a removal (the aimed kill a timed
+/// `SIGKILL` cannot deliver), in a build with this crate's
+/// `fault-injection` feature only. The steps, in order: `marked`,
+/// `blob-deleted`, `history-erased`, then for each database file
+/// `checkpointed:<file>`, `vacuumed:<file>`, `compacted:<file>`, then
+/// `erased` and `recorded`. Without the feature, a set variable refuses the
+/// removal (and the finishing of one at an open) before anything is changed.
+pub mod fault {
+    use crate::{refuse, Code, Result};
+
+    /// The variable naming the step to stop after.
+    pub const ENV: &str = "CAULDRON_REMOVE_FAULT";
+
+    /// The fixed steps; the per-file ones are `<step>:<file>.db`.
+    pub const STEPS: [&str; 5] = ["marked", "blob-deleted", "history-erased", "erased", "recorded"];
+    /// The per-database-file steps.
+    pub const FILE_STEPS: [&str; 3] = ["checkpointed", "vacuumed", "compacted"];
+
+    fn known(v: &str) -> bool {
+        STEPS.contains(&v)
+            || v.split_once(':').is_some_and(|(s, f)| FILE_STEPS.contains(&s) && f.ends_with(".db") && !f.contains('/'))
+    }
+
+    /// Refused when the variable is set and this build has no seam, or it
+    /// names no step. Called before a removal changes anything.
+    pub fn check() -> Result<()> {
+        let Ok(v) = std::env::var(ENV) else { return Ok(()) };
+        if !cfg!(feature = "fault-injection") {
+            refuse!(Code::Usage, "REFUSED: {ENV} is set (`{v}`), and this build has no fault seam. Nothing was changed.");
+        }
+        if !known(&v) {
+            refuse!(Code::Usage, "REFUSED: {ENV}=`{v}` names no step of a removal. Nothing was changed.");
+        }
+        Ok(())
+    }
+
+    /// The seam: abort here when the variable names `step`.
+    pub fn at(step: &str) {
+        #[cfg(feature = "fault-injection")]
+        if std::env::var(ENV).is_ok_and(|v| v == step) {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "{ENV}: aborting after `{step}`");
+            std::process::abort();
+        }
+        #[cfg(not(feature = "fault-injection"))]
+        let _ = step;
+    }
+}
+
+/// What removing dump `id` takes out, read from the store as it is now.
+/// The old values come from the row of the commit that created the dump,
+/// so a removal that was cut short still knows them; once its erasure has
+/// rewritten that row, they are the tombstone's, and erasure has nothing
+/// left to replace but still compacts.
+struct Plan {
+    kind: Kind,
+    bytes: Value,
+    /// The blob's sha256, when the first write still names one.
+    sha: Option<String>,
+    /// Other dumps, not tombstones, that hold the same bytes.
+    shared: Vec<String>,
+    /// The blob files of that sha256 in the store.
+    blob_paths: Vec<PathBuf>,
+}
+
+fn plan(c: &env::Cauldron, id: &str, n: &NodeRecord) -> Result<Plan> {
+    let d = dir(c);
+    let created = created_bindings(c, id)?;
+    let old_artifacts = created.get("artifacts").cloned().unwrap_or(Value::Null);
+    let (kind, bytes) = if is_tombstone(n) {
+        let r = &field(n, "meta").cloned().unwrap_or(Value::Null)["removed"];
+        (if r["kind"] == "session" { Kind::Session } else { Kind::Text }, r["bytes"].clone())
+    } else {
+        let (k, a) = artifact(n);
+        (k, a["bytes"].clone())
+    };
+    let sha = old_artifacts
+        .as_object()
+        .and_then(|m| m.values().find_map(|a| a.get("sha256").and_then(Value::as_str)))
+        .map(str::to_string)
+        .filter(|s| sha_ok(s));
+    let shared: Vec<String> = match &sha {
+        Some(h) => all(c)?
+            .iter()
+            .filter(|o| o.id.0 != id && !is_tombstone(o))
+            .filter(|o| artifact(o).1.get("sha256").and_then(Value::as_str) == Some(h.as_str()))
+            .map(|o| o.id.0.clone())
+            .collect(),
+        None => vec![],
+    };
+    let blob_paths: Vec<PathBuf> = sha
+        .iter()
+        .flat_map(|h| [Kind::Text, Kind::Session].map(|k| d.join(BLOBS).join(format!("{h}.{}", k.ext()))))
+        .filter(|p| p.is_file())
+        .collect();
+    Ok(Plan { kind, bytes, sha, shared, blob_paths })
+}
+
+fn provenance(by: &By) -> Provenance {
+    Provenance {
+        initiator: Initiator::Agent { thread: by.thread.clone(), dispatch: by.dispatch.clone() },
+        instrument: Instrument { name: by.instrument.clone(), version: by.version.clone() },
+    }
+}
+
+/// One ordinary commit setting dump `id`'s fields (`sets`, already
+/// written as `SET d.<k> = $<k>` with their bindings in `b`) and its state.
+fn set_state(c: &env::Cauldron, spine: &spine::Cauldron, id: &str, state: &str, mut b: Bindings, sets: &str, by: &By) -> Result<()> {
+    b.insert("id".into(), json!(id));
+    let statement = format!("MATCH (d: {POOL}/{DUMP} {{ id: $id }}) SET d.state = \"{state}\"{sets} RETURN d.id");
+    let env = Envelope {
+        statement,
+        bindings: b,
+        format_version: ENVELOPE_FORMAT_VERSION,
+        provenance: provenance(by),
+        mode: Mode::Commit,
+        idempotency_nonce: Some(format!(
+            "dump-{state}:{id}:{}:{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|x| x.as_nanos()).unwrap_or(0),
+            next_serial()
+        )),
+    };
+    match spine.submit(env) {
+        Ok(spine::Outcome::Committed { .. }) => Ok(()),
+        Ok(_) => Err(store_err(c, format!("marking `{id}` {state} was validated and not committed"))),
+        Err(spine::error::SpineError::Refused { witnesses }) => {
+            Err(store_err(c, format!("the dumps store refused marking `{id}` {state}: {}", json!(witnesses))))
+        }
+        Err(e) => Err(store_err(c, format!("marking `{id}` {state}: {e}"))),
+    }
+}
+
+fn open_spine(c: &env::Cauldron) -> Result<spine::Cauldron> {
+    spine::Cauldron::open(&dir(c), spine::config::SpineConfig::default()).map_err(|e| store_err(c, format!("opening the store: {e}")))
+}
+
+/// **Phase two of a removal**, holding the store's writer lock, for a dump
+/// already marked (state `removing`, or `removed` when `record` is false):
+/// delete its blob unless another dump holds the same bytes, erase its old
+/// values from every write that is not another dump's, compact every
+/// database file, and only then, when `record`, commit state `removed`.
+/// Answers the reopened handle and `{blob, same_bytes_in?, history_rows_erased,
+/// compacted}`. Every step is safe to repeat, so a run stopped anywhere is
+/// finished by running this again.
+fn erase_one(c: &env::Cauldron, spine: spine::Cauldron, id: &str, record: bool, by: &By) -> Result<(spine::Cauldron, Value)> {
+    let n = find(c, id)?;
+    let p = plan(c, id, &n)?;
+    let created = created_bindings(c, id)?;
+    let old_meta = created.get("meta").cloned().unwrap_or(Value::Null);
+    let old_body = created.get("body").cloned().unwrap_or(Value::Null);
+    let blob = if p.blob_paths.is_empty() {
+        "absent"
+    } else if p.shared.is_empty() {
+        "deleted"
+    } else {
+        "kept"
+    };
+    // The blob, unless a dump that is not removed holds the same bytes.
+    if p.shared.is_empty() {
+        for f in &p.blob_paths {
+            match std::fs::remove_file(f) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(store_err(c, format!("deleting {}: {e}", f.display()))),
+            }
+        }
+        if let Ok(f) = File::open(dir(c).join(BLOBS)) {
+            let _ = f.sync_all();
+        }
+    }
+    fault::at("blob-deleted");
+    // The record of its writes.
+    let mut needles: Vec<String> = vec![];
+    if created.get("artifacts").and_then(|a| a.get("text")).is_some() {
+        if let Some(t) = old_body.as_str().filter(|t| *t != REMOVED_BODY) {
+            needles.push(t.to_string());
+        }
+    }
+    if let Some(t) = old_meta.get("title").and_then(Value::as_str) {
+        needles.push(t.to_string());
+    }
+    if let Some(t) = old_meta["source"].get("from").and_then(Value::as_str) {
+        needles.push(t.to_string());
+    }
+    if p.shared.is_empty() {
+        needles.extend(p.sha.clone());
+    }
+    let mut replace = vec![];
+    for (k, new) in [("body", json!(REMOVED_BODY)), ("artifacts", json!({}))] {
+        if let Some(old) = created.get(k).filter(|o| **o != new) {
+            replace.push((old.clone(), new));
+        }
+    }
+    if let Some(new) = field(&n, "meta") {
+        if old_meta != *new && !old_meta.is_null() {
+            replace.push((old_meta.clone(), new.clone()));
+        }
+    }
+    let erasure = spine::erase::Erasure { keep: others_writes(c, id)?, replace, needles, with: ERASED.to_string() };
+    let erased = spine.erase_with(&erasure, &fault::at).map_err(|e| {
+        store_err(
+            c,
+            format!(
+                "{id} is marked `{}`: its content can no longer be read{}, but erasing its text from the store's \
+                 files failed: {e}. Run `{}` again to finish (or it is finished the next time the store is opened \
+                 for writing)",
+                n.state.as_deref().unwrap_or(grammar_dump::REMOVING),
+                if blob == "deleted" { " and its blob is deleted" } else { "" },
+                remove_command(c, id)
+            ),
+        )
+    })?;
+    fault::at("erased");
+    let spine = open_spine(c)?;
+    if record {
+        set_state(c, &spine, id, grammar_dump::REMOVED, Bindings::new(), "", by)?;
+        fault::at("recorded");
+    }
+    let mut doc = json!({"blob": blob, "history_rows_erased": erased.rows, "compacted": erased.files});
+    if !p.shared.is_empty() {
+        doc["same_bytes_in"] = json!(p.shared);
+        doc["note"] = json!(format!(
+            "{} hold the same bytes, so the blob is kept and the text is still in the store; remove them too to take it out",
+            p.shared.join(", ")
+        ));
+    }
+    Ok((spine, doc))
+}
+
+/// **Finish every removal left unfinished** (dumps in state `removing`),
+/// holding the store's writer lock: the open of the store by a writer (the
+/// CLI's or the `mcp` service's) calls this, and so does
+/// `cauldron soup dump-remove`. Answers the handle (reopened) and
+/// `{finished: [ids], unfinished: [{id, error}]}`; a removal that cannot be
+/// finished now (a reader holds the log, say) stays `removing` and is
+/// finished by a later open or by running the removal again.
+fn finish_pending(c: &env::Cauldron, mut spine: spine::Cauldron, by: &By) -> Result<(spine::Cauldron, Value)> {
+    let pending: Vec<String> = all(c)?.iter().filter(|n| is_removing(n)).map(|n| n.id.0.clone()).collect();
+    let (mut finished, mut unfinished) = (vec![], vec![]);
+    if !pending.is_empty() {
+        fault::check()?;
+    }
+    for id in pending {
+        match erase_one(c, spine, &id, true, by) {
+            Ok((s, _)) => {
+                spine = s;
+                finished.push(json!(id));
+            }
+            Err(e) => {
+                spine = open_spine(c)?;
+                unfinished.push(json!({"id": id, "error": e.message}));
+            }
+        }
+    }
+    Ok((spine, json!({"finished": finished, "unfinished": unfinished})))
+}
+
+/// **Remove one dump's content for good**: `cauldron soup dump-remove`.
+/// Without `yes` it is a dry run that changes nothing and says what would
+/// happen. With it, holding the store's writer lock (refused as
+/// [`Code::Locked`] while another writer, such as the `mcp` service, holds
+/// it), in two phases:
+///
+/// 1. **the mark**: one ordinary commit makes the dump a tombstone in state
+///    `removing` (the store is re-pinned from `dump@1` to `dump@2`, which
+///    adds that state and `removed`, on its first removal): `body`
+///    [`REMOVED_BODY`], `artifacts` empty, and `meta` only `{source: {kind},
+///    received_at, removed: {at, kind, bytes}}`. Title, source note,
+///    session id, cites, refs and the blob's sha256 are dropped. From here
+///    no read answers its content. Its id stays, so a soup record that
+///    cites it still finds it;
+/// 2. **the erasure** ([`erase_one`]): its blob is deleted unless another
+///    dump that is not removed holds the same bytes (that dump is named,
+///    and keeps them); the store's record of its writes is erased
+///    (`spine::erase`): every row that is not another dump's write has the
+///    old values replaced, and every string that is, or (for 8 bytes or
+///    more) holds, its text, title, source note or sha256 has that
+///    replaced; both databases are compacted, so the text is in no page and
+///    no log in the directory; and only then one more commit sets the state
+///    `removed`.
+///
+/// A removal cut short (a kill, a crash, a reader holding the log) leaves
+/// the dump `removing`, which every read says, with the command that
+/// finishes it. Running the removal again finishes it, and so does the next
+/// open of the store by a writer ([`Store::open`]). Removing a removed dump
+/// runs the erasure again and says it was already removed. Copies made
+/// elsewhere (backups, a moved-aside cauldron) are not touched.
+pub fn remove(c: &env::Cauldron, id: &str, yes: bool, by: &By) -> Result<Value> {
+    if !dump_id_ok(id) {
+        refuse!(Code::Usage, "REFUSED: `{id}` is not a dump id (DM-<n>)");
+    }
+    if !exists(c) {
+        refuse!(Code::NotFound, "REFUSED: cauldron `{}` holds no dump `{id}` (nothing has been dumped into it)", c.name);
+    }
+    fault::check()?;
+    let _lock = take_lock(c, &format!("cli {} dump-remove", std::process::id()))?;
+    let mut spine = open_spine(c)?;
+    let n = find(c, id)?;
+    let already = n.state.as_deref() == Some(grammar_dump::REMOVED);
+    let resumed = is_removing(&n);
+    let p = plan(c, id, &n)?;
+    let blob = if p.blob_paths.is_empty() {
+        "absent"
+    } else if p.shared.is_empty() {
+        "deleted"
+    } else {
+        "kept"
+    };
+    let mut doc = json!({
+        "env": c.env, "cauldron": c.name, "dump_id": id, "kind": p.kind.as_str(), "bytes": p.bytes,
+        "already_removed": already, "blob": blob,
+    });
+    if resumed {
+        doc["unfinished_removal"] = json!(true);
+    }
+    if !p.shared.is_empty() {
+        doc["same_bytes_in"] = json!(p.shared);
+        doc["note"] = json!(format!(
+            "{} hold the same bytes, so the blob is kept and the text is still in the store; remove them too to take it out",
+            p.shared.join(", ")
+        ));
+    }
+    if !yes {
+        doc["dry_run"] = json!(true);
+        if !is_tombstone(&n) {
+            doc["title"] = summary_of(&n)["title"].clone();
+        }
+        let mark = if resumed {
+            format!("finish the removal of {id}, which was marked `removing` and not finished")
+        } else {
+            format!("mark {id} removed (a tombstone: its id, kind, size and when it was received and removed stay)")
+        };
+        doc["would"] = json!([
+            mark,
+            match blob {
+                "deleted" => "delete its blob".to_string(),
+                "kept" => "keep its blob, which other dumps hold".to_string(),
+                _ => "delete no blob (it has none in the store)".to_string(),
+            },
+            "erase its text, title, source note and sha256 from the store's record of its writes, and compact the \
+             store's databases"
+                .to_string(),
+        ]);
+        doc["next"] = json!("run again with --yes to do it; it cannot be undone");
+        return Ok(doc);
+    }
+    if !is_tombstone(&n) {
+        let pin = spine.grammar(&pool()).map(|g| g.version).unwrap_or(0);
+        if pin < 2 {
+            spine = spine
+                .widen_states(&pool(), &grammar_dump::dumps_v2(POOL))
+                .map_err(|e| store_err(c, format!("re-pinning the store to dump@2: {e}")))?;
+        }
+        let removed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old = field(&n, "meta").cloned().unwrap_or(Value::Null);
+        let meta = json!({
+            "source": {"kind": old["source"]["kind"]},
+            "received_at": old["received_at"],
+            "removed": {"at": removed_at, "kind": p.kind.as_str(), "bytes": p.bytes},
+        });
+        let mut b = Bindings::new();
+        b.insert("body".into(), json!(REMOVED_BODY));
+        b.insert("meta".into(), meta);
+        b.insert("artifacts".into(), json!({}));
+        set_state(c, &spine, id, grammar_dump::REMOVING, b, " SET d.body = $body SET d.meta = $meta SET d.artifacts = $artifacts", by)?;
+        fault::at("marked");
+    }
+    let (spine, erased) = erase_one(c, spine, id, !already, by)?;
+    // Any other removal left unfinished is finished too.
+    let (_spine, others) = finish_pending(c, spine, by)?;
+    let now = find(c, id)?;
+    doc["state"] = json!(now.state);
+    doc["blob"] = erased["blob"].clone();
+    doc["removed_at"] = field(&now, "meta").map(|m| m["removed"]["at"].clone()).unwrap_or(Value::Null);
+    doc["history_rows_erased"] = erased["history_rows_erased"].clone();
+    doc["compacted"] = erased["compacted"].clone();
+    if others["finished"].as_array().is_some_and(|a| !a.is_empty()) {
+        doc["also_finished"] = others["finished"].clone();
+    }
+    if others["unfinished"].as_array().is_some_and(|a| !a.is_empty()) {
+        doc["still_unfinished"] = others["unfinished"].clone();
+    }
+    Ok(doc)
+}
+
+/// The command that removes dump `id` of `c`, exactly as it must be run:
+/// `--env` and `--cauldron` are taken only as flags.
+pub fn remove_command(c: &env::Cauldron, id: &str) -> String {
+    format!("cauldron soup dump-remove {id} --env {} --cauldron {} --yes", c.env, c.name)
+}
+
+/// The bindings of the commit that created dump `id`.
+fn created_bindings(c: &env::Cauldron, id: &str) -> Result<serde_json::Map<String, Value>> {
+    let d = dir(c);
+    let pool_conn = spine::offline::read_only_connection(&Pool::path_in(&d, &pool())).map_err(|e| store_err(c, e))?;
+    let hash: String = pool_conn
+        .query_row("SELECT created_tx FROM nodes WHERE id = ?1", [id], |r| r.get(0))
+        .map_err(|e| store_err(c, format!("reading `{id}`'s first write: {e}")))?;
+    let conn = spine::offline::read_only_connection(&d.join(spine::spine_db::SPINE_FILE)).map_err(|e| store_err(c, e))?;
+    let text: String = conn
+        .query_row("SELECT bindings FROM transactions WHERE hash = ?1 AND decided = 1", [&hash], |r| r.get(0))
+        .map_err(|e| store_err(c, format!("reading `{id}`'s first write: {e}")))?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(m)) => Ok(m),
+        _ => Err(store_err(c, format!("`{id}`'s first write will not parse"))),
+    }
+}
+
+/// The hashes of every write of a dump other than `id`: the rows erasure
+/// leaves as they are.
+fn others_writes(c: &env::Cauldron, id: &str) -> Result<std::collections::BTreeSet<String>> {
+    let conn = spine::offline::read_only_connection(&Pool::path_in(&dir(c), &pool())).map_err(|e| store_err(c, e))?;
+    let mut out = std::collections::BTreeSet::new();
+    for sql in [
+        "SELECT created_tx FROM nodes WHERE id != ?1",
+        "SELECT updated_tx FROM nodes WHERE id != ?1",
+        "SELECT updated_tx FROM node_fields WHERE node_id != ?1",
+    ] {
+        let mut s = conn.prepare(sql).map_err(|e| store_err(c, e))?;
+        let v = s
+            .query_map([id], |r| r.get::<_, String>(0))
+            .map_err(|e| store_err(c, e))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| store_err(c, e))?;
+        out.extend(v);
+    }
+    Ok(out)
+}
+
 // ------------------------------------------------------------------ reads
 
 /// The dumps store's committed-commit counter, read through a connection
@@ -880,8 +1349,19 @@ fn artifact(n: &NodeRecord) -> (Kind, Value) {
 
 /// One dump's summary: never its text.
 fn summary_of(n: &NodeRecord) -> Value {
-    let (kind, a) = artifact(n);
     let meta = field(n, "meta").cloned().unwrap_or(Value::Null);
+    if is_tombstone(n) {
+        let r = &meta["removed"];
+        let mut s = json!({
+            "id": n.id.0, "state": n.state, "kind": r["kind"], "bytes": r["bytes"],
+            "received_at": meta["received_at"], "removed_at": r["at"],
+        });
+        if is_removing(n) {
+            s["erasure"] = json!("unfinished");
+        }
+        return s;
+    }
+    let (kind, a) = artifact(n);
     let mut s = json!({
         "id": n.id.0,
         "state": n.state,
@@ -930,14 +1410,20 @@ pub fn list(c: &env::Cauldron, o: &ListOpts) -> Result<Value> {
         }
     }
     if let Some(s) = &o.state {
-        if !grammar_dump::DUMP_STATES.contains(&s.as_str()) {
-            refuse!(Code::Usage, "REFUSED: a dump's state is one of {}, not `{s}`", grammar_dump::DUMP_STATES.join(", "));
+        if !grammar_dump::DUMP_STATES_V2.contains(&s.as_str()) {
+            refuse!(Code::Usage, "REFUSED: a dump's state is one of {}, not `{s}`", grammar_dump::DUMP_STATES_V2.join(", "));
         }
     }
     let v: Vec<Value> = all(c)?
         .iter()
         .filter(|n| o.state.as_deref().is_none_or(|s| n.state.as_deref() == Some(s)))
-        .map(summary_of)
+        .map(|n| {
+            let mut s = summary_of(n);
+            if is_removing(n) {
+                s["finish_with"] = json!(remove_command(c, &n.id.0));
+            }
+            s
+        })
         .filter(|s| o.kind.as_deref().is_none_or(|k| s["kind"] == k))
         .collect();
     let total = v.len();
@@ -970,6 +1456,9 @@ fn text_window(bytes: &[u8]) -> (String, usize) {
 /// its text; a session dump's is its transcript, verbatim.
 pub fn get(c: &env::Cauldron, id: &str, offset: u64, max_chars: usize) -> Result<Value> {
     let n = find(c, id)?;
+    if is_tombstone(&n) {
+        return Ok(tombstone(c, &n));
+    }
     let (kind, a) = artifact(&n);
     let content: Vec<u8> = match kind {
         Kind::Text => field(&n, "body").and_then(Value::as_str).unwrap_or("").as_bytes().to_vec(),
@@ -1038,6 +1527,30 @@ fn window(c: &env::Cauldron, n: &NodeRecord, mut start: u64, total: u64, bytes: 
     }
     let used = if idx[lo] == text.len() { valid } else { idx[lo] };
     Ok(build(&text[..idx[lo]], used))
+}
+
+/// A removed dump, read: its tombstone, no content, nothing more to read.
+/// One whose removal is unfinished (`removing`) says so, and how to finish
+/// it: its content no longer reads, but its text may still be in the
+/// store's files until the erasure has run to the end.
+fn tombstone(c: &env::Cauldron, n: &NodeRecord) -> Value {
+    if is_removing(n) {
+        let cmd = remove_command(c, &n.id.0);
+        return json!({
+            "env": c.env, "cauldron": c.name, "dump": summary_of(n), "removed": true, "text": "", "more": false,
+            "erasure": "unfinished", "finish_with": cmd,
+            "note": format!(
+                "this dump is being removed and its removal is UNFINISHED: its content can no longer be read, but its \
+                 text may still be in the store's files. Finish it with `{cmd}`; it is also finished the next time \
+                 the store is opened for writing"
+            ),
+        });
+    }
+    json!({
+        "env": c.env, "cauldron": c.name, "dump": summary_of(n), "removed": true, "text": "", "more": false,
+        "erasure": "finished",
+        "note": "this dump was removed: its content is gone, and only its tombstone is left",
+    })
 }
 
 /// The dump `id` of `c`: `usage` when `id` is not a dump id, `not_found`
@@ -1326,6 +1839,9 @@ const TEXT_VIEW_SLACK: usize = 128;
 /// `next_turn_offset` says where the next page goes on in it.
 pub fn get_text(c: &env::Cauldron, id: &str, offset: u64, turn_offset: u64, max_chars: usize) -> Result<Value> {
     let n = find(c, id)?;
+    if is_tombstone(&n) {
+        return Ok(tombstone(c, &n));
+    }
     let (kind, a) = artifact(&n);
     if kind != Kind::Session {
         refuse!(
@@ -1498,6 +2014,22 @@ pub fn get_text(c: &env::Cauldron, id: &str, offset: u64, turn_offset: u64, max_
 /// text, or a session dump's transcript as it was stored.
 pub fn open_content(c: &env::Cauldron, id: &str) -> Result<Box<dyn Read>> {
     let n = find(c, id)?;
+    if is_removing(&n) {
+        refuse!(
+            Code::NotFound,
+            "REFUSED: `{id}` is being removed ({}) and its removal is unfinished: its content can no longer be read, \
+             but its text may still be in the store's files. Finish it with `{}`",
+            summary_of(&n)["removed_at"].as_str().unwrap_or("when, unknown"),
+            remove_command(c, id)
+        );
+    }
+    if is_tombstone(&n) {
+        refuse!(
+            Code::NotFound,
+            "REFUSED: `{id}` was removed ({}): its content is gone; only its tombstone is left",
+            summary_of(&n)["removed_at"].as_str().unwrap_or("when, unknown")
+        );
+    }
     let (kind, a) = artifact(&n);
     match kind {
         Kind::Text => Ok(Box::new(std::io::Cursor::new(field(&n, "body").and_then(Value::as_str).unwrap_or("").as_bytes().to_vec()))),
@@ -1556,8 +2088,8 @@ pub fn landed_after(c: &env::Cauldron, from: u64, head: u64, limit: usize) -> Re
         };
         for id in list {
             let n = snap.node(&NodeId(id.clone())).map_err(|e| store_err(c, e))?;
-            let (kind, a) = n.as_ref().map(artifact).unwrap_or((Kind::Text, Value::Null));
-            out.push(json!({"seq": seq, "at": at, "op": op, "id": id, "kind": kind.as_str(), "bytes": a["bytes"],
+            let sum = n.as_ref().map(summary_of).unwrap_or_else(|| json!({"kind": "text"}));
+            out.push(json!({"seq": seq, "at": at, "op": op, "id": id, "kind": sum["kind"], "bytes": sum["bytes"],
                             "state": n.and_then(|n| n.state)}));
         }
     }
@@ -2101,5 +2633,247 @@ mod tests {
         assert!(pages.len() > 1);
         assert_eq!(check_page_max(Some(PAGE_MIN_CHARS - 1)).err().unwrap().code, Code::Usage);
         assert!(check_page_max(Some(PAGE_MIN_CHARS)).is_ok() && check_page_max(None).is_ok());
+    }
+
+    /// Every file under `root`, read whole, and which of `needles` any of
+    /// them holds, with the file's name.
+    fn found_in(root: &Path, needles: &[&str]) -> Vec<(String, String)> {
+        let mut hits = vec![];
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                let bytes = std::fs::read(&p).unwrap();
+                for n in needles {
+                    if bytes.windows(n.len()).any(|w| w == n.as_bytes()) {
+                        hits.push((n.to_string(), p.display().to_string()));
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    fn remover() -> By {
+        By { thread: "cli".into(), dispatch: "cauldron soup dump-remove".into(), instrument: "test".into(), version: "0".into() }
+    }
+
+    /// The first phase of a removal alone: the dump marked `removing` and
+    /// nothing erased, as a kill right after the mark leaves it.
+    fn marked_only(c: &env::Cauldron, id: &str) {
+        let _lock = take_lock(c, "test").unwrap();
+        let mut spine = open_spine(c).unwrap();
+        if spine.grammar(&pool()).unwrap().version < 2 {
+            spine = spine.widen_states(&pool(), &grammar_dump::dumps_v2(POOL)).unwrap();
+        }
+        let n = find(c, id).unwrap();
+        let (kind, a) = artifact(&n);
+        let mut b = Bindings::new();
+        b.insert("body".into(), json!(REMOVED_BODY));
+        b.insert(
+            "meta".into(),
+            json!({"source": {"kind": "text"}, "received_at": field(&n, "meta").unwrap()["received_at"],
+                   "removed": {"at": "2026-01-01T00:00:00.000Z", "kind": kind.as_str(), "bytes": a["bytes"]}}),
+        );
+        b.insert("artifacts".into(), json!({}));
+        set_state(c, &spine, id, grammar_dump::REMOVING, b, " SET d.body = $body SET d.meta = $meta SET d.artifacts = $artifacts", &remover())
+            .unwrap();
+    }
+
+    /// A removal stopped after its mark: every read says the removal is
+    /// unfinished and names the command that finishes it, never `removed`,
+    /// while the text is still in the files; the next open of the store by
+    /// a writer finishes it (a byte scan finds nothing), and so, for another
+    /// dump, does running the removal again.
+    #[test]
+    fn an_unfinished_removal_says_so_and_is_finished_by_the_next_writer_or_a_re_run() {
+        let (t, c) = cauldron("unfinished");
+        let (one, two) = ("FIRST-UNFINISHED-MARKER", "SECOND-UNFINISHED-MARKER");
+        let s = Store::open(&c, "test").unwrap();
+        text_dump(&s, &format!("{one}\n").repeat(40), Some("title one"));
+        text_dump(&s, &format!("{two}\n").repeat(40), Some("title two"));
+        text_dump(&s, "a note that stays", None);
+        drop(s);
+
+        marked_only(&c, "DM-1");
+        assert!(!found_in(&t.0, &[one]).is_empty(), "the mark alone erases nothing");
+        let g = get(&c, "DM-1", 0, 1000).unwrap();
+        assert_eq!((g["dump"]["state"].clone(), g["erasure"].clone(), g["text"].clone()), (json!("removing"), json!("unfinished"), json!("")));
+        let cmd = "cauldron soup dump-remove DM-1 --env dev --cauldron kb --yes";
+        assert_eq!(g["finish_with"], cmd);
+        assert!(g["note"].as_str().unwrap().contains("UNFINISHED") && g["note"].as_str().unwrap().contains(cmd), "{g}");
+        let l = list(&c, &ListOpts::default()).unwrap();
+        let row = l["dumps"].as_array().unwrap().iter().find(|d| d["id"] == "DM-1").unwrap().clone();
+        assert_eq!((row["state"].clone(), row["erasure"].clone(), row["finish_with"].clone()), (json!("removing"), json!("unfinished"), json!(cmd)));
+        assert_eq!(counts(&c).unwrap()["by_state"], json!({"received": 2, "removing": 1}));
+        let raw = open_content(&c, "DM-1").err().unwrap();
+        assert!(raw.code == Code::NotFound && raw.message.contains("unfinished") && raw.message.contains(cmd), "{}", raw.message);
+        assert_eq!(list(&c, &ListOpts { state: Some("removing".into()), ..ListOpts::default() }).unwrap()["total"], 1);
+
+        // The next open by a writer finishes it.
+        let s = Store::open(&c, "test").unwrap();
+        assert_eq!(s.recovered["removals"], json!({"finished": ["DM-1"], "unfinished": []}), "{}", s.recovered);
+        drop(s);
+        assert!(found_in(&t.0, &[one, "title one"]).is_empty(), "{:?}", found_in(&t.0, &[one, "title one"]));
+        let g = get(&c, "DM-1", 0, 1000).unwrap();
+        assert_eq!((g["dump"]["state"].clone(), g["erasure"].clone()), (json!("removed"), json!("finished")));
+        // An open with nothing to finish says nothing about removals.
+        assert!(Store::open(&c, "test").unwrap().recovered.get("removals").is_none());
+
+        // Running the removal again finishes one too, and says it did.
+        marked_only(&c, "DM-2");
+        assert_eq!(get(&c, "DM-2", 0, 1000).unwrap()["dump"]["state"], "removing");
+        let dry = remove(&c, "DM-2", false, &remover()).unwrap();
+        assert_eq!(dry["unfinished_removal"], true);
+        assert!(dry["would"][0].as_str().unwrap().starts_with("finish the removal"), "{dry}");
+        let r = remove(&c, "DM-2", true, &remover()).unwrap();
+        assert_eq!((r["state"].clone(), r["already_removed"].clone(), r["unfinished_removal"].clone()), (json!("removed"), json!(false), json!(true)));
+        assert!(found_in(&t.0, &[one, two, "title one", "title two"]).is_empty());
+        // And again: idempotent.
+        let r = remove(&c, "DM-2", true, &remover()).unwrap();
+        assert_eq!((r["state"].clone(), r["already_removed"].clone()), (json!("removed"), json!(true)));
+        assert_eq!(get(&c, "DM-3", 0, 1000).unwrap()["text"], "a note that stays");
+    }
+
+    /// Removing one dump also finishes another left `removing`.
+    #[test]
+    fn a_removal_finishes_any_other_left_unfinished() {
+        let (t, c) = cauldron("others");
+        let s = Store::open(&c, "test").unwrap();
+        text_dump(&s, "OTHER-LEFT-UNFINISHED-MARKER", None);
+        text_dump(&s, "THIS-ONE-REMOVED-NOW-MARKER", None);
+        drop(s);
+        marked_only(&c, "DM-1");
+        let r = remove(&c, "DM-2", true, &remover()).unwrap();
+        assert_eq!(r["also_finished"], json!(["DM-1"]));
+        assert_eq!(get(&c, "DM-1", 0, 1000).unwrap()["dump"]["state"], "removed");
+        assert!(found_in(&t.0, &["OTHER-LEFT-UNFINISHED-MARKER", "THIS-ONE-REMOVED-NOW-MARKER"]).is_empty());
+    }
+
+    /// When erasing fails (here a reader holds the log, so it cannot be
+    /// emptied), the command the error says to run again is one that runs:
+    /// it names `--env` and `--cauldron`, which the CLI takes only as flags.
+    #[test]
+    fn a_failed_erasure_names_the_whole_command_that_finishes_it() {
+        let (_t, c) = cauldron("hint");
+        let s = Store::open(&c, "test").unwrap();
+        text_dump(&s, "a note held open by a reader while it is removed", None);
+        drop(s);
+        let reader = rusqlite::Connection::open(dir(&c).join(spine::spine_db::SPINE_FILE)).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let n: i64 = reader.query_row("SELECT count(*) FROM transactions", [], |r| r.get(0)).unwrap();
+        assert!(n >= 1);
+        let e = remove(&c, "DM-1", true, &remover()).err().expect("a held reader makes the compaction fail");
+        let cmd = "cauldron soup dump-remove DM-1 --env dev --cauldron kb --yes";
+        assert!(e.message.contains(&format!("`{cmd}`")), "{}", e.message);
+        assert_eq!(remove_command(&c, "DM-1"), cmd);
+        // Marked, not recorded: the state says the erasure is unfinished.
+        let g = get(&c, "DM-1", 0, 1000).unwrap();
+        assert_eq!((g["dump"]["state"].clone(), g["erasure"].clone(), g["finish_with"].clone()), (json!("removing"), json!("unfinished"), json!(cmd)));
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        assert_eq!(remove(&c, "DM-1", true, &remover()).unwrap()["state"], "removed");
+    }
+
+    #[test]
+    fn a_removed_dump_s_text_is_in_no_byte_of_the_cauldron_and_its_tombstone_stays() {
+        let (t, c) = cauldron("remove");
+        let secret = "PLANTED-SECRET-TOKEN-XYZZY";
+        let title = "TITLE-SECRET-PLUGH";
+        let in_transcript = "TRANSCRIPT-SECRET-FROB";
+        let shared = "SHARED-SECRET-QUUX";
+        let s = Store::open(&c, "test").unwrap();
+        let text = format!("before\n{secret} and \"quoted\" é\nafter\n").repeat(50);
+        let (d1, _) = text_dump(&s, &text, Some(title));
+        let (_, l2) = text_dump(&s, "an unrelated note that stays", Some("kept"));
+        let transcript = format!(
+            "{}\n{}\n",
+            json!({"type": "user", "message": {"role": "user", "content": format!("my key is {in_transcript}")}}),
+            json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "noted"}]}})
+        );
+        let l3 = session_dump(&s, &transcript);
+        let (_, l4) = text_dump(&s, shared, None);
+        let (_, l5) = text_dump(&s, shared, None);
+        let sha3 = Sha256::digest(transcript.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!((l2.id.as_str(), l3.id.as_str(), l4.id.as_str(), l5.id.as_str()), ("DM-2", "DM-3", "DM-4", "DM-5"));
+
+        // Refused while another writer holds the store.
+        assert_eq!(remove(&c, "DM-1", true, &remover()).err().unwrap().code, Code::Locked);
+        drop(s);
+        let all_needles = [secret, title, in_transcript, d1.blob.sha256.as_str(), sha3.as_str()];
+        assert_eq!(found_in(&t.0, &all_needles).len() >= 5, true, "planted: {:?}", found_in(&t.0, &all_needles));
+
+        // A dry run changes nothing.
+        let dry = remove(&c, "DM-1", false, &remover()).unwrap();
+        assert_eq!((dry["dry_run"].clone(), dry["blob"].clone(), dry["title"].clone()), (json!(true), json!("deleted"), json!(title)));
+        assert_eq!(get(&c, "DM-1", 0, 1000).unwrap()["dump"]["state"], "received");
+        assert!(found_in(&t.0, &[secret]).len() >= 2);
+
+        let r1 = remove(&c, "DM-1", true, &remover()).unwrap();
+        assert_eq!((r1["state"].clone(), r1["blob"].clone(), r1["already_removed"].clone()), (json!("removed"), json!("deleted"), json!(false)));
+        assert!(r1["removed_at"].is_string());
+        assert!(r1["history_rows_erased"].as_u64().unwrap() >= 1, "{r1}");
+        assert_eq!(r1["compacted"], json!(["dumps.db", "spine.db"]));
+        let r3 = remove(&c, "DM-3", true, &remover()).unwrap();
+        assert_eq!((r3["kind"].clone(), r3["blob"].clone()), (json!("session"), json!("deleted")));
+
+        // The byte scan: nothing of DM-1 or DM-3 is left in any file.
+        let hits = found_in(&t.0, &all_needles);
+        assert!(hits.is_empty(), "left behind: {hits:?}");
+
+        // The tombstones read back; their content does not.
+        let g = get(&c, "DM-1", 0, 1000).unwrap();
+        assert_eq!((g["removed"].clone(), g["text"].clone(), g["dump"]["state"].clone()), (json!(true), json!(""), json!("removed")));
+        assert_eq!(g["erasure"], "finished");
+        assert_eq!(g["dump"]["kind"], "text");
+        assert_eq!(g["dump"]["bytes"], json!(text.len()));
+        assert!(g["dump"]["removed_at"].is_string() && g["dump"]["received_at"].is_string());
+        assert!(g["dump"].get("sha256").is_none() && g["dump"].get("title").is_none());
+        assert_eq!(get_text(&c, "DM-3", 0, 0, 2000).unwrap()["dump"]["kind"], "session");
+        assert_eq!(open_content(&c, "DM-1").err().unwrap().code, Code::NotFound);
+        assert_eq!(counts(&c).unwrap()["by_state"], json!({"received": 3, "removed": 2}));
+        let removed = list(&c, &ListOpts { state: Some("removed".into()), ..ListOpts::default() }).unwrap();
+        assert_eq!(removed["total"], 2);
+        // The rest is untouched.
+        assert_eq!(get(&c, "DM-2", 0, 1000).unwrap()["text"], "an unrelated note that stays");
+        // Each removal is two commits (`removing`, then `removed`); the
+        // changes feed names the dump once, at its last.
+        let after = landed_after(&c, 5, 9, 10).unwrap();
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert_eq!((after[0]["op"].clone(), after[0]["id"].clone(), after[0]["state"].clone()), (json!("update"), json!("DM-1"), json!("removed")));
+
+        // The same bytes in another dump: the blob is kept, and that is said.
+        let r4 = remove(&c, "DM-4", true, &remover()).unwrap();
+        assert_eq!((r4["blob"].clone(), r4["same_bytes_in"].clone()), (json!("kept"), json!(["DM-5"])));
+        assert_eq!(get(&c, "DM-5", 0, 1000).unwrap()["text"], shared);
+        let r5 = remove(&c, "DM-5", true, &remover()).unwrap();
+        assert_eq!(r5["blob"], "deleted");
+        assert!(found_in(&t.0, &[shared]).is_empty());
+
+        // Again: finishes nothing new, says so.
+        let again = remove(&c, "DM-1", true, &remover()).unwrap();
+        assert_eq!((again["already_removed"].clone(), again["blob"].clone()), (json!(true), json!("absent")));
+        assert_eq!(remove(&c, "DM-9", true, &remover()).err().unwrap().code, Code::NotFound);
+
+        // A dump whose text and title are short words the store itself uses
+        // ("dump", "text"): removed, and the store's record still reads.
+        let s = Store::open(&c, "test").unwrap();
+        let (_, l7) = text_dump(&s, "dump", Some("text"));
+        drop(s);
+        assert_eq!(remove(&c, &l7.id, true, &remover()).unwrap()["state"], "removed");
+        assert_eq!(get(&c, &l7.id, 0, 1000).unwrap()["dump"]["state"], "removed");
+        assert_eq!(get(&c, "DM-2", 0, 1000).unwrap()["text"], "an unrelated note that stays");
+        assert_eq!(landed_after(&c, 0, 20, 30).unwrap().len(), 11, "six dumps, five removals");
+
+        // The store reopens, is pinned at dump@2, and takes new dumps.
+        let s = Store::open(&c, "test").unwrap();
+        assert_eq!(s.recovered["interrupted"], "none");
+        assert_eq!(s.spine.grammar(&pool()).unwrap().version, 2);
+        let (_, l8) = text_dump(&s, "after the removals", None);
+        assert_eq!(l8.id, "DM-7");
     }
 }

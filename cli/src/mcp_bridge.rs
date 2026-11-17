@@ -234,6 +234,17 @@ impl Bridge {
                 return;
             }
         };
+        // One request per line: a JSON-RPC batch (an array), or anything
+        // else that is not an object, is answered here, never relayed.
+        if !msg.is_object() {
+            self.write(&shapewire::mcp::error_body(
+                Value::Null,
+                shapewire::mcp::rpc::INVALID_REQUEST,
+                "invalid request: send one JSON-RPC message per line; a batch (an array) is not supported",
+                None,
+            ));
+            return;
+        }
         self.ctx.apply(&mut msg);
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let e = match &self.e {
@@ -280,6 +291,12 @@ enum Relayed {
     Down(String),
     /// The service is there and the relay failed.
     Failed(String),
+}
+
+/// Is `s` a `${NAME}` placeholder nobody substituted?
+fn unsubstituted(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with("${") && s.ends_with('}')
 }
 
 fn relay(e: &Environment, msg: &Value) -> Relayed {
@@ -778,7 +795,9 @@ fn dump_session(e: &Environment, ctx: &Ctx, msg: &Value) -> Value {
         return refused_answer(id, "usage", "the arguments of soup_dump_session must be an object. Nothing was read or written.".into());
     };
     let session = match args.get("session_id") {
-        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        // A `${...}` left as it was written (a command whose variable was
+        // not substituted) names no session: this session's id is used.
+        Some(Value::String(s)) if !s.trim().is_empty() && !unsubstituted(s) => Some(s.trim().to_string()),
         None | Some(Value::Null) | Some(Value::String(_)) => ctx.0.get("session_id").and_then(Value::as_str).map(str::to_string),
         Some(_) => return refused_answer(id, "usage", "`session_id` of soup_dump_session must be a string. Nothing was read or written.".into()),
     };

@@ -1,5 +1,5 @@
 //! **`cauldron create --seed` IS REFUSED IN THIS RELEASE.** The `--seed`
-//! hook `cauldrons::create` calls. Seeding a cauldron with the curated demo
+//! hook `cauldrons::create_seeded` calls. Seeding a cauldron with the curated demo
 //! needs a rework of the demo crate that is not in 0.1.x (here the demo is
 //! an environment, `env create cauldron-build`), so:
 //!
