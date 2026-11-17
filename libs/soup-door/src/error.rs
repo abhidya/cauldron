@@ -46,6 +46,8 @@ pub enum Code {
     /// An act that only a person at a terminal may perform was run without
     /// one.
     NotATerminal,
+    /// A dump is larger than one dump may be.
+    TooLarge,
 }
 
 impl Code {
@@ -68,6 +70,7 @@ impl Code {
             Code::CauldronGone => "cauldron_gone",
             Code::GrantStore => "grant_store",
             Code::NotATerminal => "not_a_terminal",
+            Code::TooLarge => "too_large",
         }
     }
 }

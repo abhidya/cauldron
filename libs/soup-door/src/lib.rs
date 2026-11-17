@@ -17,6 +17,7 @@ pub mod error;
 pub mod budget;
 pub mod catalogue;
 pub mod cut;
+pub mod dumps;
 pub mod grants;
 pub mod import;
 pub mod lock;

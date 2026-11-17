@@ -6,9 +6,9 @@
 //!  "outcome":"landed","tx":"<hex>","counts":{"records":3,"accepted":3,"refused":0}}
 //! ```
 //!
-//! It never holds record text, a citation, a link note or the door secret:
-//! only who, which cauldron, which tool, how it came out, the transaction
-//! and counts. An open adds what the open recovered (transaction hashes and
+//! It never holds record text, a dump's text or transcript, a citation, a
+//! link note or the door secret: only who, which cauldron, which tool, how it
+//! came out, the transaction and counts (and a landed dump's id and size). An open adds what the open recovered (transaction hashes and
 //! id ranges, never text).
 
 use std::io::Write;
@@ -41,6 +41,8 @@ pub struct Line {
     pub recovered: Option<Value>,
     /// Only on a `close`: why.
     pub reason: Option<String>,
+    /// Only on a dump that landed: its id (never its text).
+    pub dump: Option<String>,
 }
 
 impl Audit {
@@ -71,6 +73,9 @@ impl Audit {
         }
         if let Some(r) = l.reason {
             v["reason"] = json!(r);
+        }
+        if let Some(d) = l.dump {
+            v["dump"] = json!(d);
         }
         let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let wrote = std::fs::OpenOptions::new()

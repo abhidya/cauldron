@@ -251,6 +251,7 @@ be migrated, not refused.
 | `commit` | `repo`, `sha` |
 | `url` | `url` |
 | `thread` | `thread`, `msg` |
+| `dump` | `id`: a dump (`DM-<n>`) in the same cauldron's dumps store, the raw text the record came from |
 
 ```json
 "meta": {"cites": [{"kind": "url", "url": "https://example.com/spec"},

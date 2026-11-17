@@ -2,7 +2,9 @@
 
 Use a Cauldron **soup** (a cauldron's typed knowledge graph) from a Claude
 Code session: the plugin's MCP server gives the session tools to read,
-search and write the soups their owner has opened to it, a `curator`
+search and write the soups their owner has opened to it, and to keep raw
+text or a whole session transcript in a cauldron as a **dump** for later
+processing; a `curator`
 subagent turns notes, a conversation excerpt or findings into schema-valid
 soup records and lands them, and the published schema ships with the plugin
 so the session can read it.
@@ -18,6 +20,8 @@ Everything runs on the same machine as the cauldron. The MCP server is
 | `.mcp.json` | the MCP server `cauldron`: `cauldron mcp stdio` |
 | `agents/curator.md` | the curator subagent (`cauldron:curator`) |
 | `commands/curate.md` | `/cauldron:curate <cauldron> [--env <env>] [what to record]` |
+| `commands/dump.md` | `/cauldron:dump [<cauldron>] [--title <t>] <file or text>`: keep text as a dump |
+| `commands/dump-session.md` | `/cauldron:dump-session [title]`: keep this session's transcript as a dump |
 | `skills/soup-schema/SKILL.md` | `/cauldron:soup-schema`: the schema in brief, with a pointer to the full README |
 | `schema/` | a copy of the published schema (`schema/soup/workspace-v6/` in the Cauldron repository): `README.md`, `grammar.json`, `edges.json`, one JSON Schema per node type |
 
@@ -93,7 +97,7 @@ cauldron mcp status --env dev                        # the service and what it h
   no option skips that: an agent, whose shell has no terminal, cannot open a
   cauldron for itself, and no MCP tool can grant, revoke or list grants. The
   default scopes are `read,write,dump` (`--scopes read` opens it read-only;
-  `dump` is not used by any tool in this release).
+  `dump` lets sessions keep dumps in it, see below).
 - A grant opens the cauldron to the Claude Code sessions you run on this
   machine against that environment, whichever directory they work in: any
   session can reach it by naming it (a call's `cauldron` argument, or
@@ -127,9 +131,10 @@ ceiling 50,000), `soup_put` (records in the published shape,
 judged and landed as one all-or-nothing write, with `dry_run`, `remint`,
 `partial`, `cite` and `allow_duplicate`; the session is cited on every record
 when Claude Code passes its id), `soup_link` (edges between nodes the soup
-holds) and `soup_changes` (what landed since a cursor). `soup_claim`,
-`soup_dump` and `soup_dump_session` are listed and refuse
-(`unsupported`, `not_available_yet`). A refusal is a tool result with a
+holds) and `soup_changes` (what landed since a cursor, the soup's changes
+and the dumps), and the dump tools below. `soup_claim` is listed and always
+refuses (`unsupported`: this schema has no clusters). A refusal is a tool
+result with a
 typed `code` (`not_granted`, `no_cauldron_for_project`, `records_refused`,
 `batch_already_landed`, …) and a message that says what to do.
 
@@ -148,7 +153,91 @@ cauldron is never held, and the CLI works on it as before.
 
 Every write through the door adds a line to `<root>/data/<env>/mcp/calls.jsonl`
 (when, which client and session, which tool, the outcome and counts; never
-record text).
+record text, and never a dump's text or transcript).
+
+## Dumps
+
+A **dump** is raw text put into a cauldron for later processing: a note, a
+paste, a file, or a whole Claude Code session. It is not a soup record and
+does not go into the soup. It lands as `DM-<n>` in state `received` in the
+cauldron's **dumps store**, `<cauldron>/dumps/` beside its soup (its own
+small spine and a content-addressed blob store, made on the first dump), as
+one write. Nothing processes dumps in this release: they wait as
+`received`, and processing of dumps comes in a later release. A soup record
+that came from a dump can cite it: `meta.cites: [{"kind": "dump", "id": "DM-3"}]`.
+
+- `/cauldron:dump <file or text>` (the tool `soup_dump`) keeps up to 1 MiB of
+  text, verbatim; larger is refused as `too_large`, to be split. It takes a
+  `title`, a `source` (where the text came from), a `cite` and `refs` (soup
+  ids it is about).
+- `/cauldron:dump-session [title]` (the tool `soup_dump_session`) keeps this
+  session's transcript, or another session's by `session_id`. The bridge,
+  which runs as you beside the session, finds the transcript by the session's
+  id, only as `<config>/projects/*/<id>.jsonl` under `$CLAUDE_CONFIG_DIR`
+  (else `~/.claude`), and streams it to the service; no tool takes a path,
+  and the service reads none. It follows no link there: a project directory
+  or a transcript that is a link, a transcript with a second name (a hard
+  link), or one whose real path is outside `<config>/projects` is refused as
+  `transcript_link`, and a FIFO, device or directory in its place as
+  `transcript_unreadable`; nothing of it is read. At most 64 MiB.
+  `session_unknown` when there is no transcript of that id;
+  `transcript_unreadable` when the store or the file cannot be read. The
+  stored blob's sha256 is the transcript file's.
+- **A session transcript is stored verbatim.** It holds every message, every
+  tool call and its output (file contents, command output), and anything
+  pasted into the session, including any secret that passed through it. It
+  is kept as it is, in your own cauldron on this machine, in the cauldron's
+  dumps store.
+- **The dumps store is yours alone.** `dumps/` and `dumps/blobs/` are mode
+  0700 and every file in them (the databases, which hold a text dump's
+  text, and the blobs) 0600, whatever your umask. A store made by a build
+  that did not do this is set so the next time it is opened for writing.
+- Every dump answers a receipt: its id, `state: received`, size, sha256 and
+  the change cursor; never the text.
+- `soup_dumps` lists the dumps (`read`; never their text), and
+  `soup_dump_get` reads one's content from a byte `offset`, as much as fits
+  `max_chars`, with `next_offset` while there is more. Reading a dump's
+  content needs both `read` and `dump`: a dump is raw material, and a
+  transcript can hold tool output and pasted secrets, so a grant made only
+  to read the knowledge graph does not hand it out.
+- Writing a dump needs the `dump` scope. The service opens a cauldron's
+  dumps store on its first dump and holds it until the grant loses `dump`
+  or is revoked, or the service stops. It reads the grant again just before
+  each dump is written, and every 4 MiB while a transcript arrives.
+- **What the grant covers.** The scopes govern Claude Code sessions, which
+  reach dumps through the MCP service. `cauldron soup dumps` and `cauldron
+  soup dump-get` (`--raw` included) run as you and read any dump without a
+  grant, like every other CLI read; so a session allowed to run shell
+  commands as you can read dumps that way too. The scopes gate the MCP door;
+  they do not lock the files.
+- **A dump that does not land leaves nothing.** A dump refused or failed at
+  any step (a grant revoked while a transcript arrives included) leaves no
+  bytes: its partly written file is removed, and so is any blob no dump
+  names. If a writer is killed while a dump is written, what it left is
+  removed the next time that dumps store is opened for writing.
+- **A dump cannot be deleted in this release.** There is no verb and no tool
+  that removes one dump. If a dump holds something it must not (a secret in
+  a transcript), remove the cauldron's whole dumps store by hand:
+  1. Stop the service (`cauldron --env <env> stop mcp`) or revoke the
+     cauldron (`cauldron mcp revoke <cauldron> --env <env>`), so nothing
+     holds the store.
+  2. Remove the directory `<root>/data/<env>/cauldrons/<cauldron>/dumps/`
+     (`<root>` is `~/.cauldron`, or `$CAULDRON_HOME`; for the implicit
+     legacy cauldron, `<root>/data/<env>/soup/dumps/`).
+
+  That removes every dump of that cauldron, not just one; the soup is not
+  touched, and the next dump starts a new, empty store at `DM-1`. Removing a
+  blob alone is not enough: a text dump's text is also in the store's two
+  databases. A change cursor taken before the removal no longer fits the
+  new store (it is refused as `cursor_stale`, or misses dumps): call
+  `soup_changes` without `since` for a new one. Treat a secret that was
+  dumped as exposed, and change it.
+- From a shell: `cauldron soup dump <file|-> --env E --cauldron C [--title T]
+  [--source S]`, `cauldron soup dumps --env E --cauldron C` and `cauldron
+  soup dump-get <id> --env E --cauldron C [--offset N] [--max-chars N]
+  [--raw]` (`--raw` prints the content verbatim). While the service holds
+  the dumps store, `soup dump` is sent to it (its JSON says `forwarded_to`);
+  otherwise it writes directly.
 
 A new soup has **no regions**, and the curator never invents one. On the first
 run it files nothing it cannot place and proposes regions instead; approve

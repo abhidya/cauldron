@@ -385,9 +385,9 @@ fn pool() -> PoolName {
 }
 
 fn cursor_after(c: &spine::Cauldron, t: &Target) -> Value {
-    match c.committed_commit_counter() {
-        Ok(n) => json!(crate::cursor::cursor(&t.cauldron, n)),
-        Err(_) => Value::Null,
+    match (c.committed_commit_counter(), soup_door::dumps::counter(&t.cauldron)) {
+        (Ok(n), Ok(d)) => json!(crate::cursor::cursor(&t.cauldron, n, d)),
+        _ => Value::Null,
     }
 }
 

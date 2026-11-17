@@ -45,6 +45,21 @@
 //! - [`BODY_TIMEOUT`] (10 s) for a whole body, [`BUDGET_WAIT`] (10 s) for a
 //!   share of the budget: 16 MiB crosses loopback in milliseconds.
 //!
+//! # `POST /mcp/dump-session`
+//!
+//! The second route carries `soup_dump_session` from the stdio bridge: the
+//! `tools/call` message on the body's first line (at most
+//! `SESSION_HEAD_LIMIT`, 64 KiB), then the session's transcript, verbatim.
+//! The same three checks run first (secret, `Host`, `Origin`), then the
+//! `Content-Length` (required, at most the 64 MiB transcript limit plus the
+//! first line). Only the first line is read before the call is judged
+//! (`_ctx`, the cauldron, the `dump` grant, the size); a refused call is
+//! answered without reading a byte of the transcript. The transcript is
+//! then streamed to the dumps store's blob store, never held whole in
+//! memory, and must arrive within [`SESSION_BODY_TIMEOUT`]. At most
+//! [`SESSION_SLOTS`] such requests are read at once; another waits up to
+//! [`BUDGET_WAIT`] for a slot, then is answered **503** `busy`.
+//!
 //! The listener is bound to `127.0.0.1` only ([`bind`]); nothing here
 //! binds another address.
 
@@ -66,6 +81,7 @@ use shapewire::mcp::rpc;
 use tokio::sync::{watch, Semaphore};
 
 use crate::door::Tools;
+use soup_door::catalogue::{SESSION_HEAD_LIMIT, SESSION_PATH};
 
 /// The fixed port in `prod`, where the bridge and the faces read no seam.
 /// Every other environment's port is the kernel's choice, published
@@ -95,6 +111,16 @@ pub const BUDGET_WAIT: Duration = Duration::from_secs(10);
 /// Each connection's read buffer (the head must fit in it).
 pub const READ_BUFFER: usize = 64 * 1024;
 
+/// How many bytes of a transcript arrive between two reads of its grant.
+const SESSION_GRANT_CHECK: u64 = 4 * 1024 * 1024;
+
+/// A session dump's transcript must arrive within this (64 MiB crosses
+/// loopback in well under a second; a slow disk is given room).
+pub const SESSION_BODY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Session dumps read at once.
+pub const SESSION_SLOTS: usize = 2;
+
 /// The loopback host this door binds, and the only one.
 pub const HOST: &str = "127.0.0.1";
 
@@ -110,12 +136,23 @@ struct Http {
     identity: Identity,
     port: u16,
     budget: Arc<Semaphore>,
+    sessions: Arc<Semaphore>,
 }
 
-/// The router: `POST /mcp`, and 405 for `GET`/`DELETE` there.
+/// The router: `POST /mcp` and `POST /mcp/dump-session`, and 405 for
+/// `GET`/`DELETE` there.
 pub fn router(tools: Tools, identity: Identity, addr: SocketAddr) -> Router {
-    let state = Arc::new(Http { tools, identity, port: addr.port(), budget: Arc::new(Semaphore::new(INFLIGHT_BODY_BYTES)) });
-    Router::new().route(PATH, axum::routing::post(post).get(not_allowed).delete(not_allowed)).with_state(state)
+    let state = Arc::new(Http {
+        tools,
+        identity,
+        port: addr.port(),
+        budget: Arc::new(Semaphore::new(INFLIGHT_BODY_BYTES)),
+        sessions: Arc::new(Semaphore::new(SESSION_SLOTS)),
+    });
+    Router::new()
+        .route(PATH, axum::routing::post(post).get(not_allowed).delete(not_allowed))
+        .route(SESSION_PATH, axum::routing::post(session).get(not_allowed).delete(not_allowed))
+        .with_state(state)
 }
 
 /// **Serve `app` on `listener`** until `stop` resolves: at most
@@ -208,10 +245,8 @@ async fn read_body(body: axum::body::Body, len: usize) -> Option<Vec<u8>> {
     (out.len() == len).then_some(out)
 }
 
-async fn post(State(h): State<Arc<Http>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    let headers = &parts.headers;
-    // 1-3: who, from where. Nothing of the body has been read.
+/// Checks 1-3 of the module docs: who, from where. `Some` is the refusal.
+fn guard(h: &Http, headers: &axum::http::HeaderMap) -> Option<Response> {
     let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     if !h.tools.0.admits(auth) {
         let mut r = refuse(
@@ -221,18 +256,32 @@ async fn post(State(h): State<Arc<Http>>, req: Request) -> Response {
             None,
         );
         r.headers_mut().insert("www-authenticate", HeaderValue::from_static("Bearer realm=\"cauldron-mcp\""));
-        return r;
+        return Some(r);
     }
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
     let allowed = [format!("{HOST}:{}", h.port), format!("localhost:{}", h.port)];
     if !allowed.iter().any(|a| a == host) {
-        return refuse(StatusCode::FORBIDDEN, rpc::SERVER, "forbidden: the Host header must name this loopback door", None);
+        return Some(refuse(StatusCode::FORBIDDEN, rpc::SERVER, "forbidden: the Host header must name this loopback door", None));
     }
     if headers.contains_key(header::ORIGIN) {
-        return refuse(StatusCode::FORBIDDEN, rpc::SERVER, "forbidden: a request with an Origin (a web page) is never served here", None);
+        return Some(refuse(StatusCode::FORBIDDEN, rpc::SERVER, "forbidden: a request with an Origin (a web page) is never served here", None));
+    }
+    None
+}
+
+fn content_length(headers: &axum::http::HeaderMap) -> Option<u64> {
+    headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+async fn post(State(h): State<Arc<Http>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let headers = &parts.headers;
+    // 1-3: who, from where. Nothing of the body has been read.
+    if let Some(r) = guard(&h, headers) {
+        return r;
     }
     // 4: how much. A body without a declared length is not read at all.
-    let Some(len) = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok()) else {
+    let Some(len) = content_length(headers) else {
         return refuse(StatusCode::LENGTH_REQUIRED, rpc::SERVER, "length_required: this door reads only a body with a Content-Length", None);
     };
     if len > BODY_LIMIT as u64 {
@@ -281,4 +330,146 @@ async fn post(State(h): State<Arc<Http>>, req: Request) -> Response {
     drop(bytes);
     drop(share);
     answer
+}
+
+fn answer(id: Value, out: Result<Value, shapewire::envelope::Refusal>) -> Response {
+    use shapewire::mcp::{result_body, tool_refused, tool_result};
+    let payload = match out {
+        Ok(v) => tool_result(v),
+        Err(r) => tool_refused(&r),
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, HeaderValue::from_static("application/json")), (header::CONNECTION, HeaderValue::from_static("close"))],
+        result_body(id, payload).to_string(),
+    )
+        .into_response()
+}
+
+/// `POST /mcp/dump-session` (module docs).
+async fn session(State(h): State<Arc<Http>>, req: Request) -> Response {
+    use http_body_util::BodyExt;
+    use std::io::Write;
+    let (parts, body) = req.into_parts();
+    if let Some(r) = guard(&h, &parts.headers) {
+        return r;
+    }
+    let Some(len) = content_length(&parts.headers) else {
+        return refuse(StatusCode::LENGTH_REQUIRED, rpc::SERVER, "length_required: this door reads only a body with a Content-Length", None);
+    };
+    let most = soup_door::dumps::TRANSCRIPT_LIMIT + SESSION_HEAD_LIMIT as u64 + 1;
+    if len > most {
+        return refuse(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            rpc::SERVER,
+            &format!(
+                "too_large: this session dump is {len} bytes, and a transcript is at most {} ({}). Nothing was read or written.",
+                soup_door::dumps::TRANSCRIPT_LIMIT,
+                mib(soup_door::dumps::TRANSCRIPT_LIMIT as usize)
+            ),
+            Some(json!({"code": "too_large", "limit_bytes": soup_door::dumps::TRANSCRIPT_LIMIT, "content_length": len})),
+        );
+    }
+    let _slot = match tokio::time::timeout(BUDGET_WAIT, h.sessions.clone().acquire_owned()).await {
+        Ok(Ok(p)) => p,
+        _ => {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                rpc::SERVER,
+                &format!("busy: {SESSION_SLOTS} session dumps are being read already. Nothing was read or written. Try again."),
+                Some(json!({"code": "busy"})),
+            )
+        }
+    };
+    // The call's line, and nothing more is judged until it has been.
+    let mut body = body;
+    let mut head: Vec<u8> = Vec::new();
+    let read_head = async {
+        while !head.contains(&b'\n') {
+            if head.len() > SESSION_HEAD_LIMIT {
+                return false;
+            }
+            match body.frame().await {
+                Some(Ok(f)) => {
+                    if let Ok(d) = f.into_data() {
+                        head.extend_from_slice(&d);
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    };
+    match tokio::time::timeout(BODY_TIMEOUT, read_head).await {
+        Ok(true) => {}
+        Ok(false) => return refuse(StatusCode::BAD_REQUEST, rpc::SERVER, "bad_request: the body's first line is not a call within 64 KiB", None),
+        Err(_) => return refuse(StatusCode::REQUEST_TIMEOUT, rpc::SERVER, "timeout: the call did not arrive. Nothing was written.", None),
+    }
+    let nl = head.iter().position(|b| *b == b'\n').expect("read to a newline");
+    if nl > SESSION_HEAD_LIMIT || (nl as u64) + 1 > len {
+        return refuse(StatusCode::BAD_REQUEST, rpc::SERVER, "bad_request: the body's first line is not a call within 64 KiB", None);
+    }
+    let rest = head.split_off(nl + 1);
+    head.truncate(nl);
+    let (id, arguments) = match shapewire::mcp::parse(&head) {
+        Ok(shapewire::mcp::Incoming::Request { id, method, params })
+            if method == "tools/call" && params.get("name").and_then(Value::as_str) == Some("soup_dump_session") =>
+        {
+            (id, params.get("arguments").cloned().unwrap_or(Value::Null))
+        }
+        Ok(_) => {
+            return refuse(StatusCode::BAD_REQUEST, rpc::INVALID_REQUEST, "bad_request: this route takes only a `tools/call` of soup_dump_session", None)
+        }
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, e.code, &e.message, None),
+    };
+    let transcript = len - nl as u64 - 1;
+    let door = h.tools.0.clone();
+    let begun = tokio::task::spawn_blocking(move || door.session_begin(arguments, transcript)).await;
+    let mut s = match begun {
+        Ok(Ok(s)) => s,
+        Ok(Err(r)) => return answer(id, Err(r)),
+        Err(e) => return answer(id, Err(shapewire::envelope::Refusal::new("store", format!("the call failed inside the service: {e}")))),
+    };
+    let too_large = || crate::door::too_large_transcript(transcript);
+    let door = h.tools.0.clone();
+    let stream = async {
+        if s.blob.write_all(&rest).is_err() {
+            return Err(too_large());
+        }
+        // The grant is read again every few MiB: a revoke stops the reading.
+        let mut check_at = SESSION_GRANT_CHECK;
+        while s.blob.bytes() < transcript {
+            if s.blob.bytes() >= check_at {
+                door.session_still_allowed(&s)?;
+                check_at = s.blob.bytes() + SESSION_GRANT_CHECK;
+            }
+            match body.frame().await {
+                Some(Ok(f)) => {
+                    if let Ok(d) = f.into_data() {
+                        if let Err(e) = s.blob.write_all(&d) {
+                            return Err(if e.kind() == std::io::ErrorKind::FileTooLarge || s.blob.bytes() + d.len() as u64 > transcript {
+                                too_large()
+                            } else {
+                                shapewire::envelope::Refusal::new("store", format!("writing the transcript: {e}"))
+                            });
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    };
+    let arrived = match tokio::time::timeout(SESSION_BODY_TIMEOUT, stream).await {
+        Ok(r) => r,
+        Err(_) => Err(shapewire::envelope::Refusal::new(
+            "timeout",
+            format!("the transcript did not arrive within {} s. Nothing was written.", SESSION_BODY_TIMEOUT.as_secs()),
+        )),
+    };
+    let door = h.tools.0.clone();
+    let out = tokio::task::spawn_blocking(move || door.session_finish(s, arrived))
+        .await
+        .unwrap_or_else(|e| Err(shapewire::envelope::Refusal::new("store", format!("the call failed inside the service: {e}"))));
+    answer(id, out)
 }

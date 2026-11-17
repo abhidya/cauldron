@@ -43,6 +43,24 @@
 //! **The secret** is read from the environment's `mcp/door.secret` for each
 //! request and written only to the door's socket: never to stdout, stderr
 //! or an error message.
+//!
+//! **`soup_dump_session`** is the one call the bridge does not pass on as it
+//! is. The bridge runs as the user, beside the session, so it is the one that
+//! finds the transcript: the session is the call's `session_id`, else this
+//! session (`$CLAUDE_CODE_SESSION_ID`); the id must be a plain id (no path
+//! separator, never `.` or `..`); and the transcript is looked for only as
+//! `<config>/projects/*/<id>.jsonl`, `<config>` being `$CLAUDE_CONFIG_DIR`,
+//! else `~/.claude`. No link is followed under `<config>/projects`: a linked
+//! project directory or file, a file with a second name, or one whose real
+//! path is not in the projects store is `transcript_link`, and a FIFO,
+//! socket or device in its place is `transcript_unreadable`; in both cases
+//! nothing of it is read. None there is `session_unknown`; a store or file
+//! that cannot be read is `transcript_unreadable`, never "absent". A transcript
+//! over 64 MiB is `too_large`, and nothing is sent. Otherwise the call goes
+//! to the service's `/mcp/dump-session` route with the transcript's bytes
+//! streamed after it: as the transcript stood when the bridge looked at it,
+//! and when it has grown since (the session is still writing it), up to its
+//! last whole line. The service reads no path.
 
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
@@ -59,6 +77,20 @@ pub const CLIENT: &str = "claude-code";
 
 /// The variable Claude Code sets to the session's id.
 pub const SESSION_VAR: &str = "CLAUDE_CODE_SESSION_ID";
+
+/// The tool whose transcript the bridge finds and sends itself.
+pub const DUMP_SESSION: &str = "soup_dump_session";
+
+/// The refusal code for a session with no transcript on this machine.
+pub const SESSION_UNKNOWN: &str = "session_unknown";
+
+/// The refusal code for a transcript store or file that cannot be read.
+pub const TRANSCRIPT_UNREADABLE: &str = "transcript_unreadable";
+
+/// The refusal code for a transcript reached through a link (a linked
+/// file or project directory, a second name, or a path leading outside the
+/// projects store). Nothing of it is read.
+pub const TRANSCRIPT_LINK: &str = "transcript_link";
 
 /// The refusal code for a call made while the service is down.
 pub const SERVICE_DOWN: &str = "service_down";
@@ -213,6 +245,12 @@ impl Bridge {
                 return;
             }
         };
+        let is_dump_session = msg.get("method").and_then(Value::as_str) == Some("tools/call")
+            && msg.pointer("/params/name").and_then(Value::as_str) == Some(DUMP_SESSION);
+        if is_dump_session && !id.is_null() {
+            self.write(&dump_session(e, &self.ctx, &msg));
+            return;
+        }
         match relay(e, &msg) {
             Relayed::Answer(v) => self.write(&v),
             Relayed::Nothing => {}
@@ -441,6 +479,58 @@ mod tests {
         assert!(answer_down("dev", "x", &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
     }
 
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "cauldron-bridge-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(p.join("cc").join("projects").join("-work-a")).unwrap();
+        std::fs::create_dir_all(p.join("outside").join("-work-a")).unwrap();
+        std::fs::write(p.join("cc/projects/-work-a/sess-1.jsonl"), b"{\"inside\":1}\n").unwrap();
+        std::fs::write(p.join("outside/-work-a/sess-1.jsonl"), b"OUTSIDE\n").unwrap();
+        std::fs::write(p.join("outside/plain.txt"), b"OUTSIDE\n").unwrap();
+        p.canonicalize().unwrap()
+    }
+
+    /// A link put in place of the transcript after it was found, and a
+    /// project directory swapped for a link to a directory holding a file of
+    /// the same name: both are refused at the open, nothing read. A device
+    /// is not a regular file.
+    #[test]
+    fn a_link_swapped_in_between_the_look_and_the_open_is_refused() {
+        let root = scratch("swap");
+        let config = root.join("cc");
+        let file = config.join("projects/-work-a/sess-1.jsonl");
+        assert_eq!(locate_transcript(&config, "sess-1"), Ok(Some(file.clone())));
+        assert!(open_transcript(&config, &file).is_ok(), "the plain file opens");
+
+        // The file swapped for a link after the look.
+        let found = locate_transcript(&config, "sess-1").unwrap().unwrap();
+        std::fs::rename(&file, root.join("kept.jsonl")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside/plain.txt"), &file).unwrap();
+        assert!(matches!(open_transcript(&config, &found), Err(Transcript::Link(_))), "a linked file is not followed");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::rename(root.join("kept.jsonl"), &file).unwrap();
+
+        // The project directory swapped for a link after the look.
+        let found = locate_transcript(&config, "sess-1").unwrap().unwrap();
+        let slug = config.join("projects/-work-a");
+        std::fs::rename(&slug, root.join("kept-dir")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside/-work-a"), &slug).unwrap();
+        match open_transcript(&config, &found) {
+            Err(Transcript::Link(why)) => assert!(why.contains("leads outside"), "{why}"),
+            other => panic!("a linked project directory was followed: {other:?}"),
+        }
+        // And seen as a link by the look itself.
+        assert!(matches!(locate_transcript(&config, "sess-1"), Err(Transcript::Link(_))));
+
+        // A device in the file's place (the look refuses a non-regular file,
+        // and so does the open on its own handle).
+        assert!(matches!(open_transcript(&config, std::path::Path::new("/dev/null")), Err(Transcript::NotRegular(_))));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn with_an_unusable_environment_the_bridge_still_lists_every_tool_and_says_why() {
         let u = Unusable { name: "prod".into(), why: "there is no environment `prod`".into() };
@@ -453,4 +543,284 @@ mod tests {
         assert_eq!(r["code"], NO_ENVIRONMENT);
         assert!(r["message"].as_str().unwrap().contains("there is no environment `prod`") && r["message"].as_str().unwrap().contains("CAULDRON_ENV"), "{r}");
     }
+}
+
+// ------------------------------------------------------- soup_dump_session
+
+fn refused_answer(id: Value, code: &'static str, message: String) -> Value {
+    shapewire::mcp::result_body(id, shapewire::mcp::tool_refused(&Refusal::new(code, message)))
+}
+
+/// The Claude Code config directory: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+pub fn claude_config_dir() -> Option<std::path::PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        Some(d) => Some(std::path::PathBuf::from(d)),
+        None => std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| std::path::PathBuf::from(h).join(".claude")),
+    }
+}
+
+/// Why a transcript cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transcript {
+    /// Something that could hold it could not be read (`transcript_unreadable`).
+    Unreadable(String),
+    /// It is reached through a link, has a second name, or leads outside
+    /// the projects store (`transcript_link`). Nothing of it was read.
+    Link(String),
+    /// It is not a regular file: a FIFO, a socket, a device or a directory
+    /// (`transcript_unreadable`). Nothing of it was read.
+    NotRegular(String),
+}
+
+/// **Find `session`'s transcript** under `<config>/projects/*/<session>.jsonl`.
+/// `Ok(None)`: the store was read and holds none (or does not exist).
+/// `Err`: something that could hold it could not be read, and nothing
+/// readable was found elsewhere; or a candidate is a link (a linked project
+/// directory, or a linked file) or not a regular file, which refuses the
+/// whole look whatever else is there. Every component under the projects
+/// store is looked at with `lstat`, so no link is followed. Two copies (the
+/// session moved directory): the larger. `session` must already be a plain
+/// id. The projects store itself (`<config>/projects`) may be a link; it is
+/// taken as where it leads.
+pub fn locate_transcript(config: &std::path::Path, session: &str) -> std::result::Result<Option<std::path::PathBuf>, Transcript> {
+    debug_assert!(soup_door::dumps::session_id_ok(session));
+    let file = format!("{session}.jsonl");
+    let projects = config.join("projects");
+    let unreadable = |p: &std::path::Path, e: std::io::Error| Transcript::Unreadable(format!("{}: {e}", p.display()));
+    let entries = match std::fs::read_dir(&projects) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(&projects, e)),
+    };
+    let mut found: Option<(u64, std::path::PathBuf)> = None;
+    let mut skipped: Option<Transcript> = None;
+    for entry in entries {
+        let entry = match entry {
+            Ok(x) => x,
+            Err(e) => {
+                skipped.get_or_insert(unreadable(&projects, e));
+                continue;
+            }
+        };
+        let slug = entry.path();
+        let candidate = slug.join(&file);
+        // The entry's own type: `file_type` does not follow a link.
+        let kind = match entry.file_type() {
+            Ok(k) => k,
+            Err(e) => {
+                skipped.get_or_insert(unreadable(&slug, e));
+                continue;
+            }
+        };
+        if kind.is_symlink() {
+            // A linked project directory that leads to a file of this name:
+            // refused. Only the name is looked up; nothing is opened.
+            if std::fs::symlink_metadata(&candidate).is_ok() {
+                return Err(Transcript::Link(format!("the project directory {} is a link", slug.display())));
+            }
+            continue;
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(md) if md.file_type().is_symlink() => return Err(Transcript::Link(format!("{} is a link", candidate.display()))),
+            Ok(md) if md.file_type().is_file() => {
+                if found.as_ref().is_none_or(|(n, _)| md.len() > *n) {
+                    found = Some((md.len(), candidate));
+                }
+            }
+            Ok(_) => return Err(Transcript::NotRegular(format!("{} is not a regular file", candidate.display()))),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
+            Err(e) => {
+                skipped.get_or_insert(unreadable(&candidate, e));
+            }
+        }
+    }
+    match (found, skipped) {
+        (Some((_, p)), _) => Ok(Some(p)),
+        (None, Some(e)) => Err(e),
+        (None, None) => Ok(None),
+    }
+}
+
+/// **Open the transcript [`locate_transcript`] found**, as it stands now:
+/// with no-follow (a link put in its place since it was found is not
+/// followed, and opening a FIFO does not wait), then on the open handle a
+/// regular file with one name, and its canonical path a file in a project
+/// directory of the canonical projects store whose device and inode are the
+/// open handle's. Anything else is refused and nothing is read.
+pub fn open_transcript(config: &std::path::Path, path: &std::path::Path) -> std::result::Result<std::fs::File, Transcript> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let unreadable = |p: &std::path::Path, e: std::io::Error| Transcript::Unreadable(format!("{}: {e}", p.display()));
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => Transcript::Link(format!("{} is a link", path.display())),
+            _ => unreadable(path, e),
+        })?;
+    let md = f.metadata().map_err(|e| unreadable(path, e))?;
+    if !md.file_type().is_file() {
+        return Err(Transcript::NotRegular(format!("{} is not a regular file", path.display())));
+    }
+    if md.nlink() > 1 {
+        return Err(Transcript::Link(format!("{} has more than one name (a hard link)", path.display())));
+    }
+    let projects = config.join("projects");
+    let root = std::fs::canonicalize(&projects).map_err(|e| unreadable(&projects, e))?;
+    let real = std::fs::canonicalize(path).map_err(|e| unreadable(path, e))?;
+    if real.parent().and_then(std::path::Path::parent) != Some(root.as_path()) {
+        return Err(Transcript::Link(format!("{} leads outside {}", path.display(), projects.display())));
+    }
+    let now = std::fs::symlink_metadata(&real).map_err(|e| unreadable(&real, e))?;
+    if now.dev() != md.dev() || now.ino() != md.ino() {
+        return Err(Transcript::Link(format!("{} was replaced while it was opened", path.display())));
+    }
+    Ok(f)
+}
+
+/// How many bytes of a transcript to send: all of it, unless it grew since
+/// `len` was taken and does not end on a line there, then up to its last
+/// whole line.
+fn whole_lines(f: &mut std::fs::File, len: u64) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    if len == 0 || f.metadata()?.len() <= len {
+        return Ok(len);
+    }
+    let mut end = len;
+    let mut buf = vec![0u8; 64 * 1024];
+    while end > 0 {
+        let start = end.saturating_sub(buf.len() as u64);
+        let n = (end - start) as usize;
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf[..n])?;
+        if let Some(i) = buf[..n].iter().rposition(|b| *b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
+/// **`soup_dump_session`, the bridge's half** (module docs). Answers the
+/// JSON-RPC message to write back.
+fn dump_session(e: &Environment, ctx: &Ctx, msg: &Value) -> Value {
+    use std::io::{Seek, SeekFrom};
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    let found = match crate::mcp_door::find(e) {
+        Ok(f) => f,
+        Err(why) => return answer_down(&e.name, &why.say(), msg).unwrap_or(Value::Null),
+    };
+    let mut msg = msg.clone();
+    let Some(args) = msg.pointer_mut("/params/arguments").and_then(Value::as_object_mut) else {
+        return refused_answer(id, "usage", "the arguments of soup_dump_session must be an object. Nothing was read or written.".into());
+    };
+    let session = match args.get("session_id") {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        None | Some(Value::Null) | Some(Value::String(_)) => ctx.0.get("session_id").and_then(Value::as_str).map(str::to_string),
+        Some(_) => return refused_answer(id, "usage", "`session_id` of soup_dump_session must be a string. Nothing was read or written.".into()),
+    };
+    let Some(session) = session else {
+        return refused_answer(
+            id,
+            SESSION_UNKNOWN,
+            "no session was named and this session's id is not known here: pass `session_id` (`/cauldron:dump-session` passes \
+             it for you). Nothing was read or written."
+                .into(),
+        );
+    };
+    if !soup_door::dumps::session_id_ok(&session) {
+        return refused_answer(
+            id,
+            "usage",
+            format!("`{}` is not a session id: an id is 1-128 characters of letters, digits, `.`, `_` and `-`, not starting with `.`; never a path. Nothing was read or written.", session.chars().take(80).collect::<String>()),
+        );
+    }
+    let Some(config) = claude_config_dir() else {
+        return refused_answer(id, TRANSCRIPT_UNREADABLE, "neither $CLAUDE_CONFIG_DIR nor $HOME is set, so there is no Claude Code store to look in. Nothing was read or written.".into());
+    };
+    let refuse_unusable = |u: Transcript| match u {
+        Transcript::Unreadable(why) => refused_answer(
+            id.clone(),
+            TRANSCRIPT_UNREADABLE,
+            format!("session `{session}`'s transcript could not be looked for or read: {why}. Nothing was written."),
+        ),
+        Transcript::NotRegular(why) => refused_answer(
+            id.clone(),
+            TRANSCRIPT_UNREADABLE,
+            format!("session `{session}`'s transcript is not a plain file: {why}. Nothing was read or written."),
+        ),
+        Transcript::Link(why) => refused_answer(
+            id.clone(),
+            TRANSCRIPT_LINK,
+            format!(
+                "a link was found where session `{session}`'s transcript is looked for: {why}. The bridge reads a transcript only \
+                 as a plain file in a project directory of {}/projects, and follows no link. Nothing was read or written.",
+                config.display()
+            ),
+        ),
+    };
+    let path = match locate_transcript(&config, &session) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return refused_answer(
+                id,
+                SESSION_UNKNOWN,
+                format!(
+                    "no Claude Code transcript of session `{session}` is on this machine (looked in {}/projects). Nothing was read or written.",
+                    config.display()
+                ),
+            )
+        }
+        Err(u) => return refuse_unusable(u),
+    };
+    let mut f = match open_transcript(&config, &path) {
+        Ok(f) => f,
+        Err(u) => return refuse_unusable(u),
+    };
+    let unreadable = |e: std::io::Error| refused_answer(id.clone(), TRANSCRIPT_UNREADABLE, format!("session `{session}`'s transcript could not be read: {e}. Nothing was written."));
+    let len = match f.metadata().and_then(|m| { let l = m.len(); whole_lines(&mut f, l) }) {
+        Ok(l) => l,
+        Err(err) => return unreadable(err),
+    };
+    if len > soup_door::dumps::TRANSCRIPT_LIMIT {
+        return refused_answer(
+            id,
+            "too_large",
+            format!(
+                "session `{session}`'s transcript is {len} bytes, over the {} bytes (64 MiB) one session dump holds. Nothing was sent or written.",
+                soup_door::dumps::TRANSCRIPT_LIMIT
+            ),
+        );
+    }
+    args.insert("session_id".into(), json!(session));
+    let line = msg.to_string();
+    if line.len() > soup_door::catalogue::SESSION_HEAD_LIMIT {
+        return refused_answer(id, "usage", "the call is too long (its title?). Nothing was read or written.".into());
+    }
+    for tries in 1..=2 {
+        if let Err(err) = f.seek(SeekFrom::Start(0)) {
+            return unreadable(err);
+        }
+        let a = match crate::mcp_door::post_stream(e, found.door, soup_door::catalogue::SESSION_PATH, &line, &mut f, len) {
+            Ok(a) => a,
+            Err(err) if is_refused(&err) => return answer_down(&e.name, &format!("its door refused the connection ({err:#})"), &msg).unwrap_or(Value::Null),
+            Err(err) => return shapewire::mcp::error_body(id, shapewire::mcp::rpc::SERVER, format!("sending the transcript to the mcp service: {err:#}"), None),
+        };
+        if a.status == 401 && tries == 1 {
+            continue;
+        }
+        return match serde_json::from_str::<Value>(&a.body) {
+            Ok(mut v) => {
+                if v.get("error").is_some() && v.get("id").is_none_or(Value::is_null) {
+                    v["id"] = id.clone();
+                }
+                v
+            }
+            Err(_) => shapewire::mcp::error_body(id, shapewire::mcp::rpc::SERVER, format!("the mcp service answered HTTP {} with no JSON", a.status), None),
+        };
+    }
+    shapewire::mcp::error_body(id, shapewire::mcp::rpc::SERVER, "the mcp service refused the door secret twice", None)
 }

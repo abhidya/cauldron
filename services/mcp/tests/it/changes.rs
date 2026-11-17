@@ -143,7 +143,8 @@ fn c3_a_bounded_list_says_where_to_read_on_and_misses_nothing() {
     let d = ok(&svc.call("soup_changes", json!({"cauldron": "kb", "since": start, "limit": 2}), &c));
     assert_eq!(d["changes"].as_array().unwrap().len(), 2);
     assert_eq!(d["more"], json!(true));
-    assert_eq!(d["cursor"], json!(format!("{}.{}", start.rsplit_once('.').unwrap().0, d["changes"][1]["seq"])), "{d}");
+    let p: Vec<&str> = start.split('.').collect();
+    assert_eq!(d["cursor"], json!(format!("{}.{}.{}.{}", p[0], p[1], d["changes"][1]["seq"], p[3])), "{d}");
     assert_ne!(d["cursor"], d["head"]);
     let (all, calls) = follow(&svc, &c, &start, json!({"limit": 2}));
     assert_eq!(calls, 4);
@@ -156,7 +157,7 @@ fn c3_a_bounded_list_says_where_to_read_on_and_misses_nothing() {
     assert!(d["truncated"]["dropped_from"]["changes"].as_u64().unwrap_or(0) > 0, "{d}");
     assert_eq!(d["more"], json!(true));
     let kept = d["changes"].as_array().unwrap();
-    assert_eq!(d["cursor"], json!(format!("{}.{}", start.rsplit_once('.').unwrap().0, kept.last().unwrap()["seq"])), "{d}");
+    assert_eq!(d["cursor"], json!(format!("{}.{}.{}.{}", p[0], p[1], kept.last().unwrap()["seq"], p[3])), "{d}");
     let (all, _) = follow(&svc, &c, &start, json!({"max_chars": 700}));
     let seen: Vec<String> = all.iter().map(|x| x["tx"].as_str().unwrap().to_string()).collect();
     assert_eq!(seen, txs, "every change once, in order, under the bound");

@@ -1,14 +1,18 @@
-//! **The change cursor**, opaque to callers: `v1.<soup instance>.<counter>`.
+//! **The change cursor**, opaque to callers:
+//! `v1.<soup instance>.<counter>.<dumps counter>`.
 //!
 //! - `<soup instance>` is the first 12 hex characters of SHA-256 over the
 //!   cauldron's name, a NUL, and its `cauldron.toml` `created_at`, so a
 //!   cauldron removed and created again under the same name has a different
 //!   instance and an old cursor is recognisably someone else's.
-//! - `<counter>` is the spine's committed-commit counter: it moves exactly
-//!   when a write lands.
+//! - `<counter>` is the soup spine's committed-commit counter: it moves
+//!   exactly when a write lands.
+//! - `<dumps counter>` is the same counter of the cauldron's dumps store
+//!   (`soup_door::dumps`), 0 while it has none. A cursor written before
+//!   dumps existed has no fourth part, and is read as 0 there.
 //!
-//! `soup_status`, `soup_put` and `soup_link` answer it; `soup_changes`
-//! reads what landed since one ([`crate::changes`]).
+//! `soup_status`, `soup_put`, `soup_link` and the dump tools answer it;
+//! `soup_changes` reads what landed since one ([`crate::changes`]).
 
 use std::path::Path;
 
@@ -24,9 +28,17 @@ pub fn instance(c: &env::Cauldron) -> String {
     h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
-/// The cursor for `counter`.
-pub fn cursor(c: &env::Cauldron, counter: u64) -> String {
-    format!("v1.{}.{counter}", instance(c))
+/// The cursor for the soup's `counter` and the dumps store's `dumps`.
+pub fn cursor(c: &env::Cauldron, counter: u64, dumps: u64) -> String {
+    format!("v1.{}.{counter}.{dumps}", instance(c))
+}
+
+/// The cursor as `c` stands now, both counters read through connections
+/// that cannot write.
+pub fn now(c: &env::Cauldron) -> Result<String, String> {
+    let soup = counter_offline(&c.soup())?;
+    let dumps = soup_door::dumps::counter(c).map_err(|e| e.to_string())?;
+    Ok(cursor(c, soup, dumps))
 }
 
 /// The committed-commit counter of the soup at `soup`, read through a

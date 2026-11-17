@@ -302,6 +302,21 @@ cauldron it is the soup's one writer: `cauldron soup import` is sent to it,
 and `cauldron soup recover` is refused (`cauldron mcp status` shows what the
 service holds). The plugin's README has the details.
 
+**Dumps.** A dump is raw text put into a cauldron for later processing: a
+note, a file, or a whole Claude Code session's transcript. It is kept in the
+cauldron's dumps store beside its soup (not in the soup), as `DM-<n>` in
+state `received`, one write per dump. From Claude Code, `/cauldron:dump`
+keeps text or a file and `/cauldron:dump-session` keeps the session's
+transcript (the grant's `dump` scope allows both); from a shell, `cauldron
+soup dump <file|-> --env <env> --cauldron <name>`, with `cauldron soup
+dumps` and `cauldron soup dump-get` to read them back. A session transcript
+holds tool output and anything pasted into the session, and it is stored
+verbatim, in your own cauldron, in a dumps store only you can read (0700
+directories, 0600 files). The grant's scopes govern Claude Code sessions
+through the MCP service; the `cauldron soup dumps` and `dump-get` verbs run
+as you and read dumps without a grant, like every other CLI read. Processing
+of dumps comes in a later release.
+
 ## Known limitations
 
 This is an early release. These are known:
@@ -309,6 +324,10 @@ This is an early release. These are known:
 - **macOS only.**
 - **Nothing acts on a dump yet.** Ripples and the soup engine are coming in
   0.2.0 (see above).
+- **A dump cannot be deleted yet.** No verb removes one. To remove a
+  cauldron's dumps (all of them), stop the `mcp` service or revoke the
+  cauldron, then remove `<root>/data/<env>/cauldrons/<cauldron>/dumps/` by
+  hand; the plugin's README has the steps.
 - **Claude Code is the only inference provider that runs.** Config shows the
   other token sources, endpoints and templates greyed out, and refuses to act
   on them.

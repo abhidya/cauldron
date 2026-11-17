@@ -70,11 +70,26 @@ impl Access {
     /// every write, and [`crate::door::Door::refresh`] before keeping a
     /// cauldron open.
     pub fn why_not_writable(&self, cauldron: &env::Cauldron) -> Option<&'static str> {
+        self.why_not(cauldron, Scope::Write)
+    }
+
+    /// Why `cauldron` may not be dumped into now (`None` when its grant
+    /// allows `dump`): asked before every dump lands, and before keeping a
+    /// cauldron's dumps store open.
+    pub fn why_not_dumpable(&self, cauldron: &env::Cauldron) -> Option<&'static str> {
+        self.why_not(cauldron, Scope::Dump)
+    }
+
+    fn why_not(&self, cauldron: &env::Cauldron, scope: Scope) -> Option<&'static str> {
         match self.grants() {
             Err(_) => Some("the grant store cannot be read"),
             Ok(g) => match g.get(&cauldron.name) {
                 None => Some("its grant was revoked"),
-                Some(gr) if !gr.allows(Scope::Write) => Some("its grant lost `write`"),
+                Some(gr) if !gr.allows(scope) => Some(match scope {
+                    Scope::Write => "its grant lost `write`",
+                    Scope::Dump => "its grant lost `dump`",
+                    Scope::Read => "its grant lost `read`",
+                }),
                 Some(gr) if !gr.is_for(cauldron) => Some("the cauldron of that name is not the one that was granted"),
                 Some(_) => None,
             },

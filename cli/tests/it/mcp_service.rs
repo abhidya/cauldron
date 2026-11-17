@@ -21,6 +21,21 @@
 //!   directory and session (a caller's own `_ctx` replaced); the door secret
 //!   never appears on its stdout or stderr; a service stopped mid-session
 //!   turns the next call into `service_down`.
+//! - **D1** dumps: the bridge finds a session's transcript in a fixture
+//!   Claude Code store (a scratch `CLAUDE_CONFIG_DIR`, never the real one)
+//!   by id, or this session's by `$CLAUDE_CODE_SESSION_ID`, and the stored
+//!   blob's hash is the file's; an absent session is `session_unknown`, an
+//!   unreadable store or file `transcript_unreadable`, a path `usage`, an
+//!   oversized file `too_large`, all before anything is sent. `soup dump`
+//!   is sent to the service while it holds the dumps store and lands
+//!   directly once it is stopped; `soup dumps` and `soup dump-get` read
+//!   them back, `--raw` verbatim.
+//! - **D2** the bridge follows no link out of the projects store: a linked
+//!   file or project directory, or a second name, is `transcript_link`; a
+//!   FIFO or directory in the file's place is `transcript_unreadable`; nothing
+//!   reaches the service.
+//! - **D3** the dumps store is private whatever the umask: directories
+//!   0700, files 0600.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -125,6 +140,7 @@ impl Scratch {
             .env_remove("ENV")
             .env_remove("CAULDRON_CAULDRON")
             .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CLAUDE_CONFIG_DIR")
             .current_dir(self.0.join("work"));
         c
     }
@@ -575,7 +591,7 @@ fn b2_the_bridge_does_not_read_env_and_answers_when_its_environment_cannot_be_us
     let i = init(&mut b);
     assert!(i["result"]["instructions"].as_str().unwrap().contains("$ENV is not read"), "{i}");
     let list = b.ask(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).unwrap();
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 12, "{list}");
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), soup_door::catalogue::TOOLS.len(), "{list}");
     let (code, msg) = refused(&b.call(2, "soup_status", json!({"cauldron": "kb"})));
     assert_eq!(code, "no_environment", "{msg}");
     assert!(msg.contains("environment `prod`") && msg.contains("$CAULDRON_ENV") && msg.contains("$ENV is not read"), "{msg}");
@@ -589,4 +605,230 @@ fn b2_the_bridge_does_not_read_env_and_answers_when_its_environment_cannot_be_us
     assert_eq!(code, "service_down", "{msg}");
     assert!(msg.contains("environment `dev`"), "{msg}");
     assert_eq!(b.finish().0, 0);
+}
+
+// --------------------------------------------------------------------- D1
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(b))
+}
+
+/// A fixture transcript: `n` JSONL lines recording `cwd`.
+fn transcript(n: usize, cwd: &str, word: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        out.extend_from_slice(json!({"type": "user", "cwd": cwd, "message": {"role": "user", "content": format!("{word} {i}")}}).to_string().as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+fn chmod(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn d1_sessions_and_text_are_dumped_through_the_bridge_and_the_command_line() {
+    let s = Scratch::new("d1", &["kb"]);
+    s.grant("kb");
+    // A fixture Claude Code store, under the scratch root.
+    let config = s.0.join("claude-config");
+    let a_dir = config.join("projects").join("-work-a");
+    let b_dir = config.join("projects").join("-work-b");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::create_dir_all(&b_dir).unwrap();
+    let ta = transcript(300, "/work/a", "alpha");
+    let tb = transcript(20, "/work/b", "beta");
+    std::fs::write(a_dir.join("sess-a.jsonl"), &ta).unwrap();
+    std::fs::write(b_dir.join("sess-b.jsonl"), &tb).unwrap();
+    let cfg = config.display().to_string();
+    let vars = [("CLAUDE_CONFIG_DIR", cfg.as_str()), ("CLAUDE_CODE_SESSION_ID", "sess-b")];
+
+    // The service down: refused before anything is read.
+    let mut b = Bridge::start(&s, &s.project(), &[], &vars, &[]);
+    init(&mut b);
+    assert_eq!(refused(&b.call(1, "soup_dump_session", json!({"session_id": "sess-a"}))).0, "service_down");
+    b.finish();
+
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let mut b = Bridge::start(&s, &s.project(), &[], &vars, &pids);
+    init(&mut b);
+    // By id.
+    let r = b.call(2, "soup_dump_session", json!({"session_id": "sess-a", "title": "Session A"}));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let d = &r["structuredContent"];
+    assert_eq!((d["dump_id"].clone(), d["state"].clone(), d["kind"].clone()), (json!("DM-1"), json!("received"), json!("session")), "{d}");
+    assert_eq!(d["sha256"], json!(sha256_hex(&ta)), "the blob's hash is the file's");
+    assert_eq!((d["lines"].clone(), d["cwd"].clone(), d["session_id"].clone()), (json!(300), json!("/work/a"), json!("sess-a")));
+    assert_eq!(d["resolved_from"], json!(format!("project:{}", s.project().display())));
+    // This session, from the bridge's environment.
+    let r = b.call(3, "soup_dump_session", json!({}));
+    assert_eq!(r["structuredContent"]["session_id"], "sess-b", "{r}");
+    assert_eq!(r["structuredContent"]["sha256"], json!(sha256_hex(&tb)));
+    // Absent; a path; unreadable; too large: each refused, nothing sent.
+    let (code, msg) = refused(&b.call(4, "soup_dump_session", json!({"session_id": "sess-none"})));
+    assert_eq!(code, "session_unknown", "{msg}");
+    let (code, _) = refused(&b.call(5, "soup_dump_session", json!({"session_id": "../projects/-work-a/sess-a"})));
+    assert_eq!(code, "usage");
+    let u_dir = config.join("projects").join("-work-u");
+    std::fs::create_dir_all(&u_dir).unwrap();
+    std::fs::write(u_dir.join("sess-u.jsonl"), b"{}\n").unwrap();
+    chmod(&u_dir.join("sess-u.jsonl"), 0o000);
+    let (code, msg) = refused(&b.call(6, "soup_dump_session", json!({"session_id": "sess-u"})));
+    assert_eq!(code, "transcript_unreadable", "an unreadable file is not absent: {msg}");
+    chmod(&u_dir.join("sess-u.jsonl"), 0o600);
+    chmod(&u_dir, 0o000);
+    let (code, msg) = refused(&b.call(7, "soup_dump_session", json!({"session_id": "sess-u"})));
+    assert_eq!(code, "transcript_unreadable", "an unreadable store is not absent: {msg}");
+    // A readable copy elsewhere still wins over a locked sibling.
+    assert_eq!(b.call(8, "soup_dump_session", json!({"session_id": "sess-a"}))["isError"], json!(false));
+    chmod(&u_dir, 0o700);
+    let big = a_dir.join("sess-big.jsonl");
+    std::fs::File::create(&big).unwrap().set_len(soup_door::dumps::TRANSCRIPT_LIMIT + 1).unwrap();
+    let (code, _) = refused(&b.call(9, "soup_dump_session", json!({"session_id": "sess-big"})));
+    assert_eq!(code, "too_large");
+    // Unknown key, through the service.
+    let (code, _) = refused(&b.call(10, "soup_dump_session", json!({"session_id": "sess-a", "path": "/etc/hosts"})));
+    assert_eq!(code, "usage");
+    // A text dump through the bridge.
+    let r = b.call(11, "soup_dump", json!({"text": "from the model", "title": "t"}));
+    assert_eq!(r["structuredContent"]["dump_id"], "DM-4", "{r}");
+    b.finish();
+    let landed: Vec<Value> = s.calls().into_iter().filter(|l| l["tool"] == "soup_dump_session").collect();
+    assert_eq!(landed.len(), 4, "only the calls that reached the service are audited: {landed:?}");
+    assert!(landed.iter().all(|l| l["session"] == "sess-b" && l["client"] == "claude-code"));
+
+    // The command line, while the service holds the dumps store: sent to it.
+    let note = s.0.join("note.txt");
+    std::fs::write(&note, "a note from the shell\n").unwrap();
+    let o = s.run(&["soup", "dump", note.to_str().unwrap(), "--env", "dev", "--cauldron", "kb", "--title", "Shell note"], &pids);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    let j = o.json();
+    assert_eq!((j["dump_id"].clone(), j["forwarded_to"]["pid"].clone()), (json!("DM-5"), json!(svc.pid())), "{j}");
+    assert!(s.calls().iter().any(|l| l["tool"] == "soup_dump" && l["client"] == "cli"));
+    let list = s.run(&["soup", "dumps", "--env", "dev", "--cauldron", "kb"], &pids).json();
+    assert_eq!(list["total"], 5, "{list}");
+    assert!(!list.to_string().contains("alpha"), "a list never holds content");
+    let raw = s.command(&["soup", "dump-get", "DM-1", "--env", "dev", "--cauldron", "kb", "--raw"], &pids).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(raw.stdout, ta, "read back verbatim");
+    let w = s.run(&["soup", "dump-get", "DM-1", "--env", "dev", "--cauldron", "kb", "--max-chars", "2000"], &pids).json();
+    assert!(serde_json::to_string(&w).unwrap().chars().count() <= 2000);
+    assert!(w["next_offset"].as_u64().is_some(), "{w}");
+    svc.stop();
+
+    // Stopped: the dumps lock is free, the command line writes directly.
+    let o = s.command(&["soup", "dump", "-", "--env", "dev", "--cauldron", "kb"], &[]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut o = o;
+    o.stdin.take().unwrap().write_all(b"from stdin").unwrap();
+    let o = o.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let j: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["dump_id"], "DM-6");
+    assert!(j.get("forwarded_to").is_none());
+    let huge = s.0.join("huge.txt");
+    std::fs::write(&huge, "y".repeat(soup_door::dumps::TEXT_LIMIT + 1)).unwrap();
+    let o = s.run(&["soup", "dump", huge.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"], &[]);
+    assert_eq!(o.rc, 1);
+    assert!(o.err.contains("too_large"), "{}", o.err);
+    // The soup was never touched by any of it.
+    assert_eq!(s.node_count("kb"), 0);
+    assert!(spine::offline::rest_check(&s.soup("kb")).unwrap().is_empty());
+}
+
+/// No link is followed under the projects store: a linked transcript file,
+/// a linked project directory and a file with a second name are refused as
+/// `transcript_link`, a FIFO or a directory in the file's place as
+/// `transcript_unreadable`, each before anything is read or sent; a plain
+/// copy beside them does not make any of them usable.
+#[test]
+fn d2_the_bridge_follows_no_link_out_of_the_projects_store() {
+    let s = Scratch::new("d2", &["kb"]);
+    s.grant("kb");
+    let config = s.0.join("claude-config");
+    let projects = config.join("projects");
+    let plain = projects.join("-work-plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("sess-ok.jsonl"), transcript(5, "/work/plain", "fine")).unwrap();
+    // Outside the store: a file the user can read, and a directory holding
+    // a file named as a transcript.
+    let outside = s.0.join("outside");
+    std::fs::create_dir_all(outside.join("dir")).unwrap();
+    std::fs::write(outside.join("private.txt"), "OUTSIDE-THE-STORE\n").unwrap();
+    std::fs::write(outside.join("dir").join("sess-dir.jsonl"), "OUTSIDE-THE-STORE\n").unwrap();
+    let evil = projects.join("-evil");
+    std::fs::create_dir_all(&evil).unwrap();
+    std::os::unix::fs::symlink(outside.join("private.txt"), evil.join("sess-file.jsonl")).unwrap();
+    std::os::unix::fs::symlink(outside.join("dir"), projects.join("-linkdir")).unwrap();
+    std::fs::hard_link(outside.join("private.txt"), evil.join("sess-hard.jsonl")).unwrap();
+    let fifo = evil.join("sess-fifo.jsonl");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    std::fs::create_dir_all(evil.join("sess-subdir.jsonl")).unwrap();
+    // The same session as a plain file AND a link: the link refuses.
+    std::os::unix::fs::symlink(outside.join("private.txt"), evil.join("sess-ok.jsonl")).unwrap();
+
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let cfg = config.display().to_string();
+    let mut b = Bridge::start(&s, &s.project(), &[], &[("CLAUDE_CONFIG_DIR", cfg.as_str())], &pids);
+    init(&mut b);
+    let mut id = 1;
+    for (session, want) in [
+        ("sess-file", "transcript_link"),
+        ("sess-dir", "transcript_link"),
+        ("sess-hard", "transcript_link"),
+        ("sess-ok", "transcript_link"),
+        ("sess-fifo", "transcript_unreadable"),
+        ("sess-subdir", "transcript_unreadable"),
+    ] {
+        id += 1;
+        let (code, msg) = refused(&b.call(id, "soup_dump_session", json!({"session_id": session})));
+        assert_eq!(code, want, "{session}: {msg}");
+        assert!(msg.contains("Nothing was read or written"), "{session}: {msg}");
+        if want == "transcript_link" {
+            assert!(msg.contains("a link was found"), "{session}: {msg}");
+        }
+    }
+    b.finish();
+    assert_eq!(s.calls().into_iter().filter(|l| l["tool"] == "soup_dump_session").count(), 0, "nothing reached the service");
+    assert!(!s.data().join("cauldrons").join("kb").join("dumps").exists(), "no store was made, no byte stored");
+    svc.stop();
+}
+
+/// Under a umask that takes nothing away, a dump made by the command line
+/// still leaves the dumps store private: directories 0700, files 0600.
+#[test]
+fn d3_the_dumps_store_is_private_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("d3", &["kb"]);
+    let base = s.command(&["soup", "dump", "-", "--env", "dev", "--cauldron", "kb"], &[]);
+    let mut c = Command::new("/bin/sh");
+    c.arg("-c").arg("umask 000; exec \"$0\" \"$@\"").arg(base.get_program()).args(base.get_args());
+    for (k, v) in base.get_envs() {
+        match v {
+            Some(v) => c.env(k, v),
+            None => c.env_remove(k),
+        };
+    }
+    c.current_dir(base.get_current_dir().unwrap()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"words for the owner only").unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let d = s.data().join("cauldrons").join("kb").join("dumps");
+    let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&d), 0o700);
+    assert_eq!(mode(&d.join("blobs")), 0o700);
+    let mut files = 0;
+    for dir in [d.clone(), d.join("blobs")] {
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            if e.file_type().unwrap().is_file() {
+                files += 1;
+                assert_eq!(mode(&e.path()), 0o600, "{}", e.path().display());
+            }
+        }
+    }
+    assert!(files >= 4, "spine.db, dumps.db, writer.lock and the blob: {files}");
 }

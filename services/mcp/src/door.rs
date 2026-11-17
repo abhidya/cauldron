@@ -31,6 +31,7 @@ use soup_door::Target;
 
 use crate::access::Access;
 use crate::audit::{Audit, Line};
+use crate::dumps::{Dumps, LogOnly};
 use crate::catalogue::{self, Needs, Tool};
 use crate::ctx::{self, Ctx};
 use crate::secret::Secret;
@@ -46,6 +47,8 @@ pub struct Door {
     secret: Secret,
     access: Arc<Access>,
     pub writers: Writers,
+    /// The dumps stores this door holds.
+    pub dumps: Dumps,
     audit: Arc<Audit>,
     /// The installed version label (`$CAULDRON_VERSION`).
     label: String,
@@ -56,7 +59,15 @@ impl Door {
     pub fn new(env: env::Environment, secret: Secret, label: String, dir: &std::path::Path) -> Arc<Door> {
         let audit = Arc::new(Audit::new(dir));
         let access = Arc::new(Access::new(&env));
-        Arc::new(Door { writers: Writers::new(audit.clone(), access.clone()), access, env, secret, audit, label })
+        Arc::new(Door {
+            writers: Writers::new(audit.clone(), access.clone()),
+            dumps: Dumps::new(audit.clone(), access.clone(), Arc::new(LogOnly)),
+            access,
+            env,
+            secret,
+            audit,
+            label,
+        })
     }
 
     /// Does this `Authorization` header value carry the door secret?
@@ -80,17 +91,28 @@ impl Door {
                 self.writers.close(&name, r);
             }
         }
+        for name in self.dumps.names() {
+            let why = match self.env.find_cauldron(&name) {
+                Ok(Some(c)) => self.access.why_not_dumpable(&c),
+                _ => Some("the cauldron no longer exists"),
+            };
+            if let Some(r) = why {
+                self.dumps.close(&name, r);
+            }
+        }
     }
 
     /// Stop: close every open cauldron (each lock is free when this returns).
     pub fn shutdown(&self) {
         self.writers.close_all("the service is stopping");
+        self.dumps.close_all("the service is stopping");
     }
 
     /// Answer one call (blocking: run it on a blocking thread).
     pub fn call(&self, tool: &'static Tool, arguments: Value) -> Result<Value, Refusal> {
-        let scope = match tool.needs {
-            Needs::Scope(s) => s,
+        let (scope, also) = match tool.needs {
+            Needs::Scope(s) => (s, None),
+            Needs::Both(s, t) => (s, Some(t)),
             Needs::NotYet(why) => {
                 return Err(Refusal::new(codes::NOT_AVAILABLE_YET, format!("{why}. Nothing was read or written.")))
             }
@@ -104,30 +126,47 @@ impl Door {
         };
         let (ctx, args) = ctx::split(arguments)?;
         let mut target_name = None;
-        let out = self.call_scoped(tool, scope, &ctx, args, &mut target_name);
+        let out = self.call_scoped(tool, scope, also, &ctx, args, &mut target_name);
         if scope != Scope::Read {
             self.audit.write(audit_line(tool.name, &ctx, target_name, &out));
         }
         out
     }
 
-    fn call_scoped(&self, tool: &Tool, scope: Scope, ctx: &Ctx, args: Map<String, Value>, named: &mut Option<String>) -> Result<Value, Refusal> {
-        let mut a = Args { tool: tool.name, m: args };
-        let explicit = a.str("cauldron")?;
+    /// Steps 3-5 of the module docs: the grants, the cauldron, the scopes.
+    fn target(&self, ctx: &Ctx, explicit: Option<&str>, scopes: &[Scope], named: &mut Option<String>) -> Result<(Target, Grant, String), Refusal> {
         self.refresh();
         let grants = self.access.grants().map_err(refusal)?;
-        let res = grants
-            .resolve(&self.env.name, ctx.cwd.as_deref(), explicit.as_deref(), ctx.cauldron_var.as_deref())
-            .map_err(refusal)?;
+        let res = grants.resolve(&self.env.name, ctx.cwd.as_deref(), explicit, ctx.cauldron_var.as_deref()).map_err(refusal)?;
         *named = Some(res.cauldron.clone());
-        let grant = grants.authorize(&self.env, &res.cauldron, scope).map_err(refusal)?.clone();
+        let mut grant = None;
+        for s in scopes {
+            grant = Some(grants.authorize(&self.env, &res.cauldron, *s).map_err(refusal)?.clone());
+        }
+        let grant = grant.expect("at least one scope");
         let cauldron = self
             .env
             .find_cauldron(&res.cauldron)
             .ok()
             .flatten()
             .ok_or_else(|| Refusal::new("cauldron_gone", format!("cauldron `{}` no longer exists. Nothing was read or written.", res.cauldron)))?;
-        let t = Target { env: self.env.clone(), cauldron, resolved_from: Some(res.from.as_text()) };
+        let from = res.from.as_text();
+        Ok((Target { env: self.env.clone(), cauldron, resolved_from: Some(from.clone()) }, grant, from))
+    }
+
+    fn call_scoped(
+        &self,
+        tool: &Tool,
+        scope: Scope,
+        also: Option<Scope>,
+        ctx: &Ctx,
+        args: Map<String, Value>,
+        named: &mut Option<String>,
+    ) -> Result<Value, Refusal> {
+        let mut a = Args { tool: tool.name, m: args };
+        let explicit = a.str("cauldron")?;
+        let scopes: Vec<Scope> = std::iter::once(scope).chain(also).collect();
+        let (t, grant, from) = self.target(ctx, explicit.as_deref(), &scopes, named)?;
         let mut doc = match tool.name {
             "soup_status" => {
                 a.done()?;
@@ -208,13 +247,194 @@ impl Door {
                 a.done()?;
                 self.writers.link(&t, who(ctx), links)?
             }
+            "soup_dump" => {
+                let text = match a.take("text") {
+                    Some(Value::String(s)) => s,
+                    _ => return Err(usage("`text` of soup_dump must be given, a string")),
+                };
+                let title = a.str("title")?;
+                let from = a.str("source")?;
+                let cite = a.take("cite");
+                let refs = match a.take("refs") {
+                    None => vec![],
+                    Some(Value::Array(v)) if v.iter().all(Value::is_string) => v.into_iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+                    Some(_) => return Err(usage("`refs` of soup_dump must be a list of node ids")),
+                };
+                a.done()?;
+                soup_door::dumps::check_text(&text).map_err(refusal)?;
+                soup_door::dumps::check_extras(title.as_deref(), from.as_deref(), cite.as_ref(), &refs).map_err(refusal)?;
+                self.dump_text(&t, ctx, text, title, from, cite, refs)?
+            }
+            "soup_dump_session" => {
+                return Err(usage(
+                    "soup_dump_session is answered through the stdio bridge (`cauldron mcp stdio`, which Claude Code \
+                     starts): the bridge finds the session's transcript on this machine and sends its bytes with the call. \
+                     This door never reads a file a call names",
+                ))
+            }
+            "soup_dumps" => {
+                let o = soup_door::dumps::ListOpts { state: a.str("state")?, kind: a.str("kind")?, limit: a.count("limit")? };
+                let mc = a.count("max_chars")?;
+                a.done()?;
+                bounded(soup_door::dumps::list(&t.cauldron, &o).map_err(refusal)?, mc, &t)
+            }
+            "soup_dump_get" => {
+                let id = a.required_str("id")?;
+                let offset = a.count("offset")?.unwrap_or(0) as u64;
+                let mc = a.count("max_chars")?;
+                a.done()?;
+                // The bound is the window's own: `resolved_from` and
+                // `truncated` are counted in it.
+                let reserve = budget::size(&json!({"resolved_from": from, "truncated": {"fields": [], "items_dropped": 0}}));
+                let max = budget::clamp(mc).saturating_sub(reserve).max(64);
+                let mut doc = soup_door::dumps::get(&t.cauldron, &id, offset, max).map_err(refusal)?;
+                doc["truncated"] = json!({"fields": [], "items_dropped": 0});
+                doc
+            }
             other => return Err(Refusal::new(codes::UNKNOWN_METHOD, other.to_string())),
         };
         if let Some(o) = doc.as_object_mut() {
-            o.entry("resolved_from").or_insert_with(|| json!(res.from.as_text()));
+            o.entry("resolved_from").or_insert_with(|| json!(from));
         }
         Ok(doc)
     }
+
+    /// `soup_dump`: the text's bytes to the blob store, then one write.
+    #[allow(clippy::too_many_arguments)]
+    fn dump_text(
+        &self,
+        t: &Target,
+        ctx: &Ctx,
+        text: String,
+        title: Option<String>,
+        from: Option<String>,
+        cite: Option<Value>,
+        refs: Vec<String>,
+    ) -> Result<Value, Refusal> {
+        use std::io::Write;
+        let w = who(ctx);
+        self.dumps.prepare(t, &w)?;
+        let mut b = soup_door::dumps::blob_writer(&t.cauldron, soup_door::dumps::Kind::Text).map_err(refusal)?;
+        b.write_all(text.as_bytes()).map_err(|e| Refusal::new("store", format!("writing the dump's bytes: {e}")))?;
+        let env = t.env.name.clone();
+        let (client, session) = (ctx.client.clone(), ctx.session_id.clone());
+        let make = move |blob: &soup_door::dumps::Blob, _: &std::path::Path| {
+            Ok(soup_door::dumps::NewDump {
+                env,
+                content: soup_door::dumps::Content::Text { text, from },
+                blob: blob.clone(),
+                title,
+                cite,
+                refs,
+                client,
+                session,
+            })
+        };
+        self.dumps.commit(t, &w, b, make, "mcp soup_dump")
+    }
+
+    /// **`soup_dump_session`, first half** (the HTTP layer has read the
+    /// call's line and nothing of the transcript): the context, the
+    /// cauldron, the `dump` grant, the arguments, and the size; then the
+    /// dumps store is opened and a blob writer made for the transcript's
+    /// bytes. A refusal here is audited, and the transcript is never read.
+    pub fn session_begin(&self, arguments: Value, bytes: u64) -> Result<SessionDump, Refusal> {
+        let (ctx, args) = ctx::split(arguments)?;
+        let mut named = None;
+        let out = self.session_begin_scoped(&ctx, args, bytes, &mut named);
+        if let Err(r) = &out {
+            self.audit.write(audit_line("soup_dump_session", &ctx, named, &Err(r.clone())));
+        }
+        out
+    }
+
+    fn session_begin_scoped(&self, ctx: &Ctx, args: Map<String, Value>, bytes: u64, named: &mut Option<String>) -> Result<SessionDump, Refusal> {
+        let mut a = Args { tool: "soup_dump_session", m: args };
+        let explicit = a.str("cauldron")?;
+        let session_id = a.str("session_id")?;
+        let title = a.str("title")?;
+        a.done()?;
+        let (t, _, _) = self.target(ctx, explicit.as_deref(), &[Scope::Dump], named)?;
+        let Some(session_id) = session_id.filter(|s| soup_door::dumps::session_id_ok(s)) else {
+            return Err(usage("soup_dump_session needs the session's id (`session_id`, a plain id, never a path)"));
+        };
+        soup_door::dumps::check_extras(title.as_deref(), None, None, &[]).map_err(refusal)?;
+        if bytes > soup_door::dumps::TRANSCRIPT_LIMIT {
+            return Err(too_large_transcript(bytes));
+        }
+        let w = who(ctx);
+        self.dumps.prepare(&t, &w)?;
+        let blob = soup_door::dumps::blob_writer(&t.cauldron, soup_door::dumps::Kind::Session).map_err(refusal)?;
+        Ok(SessionDump { ctx: ctx.clone(), target: t, session_id, title, blob, expected: bytes })
+    }
+
+    /// **`soup_dump_session`, second half**: the transcript's bytes are in
+    /// `s.blob` (or did not arrive: `arrived` says why). Name the blob by its
+    /// hash, read its lines and cwd, and land the dump. Audited.
+    pub fn session_finish(&self, s: SessionDump, arrived: Result<(), Refusal>) -> Result<Value, Refusal> {
+        let name = Some(s.target.cauldron.name.clone());
+        let ctx = s.ctx.clone();
+        let out = (|| {
+            arrived?;
+            if s.blob.bytes() != s.expected {
+                return Err(Refusal::new("bad_request", "the transcript did not match its declared length. Nothing was written."));
+            }
+            let (session_id, title, client, session) = (s.session_id.clone(), s.title.clone(), ctx.client.clone(), ctx.session_id.clone());
+            let env = s.target.env.name.clone();
+            let make = move |blob: &soup_door::dumps::Blob, path: &std::path::Path| {
+                let (lines, cwd) =
+                    soup_door::dumps::transcript_facts(path).map_err(|e| Refusal::new("store", format!("reading the stored transcript: {e}")))?;
+                Ok(soup_door::dumps::NewDump {
+                    env,
+                    content: soup_door::dumps::Content::Session { session_id, cwd, lines },
+                    blob: blob.clone(),
+                    title,
+                    cite: None,
+                    refs: vec![],
+                    client,
+                    session,
+                })
+            };
+            let mut r = self.dumps.commit(&s.target, &who(&ctx), s.blob, make, "mcp soup_dump_session")?;
+            r["resolved_from"] = json!(s.target.resolved_from);
+            Ok(r)
+        })();
+        self.audit.write(audit_line("soup_dump_session", &ctx, name, &out));
+        out
+    }
+}
+
+impl Door {
+    /// While a transcript arrives: is the dump still allowed? A refusal (the
+    /// grant was revoked or lost `dump`) stops reading the rest.
+    pub fn session_still_allowed(&self, s: &SessionDump) -> Result<(), Refusal> {
+        self.dumps.still_allowed(&s.target)
+    }
+}
+
+/// A `soup_dump_session` between its two halves.
+pub struct SessionDump {
+    ctx: Ctx,
+    target: Target,
+    session_id: String,
+    title: Option<String>,
+    /// Where the transcript's bytes go as they arrive.
+    pub blob: soup_door::dumps::BlobWriter,
+    expected: u64,
+}
+
+/// `too_large`, for a transcript over the limit.
+pub fn too_large_transcript(bytes: u64) -> Refusal {
+    Refusal::new(
+        "too_large",
+        format!(
+            "this transcript is {bytes} bytes, over the {} bytes (64 MiB) one session dump holds. Nothing was written.",
+            soup_door::dumps::TRANSCRIPT_LIMIT
+        ),
+    )
+}
+
+impl Door {
 
     /// `soup_status`.
     fn status(&self, t: &Target, grant: &Grant) -> Result<Value, Refusal> {
@@ -233,7 +453,8 @@ impl Door {
             }
         }
         let regions = counts.get("region").and_then(Value::as_u64).unwrap_or(0);
-        let cursor = crate::cursor::counter_offline(&soup).map(|n| crate::cursor::cursor(&t.cauldron, n)).map_err(|e| store(&e))?;
+        let cursor = crate::cursor::now(&t.cauldron).map_err(|e| store(&e))?;
+        let dumps = soup_door::dumps::counts(&t.cauldron).map_err(refusal)?;
         let writer = match self.writers.get(&t.cauldron.name) {
             Some(w) => json!({
                 "open": true,
@@ -262,6 +483,12 @@ impl Door {
             "total": total,
             "cursor": cursor,
             "writer": writer,
+            "dumps": {
+                "store": dumps["store"],
+                "total": dumps["total"],
+                "by_state": dumps["by_state"],
+                "held": self.dumps.holds(&t.cauldron.name),
+            },
         }))
     }
 }
@@ -326,7 +553,19 @@ fn audit_line(tool: &str, ctx: &Ctx, cauldron: Option<String>, out: &Result<Valu
         }
         tx = d.get("landed").and_then(|l| l.get("tx")).and_then(Value::as_str).map(str::to_string);
     }
+    let mut dump = None;
+    if let Ok(d) = out {
+        if let Some(id) = d.get("dump_id").and_then(Value::as_str) {
+            dump = Some(id.to_string());
+            tx = d.get("tx").and_then(Value::as_str).map(str::to_string);
+            counts.insert("bytes".into(), d["bytes"].clone());
+            if let Some(n) = d.get("lines") {
+                counts.insert("lines".into(), n.clone());
+            }
+        }
+    }
     let outcome = match out {
+        Ok(d) if d.get("dump_id").is_some() => "received".to_string(),
         Ok(d) => d.get("outcome").and_then(Value::as_str).unwrap_or("ok").to_string(),
         Err(r) => r.code.to_string(),
     };
@@ -338,6 +577,7 @@ fn audit_line(tool: &str, ctx: &Ctx, cauldron: Option<String>, out: &Result<Valu
         outcome,
         tx,
         counts: Value::Object(counts),
+        dump,
         ..Line::default()
     }
 }

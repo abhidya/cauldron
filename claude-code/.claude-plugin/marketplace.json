@@ -10,7 +10,7 @@
     {
       "name": "cauldron",
       "source": "./cauldron",
-      "description": "The cauldron MCP server, a curator subagent and the published soup schema, for using a Cauldron soup as a knowledge graph from Claude Code."
+      "description": "The cauldron MCP server, dump commands, a curator subagent and the published soup schema, for using a Cauldron soup as a knowledge graph from Claude Code."
     }
   ]
 }

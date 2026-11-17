@@ -1,5 +1,6 @@
-//! **`cauldron soup import | regions | region | nodes | search | get`** — a
-//! cauldron's soup, offline, for an agent that is not the soup daemon.
+//! **`cauldron soup import | regions | region | nodes | search | get | dump |
+//! dumps | dump-get`** — a cauldron's soup, offline, for an agent that is not
+//! the soup daemon, and the dumps kept beside it.
 //!
 //! - `import` lands records written in the PUBLISHED shape
 //!   (`schema/soup/workspace-v6/`) as ONE write, all or nothing, after the
@@ -91,6 +92,16 @@
 //! naming the service, which recovers the soup itself when it opens it. An
 //! ungranted cauldron is never held, and the import runs directly as before.
 //!
+//! # Dumps
+//!
+//! `dump` keeps a file's text (or stdin's) as a dump in the cauldron's dumps
+//! store beside its soup (`soup_door::dumps`): `DM-<n>` in state `received`,
+//! one transaction, for later processing. Like `import`, it writes directly
+//! when nothing else holds the store, and when the `mcp` service holds it
+//! (the cauldron is granted `dump`, and a dump came through the door) it is
+//! sent to the service as one `soup_dump`. `dumps` and `dump-get` read the
+//! store through connections that cannot write.
+//!
 //! The logic lives in the `soup-door` library (`libs/soup-door`), which
 //! answers every verb as JSON or a typed error; this module parses the
 //! arguments and prints.
@@ -177,6 +188,22 @@ cauldron soup — a cauldron's soup, offline
         the snippet is --max-chars long (default 160) around the first hit.
     cauldron soup get <id>... [--cauldron <name>] [--env <env>] [--max-chars N]
         Those nodes as records in the published shape, with their outgoing edges.
+    cauldron soup dump <file|-> [--cauldron <name>] [--env <env>] [--title <t>] [--source <s>]
+        Keep the file's text (or stdin's, with -) as a dump in the cauldron's dumps store,
+        beside its soup (not as a soup node): DM-<n>, in state `received`, as one write,
+        for later processing (processing of dumps comes in a later release). At most 1 MiB
+        of UTF-8 text; a larger one is refused as `too_large` (split it). Prints a receipt
+        (id, bytes, sha256), never the text. While the `mcp` service holds the cauldron's
+        dumps store (`cauldron mcp status`), the dump is sent to it and lands through it,
+        printed the same way plus `forwarded_to`.
+    cauldron soup dumps [--cauldron <name>] [--env <env>] [--state <s>] [--kind text|session] [--limit N]
+        The cauldron's dumps, newest first: id, state, kind, title, bytes, sha256, source,
+        when received. Never their text. At most --limit (50).
+    cauldron soup dump-get <id> [--cauldron <name>] [--env <env>] [--offset N] [--max-chars N] [--raw]
+        One dump's content from byte --offset (default 0): JSON whose whole text is at most
+        --max-chars (default 12000, at most 50000), with `next_offset` while there is more.
+        --raw prints the whole content, verbatim, and nothing else (--offset and --max-chars
+        do not apply): a text dump's text, or a session dump's transcript exactly as stored.
     cauldron soup help
 
   Every verb prints JSON on stdout and exits non-zero on a refusal. Reads open the store
@@ -207,12 +234,17 @@ pub(crate) fn verb_soup(args: &[String]) -> Result<i32> {
         Some("search") => search(&args[1..]),
         Some("get") => get(&args[1..]),
         Some("recover") => recover(&args[1..]),
+        Some("dump") => dump(&args[1..]),
+        Some("dumps") => dumps(&args[1..]),
+        Some("dump-get") => dump_get(&args[1..]),
         None => {
             eprint!("{USAGE}");
             Ok(2)
         }
         Some(other) => {
-            eprintln!("cauldron soup: no verb `{other}` (import | recover | regions | region | nodes | search | get | help)");
+            eprintln!(
+                "cauldron soup: no verb `{other}` (import | recover | regions | region | nodes | search | get | dump | dumps | dump-get | help)"
+            );
             Ok(2)
         }
     }
@@ -233,6 +265,11 @@ struct Args {
     dry_run: bool,
     remint: bool,
     allow_duplicate: bool,
+    title: Option<String>,
+    source: Option<String>,
+    kind: Option<String>,
+    offset: Option<usize>,
+    raw: bool,
     pos: Vec<String>,
 }
 
@@ -247,7 +284,8 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
             _ => (s.as_str(), None),
         };
-        if flag.starts_with('-') && !allow.contains(&flag) {
+        // A lone `-` is stdin (`soup dump -`), not an option.
+        if flag.starts_with('-') && flag != "-" && !allow.contains(&flag) {
             bail!("unknown option `{s}` for `cauldron soup {verb}`");
         }
         let take = |it: &mut std::slice::Iter<'_, String>| -> Result<String> {
@@ -270,6 +308,11 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--dry-run" => a.dry_run = true,
             "--remint" => a.remint = true,
             "--allow-duplicate" => a.allow_duplicate = true,
+            "--title" => a.title = Some(take(&mut it)?),
+            "--source" => a.source = Some(take(&mut it)?),
+            "--kind" => a.kind = Some(take(&mut it)?),
+            "--offset" => a.offset = Some(count(flag, &take(&mut it)?)?),
+            "--raw" => a.raw = true,
             _ => a.pos.push(s.clone()),
         }
     }
@@ -575,5 +618,163 @@ fn region(args: &[String]) -> Result<i32> {
     };
     let t = target("region", &a, false)?;
     print(&soup_door::reads::region(&t, id, &read_opts(&a))?)?;
+    Ok(0)
+}
+
+// -------------------------------------------------------------------- dumps
+
+/// **`cauldron soup dump <file|->`**: keep its text as a dump.
+fn dump(args: &[String]) -> Result<i32> {
+    let a = parse("dump", args, &["--env", "--cauldron", "-c", "--title", "--source"])?;
+    let [input] = a.pos.as_slice() else {
+        bail!("`cauldron soup dump` takes ONE file, or - for stdin (got {}); `cauldron soup help`", a.pos.len());
+    };
+    // Read one byte past the limit, so an oversized input is known without
+    // reading all of it.
+    let limit = soup_door::dumps::TEXT_LIMIT as u64 + 1;
+    let mut bytes = Vec::new();
+    {
+        use std::io::Read;
+        if input == "-" {
+            std::io::stdin().lock().take(limit).read_to_end(&mut bytes).context("reading stdin")?;
+        } else {
+            std::fs::File::open(input).with_context(|| format!("opening {input}"))?.take(limit).read_to_end(&mut bytes).with_context(|| format!("reading {input}"))?;
+        }
+    }
+    if bytes.len() as u64 >= limit {
+        bail!(
+            "REFUSED (too_large): {input} is over the {} bytes (1 MiB) one dump holds. Nothing was written. Split it into several dumps.",
+            soup_door::dumps::TEXT_LIMIT
+        );
+    }
+    let text = String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("REFUSED: {input} is not UTF-8 text; a dump holds text. Nothing was written."))?;
+    soup_door::dumps::check_text(&text)?;
+    soup_door::dumps::check_extras(a.title.as_deref(), a.source.as_deref(), None, &[])?;
+    let t = target("dump", &a, true)?;
+    match soup_door::dumps::Store::open(&t.cauldron, &format!("cli {}", std::process::id())) {
+        Ok(store) => {
+            print(&dump_direct(&t, &store, text, &a)?)?;
+            Ok(0)
+        }
+        Err(e) if e.code == soup_door::Code::Locked => match soup_door::dumps::held_by_service(&t.cauldron) {
+            Some(pid) => match dump_forward(&t, &text, &a, pid)? {
+                Some(rc) => Ok(rc),
+                // The service let the store go between the lock and the call.
+                None => {
+                    let store = soup_door::dumps::Store::open(&t.cauldron, &format!("cli {}", std::process::id()))?;
+                    print(&dump_direct(&t, &store, text, &a)?)?;
+                    Ok(0)
+                }
+            },
+            None => Err(e.into()),
+        },
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn dump_direct(t: &Target, store: &soup_door::dumps::Store, text: String, a: &Args) -> Result<Value> {
+    use std::io::Write;
+    let mut w = store.blob(soup_door::dumps::Kind::Text)?;
+    w.write_all(text.as_bytes()).context("writing the dump's bytes")?;
+    let by = soup_door::dumps::By {
+        thread: "cli".into(),
+        dispatch: "cauldron soup dump".into(),
+        instrument: "cauldron".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+    };
+    let make = |blob: &soup_door::dumps::Blob| {
+        Ok(soup_door::dumps::NewDump {
+            env: t.env.name.clone(),
+            content: soup_door::dumps::Content::Text { text, from: a.source.clone() },
+            blob: blob.clone(),
+            title: a.title.clone(),
+            cite: None,
+            refs: vec![],
+            client: "cli".into(),
+            session: None,
+        })
+    };
+    let (d, landed) = store.commit(w, || Ok(()), make, &by, |e| e)?;
+    Ok(soup_door::dumps::receipt(&t.cauldron.name, &t.env.name, &d, &landed))
+}
+
+/// The dump, sent to the `mcp` service that holds the store as one
+/// `soup_dump`. `None`: the service no longer holds it (dump directly).
+fn dump_forward(t: &Target, text: &str, a: &Args, pid: u32) -> Result<Option<i32>> {
+    let svc = crate::mcp_door::SERVICE;
+    let holder = format!("the `{svc}` service (pid {pid})");
+    let found = match crate::mcp_door::find(&t.env) {
+        Ok(f) if f.pid == pid => f,
+        Ok(f) => bail!(
+            "REFUSED: {holder} holds cauldron `{}`'s dumps store, but the running `{svc}` service is pid {}. Nothing was written. See `cauldron mcp status --env {}`.",
+            t.cauldron.name,
+            f.pid,
+            t.env.name
+        ),
+        Err(why) => bail!(
+            "REFUSED: {holder} holds cauldron `{}`'s dumps store, so this dump would be sent to it, but {}. Nothing was written. Try again in a moment.",
+            t.cauldron.name,
+            why.say()
+        ),
+    };
+    let mut args = json!({"cauldron": t.cauldron.name, "text": text, "_ctx": {"client": "cli"}});
+    if let Some(x) = &a.title {
+        args["title"] = json!(x);
+    }
+    if let Some(x) = &a.source {
+        args["source"] = json!(x);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        args["_ctx"]["cwd"] = json!(cwd.display().to_string());
+    }
+    eprintln!("cauldron soup dump: {holder} holds cauldron `{}`'s dumps store; the dump is sent to it and lands through it", t.cauldron.name);
+    let result = crate::mcp_door::call(&t.env, found.door, "soup_dump", args)
+        .with_context(|| format!("sending the dump to {holder}; nothing is known to have been written, check `cauldron soup dumps`"))?;
+    if result["isError"] != json!(true) {
+        let mut doc = result["structuredContent"].clone();
+        if let Some(m) = doc.as_object_mut() {
+            m.remove("resolved_from");
+            m.remove("cursor");
+            m.insert("forwarded_to".into(), json!({"service": svc, "pid": pid}));
+        }
+        print(&doc)?;
+        return Ok(Some(0));
+    }
+    let refused = &result["structuredContent"]["refused"];
+    let code = refused["code"].as_str().unwrap_or("");
+    match code {
+        "not_granted" | "locked" => Ok(None),
+        _ => bail!("REFUSED ({holder} answered `{code}`): {}", refused["message"].as_str().unwrap_or("")),
+    }
+}
+
+fn dumps(args: &[String]) -> Result<i32> {
+    let a = parse("dumps", args, &["--env", "--cauldron", "-c", "--state", "--kind", "--limit"])?;
+    if let Some(p) = a.pos.first() {
+        bail!("`cauldron soup dumps` takes no arguments (got `{p}`); `soup dump-get` reads one");
+    }
+    let t = target("dumps", &a, false)?;
+    let o = soup_door::dumps::ListOpts { state: a.state.clone(), kind: a.kind.clone(), limit: a.limit };
+    print(&soup_door::dumps::list(&t.cauldron, &o)?)?;
+    Ok(0)
+}
+
+fn dump_get(args: &[String]) -> Result<i32> {
+    let a = parse("dump-get", args, &["--env", "--cauldron", "-c", "--offset", "--max-chars", "--raw"])?;
+    let [id] = a.pos.as_slice() else {
+        bail!("`cauldron soup dump-get` takes ONE dump id (got {}); `cauldron soup dumps` lists them", a.pos.len());
+    };
+    let t = target("dump-get", &a, false)?;
+    if !a.raw {
+        let max = soup_door::budget::clamp(a.max_chars);
+        print(&soup_door::dumps::get(&t.cauldron, id, a.offset.unwrap_or(0) as u64, max)?)?;
+        return Ok(0);
+    }
+    // The whole content, verbatim.
+    use std::io::{Read, Write};
+    let mut content = soup_door::dumps::open_content(&t.cauldron, id)?;
+    let mut out = std::io::stdout().lock();
+    std::io::copy(&mut (&mut content).take(u64::MAX), &mut out)?;
+    out.flush()?;
     Ok(0)
 }

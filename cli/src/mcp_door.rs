@@ -170,6 +170,44 @@ pub fn post(e: &Environment, door: SocketAddr, body: &str) -> Result<Answer> {
     parse_http(&raw)
 }
 
+/// `POST <path>` with the secret: `head` (one JSON-RPC message, no
+/// newline) on the first line, then `len` bytes of `content`, streamed, never
+/// held whole. When the door answers before taking every byte (it refused
+/// the call from its first line), its answer is still read.
+pub fn post_stream(e: &Environment, door: SocketAddr, path: &str, head_line: &str, content: &mut dyn Read, len: u64) -> Result<Answer> {
+    let secret = secret(e)?;
+    let mut s = env::egress::connect_tcp("mcp door", &door, Duration::from_secs(5)).with_context(|| format!("connecting to the mcp door at {door}"))?;
+    s.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+    s.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+    let total = head_line.len() as u64 + 1 + len;
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/octet-stream\r\n\
+         Content-Length: {total}\r\nConnection: close\r\n",
+        port = door.port(),
+    );
+    s.write_all(head.as_bytes())?;
+    s.write_all(b"Authorization: Bearer ")?;
+    s.write_all(secret.as_bytes())?;
+    s.write_all(b"\r\n\r\n")?;
+    let sent = (|| -> std::io::Result<u64> {
+        s.write_all(head_line.as_bytes())?;
+        s.write_all(b"\n")?;
+        let n = std::io::copy(&mut content.take(len), &mut s)?;
+        s.flush()?;
+        Ok(n)
+    })();
+    let mut raw = Vec::new();
+    let read = s.read_to_end(&mut raw);
+    if raw.is_empty() {
+        let n = sent.with_context(|| format!("sending to the mcp door at {door}"))?;
+        read.with_context(|| format!("reading the mcp door's answer from {door}"))?;
+        if n != len {
+            bail!("the content ended after {n} of {len} bytes");
+        }
+    }
+    parse_http(&raw)
+}
+
 fn parse_http(raw: &[u8]) -> Result<Answer> {
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").context("the mcp door's answer has no end of headers")?;
     let head = String::from_utf8_lossy(&raw[..split]).into_owned();

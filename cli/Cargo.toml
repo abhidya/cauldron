@@ -74,6 +74,10 @@ toml = { workspace = true }
 # tokio, no axum, no env).
 tungstenite = "0.24"
 shapewire = { path = "../libs/shapewire", default-features = false }
+# The stdio bridge opens a session's transcript with O_NOFOLLOW and
+# O_NONBLOCK, and names ELOOP: constants only, no `unsafe`. The version the
+# lockfile already holds.
+libc = "0.2"
 
 # REL-6a5: the `it` binary exports CAULDRON_ISOLATED=1 at load, so every
 # `cauldron` child a test spawns is isolated and refuses his real root, his

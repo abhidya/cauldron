@@ -4,9 +4,7 @@
 //! `tools/list` with the same list when the service is not running. Static:
 //! `tools/list` answers the same
 //! list whether or not any cauldron is granted, so a client's configuration
-//! never finds a tool missing. A tool that is listed but not yet built in
-//! this release answers `not_available_yet`; `soup_claim` always answers
-//! `unsupported`.
+//! never finds a tool missing. `soup_claim` always answers `unsupported`.
 //!
 //! Every tool takes an optional `cauldron`, which names the target outright
 //! (the service's `ctx` module has the rest of the resolution). Every read takes an
@@ -31,11 +29,25 @@ pub const CTX_KEY: &str = "_ctx";
 /// fit before sending it.
 pub const REQUEST_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// The door's second route: `soup_dump_session` as the stdio bridge sends
+/// it. The body is the `tools/call` message on its first line (at most
+/// [`SESSION_HEAD_LIMIT`] bytes) and then the session's transcript,
+/// verbatim, streamed to the dumps store's blob store and never held whole
+/// in memory. The service reads no path a caller names: the transcript
+/// arrives as bytes from the bridge, which found it on this machine.
+pub const SESSION_PATH: &str = "/mcp/dump-session";
+
+/// The most the first line of a [`SESSION_PATH`] request may be.
+pub const SESSION_HEAD_LIMIT: usize = 64 * 1024;
+
 /// What a tool needs before it may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Needs {
     /// A grant with this scope on the resolved cauldron.
     Scope(Scope),
+    /// A grant with both scopes (reading a dump's content: `read` and
+    /// `dump`).
+    Both(Scope, Scope),
     /// Listed, not built in this release: always `not_available_yet`.
     NotYet(&'static str),
     /// Listed so a client's configuration finds it; always `unsupported`.
@@ -164,7 +176,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "soup_changes",
         needs: Needs::Scope(Scope::Read),
-        description: "What landed since a cursor, oldest first: {changes: [{seq, at, op, tx, ids: [{id, type, handle}], count}], cursor, head, more}. `op` is `create` (new nodes), `link` (new edges only) or `update`. With no `since`, only the current cursor, never a dump of the soup. Take a cursor from soup_status, soup_put, soup_link or an earlier soup_changes, and pass the answer's `cursor` as the next `since`. A cursor of another cauldron, or of a cauldron removed and made again under the same name, is refused as `cursor_unknown`; one ahead of the soup as `cursor_stale`.",
+        description: "What landed since a cursor, oldest first: {changes: [{seq, at, op, tx, ids: [{id, type, handle}], count}], dumps: [{seq, at, op, id, kind, bytes, state}], cursor, head, more}. In `changes` (the soup), `op` is `create` (new nodes), `link` (new edges only) or `update`; `dumps` are the dumps received (ids and sizes, never text). With no `since`, only the current cursor, never a dump of the soup. Take a cursor from soup_status, soup_put, soup_link or an earlier soup_changes, and pass the answer's `cursor` as the next `since`. A cursor of another cauldron, or of a cauldron removed and made again under the same name, is refused as `cursor_unknown`; one ahead of the soup as `cursor_stale`.",
         schema: || {
             object(
                 json!({"cauldron": cauldron(), "since": {"type": "string", "description": "A cursor (v1.…) this cauldron answered earlier."},
@@ -181,15 +193,57 @@ pub const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "soup_dump",
-        needs: Needs::NotYet("`soup_dump` is listed and not built in this release"),
-        description: "Keep a piece of text in the cauldron as a dump, for later processing. Answers a receipt with the dump's id, never the text.",
-        schema: || object(json!({"cauldron": cauldron(), "text": {"type": "string"}, "title": {"type": "string"}, "cite": {"type": "object"}, "refs": {"type": "array", "items": {"type": "string"}}}), &["text"]),
+        needs: Needs::Scope(Scope::Dump),
+        description: "Keep a piece of raw text in the cauldron as a dump, for later processing: it lands as `DM-<n>` in state `received`, in the cauldron's dumps store beside its soup (not as a soup node). One dump is one write. At most 1 MiB of text (larger is refused as `too_large`; split it). `title` names it; `source` says where the text came from; `cite` (meta.cites form) and `refs` (soup ids) are kept with it. Answers a receipt (id, bytes, sha256, cursor), never the text. Processing of dumps comes in a later release.",
+        schema: || {
+            object(
+                json!({"cauldron": cauldron(),
+                       "text": {"type": "string", "description": "The text to keep, verbatim. At most 1 MiB (UTF-8 bytes)."},
+                       "title": {"type": "string", "description": "A short name for the dump (at most 200 characters)."},
+                       "source": {"type": "string", "description": "Where the text came from, in a few words (at most 500 characters)."},
+                       "cite": {"type": "object", "description": "One citation in `meta.cites` form, e.g. {\"kind\":\"url\",\"url\":\"…\"}."},
+                       "refs": {"type": "array", "items": {"type": "string"}, "description": "Ids of soup nodes this text is about."}}),
+                &["text"],
+            )
+        },
     },
     Tool {
         name: "soup_dump_session",
-        needs: Needs::NotYet("`soup_dump_session` is listed and not built in this release"),
-        description: "Keep a session's transcript in the cauldron as a dump, for later processing. Answers a receipt with the dump's id.",
-        schema: || object(json!({"cauldron": cauldron(), "session_id": {"type": "string"}, "title": {"type": "string"}}), &[]),
+        needs: Needs::Scope(Scope::Dump),
+        description: "Keep a Claude Code session's transcript in the cauldron as a dump, verbatim, for later processing (at most 64 MiB). The session is `session_id`, else this session. Its transcript is found on this machine under the Claude Code config directory's `projects` store, by the bridge, never by a path. A transcript holds tool output and anything pasted into the session; it is stored as it is. Answers a receipt (id, bytes, sha256 equal to the transcript file's, lines, cwd). `session_unknown` when no transcript has that id.",
+        schema: || {
+            object(
+                json!({"cauldron": cauldron(),
+                       "session_id": {"type": "string", "description": "The session whose transcript to keep (its id, never a path). Default: this session."},
+                       "title": {"type": "string", "description": "A short name for the dump (at most 200 characters)."}}),
+                &[],
+            )
+        },
+    },
+    Tool {
+        name: "soup_dumps",
+        needs: Needs::Scope(Scope::Read),
+        description: "The cauldron's dumps, newest first, as summaries {id, state, kind, title, bytes, sha256, received_at, source}: never their text. Filter by `state` (received, processed, failed) and `kind` (text, session).",
+        schema: || {
+            object(
+                json!({"cauldron": cauldron(), "state": {"type": "string"}, "kind": {"type": "string"},
+                       "limit": limit(crate::dumps::LIST_LIMIT), "max_chars": max_chars()}),
+                &[],
+            )
+        },
+    },
+    Tool {
+        name: "soup_dump_get",
+        needs: Needs::Both(Scope::Read, Scope::Dump),
+        description: "One dump's content, from byte `offset`, as much as fits `max_chars`: a text dump's text, or a session transcript verbatim. The answer says `next_offset` when there is more; call again with it. Needs a grant of both `read` and `dump`.",
+        schema: || {
+            object(
+                json!({"cauldron": cauldron(), "id": {"type": "string", "description": "The dump's id, e.g. DM-1."},
+                       "offset": {"type": "integer", "minimum": 0, "description": "The byte to start at. Default 0."},
+                       "max_chars": max_chars()}),
+                &["id"],
+            )
+        },
     },
 ];
 
@@ -234,7 +288,7 @@ mod tests {
             let d = m["description"].as_str().unwrap();
             assert!(d.contains("floor 256") && d.contains("ceiling 50000") && d.contains("twice"), "{d}");
         }
-        assert_eq!(seen, 6, "every read takes max_chars");
+        assert_eq!(seen, 8, "every read takes max_chars");
         assert_eq!(crate::budget::clamp(Some(1)), crate::budget::MAX_CHARS_FLOOR);
     }
 }

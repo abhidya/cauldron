@@ -1,0 +1,48 @@
+{
+  "fields": {
+    "artifacts": {
+      "required": false,
+      "kind": "object",
+      "max_chars": null,
+      "min_chars": null
+    },
+    "body": {
+      "required": true,
+      "kind": "text",
+      "max_chars": null,
+      "min_chars": 1
+    },
+    "env": {
+      "required": true,
+      "kind": "text",
+      "max_chars": null,
+      "min_chars": 1
+    },
+    "from_cluster": {
+      "required": false,
+      "kind": "text",
+      "max_chars": null,
+      "min_chars": null
+    },
+    "notes": {
+      "required": false,
+      "kind": "any",
+      "max_chars": null,
+      "min_chars": null
+    },
+    "seq": {
+      "required": false,
+      "kind": "integer",
+      "max_chars": null,
+      "min_chars": null
+    }
+  },
+  "states": [
+    "received",
+    "processed",
+    "failed"
+  ],
+  "count_cells": {},
+  "id_prefix": "DM",
+  "required_edges_at_mint": {}
+}

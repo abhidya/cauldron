@@ -13,6 +13,8 @@
 //! - [`catalogue`]: the tools;
 //! - [`changes`]: `soup_changes`, what landed since a cursor;
 //! - [`writer`]: one writer thread per open cauldron;
+//! - [`dumps`]: the dump tools' store, held per cauldron, and the side
+//!   effects hook a landed dump calls;
 //! - [`access`], [`secret`], [`audit`], [`cursor`], [`seam`], [`daemon`].
 
 pub mod access;
@@ -23,6 +25,7 @@ pub mod ctx;
 pub mod cursor;
 pub mod daemon;
 pub mod door;
+pub mod dumps;
 pub mod http;
 pub mod seam;
 pub mod secret;

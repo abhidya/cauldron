@@ -269,6 +269,78 @@ impl Service {
     }
 }
 
+impl Service {
+    /// `soup_dump_session` as the stdio bridge sends it: the call on the
+    /// first line, then the transcript's bytes.
+    pub fn dump_session(&self, args: Value, ctx: &Value, transcript: &[u8]) -> Resp {
+        let mut args = args;
+        args["_ctx"] = ctx.clone();
+        let call = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "soup_dump_session", "arguments": args}});
+        let mut body = call.to_string().into_bytes();
+        body.push(b'\n');
+        body.extend_from_slice(transcript);
+        let h = vec![
+            ("Host".to_string(), format!("127.0.0.1:{}", self.door.port())),
+            ("Authorization".to_string(), self.bearer.clone()),
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+        ];
+        http_bytes(self.door, "POST", "/mcp/dump-session", &h, &body)
+    }
+
+    /// [`Service::dump_session`]'s JSON-RPC `result`.
+    pub fn dump_session_result(&self, args: Value, ctx: &Value, transcript: &[u8]) -> Value {
+        let r = self.dump_session(args, ctx, transcript);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["id"], 7, "{v}");
+        v.get("result").cloned().unwrap_or_else(|| panic!("no result: {v}"))
+    }
+}
+
+/// HTTP/1.1 to `path` with a raw body and `Connection: close`.
+pub fn http_bytes(addr: SocketAddr, method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> Resp {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(600))).unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()));
+    s.write_all(req.as_bytes()).unwrap();
+    // The service may answer (a refusal) before reading the whole body.
+    let _ = s.write_all(body);
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    Resp { status, head: head.to_string(), body: body.to_string() }
+}
+
+/// A Claude Code transcript as a fixture: `n` JSONL lines, each recording
+/// `cwd`, with a little of everything a real one holds.
+pub fn transcript(n: usize, cwd: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        let line = json!({"type": if i % 2 == 0 { "user" } else { "assistant" }, "cwd": cwd, "sessionId": "sess-fixture",
+            "message": {"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("line {i}: some words, \"quoted\", é")}});
+        out.extend_from_slice(line.to_string().as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// SHA-256 of `b`, hex.
+pub fn sha256_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(b))
+}
+
+/// The dumps store of `c`.
+pub fn dumps_dir(s: &Scratch, c: &str) -> PathBuf {
+    s.data().join("cauldrons").join(c).join("dumps")
+}
+
 /// One line to the seam, one line back.
 pub fn seam_say(addr: SocketAddr, line: &str) -> String {
     let mut s = TcpStream::connect(addr).unwrap();

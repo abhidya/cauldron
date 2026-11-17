@@ -7,7 +7,7 @@ use crate::support::*;
 const LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
 
 /// Every tool of the design's catalogue, in order.
-const TOOLS: [&str; 12] = [
+const TOOLS: [&str; 14] = [
     "soup_status",
     "soup_regions",
     "soup_region",
@@ -20,6 +20,8 @@ const TOOLS: [&str; 12] = [
     "soup_claim",
     "soup_dump",
     "soup_dump_session",
+    "soup_dumps",
+    "soup_dump_get",
 ];
 
 #[test]
@@ -83,8 +85,9 @@ fn d1_the_door_admits_only_the_secret_on_loopback_and_no_browser() {
     let r: Value = serde_json::from_str(&svc.post(&body.to_string(), &[]).body).unwrap();
     assert_eq!(refused(&r["result"]).0, "bad_ctx");
     assert_eq!(refused(&svc.call("soup_status", json!({"cauldron": "kb"}), &json!({"cwd": "/"}))).0, "bad_ctx");
-    // Listed but not built here, and never supported.
-    assert_eq!(refused(&svc.call("soup_dump", json!({"text": "x"}), &ctx(&work))).0, "not_available_yet");
+    // A dump is closed by default too; a cluster claim is never supported.
+    assert_eq!(refused(&svc.call("soup_dump", json!({"text": "x"}), &ctx(&work))).0, "no_cauldron_for_project");
+    assert_eq!(refused(&svc.call("soup_dump", json!({"cauldron": "kb", "text": "x"}), &ctx(&work))).0, "not_granted");
     assert_eq!(refused(&svc.call("soup_claim", json!({"cluster": "x", "region": "R-1"}), &ctx(&work))).0, "unsupported");
     // An unknown tool is the protocol's -32602.
     let body = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "soup_grant", "arguments": {}}});

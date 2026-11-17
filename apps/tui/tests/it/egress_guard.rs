@@ -487,25 +487,55 @@ fn http_deps(manifest: &str) -> Vec<String> {
     out
 }
 
+/// **THE HTTP-DEPENDENCY ALLOW-LIST**: `(member, crate, the exact manifest
+/// line, why)`. The line is matched WHOLE, so a change to the dependency (a
+/// `client` feature added, a rename) is no longer allowed and fails; an
+/// entry that matches nothing is stale and fails too.
+const HTTP_DEP_ALLOWED: &[(&str, &str, &str, &str)] = &[(
+    "services/mcp",
+    "hyper",
+    r#"hyper = { version = "1", features = ["server", "http1"] }"#,
+    "the mcp service's LISTENER: hyper with the `server` and `http1` features only (no `client`), serving JSON-RPC on the \
+     loopback socket services/mcp/src/http.rs binds to 127.0.0.1; it dials nothing. The face does not link the service, \
+     and the CLI has it only as a dev-dependency (its tests)",
+)];
+
 /// **REL-6a6: NO MEMBER IN REACH DEPENDS ON AN HTTP CLIENT, RENAMED OR
 /// NOT.** Opposed: the detector finds a direct and a renamed dependency in a
-/// planted manifest, and not a crate that merely contains the name.
+/// planted manifest, and not a crate that merely contains the name. A
+/// dependency in [`HTTP_DEP_ALLOWED`] passes only as that exact line.
 #[test]
 fn rel6a6_no_member_in_reach_depends_on_an_http_client_even_renamed() {
     let planted = "[package]\nname = \"x\"\n[dependencies]\nreqwest = \"0.12\"\nweb = { package = \"ureq\", version = \"2\" }\nhyperlocal-ish = \"1\"\n[dev-dependencies]\nnet = { version = \"1\", package = \"curl\" }\n";
     assert_eq!(http_deps(planted).len(), 3, "the detector, planted: {:?}", http_deps(planted));
+    // Opposed: an allowed line with one feature more is flagged again.
+    let widened = r#"hyper = { version = "1", features = ["server", "http1", "client"] }"#;
+    assert!(!HTTP_DEP_ALLOWED.iter().any(|(_, c, line, _)| format!("{line} ({c})") == http_deps(&format!("[dependencies]\n{widened}\n"))[0]));
     let ws = workspace();
     let mut wrong = Vec::new();
     let mut read = 0;
+    let mut used = BTreeSet::new();
     for m in members(&ws) {
         if OUT_OF_REACH.iter().any(|(p, _)| *p == m) {
             continue;
         }
         let text = std::fs::read_to_string(ws.join(&m).join("Cargo.toml")).unwrap();
         read += 1;
-        wrong.extend(http_deps(&text).into_iter().map(|d| format!("{m}/Cargo.toml: {d}")));
+        for d in http_deps(&text) {
+            match HTTP_DEP_ALLOWED.iter().position(|(am, c, line, _)| *am == m && d == format!("{line} ({c})")) {
+                Some(i) => {
+                    used.insert(i);
+                }
+                None => wrong.push(format!("{m}/Cargo.toml: {d}")),
+            }
+        }
     }
     assert!(read >= 10, "sentinel: only {read} member manifests read");
+    for (i, (m, c, line, why)) in HTTP_DEP_ALLOWED.iter().enumerate() {
+        if !used.contains(&i) {
+            wrong.push(format!("stale allowance: {m}/Cargo.toml has no `{line}` ({c}: {why})"));
+        }
+    }
     assert!(wrong.is_empty(), "an HTTP client in reach of the face/CLI:\n{}", wrong.join("\n"));
 }
 
@@ -568,6 +598,14 @@ const SHIPPED_ALLOWED: &[(&str, &str, usize, &str, &str)] = &[
         "RV1.S12a ctl node: a websocket HANDSHAKE over the TcpStream env::egress::connect_tcp already admitted; it dials nothing itself",
     ),
     ("apps/tui/src/cauldron_env.rs", concat!("cauldron_", "bin()"), 1, "pub fn cauldron_bin", "the resolver's definition, not a spawn"),
+    (
+        "services/mcp/src/http.rs",
+        concat!("hyper", "::"),
+        1,
+        "pub const HOST: &str = \"127.0.0.1\";",
+        "the mcp service's LISTENER: an http1 SERVER connection builder over the socket `bind` opens on 127.0.0.1 only; it \
+         serves, and dials nothing (see HTTP_DEP_ALLOWED)",
+    ),
 ];
 
 /// Members whose shipped code is NOT in the face/CLI's reach, with why.

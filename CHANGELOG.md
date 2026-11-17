@@ -21,11 +21,145 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.6, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.7, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.6, only an
+  the disable and trigger a fresh usage reading. Through 0.1.7, only an
   explicit enable clears it.
+
+## [0.1.7] — 2026-11-16
+
+Dumps: raw text put into a cauldron for later processing, from Claude Code
+or a shell, including a whole Claude Code session's transcript. A dump is
+kept in the cauldron's dumps store beside its soup, never in the soup, and
+waits there in state `received`. Nothing processes dumps in this release;
+processing of dumps comes in a later release. Stores made by 0.1.6 open
+unchanged.
+
+### Added
+
+- **The dumps store.** Each cauldron's dumps live in `<cauldron>/dumps/`
+  (for the implicit legacy cauldron, `data/<env>/soup/dumps/`), beside its
+  soup: a spine of its own with one pool, `dumps`, whose grammar `dump@1`
+  is grammar v7's `dump` node type copied (prefix `DM`, states `received`,
+  `processed`, `failed`, the same fields) plus an optional `meta` object, and
+  a content-addressed blob store, `blobs/<sha256>.<txt|jsonl>`. It is made on
+  the first dump; a cauldron nobody has dumped into has none. Each dump is
+  one transaction: its bytes are written to a temporary file in the blob
+  store; then, holding the store, the grant is read again (by the service),
+  the file is synced and named by its sha256, and one write creates
+  `DM-<n>` in state `received`. A dump refused or failed at any step leaves
+  no bytes: its temporary file is removed, and so is any blob no dump
+  names. A writer killed mid-dump can leave a temporary file, or a blob and
+  no node; both are removed the next time the store is opened for writing
+  (the service's `open-dumps` audit line counts them, under
+  `recovered_at_open.swept`). The
+  same text dumped twice is two dumps and one blob. The store is private to
+  its owner: its directories are made 0700 and its files 0600, whatever the
+  umask. A soup record that
+  came from a dump can cite it as `meta.cites: [{"kind": "dump", "id":
+  "DM-3"}]` (documented in the schema's README; `meta` is open, so nothing
+  in the grammar changed).
+- **`soup_dump`** (MCP): keep up to 1 MiB of text as a dump, with an optional
+  `title`, `source`, `cite` and `refs`. Larger text is refused as
+  `too_large`. It answers a receipt: `dump_id`, `state: received`, `kind`,
+  `bytes`, `sha256`, `blob_reused`, `tx`, the change `cursor`, and `next`
+  (that processing comes later); never the text.
+- **`soup_dump_session`** (MCP): keep a Claude Code session's transcript as
+  a dump, verbatim, up to 64 MiB. The stdio bridge, which runs as the user
+  beside the session, finds the transcript: the session is the call's
+  `session_id`, else `$CLAUDE_CODE_SESSION_ID`; it must be a plain id (no
+  path separator); and it is looked for only as
+  `<config>/projects/*/<id>.jsonl`, `<config>` being `$CLAUDE_CONFIG_DIR`,
+  else `~/.claude`. It follows no link there: a project directory or
+  transcript that is a link, a transcript with a second name, or one whose
+  real path is outside `<config>/projects` is `transcript_link`, and a FIFO,
+  device or directory in the transcript's place is `transcript_unreadable`;
+  nothing of it is read. No transcript of that id is `session_unknown`; a
+  store or file that cannot be read is `transcript_unreadable`, not absent;
+  over 64 MiB is `too_large`; each is answered before anything is sent. The
+  bridge streams the transcript to the service's new route,
+  `POST /mcp/dump-session` (the call on the first line, then the bytes); the
+  service judges the call, grant included, before it reads any of the
+  transcript, streams it to the blob store without holding it in memory,
+  and never reads a path a call names. The receipt adds `session_id`,
+  `lines` and `cwd`, and its `sha256` is the transcript file's. A
+  transcript still being written is sent as it stood when the bridge looked
+  at it, and when it has grown since, up to its last whole line. Called through
+  `POST /mcp` instead, the tool is refused as `usage`.
+- **`soup_dumps`** (MCP, `read`): the dumps, newest first, as summaries (id,
+  state, kind, title, bytes, sha256, when received, source), never their
+  text, filtered by `state` and `kind`. **`soup_dump_get`** (MCP, `read` and
+  `dump`): one dump's content from a byte `offset`, as much as fits
+  `max_chars`, with `next_offset` while there is more. Reading content needs
+  both scopes because a dump is raw material: a transcript holds tool output
+  and anything pasted into the session, and a grant made to read the
+  knowledge graph does not hand it out to a Claude Code session. The scopes
+  govern sessions through the MCP service only: `cauldron soup dumps` and
+  `cauldron soup dump-get` run as the user and read dumps without a grant,
+  like every other CLI read.
+- **`cauldron soup dump <file|-> --env <env> --cauldron <name> [--title <t>]
+  [--source <s>]`**, `cauldron soup dumps` and `cauldron soup dump-get <id>
+  [--offset N] [--max-chars N] [--raw]` (`--raw` prints the content
+  verbatim). `soup dump` writes directly when nothing holds the dumps store;
+  while the `mcp` service holds it, the dump is sent to the service as one
+  `soup_dump` and printed the same way, plus `forwarded_to`, as `soup
+  import` does. The reads open the store so that they cannot write.
+- **Plugin commands** `/cauldron:dump` (text, or a file's text) and
+  `/cauldron:dump-session [title]` (this session's transcript, by
+  `${CLAUDE_SESSION_ID}`), and README sections on dumps. A session
+  transcript holds every message, every tool call and its output, and
+  anything pasted into the session; it is stored verbatim, in the user's own
+  cauldron on this machine.
+- **A side-effect hook after each dump.** Once a dump's transaction has
+  committed and the store has been let go, the service calls its
+  `SideEffects` hook; in this release that only writes a log line. Later
+  processing attaches there, after the write and never inside it.
+
+### Changed
+
+- **The `dump` scope is used.** A grant's `dump` scope (in the default
+  `read,write,dump`) is what `soup_dump` and `soup_dump_session` need. The
+  service opens a cauldron's dumps store on its first dump, under the
+  store's own writer lock (`mcp <pid>`), and holds it until the grant loses
+  `dump` or is revoked, or the service stops; it reads the grant again
+  immediately before each dump is written, and every 4 MiB while a
+  transcript arrives (a revoke stops the reading). A dump refused that way
+  is answered "Nothing was written", and nothing is.
+- **The change cursor has a fourth part**, the dumps store's counter:
+  `v1.<instance>.<soup counter>.<dumps counter>`. A cursor 0.1.6 answered
+  (three parts) is still accepted, read as dumps counter 0. A four-part
+  cursor given to a 0.1.6 service is refused there as `cursor_unknown`.
+- **`soup_changes` lists dumps** beside the soup's changes:
+  `dumps: [{seq, at, op, id, kind, bytes, state}]`, ids and sizes only, cut
+  by the same `limit` and `max_chars`, with the cursor moved back to the
+  last item kept.
+- **`soup_status` counts dumps:** `dumps: {store, total, by_state, held}`.
+- **The audit log** gets one line per dump call (and per open and close of a
+  dumps store), with the dump's id, its size and a transcript's line count,
+  never its text.
+- **`cauldron mcp status`** shows, per cauldron, what its dumps store's lock
+  says (`dumps_lock_says`).
+
+### Known limitations
+
+- **A dump cannot be deleted.** No verb or tool removes one. To remove a
+  cauldron's dumps (all of them, for example after a transcript holding a
+  secret was dumped), stop the `mcp` service or revoke the cauldron, then
+  remove `<root>/data/<env>/cauldrons/<cauldron>/dumps/` by hand
+  (`<root>/data/<env>/soup/dumps/` for the implicit legacy cauldron). A
+  blob alone is not enough: a text dump's text is also in the store's
+  databases. The plugin's README has the steps.
+
+### Compatibility
+
+- A store made by 0.1.6 opens under 0.1.7 unchanged: nothing in its soup
+  changes, and a cauldron has no dumps store until its first dump.
+- A cauldron holding dumps works under the 0.1.6 binary: it reads and writes
+  only `soup/` and does not look in `dumps/`. Checked with a 0.1.6 build
+  (its `soup nodes`, `regions`, `search`, `get`, `import`, `recover`,
+  `list` and `mcp status` on a cauldron with a dump), and by reading the
+  0.1.6 service, which opens, reads and scans only the soup's directory.
 
 ## [0.1.6] — 2026-11-16
 
@@ -441,7 +575,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/broomstick-ai/cauldron/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/broomstick-ai/cauldron/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/broomstick-ai/cauldron/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/broomstick-ai/cauldron/compare/v0.1.3...v0.1.4

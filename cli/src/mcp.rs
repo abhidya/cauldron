@@ -291,6 +291,7 @@ fn status(args: &[String]) -> Result<i32> {
             "projects": grant.map(|gr| gr.projects.clone()).unwrap_or_default(),
             "held_by_service": held.contains(&c.name),
             "writer_lock_says": soup_door::lock::lock_says(&c),
+            "dumps_lock_says": soup_door::dumps::lock_says(&c),
         }));
     }
     println!(
@@ -300,8 +301,9 @@ fn status(args: &[String]) -> Result<i32> {
             "service": service,
             "open": open,
             "cauldrons": cauldrons,
-            "note": "`writer_lock_says` is the text the last holder wrote into <soup>/writer.lock; the lock itself, \
-                     not the text, says who holds it now, and `held_by_service` is the service's own answer",
+            "note": "`writer_lock_says` is the text the last holder wrote into <soup>/writer.lock (and `dumps_lock_says` \
+                     into <cauldron>/dumps/writer.lock); the lock itself, not the text, says who holds it now, and \
+                     `held_by_service` is the service's own answer for the soup",
         }))?
     );
     Ok(0)

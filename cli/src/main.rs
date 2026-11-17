@@ -78,7 +78,8 @@ mod cauldron_seed;
 mod cauldrons;
 mod ctl;
 // `cauldron soup import | recover | regions | get | nodes |
-// search | region`, the soup offline.
+// search | region | dump | dumps | dump-get`, the soup offline, and the
+// dumps kept beside it.
 mod soup;
 // `cauldron link` and the `.cauldron` project marker the soup verbs read.
 mod link;
@@ -135,7 +136,7 @@ const VERBS: &[(&str, &str)] = &[
     ("ctl", "the coordinator's face, headless: dump | frame | node (`ctl help`)"),
     ("create", "make a cauldron (cauldrons/<name>/, with its own empty soup) in this environment"),
     ("list", "the cauldrons of this environment (the implicit legacy one marked)"),
-    ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region (`soup help`)"),
+    ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get (`soup help`)"),
     ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
     ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
 ];
@@ -157,11 +158,12 @@ cauldron — the Cauldron entry point
                                      empty soup (one pool, `ws`, grammar v6)
     cauldron list [--env <e>] [--json]
                                      the cauldrons of an environment; writes nothing
-    cauldron soup import|recover|regions|get|nodes|search|region ...
+    cauldron soup import|recover|regions|get|nodes|search|region|dump|dumps|dump-get ...
                                      a cauldron's soup, offline: land records in the
                                      published schema shape as one all-or-nothing
                                      write; settle an interrupted import; list
-                                     regions; read and search nodes.
+                                     regions; read and search nodes; keep text as a
+                                     dump beside the soup, and read dumps back.
                                      JSON out, non-zero on refusal (`cauldron soup help`)
     cauldron link <cauldron> --env <e> [--dir <path>] | --show
                                      write a .cauldron marker naming this project's

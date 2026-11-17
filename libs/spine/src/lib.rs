@@ -35,6 +35,7 @@ pub mod envelope;
 pub mod exec;
 pub mod fault;
 pub mod flags;
+pub mod grammar_dump;
 pub mod grammar_v6;
 pub mod ladle;
 pub mod locks;

@@ -1,22 +1,26 @@
-//! **`soup_changes`**: what landed in a soup since a cursor, read through
-//! connections that cannot write (never through the writer thread).
+//! **`soup_changes`**: what landed in a cauldron since a cursor, read
+//! through connections that cannot write (never through a writer thread).
 //!
-//! The stream is the spine's committed-commit counter: every write that
-//! lands bumps it by one and stamps its transaction row with the new value
-//! (`committed_at`). A cursor (`v1.<soup instance>.<counter>`, see
-//! [`crate::cursor`]) names a point in that stream; the changes after it are
-//! the rows whose `committed_at` is above it, oldest first.
+//! There are two streams, each a spine's committed-commit counter: the
+//! soup's, and the dumps store's (`soup_door::dumps`). Every write that
+//! lands bumps its spine's counter by one and stamps its transaction row
+//! with the new value (`committed_at`). A cursor
+//! (`v1.<soup instance>.<counter>.<dumps counter>`, see [`crate::cursor`])
+//! names a point in both; the changes after it are the rows whose
+//! `committed_at` is above it, oldest first, in `changes` (the soup) and
+//! `dumps` (the dumps store).
 //!
-//! Each change says what the write did, from the pool files' own `*_tx`
+//! Each soup change says what the write did, from the pool files' own `*_tx`
 //! columns: `create` (it made nodes; `ids` are those nodes), `link` (it made
 //! edges between nodes that already existed; `ids` are the edges' sources)
 //! or `update` (it changed nodes it did not make). At most
 //! [`IDS_PER_CHANGE`] ids are listed per change; `count` is how many there
-//! were.
+//! were. Each dump entry is `{seq, at, op: "dump", id, kind, bytes, state}`
+//! (ids and sizes, never text).
 //!
 //! Refusals: a cursor that is not this door's form, or that belongs to
 //! another cauldron (or to one removed and made again under the same name),
-//! is `cursor_unknown`; one whose counter is above the soup's is
+//! is `cursor_unknown`; one whose counter is above its stream's is
 //! `cursor_stale`. With no `since`, the answer is the current cursor and no
 //! changes: never a dump of the soup.
 
@@ -55,11 +59,15 @@ fn unknown(t: &Target, since: &str, why: &str) -> Refusal {
     )
 }
 
-/// The counter `since` names, checked against this cauldron and its head.
-pub fn parse_since(t: &Target, since: &str, head: u64) -> Result<u64, Refusal> {
-    let mut parts = since.trim().splitn(3, '.');
-    let (Some("v1"), Some(inst), Some(n)) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(unknown(t, since, "a cursor has the form v1.<instance>.<counter>"));
+/// The counters `since` names (the soup's, the dumps store's), checked
+/// against this cauldron and its heads. A cursor with no dumps part (one
+/// written before dumps existed) is read as dumps counter 0.
+pub fn parse_since(t: &Target, since: &str, head: u64, dumps_head: u64) -> Result<(u64, u64), Refusal> {
+    let parts: Vec<&str> = since.trim().split('.').collect();
+    let (inst, n, d) = match parts.as_slice() {
+        ["v1", inst, n] => (*inst, *n, None),
+        ["v1", inst, n, d] => (*inst, *n, Some(*d)),
+        _ => return Err(unknown(t, since, "a cursor has the form v1.<instance>.<counter>.<dumps counter>")),
     };
     if inst != cursor::instance(&t.cauldron) {
         return Err(unknown(
@@ -69,18 +77,22 @@ pub fn parse_since(t: &Target, since: &str, head: u64) -> Result<u64, Refusal> {
         ));
     }
     let n: u64 = n.parse().map_err(|_| unknown(t, since, "its counter is not a number"))?;
-    if n > head {
+    let d: u64 = match d {
+        None => 0,
+        Some(d) => d.parse().map_err(|_| unknown(t, since, "its dumps counter is not a number"))?,
+    };
+    if n > head || d > dumps_head {
         return Err(Refusal::new(
             "cursor_stale",
             format!(
-                "`{since}` is ahead of cauldron `{}`'s soup, whose cursor is `{}`: the soup has not seen that many \
+                "`{since}` is ahead of cauldron `{}`, whose cursor is `{}`: it has not seen that many \
                  writes. Nothing was read. Call soup_changes without `since` for the current cursor.",
                 t.cauldron.name,
-                cursor::cursor(&t.cauldron, head)
+                cursor::cursor(&t.cauldron, head, dumps_head)
             ),
         ));
     }
-    Ok(n)
+    Ok((n, d))
 }
 
 /// One transaction row of the stream.
@@ -91,12 +103,14 @@ struct Row {
     by: Option<String>,
 }
 
-/// The answer: `{env, cauldron, since, cursor, head, changes, more}` (+
-/// `next` when the list stopped short). `cursor` is where to read on from.
+/// The answer: `{env, cauldron, since, cursor, head, changes, dumps,
+/// more}` (+ `next` when a list stopped short). `cursor` is where to read
+/// on from.
 pub fn changes(t: &Target, since: Option<&str>, limit: Option<usize>) -> Result<Value, Refusal> {
     let soup = t.soup();
     let head = cursor::counter_offline(&soup).map_err(|e| store(t, &e))?;
-    let head_cursor = cursor::cursor(&t.cauldron, head);
+    let dumps_head = soup_door::dumps::counter(&t.cauldron).map_err(|e| store(t, &e))?;
+    let head_cursor = cursor::cursor(&t.cauldron, head, dumps_head);
     let Some(since) = since else {
         return Ok(json!({
             "env": t.env.name,
@@ -105,31 +119,41 @@ pub fn changes(t: &Target, since: Option<&str>, limit: Option<usize>) -> Result<
             "cursor": head_cursor,
             "head": head_cursor,
             "changes": [],
+            "dumps": [],
             "more": false,
             "note": "no `since`: this is the current cursor only; pass it as `since` later to read what landed after it",
         }));
     };
-    let from = parse_since(t, since, head)?;
+    let (from, dumps_from) = parse_since(t, since, head, dumps_head)?;
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let rows = rows_after(&soup, from, head, limit + 1).map_err(|e| store(t, &e))?;
-    let more = rows.len() > limit;
+    let more_soup = rows.len() > limit;
     let rows = &rows[..rows.len().min(limit)];
     let pools = pool_files(&soup).map_err(|e| store(t, &e))?;
     let mut list = Vec::new();
     for r in rows {
         list.push(change(&pools, r).map_err(|e| store(t, &e))?);
     }
-    let cursor = match (more, rows.last()) {
-        (true, Some(last)) => cursor::cursor(&t.cauldron, last.counter),
-        _ => head_cursor.clone(),
+    let mut dumps = soup_door::dumps::landed_after(&t.cauldron, dumps_from, dumps_head, limit).map_err(|e| store(t, &e))?;
+    let more_dumps = dumps.len() > limit;
+    dumps.truncate(limit);
+    let soup_at = match (more_soup, rows.last()) {
+        (true, Some(last)) => last.counter,
+        _ => head,
     };
+    let dumps_at = match (more_dumps, dumps.last().and_then(|d| d["seq"].as_u64())) {
+        (true, Some(last)) => last,
+        _ => dumps_head,
+    };
+    let more = more_soup || more_dumps;
     let mut doc = json!({
         "env": t.env.name,
         "cauldron": t.cauldron.name,
         "since": since,
-        "cursor": cursor,
+        "cursor": cursor::cursor(&t.cauldron, soup_at, dumps_at),
         "head": head_cursor,
         "changes": list,
+        "dumps": dumps,
         "more": more,
     });
     if more {
@@ -138,17 +162,35 @@ pub fn changes(t: &Target, since: Option<&str>, limit: Option<usize>) -> Result<
     Ok(doc)
 }
 
-/// After a whole-reply bound cut the list: `cursor` is moved back to the
-/// last change kept, so reading on from it misses nothing.
+/// After a whole-reply bound cut a list: the cursor's part for that list is
+/// moved back to the last item kept, so reading on from it misses nothing.
 pub fn after_budget(t: &Target, doc: &mut Value) {
-    let dropped = doc["truncated"]["dropped_from"]["changes"].as_u64().unwrap_or(0);
-    if dropped == 0 {
+    let dropped = |k: &str| doc["truncated"]["dropped_from"][k].as_u64().unwrap_or(0);
+    let (soup_cut, dumps_cut) = (dropped("changes"), dropped("dumps"));
+    if soup_cut == 0 && dumps_cut == 0 {
         return;
     }
-    let Some(last) = doc["changes"].as_array().and_then(|c| c.last()).and_then(|c| c["seq"].as_u64()) else { return };
-    doc["cursor"] = json!(cursor::cursor(&t.cauldron, last));
+    let Some(cur) = doc["cursor"].as_str().map(str::to_string) else { return };
+    let parts: Vec<&str> = cur.split('.').collect();
+    let (Some(s), Some(d)) = (parts.get(2).and_then(|x| x.parse::<u64>().ok()), parts.get(3).and_then(|x| x.parse::<u64>().ok())) else {
+        return;
+    };
+    let last = |k: &str| doc[k].as_array().and_then(|c| c.last()).and_then(|c| c["seq"].as_u64());
+    let s = if soup_cut > 0 { last("changes").unwrap_or(s.min(parse_from(doc))) } else { s };
+    let d = if dumps_cut > 0 { last("dumps").unwrap_or(d.min(parse_dumps_from(doc))) } else { d };
+    doc["cursor"] = json!(cursor::cursor(&t.cauldron, s, d));
     doc["more"] = json!(true);
     doc["next"] = json!(NEXT);
+}
+
+/// The soup counter `since` named (0 when unreadable): where to read on
+/// from when a cut left no change in the list.
+fn parse_from(doc: &Value) -> u64 {
+    doc["since"].as_str().and_then(|s| s.split('.').nth(2)).and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
+fn parse_dumps_from(doc: &Value) -> u64 {
+    doc["since"].as_str().and_then(|s| s.split('.').nth(3)).and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
 fn rows_after(soup: &Path, from: u64, head: u64, n: usize) -> Result<Vec<Row>, String> {
