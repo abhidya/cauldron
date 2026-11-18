@@ -147,6 +147,12 @@ your dumps into records:
   points at while it thinks, and the regions its records go into while it
   writes them, so you and your sessions write everywhere else meanwhile
   ([Region locks](#region-locks)).
+- 0.1.15: prebuilt binaries for Apple silicon, installed with no Rust
+  toolchain ([Install](#install)); a plugin MCP launcher that finds
+  `cauldron` without the `PATH` Claude Code was started with; and
+  `cauldron soup import-corpus`, which brings records in the older corpus
+  format into a cauldron's soup ([Records in the older corpus
+  format](#records-in-the-older-corpus-format)).
 
 cauldron has three parts:
 
@@ -192,14 +198,99 @@ come from the environment's data or the demo data. See
 
 ## Requirements
 
-- **macOS only.** The supervisor runs on launchd and the build signs its
-  binaries with `codesign`. Linux and Windows are not supported.
-- **A Rust toolchain**, installed with [rustup](https://rustup.rs) (stable,
-  edition 2021), plus the Xcode Command Line Tools (`xcode-select --install`).
+- **macOS only.** The supervisor runs on launchd and its binaries are signed
+  with `codesign`. Linux and Windows are not supported.
+- **For the prebuilt install:** an Apple silicon (arm64) Mac. Nothing else:
+  no Rust toolchain, no Xcode tools.
+- **To build from source:** a Rust toolchain, installed with
+  [rustup](https://rustup.rs) (stable, edition 2021), plus the Xcode Command
+  Line Tools (`xcode-select --install`).
 - **Claude Code**, installed and logged in (`claude` on your `PATH`). The
   threads daemon runs your agents through it.
 
 ## Install
+
+There are two ways in. **Use the prebuilt binaries** if you want to use
+cauldron on an Apple silicon Mac; **build from source** if you work on
+cauldron itself, or your Mac is an Intel one. Both give you the same
+environment, service pins and supervisor, and run the same later steps. The
+prebuilt install also keeps the bundle in `share/cauldron/releases/` and its
+service and MCP tool declarations in `share/cauldron/` under your cauldron
+root, and its `threads` keeps the bundle's ad-hoc signature.
+
+### Prebuilt binaries (Apple silicon, no Rust toolchain)
+
+From 0.1.15, each release on GitHub carries two files: the bundle
+`cauldron-<version>-aarch64-apple-darwin.tar.gz` (the `cauldron` command, the
+terminal UI, the `threads` daemon, the `mcp` service, their declarations and
+the installer) and `SHA256SUMS`, its checksum. Download both with `curl`,
+check the checksum, unpack, and install (the commands are for 0.1.15;
+change the version for another release):
+
+```sh
+mkdir cauldron-download && cd cauldron-download
+curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.15/cauldron-0.1.15-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.15/SHA256SUMS
+shasum -a 256 -c SHA256SUMS
+tar -xzf cauldron-0.1.15-aarch64-apple-darwin.tar.gz
+cauldron-0.1.15-aarch64-apple-darwin/install --prebuilt cauldron-0.1.15-aarch64-apple-darwin.tar.gz
+```
+
+`shasum -a 256 -c SHA256SUMS` must print `OK` for the tarball. The installer
+checks it again itself: `--prebuilt <tarball>` reads the `SHA256SUMS` beside
+the tarball, or takes the sum with `--sha256 <sum>`. From a clone of the
+repository, `./scripts/install --prebuilt <url> --sha256 <sum>` downloads
+the tarball itself (https only; a URL always needs `--sha256`). It refuses a
+Mac that is not arm64 first. Before it unpacks anything, it refuses a tarball
+whose sum does not match, and one with an entry outside its own directory (an
+absolute path, `..`, or a link). It then unpacks the tarball into a scratch
+directory, where every file must match the bundle's own checksum list and
+every binary must be an arm64 executable carrying a valid signature; a
+bundle that fails any of these is not installed. A download is cut off past
+256 MiB. The bundle's own `install`, run without `--prebuilt`, says to pass
+it the tarball. It needs no cargo, git or compiler. It places the
+bundle in `~/.cauldron/share/cauldron/releases/<version>-<commit>/`, installs
+`threads` and `mcp` from it as versions of their own (`cauldron build
+<service> --artifact <image>`), and then does exactly what the from-source
+install does below: makes `prod`, pins the services, puts the supervisor under
+launchd, and prints the same closing lines. `--dry-run` checks a local tarball
+and prints the plan without installing anything. To upgrade, run the new
+release's install the same way with `--replace-running`.
+
+**What "ad-hoc signed" means here.** Every binary in the bundle is signed
+with `codesign --sign -`, an ad-hoc signature: it carries no developer
+identity, and it is not notarised by Apple. An Apple silicon Mac runs no
+unsigned code, so the signature is what lets the binaries run at all, and
+`codesign --verify` (which the installer runs) shows that their bytes are
+the ones that were signed. It does not say who built them; the checksum
+you compare with the release's `SHA256SUMS` is what ties the tarball to the
+release. That `SHA256SUMS` comes from the same release page as the tarball,
+so it protects against a download that was damaged or changed on the way to
+you, and is only as trustworthy as the GitHub release itself and HTTPS:
+someone who could replace the tarball on the release page could replace
+`SHA256SUMS` too, and the installer would accept both. The bundle is built
+reproducibly from the public tree (`scripts/build-release-bundle`): two
+builds of one commit on one machine give the same tarball byte for byte.
+
+**Gatekeeper and the quarantine attribute.** A file downloaded by a browser
+(or another app that marks its downloads) carries the extended attribute
+`com.apple.quarantine`, and `tar` copies it onto every file it unpacks.
+Gatekeeper checks a quarantined program when it is launched, and it refuses
+an ad-hoc-signed, un-notarised one: macOS says it cannot verify the program,
+and the command does not run. `curl` does not set the attribute, which is why
+the commands above use it. If you downloaded the tarball with a browser,
+remove the attribute before unpacking it:
+
+```sh
+xattr -d com.apple.quarantine cauldron-0.1.15-aarch64-apple-darwin.tar.gz
+```
+
+(If you unpacked it already, `xattr -dr com.apple.quarantine
+cauldron-0.1.15-aarch64-apple-darwin` clears the unpacked directory too.) The
+installer refuses a quarantined tarball and prints that command. `xattr -l
+<file>` lists a file's attributes.
+
+### From source
 
 ```sh
 git clone https://github.com/broomstick-ai/cauldron
@@ -210,8 +301,8 @@ cd cauldron
 `./scripts/install` builds `cauldron`, `tui`, the `threads` daemon and the
 `mcp` service in release mode, makes the environment `prod`, pins `threads`
 and `mcp` in it, and puts the environment's supervisor under launchd for the
-current user. It always installs the whole stack. There are no prebuilt
-binaries: it builds from the checkout. It installs
+current user. It always installs the whole stack, built from the checkout.
+It installs
 everything under your own home directory (`~/.cauldron`, or `$CAULDRON_HOME` if
 you set it). It checks that it is running on macOS before it does anything, and
 it prints each step it takes. It does not sign anything with a personal
@@ -261,12 +352,22 @@ Then open a new terminal. (For bash, use `~/.bash_profile`. If you set
 `$CAULDRON_HOME`, the directory is `$CAULDRON_HOME/bin`.) The commands below
 assume `cauldron` is on your `PATH`.
 
-Claude Code must find `cauldron` too: the plugin starts its MCP server as the
-bare command `cauldron mcp stdio`. Claude Code started from a terminal takes
-that terminal's `PATH`; started from the Dock, Finder or an IDE, it may not
-read your shell startup file, and its sessions then have no cauldron tools.
-Start it from a terminal where `command -v cauldron` prints
-`~/.cauldron/bin/cauldron`.
+Claude Code does not need `cauldron` on its own `PATH`. The plugin starts
+its MCP server through a small launcher it ships, `bin/cauldron-mcp`, which
+runs `cauldron mcp stdio` from the first of: the path in `$CAULDRON_BIN`; the
+path the installer records for `prod` in `~/Library/Application
+Support/cauldron/cauldron-bin`; `~/.cauldron/bin/cauldron` (or
+`$CAULDRON_HOME/bin/cauldron`); and `cauldron` on `PATH`. So a Claude Code
+started from the Dock, Finder or an IDE, whose `PATH` is the system's, finds
+it too. Whichever source names it, the launcher runs only a regular file
+(not a symlink) owned by you or root that group and others cannot write,
+in directories owned by you or root that group and others cannot write
+either. It does not take one from the project directory Claude Code starts
+it in: `$CAULDRON_BIN` there is refused, and the `PATH` step skips empty
+and relative entries (`.`, or a leading, trailing or doubled `:`), entries
+inside the project, and entries others can write to. When it finds none,
+the session still lists a `cauldron` server, with no tools, whose
+instructions say where it looked and how to install.
 
 To check that the services are up:
 
@@ -342,12 +443,50 @@ every other environment shows only what was made in it there. The soup that
 `cauldron soup`, the MCP tools and the ripples read and write lives in each
 cauldron's directory, `~/.cauldron/data/<env>/cauldrons/<name>/soup`, in the
 published `workspace@6` grammar; the terminal interface does not read it
-yet. That soup is the store to write knowledge into. This release has no
-importer for the older workspace format: records from it have to be
-rewritten in the published record shape first, then landed with `cauldron
-soup import` (`--remint` turns their ids into labels and prints the ids
-they were given). When the tab will read a cauldron's soup, and what then
-becomes of the seed file, is not settled in this release.
+yet. That soup is the store to write knowledge into; records in the older
+format are brought into it with `cauldron soup import-corpus` (below). The
+terminal interface keeps reading its seed file in this release, and an
+import does not change that file. When the tab will read a cauldron's soup
+instead is not settled in this release.
+
+### Records in the older corpus format
+
+`cauldron soup import-corpus <file-or-dir> --env prod --cauldron <name>`
+lands records written in the older corpus format (corpus schema version 5,
+the seed file's `corpus`) in a cauldron's soup. It reads a seed file, a
+bare corpus (`regions` and `nodes`), one record, or a directory of
+one-record files, searched recursively. Run it with `--dry-run` first:
+
+```sh
+cauldron soup import-corpus ~/old-store --env prod --cauldron kb --dry-run
+cauldron soup import-corpus ~/old-store --env prod --cauldron kb
+```
+
+Each region becomes a `region` record (its `narrows` become edges) and each
+node a record of its type (its `in_region` become edges, and its `cite`
+`<thread>#<msg>` becomes `operator`). Two keys the old format could not hold
+are read too: `refs` on a node (ids, or `{to, kind, note}`) become edges,
+and `cites` becomes `meta.cites`. Every record keeps its old id in
+`meta.imported_from`, and every record gets a new id: the printed JSON's
+`corpus.id_map` maps old ids to new ones, and references and `[[links]]`
+between the imported records are rewritten. The batch then goes through
+`cauldron soup import --remint` unchanged: every record is judged by the
+soup's door, nothing lands unless all of it does, the same batch twice is
+refused, a write to a project marker tracked by git is refused, and while
+the `mcp` service holds the cauldron the import is sent to it.
+
+What the published schema cannot hold is listed under `corpus.not_carried`,
+each item with its reason, and is not imported: clusters (the schema has no
+cluster type yet), with the regions each claims and what each holds; a node
+whose type is not one of the schema's ten content types; a reference to an
+id that is not in the input; a symbolic link inside a directory input,
+which is not followed; and the seed's messages and dashboards. A
+`regions`, `nodes` or `clusters` that is not a list refuses the import. A key
+the format does not have is listed and carried verbatim in
+`meta.imported_from.unmapped`, and a boundary that names old ids is listed,
+since its text keeps them. A state outside its type's states, a boundary
+over its cap, or a node left with no region is refused by the door, and the
+whole batch with it.
 
 ## From install to a working session
 
@@ -1375,8 +1514,18 @@ This is an early release. These are known:
   of what the dump means; it has not been measured on real dumps. A dump
   it matches to no region holds nothing during its call, and its records
   are held only for the write itself.
-- **No prebuilt binaries.** `./scripts/install` builds everything from the
-  checkout, which needs the Rust toolchain and takes a while.
+- **The prebuilt binaries are for Apple silicon only, and are not
+  notarised.** They are ad-hoc signed (see [Install](#install)). On an Intel
+  Mac, build from source. The prebuilt `threads` keeps the bundle's ad-hoc
+  signature: `HARNESS_SIGN_SCRIPT` is not used on that path. In a prebuilt
+  install, the account board's "make this the machine's login" action
+  (`tui pool`, key `s`) runs no helper by default. The `claude-accounts`
+  script it needs ships only in the source tree, so the action refuses, runs
+  nothing, and says how to point `TUI_POOL_ACCOUNTS_TOOL` at a clone's copy.
+  The board's other actions go to the threads daemon and work. In every
+  build, that helper runs only from an absolute path to a regular file you
+  own that group and others cannot write, in directories owned by you or
+  root that nobody else can write. Anything else is refused.
 - **A dump is removed from a shell only.** `cauldron soup dump-remove
   <DM-n> --env <env> --cauldron <cauldron> --yes` erases one dump's content
   from the cauldron's directory and leaves a tombstone; it is refused while

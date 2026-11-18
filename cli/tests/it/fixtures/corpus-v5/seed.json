@@ -1,0 +1,123 @@
+{
+  "_note": "A seed in the version-5 corpus format, for the import-corpus tests.",
+  "clusters": [
+    {
+      "id": "import",
+      "name": "Import",
+      "description": "Bringing older records in.",
+      "regions": [
+        "R-1",
+        "R-2"
+      ],
+      "tasks": [
+        {
+          "id": "T-1",
+          "handle": "Write the importer",
+          "state": "done"
+        }
+      ],
+      "children": [
+        {
+          "id": "files",
+          "name": "Files",
+          "description": "The files.",
+          "regions": [
+            "R-2"
+          ]
+        }
+      ]
+    }
+  ],
+  "corpus": {
+    "schema_version": 5,
+    "regions": [
+      {
+        "id": "R-1",
+        "handle": "THE IMPORTER - bringing records from older stores into a soup.",
+        "boundary": "Inside: how records from an older store are read, mapped and landed. Outside: the schema itself (R-3).",
+        "schema_version": 5
+      },
+      {
+        "id": "R-2",
+        "handle": "CORPUS FILES - the seed corpus file and its one-record-per-file form.",
+        "boundary": "Inside: the shape of corpus files on disk and how they are found. Outside: the mapping to records (R-1).",
+        "narrows": [
+          "R-1"
+        ]
+      },
+      {
+        "id": "R-3",
+        "handle": "THE SCHEMA - the published record shapes a soup accepts.",
+        "boundary": "Inside: record types, states, fields and edge kinds. Outside: how records arrive (R-1)."
+      }
+    ],
+    "nodes": [
+      {
+        "id": "DEC-1",
+        "type": "decision",
+        "state": "decided",
+        "handle": "Corpus ids become batch labels, so every record gets a fresh id.",
+        "body": "Carried ids could collide with what the soup holds; see [[IS-2]].",
+        "in_region": [
+          "R-2"
+        ],
+        "cite": "notes#4"
+      },
+      {
+        "id": "IS-2",
+        "type": "issue",
+        "state": "open",
+        "handle": "A corpus may name a region that is not in the file.",
+        "in_region": [
+          "R-3"
+        ]
+      },
+      {
+        "id": "Q-1",
+        "type": "question",
+        "state": "open",
+        "handle": "Should clusters be imported once the schema has them?",
+        "in_region": [
+          "R-1"
+        ],
+        "refs": [
+          "DEC-1"
+        ],
+        "cites": [
+          {
+            "kind": "url",
+            "url": "https://example.com/corpus-notes"
+          }
+        ]
+      },
+      {
+        "id": "C-1",
+        "type": "idea",
+        "state": "exploring",
+        "handle": "A directory of records could be watched and imported as it grows.",
+        "in_region": [
+          "R-2"
+        ],
+        "tags": [
+          "later"
+        ]
+      },
+      {
+        "id": "INC-1",
+        "type": "incident",
+        "state": "closed",
+        "handle": "An import once stopped half way.",
+        "in_region": [
+          "R-1"
+        ],
+        "cite": "notes#9"
+      }
+    ]
+  },
+  "messages": {
+    "notes#4": {
+      "date": "2026-01-01",
+      "text": "Remint every id."
+    }
+  }
+}

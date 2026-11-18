@@ -141,3 +141,59 @@ async fn a_refusal_quoting_the_key_comes_back_masked_through_perform() {
     assert!(!note.contains(ADDR) && !note.contains("quill"), "the key is drawn whole: {note}");
     assert!(note.contains(&tui::pool::model::shown_name(ADDR)), "the key is drawn by the one masker: {note}");
 }
+
+/// Whether the `claude-accounts` helper may run at all, whatever named it:
+/// only an absolute path to a regular file you own, not writable by group or
+/// others, in directories owned by you or root that nobody else can write.
+/// A release-bundle build has no default helper, and says so.
+#[test]
+fn the_accounts_helper_runs_only_from_a_path_nobody_else_can_write() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use tui::pool::action::{helper_refusal, NO_HELPER_IN_THIS_BUILD};
+    let stub = |p: &Path, mode: u32| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+
+    let ok = root.join("mine/claude-accounts");
+    stub(&ok, 0o755);
+    assert_eq!(helper_refusal(&ok), None, "a stub of yours in a private directory runs");
+
+    // No helper in this build (a release bundle's default): refused with the sentence that says why.
+    assert_eq!(helper_refusal(Path::new("")).as_deref(), Some(NO_HELPER_IN_THIS_BUILD));
+    assert!(NO_HELPER_IN_THIS_BUILD.contains("TUI_POOL_ACCOUNTS_TOOL"));
+
+    let rel = helper_refusal(Path::new("services/threads/scripts/claude-accounts")).unwrap();
+    assert!(rel.contains("not an absolute path") && rel.contains("Nothing ran"), "{rel}");
+
+    let gw = root.join("gw/claude-accounts");
+    stub(&gw, 0o775);
+    assert!(helper_refusal(&gw).unwrap().contains("writable by group or others"));
+
+    let open = root.join("open/apps/tui/claude-accounts");
+    stub(&open, 0o755);
+    std::fs::set_permissions(root.join("open"), std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(helper_refusal(&open).unwrap().contains("writable by group or others"));
+    std::fs::set_permissions(root.join("open"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // THE PLANTED CASE: the shape of a path compiled from a build directory in
+    // the shared temporary directory, created by "another user" (here: us).
+    let planted_root = PathBuf::from(format!("/private/tmp/tui-planted-helper-{}", std::process::id()));
+    let planted = planted_root.join("src/services/threads/scripts/claude-accounts");
+    stub(&planted, 0o755);
+    let why = helper_refusal(&planted);
+    let _ = std::fs::remove_dir_all(&planted_root);
+    assert!(why.as_deref().is_some_and(|w| w.contains("/private/tmp is writable by group or others")), "{why:?}");
+}
+
+/// A checkout build's default helper is the checkout's own script, and that
+/// default passes the same check (this tree is yours, in your directories).
+#[test]
+fn a_checkout_builds_default_helper_is_its_own_script() {
+    let d = tui::pool::action::default_accounts_tool().expect("a checkout build has a default helper");
+    assert!(d.ends_with("services/threads/scripts/claude-accounts"), "{}", d.display());
+}

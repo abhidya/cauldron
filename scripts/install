@@ -2,6 +2,45 @@
 # scripts/install — build cauldron (release) and install it for THE CURRENT USER.
 #
 #   scripts/install [--dry-run] [--env <name>] [--from <dir>] [--replace-running]
+#   scripts/install --prebuilt <tarball-or-url> [--sha256 <sum>] [--dry-run] [--env <name>] [--replace-running]
+#
+# THE PREBUILT PATH (`--prebuilt`): installs from a release bundle,
+# `cauldron-<version>-aarch64-apple-darwin.tar.gz` (scripts/build-release-bundle),
+# with no cargo, no Rust toolchain and no git. The from-source path below
+# stays the default and is unchanged. In place of building:
+#   1. refuses any machine that is not arm64 (the binaries are arm64 only);
+#   2c. refuses a tarball that carries macOS's quarantine attribute (a
+#      browser download), naming the `xattr -d` command, because Gatekeeper
+#      would refuse the unpacked binaries; then verifies the tarball BEFORE
+#      anything is unpacked: its sha256 must be
+#      the one given with --sha256, or (a local file only) the one a
+#      `SHA256SUMS` beside it names. A URL needs --sha256 and must be https;
+#      plain http is refused. Every entry must sit under the one top
+#      directory `cauldron-<version>-aarch64-apple-darwin/`: an absolute
+#      path, a `..` component, a link, a device or a fifo refuses the whole
+#      tarball. Unpacked into a scratch directory, the bundle must hold every
+#      file below, match its own inner SHA256SUMS, and every binary must be a
+#      thin arm64 Mach-O whose ad-hoc signature verifies (`codesign --verify
+#      --strict`) under the identifier the bundle gives it. An existing mcp
+#      pin is compared with the bundle's commit (BUNDLE), as 2c compares it
+#      with the checkout's on the from-source path.
+#   3. places the bundle at <root>/share/cauldron/releases/<version>-<commit>/.
+#      Its bin/cauldron and bin/tui are the binaries step 5 installs. Its
+#      shipped declarations go to <root>/share/cauldron/services/ and
+#      <root>/share/cauldron/mcp/ (the previous ones kept as `.prev`), where
+#      a release binary at <root>/bin/cauldron reads them, as the last write
+#      before step 5, so a run that stops earlier leaves the installed
+#      binary on the declarations it came with.
+#   4b/4c. `cauldron build threads|mcp --json --env-copy --artifact
+#      <release>/libexec/<image>` in place of the cargo builds: a NEW version
+#      `<commit>-release+<env>` whose commit is read off the image. The
+#      threads image keeps the bundle's ad-hoc signature (verified again in
+#      its version directory; HARNESS_SIGN_SCRIPT is not used on this path),
+#      and is pinned `--addr auto` as on the from-source path. Steps 4, 5,
+#      the marker, the upgrade of an mcp pin under --replace-running, and
+#      the closing lines are the same.
+# --dry-run verifies a local tarball the same way (in a temporary directory
+# outside HOME) and prints the plan; a URL is not downloaded by a dry run.
 #
 # What it does, in order, and says as it goes:
 #   1. Refuses anything but macOS (launchd, codesign and ~/Library are the
@@ -133,9 +172,11 @@
 # (2b). Run `scripts/install --replace-running` after a `git pull` to
 # upgrade.
 #
-# Its closing lines (and a --dry-run's) say that `cauldron` must be on the
-# PATH Claude Code itself sees, since the plugin's MCP server is the bare
-# command `cauldron mcp stdio`, and how to check. On an upgrade (an existing
+# After step 5, for the prod environment, it writes the install marker the
+# plugin's MCP launcher (claude-code/cauldron/bin/cauldron-mcp) reads:
+# "$HOME/Library/Application Support/cauldron/cauldron-bin", one line, the
+# absolute path of <root>/bin/cauldron. Its closing lines (and a --dry-run's)
+# say where the launcher looks, and how to check. On an upgrade (an existing
 # environment), they also name any MCP grant that names its cauldron only by
 # name, which every call refuses until it is granted again, with the command
 # that grants it again (read-only: `cauldron --env <name> mcp grants`).
@@ -164,8 +205,10 @@ FINISHED=0
 MARKER_TMP=""
 STAGE=""
 CLAIMED=""
+PB_STAGE=""
 on_exit() {
     local rc=$?
+    if [[ -n "${PB_STAGE}" ]]; then rm -rf "${PB_STAGE}" || :; fi
     if [[ -n "${MARKER_TMP}" ]]; then rm -f "${MARKER_TMP}" || :; fi
     if [[ -n "${STAGE}" ]]; then rm -rf "${STAGE}" || :; fi
     if [[ -n "${CLAIMED}" ]]; then rm -rf "${CLAIMED}" || :; fi
@@ -189,8 +232,10 @@ DRY=0
 ENV_NAME="prod"
 FROM=""
 REPLACE_RUNNING=0
+PREBUILT=""
+PB_SHA=""
 
-usage() { sed -n '2,4p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,5p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY=1 ;;
@@ -199,6 +244,10 @@ while [[ $# -gt 0 ]]; do
         --env=*) ENV_NAME="${1#--env=}" ;;
         --from) [[ $# -ge 2 ]] || usage; FROM="$2"; shift ;;
         --from=*) FROM="${1#--from=}" ;;
+        --prebuilt) [[ $# -ge 2 ]] || usage; PREBUILT="$2"; shift ;;
+        --prebuilt=*) PREBUILT="${1#--prebuilt=}" ;;
+        --sha256) [[ $# -ge 2 ]] || usage; PB_SHA="$2"; shift ;;
+        --sha256=*) PB_SHA="${1#--sha256=}" ;;
         -h|--help) usage ;;
         *) echo "install: unknown argument '$1'" >&2; usage ;;
     esac
@@ -206,6 +255,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 say()  { printf 'install: %s\n' "$*"; }
+if [[ -n "${PREBUILT}" && -n "${FROM}" ]]; then
+    printf 'install: REFUSED: --prebuilt and --from are two different sources of binaries; give one.\n' >&2; exit 2
+fi
+if [[ -n "${PB_SHA}" && -z "${PREBUILT}" ]]; then
+    printf 'install: REFUSED: --sha256 is the checksum of a --prebuilt tarball; there is no --prebuilt here.\n' >&2; exit 2
+fi
+# The copy of this script inside a release bundle sits beside the bundle's
+# BUNDLE file, not in a checkout: without --prebuilt it would try to build
+# from a source tree that is not there.
+if [[ -z "${PREBUILT}" && -z "${FROM}" && -f "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/BUNDLE" ]]; then
+    printf 'install: REFUSED: this is the installer inside a release bundle, which installs the bundle'"'"'s binaries and builds nothing. Run it with the tarball it came in: ./install --prebuilt <path of cauldron-<version>-aarch64-apple-darwin.tar.gz> (with its SHA256SUMS beside it, or --sha256 <sum>). To build from source instead, run scripts/install from a clone of the repository.\n' >&2; exit 2
+fi
 step() { printf '\ninstall: == %s\n' "$*"; }
 die()  { printf 'install: REFUSED: %s\n' "$*" >&2; exit 2; }
 run()  {
@@ -222,6 +283,10 @@ old_mcp_note() {
     [[ ${MCP_OLD_LEFT:-0} -eq 1 ]] || return 0
     say ""
     say "mcp:      the mcp service is still the old build (${MCP_PIN}); to upgrade it:"
+    if [[ -n "${PREBUILT}" ]]; then
+        say "            run this install again with --replace-running"
+        return 0
+    fi
     say "            ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy"
     say "            ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
 }
@@ -239,13 +304,24 @@ name_only_note() {
 }
 bridge_note() {
     say ""
-    say "MCP:      Claude Code runs the plugin's MCP server as the bare command \`cauldron mcp stdio\`,"
-    say "          so \`cauldron\` must be on the PATH that Claude Code itself sees, not only your"
-    say "          terminal's. Started from a terminal, Claude Code inherits that terminal's PATH;"
-    say "          started from the Dock, Finder or an IDE, it may not read your shell startup file,"
-    say "          and its sessions then have no cauldron tools."
-    say "          to check: \`command -v cauldron\` in the terminal you start Claude Code from prints"
-    say "          ${ROOT}/bin/cauldron, and \`/mcp\` inside a session lists cauldron as connected."
+    say "MCP:      the plugin's MCP server is its launcher, bin/cauldron-mcp, which runs \`cauldron mcp stdio\`"
+    say "          without needing \`cauldron\` on the PATH Claude Code was started with. It looks at"
+    say "          \$CAULDRON_BIN, then the install marker ${INSTALL_MARKER} (written for prod),"
+    say "          then ${ROOT}/bin/cauldron, then PATH."
+    say "          to check: \`/mcp\` inside a session lists cauldron as connected; a session that finds no"
+    say "          cauldron shows a cauldron server with no tools, whose instructions say how to install."
+}
+# The install marker the plugin's launcher reads (prod only): one line, the
+# absolute path of <root>/bin/cauldron. Replaced whole (a temp file, then mv).
+INSTALL_MARKER="${HOME:-}/Library/Application Support/cauldron/cauldron-bin"
+write_install_marker() {
+    [[ "${ENV_NAME}" == prod ]] || return 0
+    local dir="${INSTALL_MARKER%/*}"
+    printf 'install: $ write %q (%s)\n' "${INSTALL_MARKER}" "${ROOT}/bin/cauldron"
+    [[ ${DRY} -eq 0 ]] || return 0
+    mkdir -p "${dir}"
+    printf '%s\n' "${ROOT}/bin/cauldron" >"${INSTALL_MARKER}.tmp.$$"
+    mv -f "${INSTALL_MARKER}.tmp.$$" "${INSTALL_MARKER}"
 }
 
 [[ ${DRY} -eq 1 ]] && say "DRY RUN — nothing below is executed; this is the plan."
@@ -255,6 +331,10 @@ step "1. platform"
 os="$(uname -s)"
 [[ "${os}" == "Darwin" ]] || die "cauldron's supervisor runs under launchd and needs macOS; this is ${os}."
 say "macOS $(sw_vers -productVersion 2>/dev/null || echo '?') ($(uname -m))"
+if [[ -n "${PREBUILT}" ]]; then
+    arch="$(uname -m)"
+    [[ "${arch}" == arm64 ]] || die "the prebuilt bundle holds arm64 (Apple silicon) binaries only, and this machine (or this shell) is ${arch}. On an Intel Mac, install from source: clone the repository and run scripts/install. Under Rosetta on Apple silicon, run the install from a native (arm64) terminal. Nothing was installed, written or loaded."
+fi
 
 # ── 2. who and where ────────────────────────────────────────────────────────
 step "2. user and HOME"
@@ -343,8 +423,8 @@ fi
 # refuse is refused BEFORE the release build and before step 4 writes
 # env.toml (REL-4.S5 D3). Which case applies is re-stated in step 4b.
 THREADS_PENDING="${ROOT}/data/.install-threads-pending.${ENV_NAME}"
-threads_pinned() { grep -qE '^[[:space:]]*\[services\.threads\][[:space:]]*$' "${MANIFEST}"; }
-mcp_pinned() { grep -qE '^[[:space:]]*\[services\.mcp\][[:space:]]*$' "${MANIFEST}"; }
+threads_pinned() { [[ -f "${MANIFEST}" ]] && grep -qE '^[[:space:]]*\[services\.threads\][[:space:]]*$' "${MANIFEST}"; }
+mcp_pinned() { [[ -f "${MANIFEST}" ]] && grep -qE '^[[:space:]]*\[services\.mcp\][[:space:]]*$' "${MANIFEST}"; }
 # pinned_version <service>: the `version` of `[services.<service>]` in
 # env.toml (a basic string), or nothing.
 pinned_version() {
@@ -441,7 +521,7 @@ elif [[ -e "${THREADS_PENDING}" ]] && ! { threads_pinned && mcp_pinned; }; then
         # `env create`), and who may never have heard of a marker. It says
         # what happened in his terms and gives him the exact commands.
         rerun="$(printf '%q' "${SELF}"; printf ' %q' "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}")"
-        if [[ -n "${FROM}" ]]; then recover_bin="${FROM%/}/cauldron"; else recover_bin="${CARGO_TARGET_DIR:-${REPO}/target}/release/cauldron"; fi
+        if [[ -n "${PREBUILT}" ]]; then recover_bin="${ROOT}/bin/cauldron"; elif [[ -n "${FROM}" ]]; then recover_bin="${FROM%/}/cauldron"; else recover_bin="${CARGO_TARGET_DIR:-${REPO}/target}/release/cauldron"; fi
         {
             case "$(marker_field state)" in
                 creating)
@@ -595,6 +675,153 @@ resolve_base_tree() {
         BASE_WHY="the tree \`cauldron build\` compiles: the workspace ${probe_bin} was built from"
     fi
 }
+# ── 2c (prebuilt). the bundle: checksum, entries, contents, signatures ─────
+# PB_DIR: the unpacked bundle directory; PB_VERSION / PB_COMMIT from its
+# BUNDLE. In a real run the scratch directory is beside the root
+# (${ROOT}.prebuilt.<pid>, removed by the EXIT trap); in a dry run it is a
+# temporary directory outside HOME.
+PB_DIR=""
+PB_VERSION=""
+PB_COMMIT=""
+PB_TOP=""
+pb_refuse() { die "$* Nothing was installed, written or loaded."; }
+# pb_macho_arm64 <file>: a thin arm64 Mach-O (magic cffaedfe, cputype 0x0100000c).
+pb_macho_arm64() { [[ "$(od -An -tx1 -N8 "$1" | tr -d ' \n')" == cffaedfe0c000001 ]]; }
+# pb_signed <file> <identifier>: an ad-hoc signature that verifies, under that identifier.
+pb_signed() {
+    local info
+    codesign --verify --strict "$1" 2>/dev/null || return 1
+    info="$(codesign -dv "$1" 2>&1)" || return 1
+    grep -qx 'Signature=adhoc' <<<"${info}" && grep -qx "Identifier=$2" <<<"${info}"
+}
+pb_fetch_and_verify() {
+    local src="${PREBUILT}" file want got base listing names bad
+    case "${src}" in
+        http://*) pb_refuse "--prebuilt ${src} is plain http, which anyone on the path can change; use the https URL of the release asset." ;;
+        https://*)
+            [[ -n "${PB_SHA}" ]] || pb_refuse "a --prebuilt URL needs --sha256 <sum>: the sha256 the release's SHA256SUMS gives for the tarball (a download is never trusted on its own)."
+            command -v curl >/dev/null 2>&1 || pb_refuse "curl is not on PATH, so ${src} cannot be downloaded."
+            if [[ ${DRY} -eq 1 ]]; then
+                say "would download ${src} (https only) and check its sha256 is ${PB_SHA}; a dry run downloads nothing"
+                return 1
+            fi
+            file="${PB_STAGE}/download.tar.gz"
+            printf 'install: $ curl --proto =https --proto-redir =https --tlsv1.2 --max-filesize 268435456 -fsSL -o %q %q\n' "${file}" "${src}"
+            # A bundle is tens of megabytes; a download that grows past 256 MiB
+            # is not one, and is cut off before it can fill the disk.
+            curl --proto '=https' --proto-redir '=https' --tlsv1.2 --max-filesize 268435456 -fsSL -o "${file}" "${src}" \
+                || pb_refuse "downloading ${src} failed (curl's error is above; a file over 256 MiB is refused)." ;;
+        *://*) pb_refuse "--prebuilt ${src}: only a local file or an https URL is accepted." ;;
+        *)
+            [[ -f "${src}" ]] || pb_refuse "--prebuilt ${src} is not a file."
+            file="${src}" ;;
+    esac
+    # A file a browser downloaded carries macOS's quarantine attribute, and
+    # tar copies it onto every file it unpacks; Gatekeeper then refuses to
+    # run the ad-hoc-signed, un-notarised binaries (a launch waits on a
+    # dialog). Refused here, with the command, rather than half-installed.
+    if ls -l@ "${file}" 2>/dev/null | grep -q 'com\.apple\.quarantine'; then
+        pb_refuse "${file} carries macOS's quarantine attribute (a browser, or another app that marks its downloads, saved it). Its binaries are ad-hoc signed and not notarised, so once unpacked Gatekeeper would refuse to run them. If you trust the file (its checksum is checked next), remove the attribute and run this again: xattr -d com.apple.quarantine $(printf '%q' "${file}")"
+    fi
+    got="$(shasum -a 256 "${file}" | awk '{print $1}')"
+    if [[ -n "${PB_SHA}" ]]; then
+        want="$(tr 'A-F' 'a-f' <<<"${PB_SHA}")"
+        [[ "${want}" =~ ^[0-9a-f]{64}$ ]] || pb_refuse "--sha256 ${PB_SHA} is not a sha256 (64 hex digits)."
+        say "checksum   --sha256 ${want}"
+    else
+        local sums
+        sums="$(dirname "${file}")/SHA256SUMS"
+        [[ -f "${sums}" ]] || pb_refuse "no checksum for ${file}: pass --sha256 <sum> (from the release's SHA256SUMS), or put that SHA256SUMS beside the tarball."
+        want="$(awk -v n="$(basename "${file}")" '$2==n || $2=="*" n {print $1; exit}' "${sums}")"
+        [[ -n "${want}" ]] || pb_refuse "${sums} does not name $(basename "${file}")."
+        say "checksum   ${sums} names ${want}"
+    fi
+    [[ "${got}" == "${want}" ]] || pb_refuse "the tarball's sha256 is ${got}, not ${want}: it is not the file the checksum is for (a damaged or different download)."
+    say "checksum   OK: sha256 ${got}"
+    # Entries, before anything is unpacked.
+    listing="$(tar -tvzf "${file}" 2>/dev/null)" || pb_refuse "${file} is not a gzip-compressed tar archive."
+    names="$(tar -tzf "${file}")"
+    PB_TOP="$(sed -n '1{s|/.*$||;p;}' <<<"${names}")"
+    [[ "${PB_TOP}" =~ ^cauldron-[0-9]+\.[0-9]+\.[0-9]+-aarch64-apple-darwin$ ]] \
+        || pb_refuse "the tarball's top directory is '${PB_TOP}', not cauldron-<version>-aarch64-apple-darwin: it is not a cauldron release bundle."
+    bad="$(awk -v top="${PB_TOP}" '{ n=$0; sub(/\/$/,"",n); if (n ~ /^\// || n ~ /(^|\/)\.\.(\/|$)/ || (n != top && index(n, top "/") != 1)) print }' <<<"${names}")"
+    [[ -z "${bad}" ]] || pb_refuse "the tarball has entries outside ${PB_TOP}/ (an absolute path or a .. component), so it could write outside the directory it is unpacked into: $(tr '\n' ' ' <<<"${bad}")"
+    # The type letter from the verbose listing, the name from the plain one
+    # (same order): a link line ends in its TARGET, not its own name.
+    local types=() l t i=0
+    while IFS= read -r l; do types+=("${l:0:1}"); done <<<"${listing}"
+    bad=""
+    while IFS= read -r l; do
+        t="${types[${i}]:-?}"; i=$((i+1))
+        [[ "${t}" == - || "${t}" == d ]] || bad="${bad}${l} "
+    done <<<"${names}"
+    [[ -z "${bad}" ]] || pb_refuse "the tarball has entries that are not plain files or directories (a link, device or fifo): $(tr '\n' ' ' <<<"${bad}")"
+    say "entries    every entry is a file or directory under ${PB_TOP}/"
+    mkdir -p "${PB_STAGE}/x"
+    tar -xzf "${file}" -C "${PB_STAGE}/x"
+    PB_DIR="${PB_STAGE}/x/${PB_TOP}"
+    local f missing=""
+    for f in bin/cauldron bin/tui libexec/threads libexec/cauldron-mcp share/cauldron/services/threads.toml \
+             share/cauldron/services/mcp.toml share/cauldron/mcp/agents.toml BUNDLE SHA256SUMS; do
+        [[ -f "${PB_DIR}/${f}" && ! -L "${PB_DIR}/${f}" ]] || missing="${missing} ${f}"
+    done
+    [[ -z "${missing}" ]] || pb_refuse "the bundle lacks:${missing}."
+    (cd "${PB_DIR}" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1) \
+        || pb_refuse "a file in the bundle does not match the bundle's own SHA256SUMS: it was changed after the bundle was built."
+    PB_VERSION="$(sed -n 's/^version=//p' "${PB_DIR}/BUNDLE")"
+    PB_COMMIT="$(sed -n 's/^commit=//p' "${PB_DIR}/BUNDLE")"
+    [[ "cauldron-${PB_VERSION}-aarch64-apple-darwin" == "${PB_TOP}" && "${PB_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+        && grep -qx 'target=aarch64-apple-darwin' "${PB_DIR}/BUNDLE" \
+        || pb_refuse "the bundle's BUNDLE file does not name version ${PB_TOP#cauldron-}, a full commit and target aarch64-apple-darwin."
+    local rel id
+    for rel in bin/cauldron:cauldron bin/tui:tui libexec/threads:com.harness.threads libexec/cauldron-mcp:cauldron-mcp; do
+        id="${rel#*:}"; rel="${rel%%:*}"
+        pb_macho_arm64 "${PB_DIR}/${rel}" || pb_refuse "${rel} in the bundle is not an arm64 executable."
+        pb_signed "${PB_DIR}/${rel}" "${id}" \
+            || pb_refuse "${rel} in the bundle does not carry a valid ad-hoc signature as ${id} (\`codesign --verify --strict\` fails, or another identifier): it was changed after it was signed."
+    done
+    say "contents   version ${PB_VERSION}, commit ${PB_COMMIT:0:12}; every file matches the bundle's SHA256SUMS"
+    say "signatures bin/cauldron, bin/tui, libexec/threads, libexec/cauldron-mcp: arm64, ad-hoc signed, verified"
+    return 0
+}
+if [[ -n "${PREBUILT}" ]]; then
+    step "2c. the prebuilt bundle: checksum, entries, contents, signatures (no build, no cargo, no git)"
+    command -v codesign >/dev/null 2>&1 || die "codesign is not on PATH (it ships with macOS, at /usr/bin/codesign), so the bundle's signatures cannot be verified."
+    if [[ ${DRY} -eq 1 ]]; then
+        PB_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/cauldron-prebuilt.XXXXXX")"
+    else
+        PB_STAGE="${ROOT}.prebuilt.$$"
+        mkdir "${PB_STAGE}"
+    fi
+    pb_fetch_and_verify || :
+    if [[ -n "${MCP_PIN}" ]]; then
+        if [[ -n "${PB_COMMIT}" ]]; then
+            MCP_HEAD="${PB_COMMIT:0:12}"
+            pin_base="${MCP_PIN%%+*}"
+            if [[ "${pin_base}" == "${MCP_HEAD}-"* && "${pin_base}" != *-dirty.* ]]; then MCP_STATE=current; else MCP_STATE=old; fi
+        else
+            MCP_STATE=unknown
+        fi
+        case "${MCP_STATE}" in
+            current) say "mcp is pinned at ${MCP_PIN}, this bundle's build (commit ${MCP_HEAD}); step 4c leaves it as it is" ;;
+            *)
+                if [[ "${MCP_STATE}" == old ]]; then
+                    say "mcp is pinned at ${MCP_PIN}, which is NOT this bundle's build (commit ${MCP_HEAD})"
+                else
+                    say "mcp is pinned at ${MCP_PIN}, and whether that is this bundle's build cannot be told before it is downloaded"
+                fi
+                if [[ ${REPLACE_RUNNING} -eq 1 ]]; then
+                    say "  --replace-running: step 4c installs mcp from this bundle and re-pins it (upgrade)"
+                    NEED_MCP=1
+                    MCP_REPIN=1
+                else
+                    say "  without --replace-running step 4c leaves it as it is; the mcp service stays the old build"
+                fi ;;
+        esac
+    fi
+fi
+
+if [[ -z "${PREBUILT}" ]]; then
 step "2c. is this checkout clean? (only needed when step 4b or 4c builds)"
 # An existing mcp pin: is it this checkout's build? Its label starts with
 # the commit it was built from (12 characters) and the profile; a `-dirty`
@@ -638,10 +865,40 @@ else
     if [[ ${NEED_THREADS} -eq 1 ]]; then check_build_tree threads 4b; fi
     if [[ ${NEED_MCP} -eq 1 ]]; then check_build_tree mcp 4c; fi
 fi
+fi
 
 # ── 3. binaries ─────────────────────────────────────────────────────────────
 step "3. binaries"
-if [[ -n "${FROM}" ]]; then
+REL_DIR=""
+if [[ -n "${PREBUILT}" ]]; then
+    if [[ -z "${PB_DIR}" ]]; then
+        BIN_DIR="<the bundle>/bin"
+        REL_DIR="${ROOT}/share/cauldron/releases/<version>-<commit>"
+        say "the bundle's binaries (after the download a real run makes); nothing is built"
+    elif [[ ${DRY} -eq 1 ]]; then
+        REL_DIR="${ROOT}/share/cauldron/releases/${PB_VERSION}-${PB_COMMIT:0:12}"
+        BIN_DIR="${PB_DIR}/bin"
+        say "would place the bundle at ${REL_DIR} and its declarations at ${ROOT}/share/cauldron/{services,mcp}; nothing is built"
+    else
+        REL_DIR="${ROOT}/share/cauldron/releases/${PB_VERSION}-${PB_COMMIT:0:12}"
+        if [[ -d "${REL_DIR}" ]]; then
+            cmp -s "${REL_DIR}/SHA256SUMS" "${PB_DIR}/SHA256SUMS"                 || die "${REL_DIR} already holds version ${PB_VERSION} at commit ${PB_COMMIT:0:12} with OTHER contents than this bundle; it is left as it is. Move it away to install this bundle. Nothing was installed."
+            (cd "${REL_DIR}" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1)                 || die "${REL_DIR} no longer matches its own SHA256SUMS (a file in it was changed); move it away to install this bundle. Nothing was installed."
+            say "the bundle is already in place at ${REL_DIR} (same contents); kept"
+        else
+            run mkdir -p "${ROOT}/share/cauldron/releases"
+            run mv "${PB_DIR}" "${REL_DIR}"
+            say "placed the bundle at ${REL_DIR}"
+        fi
+        # The shipped declarations a release binary at ${ROOT}/bin reads are
+        # put in place by place_declarations, right before step 5, so a run
+        # that stops in step 4, 4b or 4c leaves the installed binary and the
+        # running holder on the declarations they came with. Steps 4 to 4c
+        # run the bundle's own cauldron, which reads the bundle's copy.
+        BIN_DIR="${REL_DIR}/bin"
+    fi
+    say "using the bundle's binaries in ${BIN_DIR} (no build)"
+elif [[ -n "${FROM}" ]]; then
     BIN_DIR="$(cd -P "${FROM}" 2>/dev/null && pwd -P)" || die "--from ${FROM} is not a directory."
     say "using prebuilt binaries in ${BIN_DIR} (no build)"
 else
@@ -651,6 +908,8 @@ else
     (cd "${REPO}" && run cargo build --release -p cauldron --bin cauldron -p tui --bin tui)
 fi
 CAULDRON="${BIN_DIR}/cauldron"
+# The images steps 4b and 4c install on the prebuilt path.
+if [[ -n "${PB_DIR}" && ${DRY} -eq 1 ]]; then PB_LIBEXEC="${PB_DIR}/libexec"; else PB_LIBEXEC="${REL_DIR}/libexec"; fi
 if [[ ${DRY} -eq 0 ]]; then
     [[ -x "${CAULDRON}" ]] || die "no executable cauldron at ${CAULDRON}."
     [[ -x "${BIN_DIR}/tui" ]] || say "WARNING: no tui at ${BIN_DIR}/tui; the holder installs without a face."
@@ -702,7 +961,11 @@ if [[ ${CREATED_ENV} -eq 0 && ${RESUME_THREADS} -eq 0 ]]; then
         fi
     else
         say "threads is NOT pinned in the existing ${MANIFEST}, and install does not add threads to an existing environment."
+        if [[ -n "${PREBUILT}" ]]; then
+        say "  to host it:  ${CAULDRON} --env ${ENV_NAME} build threads --env-copy --artifact ${PB_LIBEXEC}/threads"
+        else
         say "  to host it:  ${CAULDRON} --env ${ENV_NAME} build threads --env-copy"
+        fi
         say "         then: ${CAULDRON} --env ${ENV_NAME} pin threads <the label that build printed> --addr auto"
     fi
 elif [[ ${RESUME_THREADS} -eq 1 ]] && threads_pinned; then
@@ -713,11 +976,16 @@ else
         say "an earlier install created ${MANIFEST} and stopped before pinning threads"
         say "  (${THREADS_PENDING} is still there); finishing step 4b now"
     fi
+    if [[ -z "${PREBUILT}" ]]; then
     [[ -f "${THREADS_SIGNER}" ]] || die "no threads signer at ${THREADS_SIGNER}; this checkout is incomplete."
     if [[ ${DRY} -eq 0 ]]; then
         command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH, and \`cauldron build threads\` compiles it from ${REPO}. Install Rust (https://rustup.rs) and re-run."
     fi
-    if [[ -n "${HARNESS_SIGN_SCRIPT:-}" ]]; then
+    fi
+    if [[ -n "${PREBUILT}" ]]; then
+        say "signer     none: the bundle's image keeps its ad-hoc signature (com.harness.threads), verified again in its version directory"
+        if [[ -n "${HARNESS_SIGN_SCRIPT:-}" ]]; then say "           (HARNESS_SIGN_SCRIPT is not used on the prebuilt path)"; fi
+    elif [[ -n "${HARNESS_SIGN_SCRIPT:-}" ]]; then
         say "signer     HARNESS_SIGN_SCRIPT=${HARNESS_SIGN_SCRIPT} (identity)"
     else
         say "signer     ad-hoc (set HARNESS_SIGN_SCRIPT to sign with an identity)"
@@ -735,12 +1003,14 @@ else
     # may be pinned to — is never renamed over, and neither is any copy that
     # existed before. `--json` puts the record on stdout (cargo's output stays
     # on stderr); it names that label.
-    printf 'install: $'; printf ' %q' "${CAULDRON}" --env "${ENV_NAME}" build threads --json --env-copy; printf '\n'
+    THREADS_BUILD=(build threads --json --env-copy)
+    if [[ -n "${PREBUILT}" ]]; then THREADS_BUILD+=(--artifact "${PB_LIBEXEC}/threads"); fi
+    printf 'install: $'; printf ' %q' "${CAULDRON}" --env "${ENV_NAME}" "${THREADS_BUILD[@]}"; printf '\n'
     BUILDS="${ROOT}/data/shared/builds/threads"
     if [[ ${DRY} -eq 1 ]]; then
         ENV_LABEL="<label>+${ENV_NAME}"
     else
-        build_json="$("${CAULDRON}" --env "${ENV_NAME}" build threads --json --env-copy)"
+        build_json="$("${CAULDRON}" --env "${ENV_NAME}" "${THREADS_BUILD[@]}")"
         labels="$(grep -oE '"label"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"${build_json}" | sed -E 's/.*"([^"]*)"$/\1/')"
         [[ -n "${labels}" && "$(wc -l <<<"${labels}" | tr -d ' ')" == 1 ]] \
             || die "\`cauldron build threads --json --env-copy\` did not name exactly one version label; it printed: ${build_json}"
@@ -753,6 +1023,18 @@ else
         say "built threads as this environment's own version ${ENV_LABEL}"
     fi
     VDIR="${BUILDS}/${ENV_LABEL}"
+    if [[ -n "${PREBUILT}" ]]; then
+        # The image is the bundle's, signed when the bundle was built: it is
+        # verified in place, not re-signed.
+        printf 'install: $ codesign --verify --strict %q\n' "${VDIR}/threads"
+        if [[ ${DRY} -eq 0 ]]; then
+            [[ "$(grep -cF "\"label\": \"${ENV_LABEL}\"" "${VDIR}/build.json")" == 1 ]] \
+                || die "the build record ${VDIR}/build.json does not name ${ENV_LABEL}; nothing was pinned."
+            pb_signed "${VDIR}/threads" com.harness.threads \
+                || die "the installed image ${VDIR}/threads does not verify as the bundle's ad-hoc-signed com.harness.threads; threads was NOT pinned, and its copy ${VDIR} is removed."
+        fi
+        CLAIMED=""
+    else
     # Sign it in THIS environment's own data dir, then rename the signed image
     # over the unsigned one inside the new version directory (nothing pins it
     # yet). On any failure the EXIT trap (on_exit) removes the staging dir AND the
@@ -777,6 +1059,7 @@ else
     STAGE=""
     # Signed and in place: from here a failure leaves it, never removes it.
     CLAIMED=""
+    fi
     # The pin is the one edit of env.toml: re-check, right before it, that
     # the file is still the one this install (or the one it resumes) created.
     if [[ ${DRY} -eq 0 ]] && ! marker_owns_manifest; then
@@ -811,7 +1094,11 @@ if mcp_pinned && [[ ${MCP_REPIN} -eq 0 ]]; then
             say "  the mcp service may still be an old build: it is pinned at ${MCP_PIN}, which cannot be compared with this checkout."
         fi
         say "  Claude Code sessions reach that service, so this release's mcp changes do not reach them. To upgrade it:"
+        if [[ -n "${PREBUILT}" ]]; then
+        say "    ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy --artifact ${PB_LIBEXEC}/cauldron-mcp"
+        else
         say "    ${CAULDRON} --env ${ENV_NAME} build mcp --env-copy"
+        fi
         say "    then: ${CAULDRON} --env ${ENV_NAME} pin mcp <the label that build printed>"
         say "  (or run this install again with --replace-running, which does both)"
     fi
@@ -835,17 +1122,19 @@ else
         say "mcp is NOT pinned in the existing ${MANIFEST}: adding it (upgrade). \`cauldron pin\` writes"
         say "  the pin; every other pin and setting in env.toml is left exactly as it is"
     fi
-    if [[ ${DRY} -eq 0 ]]; then
+    if [[ ${DRY} -eq 0 && -z "${PREBUILT}" ]]; then
         command -v cargo >/dev/null 2>&1 || die "cargo is not on PATH, and \`cauldron build mcp\` compiles it from ${REPO}. Install Rust (https://rustup.rs) and re-run."
     fi
     # The same NEW-version build as threads (`--env-copy`): the shared
     # `<label>` another environment may be pinned to is never written.
-    printf 'install: $'; printf ' %q' "${CAULDRON}" --env "${ENV_NAME}" build mcp --json --env-copy; printf '\n'
+    MCP_BUILD=(build mcp --json --env-copy)
+    if [[ -n "${PREBUILT}" ]]; then MCP_BUILD+=(--artifact "${PB_LIBEXEC}/cauldron-mcp"); fi
+    printf 'install: $'; printf ' %q' "${CAULDRON}" --env "${ENV_NAME}" "${MCP_BUILD[@]}"; printf '\n'
     MCP_BUILDS="${ROOT}/data/shared/builds/mcp"
     if [[ ${DRY} -eq 1 ]]; then
         MCP_LABEL="<label>+${ENV_NAME}"
     else
-        build_json="$("${CAULDRON}" --env "${ENV_NAME}" build mcp --json --env-copy)"
+        build_json="$("${CAULDRON}" --env "${ENV_NAME}" "${MCP_BUILD[@]}")"
         labels="$(grep -oE '"label"[[:space:]]*:[[:space:]]*"[^"]*"' <<<"${build_json}" | sed -E 's/.*"([^"]*)"$/\1/')"
         [[ -n "${labels}" && "$(wc -l <<<"${labels}" | tr -d ' ')" == 1 ]] \
             || die "\`cauldron build mcp --json --env-copy\` did not name exactly one version label; it printed: ${build_json}"
@@ -882,12 +1171,35 @@ if [[ ${CREATED_ENV} -eq 1 || ${RESUME_THREADS} -eq 1 ]]; then
 fi
 
 # ── 5. supervisor ───────────────────────────────────────────────────────────
+# place_declarations (prebuilt only): the bundle's shipped service and MCP
+# tool declarations at ${ROOT}/share/cauldron/{services,mcp}, which the
+# binary step 5 installs at ${ROOT}/bin reads (../share/cauldron/), each
+# replaced whole, the previous one kept as .prev. Done here, as the last
+# write before step 5, and not in step 3. (Each is two renames, so for an
+# instant between them that directory is absent: a cauldron command started
+# at that very instant would find no shipped declaration in it.)
+place_declarations() {
+    local d
+    for d in services mcp; do
+        run cp -R "${REL_DIR}/share/cauldron/${d}" "${ROOT}/share/cauldron/.${d}.new.$$"
+        if [[ -d "${ROOT}/share/cauldron/${d}" ]]; then
+            run rm -rf "${ROOT}/share/cauldron/${d}.prev"
+            run mv "${ROOT}/share/cauldron/${d}" "${ROOT}/share/cauldron/${d}.prev"
+        fi
+        run mv "${ROOT}/share/cauldron/.${d}.new.$$" "${ROOT}/share/cauldron/${d}"
+    done
+}
 step "5. supervisor (launchd job)"
+if [[ -n "${PREBUILT}" && ${DRY} -eq 0 ]]; then
+    place_declarations
+    say "placed the bundle's declarations at ${ROOT}/share/cauldron/{services,mcp} (the previous ones kept as .prev)"
+fi
 # `cauldron install` has the same running-job guard (REL-4.S3c), so the
 # operator's --replace-running is passed through to it.
 INSTALL_ARGS=(install)
 if [[ ${REPLACE_RUNNING} -eq 1 ]]; then INSTALL_ARGS+=(--replace-running); fi
 run "${CAULDRON}" --env "${ENV_NAME}" "${INSTALL_ARGS[@]}"
+write_install_marker
 
 if [[ ${DRY} -eq 1 ]]; then
     if [[ -x "${CAULDRON}" ]]; then

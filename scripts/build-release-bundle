@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# build-release-bundle <commit-ish> <out-dir> [--public-commit <sha>] [--keep]
+#
+# Builds the prebuilt macOS arm64 release bundle of ONE commit, from the
+# PUBLIC tree of that commit and never from a working tree:
+#
+#   1. `scripts/build-public-archive <commit>` makes the public artifact (the
+#      same definition check-public-tree.sh and check-no-personal-data.sh
+#      check), and it is unpacked into a scratch source directory
+#      (CAULDRON_RELEASE_BUILD_ROOT, default /private/tmp/cauldron-release-build,
+#      which must not already hold this version's directory). Nothing is
+#      compiled in this checkout.
+#   2. The scratch tree is made a throw-away git repository with one commit of
+#      exactly the unpacked files, so every build script finds a CLEAN tree
+#      (dirty=0). The commit every binary states (`--build-stamp`) is PINNED to
+#      the archived commit, or to --public-commit when the bundle is built from
+#      a private tree whose public counterpart has another id.
+#   3. `cargo build --release --locked` of the four binaries scripts/install
+#      lays out: `cauldron` and `tui` (bin/), `threads` and `cauldron-mcp`
+#      (libexec/, installed as services by `cauldron build <service>
+#      --artifact`). The compiler flags are passed in CARGO_ENCODED_RUSTFLAGS,
+#      which cargo reads before RUSTFLAGS, CARGO_BUILD_RUSTFLAGS and any
+#      config file's build.rustflags, so nothing on the build machine adds to
+#      them:
+#        --remap-path-prefix for HOME, the cargo home, the rustup home, the
+#          scratch directory and its source directory (panic locations and
+#          file!() name /cauldron, /cauldron-build, /cargo, /rustup and
+#          /build-home instead: prefixes at the top of the root volume, which
+#          no non-root user can create; the build refuses to start if one
+#          exists). A remap does not reach a path a crate compiles in with
+#          env!("CARGO_MANIFEST_DIR"); no binary in the bundle may use one at
+#          run time (`--cfg cauldron_release_bundle` below compiles them out),
+#          and step 6 fails the bundle if one is left;
+#        -C debuginfo=0, and the linker told to write no debug map and no
+#          local symbols (-Wl,-S -Wl,-x);
+#        --cfg cauldron_release_bundle, so the binaries look for what ships
+#          with them beside themselves (`../share/cauldron/`), compile in no
+#          source-tree path for it, and run no helper from the source tree
+#          (the terminal board's account action has no default helper).
+#   4. The bundle directory `cauldron-<version>-aarch64-apple-darwin/`:
+#        bin/cauldron  bin/tui  libexec/threads  libexec/cauldron-mcp
+#        share/cauldron/services/*.toml   (the shipped service declarations)
+#        share/cauldron/mcp/              (the shipped MCP tool declarations)
+#        install  README.md  LICENSE  NOTICE  BUNDLE  SHA256SUMS
+#      Every binary is AD-HOC code-signed (`codesign --force --sign -
+#      --identifier <id>`; `threads` keeps the identifier its own signer
+#      uses, com.harness.threads). BUNDLE holds name, version, commit and
+#      target; the inner SHA256SUMS covers every other file in the bundle.
+#   5. One tarball `<out-dir>/cauldron-<version>-aarch64-apple-darwin.tar.gz`
+#      and `<out-dir>/SHA256SUMS` for it. Its metadata says nothing about the
+#      builder: ustar format, entries in byte order, every owner uid 0 / gid
+#      0 / root / wheel, every mode 0755 (directories, binaries, `install`)
+#      or 0644 (everything else) whatever the builder's umask, every mtime
+#      the commit's own time in UTC (BUNDLE records it as commit_time), no
+#      extended attributes, gzip without a name or time.
+#
+# REPRODUCIBLE: the whole run (cargo, tar, gzip, date) is under TZ=UTC and
+# LC_ALL=C with umask 022, SOURCE_DATE_EPOCH is the commit's time (threads
+# compiles that in as its build time), and every path of the build is
+# remapped, so two builds of one commit on one toolchain, in different
+# build roots, give the same tarball byte for byte.
+#   6. scripts/check-release-bundle on the tarball, with the scratch build
+#      root and source directory as extra forbidden literals
+#      (CAULDRON_RELEASE_FORBID), while that tree still exists, so the
+#      runtime probe sees a binary that reaches into it. Its failure fails
+#      this script.
+#
+# macOS arm64 only. The scratch directory is removed at the end unless
+# --keep is given. Exit 0 built and checked; 2 usage or a refused
+# precondition; anything else the failing step's code.
+set -euo pipefail
+# No time zone, locale or umask of the builder's reaches the bundle.
+export TZ=UTC LC_ALL=C LANG=C
+umask 022
+
+FINISHED=0
+SCRATCH=""
+KEEP=0
+on_exit() {
+    local rc=$?
+    if [[ -n "${SCRATCH}" && ${KEEP} -eq 0 ]]; then
+        chmod -R u+w "${SCRATCH}" 2>/dev/null || :
+        rm -rf "${SCRATCH}" || :
+    fi
+    if [[ ${rc} -eq 0 && ${FINISHED} -ne 1 ]]; then
+        echo "build-release-bundle: ABORTED on an internal error (above); no bundle was produced. rc 70." >&2
+        rc=70
+    fi
+    exit "${rc}"
+}
+trap on_exit EXIT
+
+say() { printf 'build-release-bundle: %s\n' "$*"; }
+die() { printf 'build-release-bundle: REFUSED: %s\n' "$*" >&2; exit 2; }
+
+REF=""; OUT=""; PUBLIC_COMMIT=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --public-commit) [[ $# -ge 2 ]] || die "--public-commit needs a commit id"; PUBLIC_COMMIT="$2"; shift ;;
+        --keep) KEEP=1 ;;
+        -h|--help) sed -n '2,3p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; FINISHED=1; exit 0 ;;
+        -*) die "unknown option $1" ;;
+        *) if [[ -z "${REF}" ]]; then REF="$1"; elif [[ -z "${OUT}" ]]; then OUT="$1"; else die "unexpected argument $1"; fi ;;
+    esac
+    shift
+done
+[[ -n "${REF}" && -n "${OUT}" ]] || die "usage: build-release-bundle <commit-ish> <out-dir> [--public-commit <sha>] [--keep]"
+
+[[ "$(uname -s)" == Darwin ]] || die "the bundle is macOS-only; this is $(uname -s)."
+[[ "$(uname -m)" == arm64 ]] || die "the bundle is arm64-only and is built natively; this machine (or shell) is $(uname -m)."
+for c in cargo git codesign shasum tar gzip; do
+    command -v "${c}" >/dev/null 2>&1 || die "${c} is not on PATH."
+done
+
+SELF_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+TOP="$(git -C "${SELF_DIR}" rev-parse --show-toplevel)"
+COMMIT="$(git -C "${TOP}" rev-parse --verify "${REF}^{commit}")"
+STAMP_COMMIT="${PUBLIC_COMMIT:-${COMMIT}}"
+[[ "${STAMP_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || die "--public-commit must be a full 40-character commit id."
+COMMIT_TIME="$(git -C "${TOP}" show -s --format=%ct "${COMMIT}")"
+
+mkdir -p "${OUT}"
+OUT="$(cd -P "${OUT}" && pwd -P)"
+
+BUILD_ROOT="${CAULDRON_RELEASE_BUILD_ROOT:-/private/tmp/cauldron-release-build}"
+mkdir -p "${BUILD_ROOT}"
+BUILD_ROOT="$(cd -P "${BUILD_ROOT}" && pwd -P)"
+case "${BUILD_ROOT}" in
+    "${HOME}"|"${HOME}"/*|/Users/*) die "the scratch build root ${BUILD_ROOT} is under a home directory, and its path is compiled into the binaries; use a neutral directory (CAULDRON_RELEASE_BUILD_ROOT)." ;;
+esac
+# A root whose path names the builder (a per-user scratch directory often
+# does) would be refused by the check at the end, after the whole build.
+ME_NAME="$(id -un)"
+if [[ -n "${ME_NAME}" ]] && grep -qiF -- "${ME_NAME}" <<<"${BUILD_ROOT}"; then
+    die "the scratch build root ${BUILD_ROOT} contains your user name, which the check at the end refuses in a binary; use a neutral directory (CAULDRON_RELEASE_BUILD_ROOT)."
+fi
+# The source is unpacked and compiled under the build root, so nobody else
+# may be able to change what is in it: it must be yours and writable by you
+# alone, and every directory above it yours or root's and not writable by
+# others, except a root-owned sticky one (/private/tmp), where others cannot
+# rename or remove what is yours.
+MY_UID="$(id -u)"
+read -r o m <<<"$(stat -f '%u %p' "${BUILD_ROOT}")"
+[[ "${o}" == "${MY_UID}" ]] || die "the scratch build root ${BUILD_ROOT} belongs to uid ${o}, not to you, so its owner could change the source while it builds; use another (CAULDRON_RELEASE_BUILD_ROOT)."
+(( (8#${m} & 8#022) == 0 )) || die "the scratch build root ${BUILD_ROOT} is writable by group or others (mode ${m}); make it 755 or use another."
+d="$(dirname "${BUILD_ROOT}")"
+while :; do
+    read -r o m <<<"$(stat -f '%u %p' "${d}")"
+    if [[ "${o}" != "${MY_UID}" && "${o}" != 0 ]]; then die "${d}, above the scratch build root, belongs to uid ${o}; use another build root."; fi
+    if (( (8#${m} & 8#022) != 0 )) && ! { [[ "${o}" == 0 ]] && (( (8#${m} & 8#1000) != 0 )); }; then
+        die "${d}, above the scratch build root, is writable by group or others (mode ${m}) and is not a root-owned sticky directory; use another build root."
+    fi
+    [[ "${d}" == / ]] && break
+    d="$(dirname "${d}")"
+done
+# The prefixes the remap writes in place of the build's own paths must not
+# exist, so nothing compiled with them can ever resolve to a file.
+for p in /cauldron /cauldron-build /cargo /rustup /build-home; do
+    [[ ! -e "${p}" ]] || die "${p} exists on this machine; it is one of the neutral prefixes the build remaps its paths to, and must not resolve to anything."
+done
+
+# The archive, unpacked: the PUBLIC tree of the commit. The version comes
+# from the archive itself, so it is read before the scratch directory, whose
+# fixed name carries it, is made.
+VERSION="$(cd "${TOP}" && git show "${COMMIT}:Cargo.toml" | awk '
+    /^\[/ { sec=$0 }
+    sec=="[workspace.package]" && /^version[[:space:]]*=/ { s=$0; sub(/^[^"]*"/,"",s); sub(/".*$/,"",s); print s; exit }')"
+[[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "could not read [workspace.package] version from the commit's Cargo.toml (got '${VERSION}')."
+NAME="cauldron-${VERSION}-aarch64-apple-darwin"
+# A FIXED path per version: the source directory's path is part of what the
+# compiler sees, so the same commit builds in the same place every time.
+WORK="${BUILD_ROOT}/cauldron-${VERSION}"
+[[ ! -e "${WORK}" ]] || die "${WORK} already exists (an earlier run kept it, or another run is building); move it away first."
+mkdir "${WORK}"
+SCRATCH="${WORK}"
+SRC="${WORK}/src"
+mkdir "${SRC}"
+(cd "${TOP}" && "${SELF_DIR}/build-public-archive" "${COMMIT}" "${WORK}/public.tar" >/dev/null)
+tar -xf "${WORK}/public.tar" -C "${SRC}"
+say "public tree of ${COMMIT} unpacked at ${SRC} (version ${VERSION})"
+
+# A throw-away repository holding exactly the unpacked files, so the build
+# scripts' dirt check sees a clean tree. No hooks, no global or system config.
+gitq() {
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_AUTHOR_NAME=release GIT_AUTHOR_EMAIL=release@localhost GIT_COMMITTER_NAME=release \
+        GIT_COMMITTER_EMAIL=release@localhost GIT_AUTHOR_DATE="@${COMMIT_TIME} +0000" \
+        GIT_COMMITTER_DATE="@${COMMIT_TIME} +0000" \
+        git -C "${SRC}" -c core.hooksPath=/dev/null -c commit.gpgsign=false "$@"
+}
+gitq init -q --template=
+gitq add -A -f .
+gitq commit -q -m "public tree of ${STAMP_COMMIT}"
+[[ -z "$(gitq status --porcelain --untracked-files=normal)" ]] || die "the scratch tree is not clean after its one commit."
+
+# The compiler flags, and nothing else (see the header).
+CARGO_HOME_DIR="${CARGO_HOME:-${HOME}/.cargo}"
+RUSTUP_HOME_DIR="${RUSTUP_HOME:-${HOME}/.rustup}"
+SEP=$'\x1f'
+FLAGS="--remap-path-prefix=${HOME}=/build-home"
+FLAGS+="${SEP}--remap-path-prefix=${CARGO_HOME_DIR}=/cargo"
+FLAGS+="${SEP}--remap-path-prefix=${RUSTUP_HOME_DIR}=/rustup"
+# The scratch directory (the target dir: build-script output) first, the
+# source directory after it: when several match, rustc applies the last.
+FLAGS+="${SEP}--remap-path-prefix=${SCRATCH}=/cauldron-build"
+FLAGS+="${SEP}--remap-path-prefix=${SRC}=/cauldron"
+# Symbols are dropped by the LINKER (-S: no debug map, whose object-file
+# entries name the toolchain's path; -x: no local symbols), not by
+# -C strip, which runs the toolchain's own objcopy.
+FLAGS+="${SEP}-Cdebuginfo=0${SEP}-Cstrip=none${SEP}-Clink-arg=-Wl,-S${SEP}-Clink-arg=-Wl,-x${SEP}--cfg=cauldron_release_bundle"
+TARGET_DIR="${SCRATCH}/target"
+
+say "building cauldron, tui, threads and cauldron-mcp (release) in ${SRC}"
+(
+    cd "${SRC}"
+    env -u RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u RUSTDOCFLAGS -u CARGO_BUILD_TARGET \
+        -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
+        CARGO_ENCODED_RUSTFLAGS="${FLAGS}" \
+        CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=none CARGO_INCREMENTAL=0 \
+        SOURCE_DATE_EPOCH="${COMMIT_TIME}" \
+        CAULDRON_BUILD_COMMIT_PIN="${STAMP_COMMIT}" TUI_BUILD_COMMIT_PIN="${STAMP_COMMIT}" \
+        THREADS_BUILD_COMMIT_PIN="${STAMP_COMMIT}" MCP_BUILD_COMMIT_PIN="${STAMP_COMMIT}" \
+        cargo build --release --locked --target-dir "${TARGET_DIR}" \
+            -p cauldron --bin cauldron -p tui --bin tui -p threads --bin threads -p cauldron-mcp --bin cauldron-mcp
+)
+
+STAGE="${SCRATCH}/stage"
+B="${STAGE}/${NAME}"
+mkdir -p "${B}/bin" "${B}/libexec" "${B}/share/cauldron/services" "${B}/share/cauldron/mcp"
+# Copied by content (cat), so no file flag or extended attribute travels.
+place() { cat "$1" >"$2"; chmod 0755 "$2"; }
+place "${TARGET_DIR}/release/cauldron" "${B}/bin/cauldron"
+place "${TARGET_DIR}/release/tui" "${B}/bin/tui"
+place "${TARGET_DIR}/release/threads" "${B}/libexec/threads"
+place "${TARGET_DIR}/release/cauldron-mcp" "${B}/libexec/cauldron-mcp"
+for f in "${SRC}"/services/*.toml; do cat "${f}" >"${B}/share/cauldron/services/$(basename "${f}")"; done
+for f in "${SRC}"/mcp/*; do [[ -f "${f}" ]] && cat "${f}" >"${B}/share/cauldron/mcp/$(basename "${f}")"; done
+cat "${SRC}/scripts/install" >"${B}/install"; chmod 0755 "${B}/install"
+for f in README.md LICENSE NOTICE; do cat "${SRC}/${f}" >"${B}/${f}"; done
+
+# Ad-hoc signatures (codesign ships with macOS; arm64 runs nothing unsigned).
+sign() { codesign --force --sign - --identifier "$2" "$1" && codesign --verify --strict "$1"; }
+sign "${B}/bin/cauldron" cauldron
+sign "${B}/bin/tui" tui
+sign "${B}/libexec/threads" com.harness.threads
+sign "${B}/libexec/cauldron-mcp" cauldron-mcp
+
+printf 'name=cauldron\nversion=%s\ncommit=%s\ncommit_time=%s\ntarget=aarch64-apple-darwin\nsigned=adhoc\n' \
+    "${VERSION}" "${STAMP_COMMIT}" "${COMMIT_TIME}" >"${B}/BUNDLE"
+# Modes by kind, never by the builder's umask.
+find "${B}" -type d -exec chmod 0755 {} +
+find "${B}" -type f -exec chmod 0644 {} +
+chmod 0755 "${B}/bin/cauldron" "${B}/bin/tui" "${B}/libexec/threads" "${B}/libexec/cauldron-mcp" "${B}/install"
+(cd "${B}" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "${f}"; done) >"${STAGE}/inner-sums"
+mv "${STAGE}/inner-sums" "${B}/SHA256SUMS"
+
+# Deterministic tarball: sorted entries, fixed owner, the commit's time in
+# UTC, no extended attributes, gzip without a name or time. `touch -t` reads
+# its argument as local time, which TZ=UTC (exported above) makes UTC: the
+# mtime is the commit's own second, not that plus the builder's offset.
+find "${B}" -exec env TZ=UTC touch -h -t "$(TZ=UTC date -u -r "${COMMIT_TIME}" +%Y%m%d%H%M.%S)" {} +
+(cd "${STAGE}" && find "${NAME}" | LC_ALL=C sort) >"${SCRATCH}/entries"
+TARBALL="${OUT}/${NAME}.tar.gz"
+(cd "${STAGE}" && COPYFILE_DISABLE=1 TZ=UTC tar --format ustar --no-recursion --uid 0 --gid 0 --uname root --gname wheel \
+    --no-xattrs --no-mac-metadata -cf - -T "${SCRATCH}/entries") | gzip -n -9 >"${TARBALL}.part"
+mv -f "${TARBALL}.part" "${TARBALL}"
+(cd "${OUT}" && shasum -a 256 "${NAME}.tar.gz") >"${OUT}/SHA256SUMS"
+say "wrote ${TARBALL}"
+say "wrote ${OUT}/SHA256SUMS: $(cat "${OUT}/SHA256SUMS")"
+
+CAULDRON_RELEASE_FORBID="$(printf '%s\n' "${BUILD_ROOT}" "${SCRATCH}" "${SRC}")" \
+    "${SELF_DIR}/check-release-bundle" "${TARBALL}"
+if [[ ${KEEP} -eq 1 ]]; then say "kept the scratch directory ${SCRATCH}"; fi
+FINISHED=1

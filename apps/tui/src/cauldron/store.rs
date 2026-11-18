@@ -97,7 +97,9 @@ pub fn global_dir(env: &Environment) -> PathBuf {
 /// synthetic, the shape the old repo `data/` had). A face on a real
 /// environment never reads it (REL-3.S2): `tui --cauldron` opens with
 /// [`no_seeds`], and only an explicit `--seeds <dir>` or a test opens a
-/// fixture.
+/// fixture. Not compiled into a release-bundle binary at all, so no
+/// build-machine path is baked into it.
+#[cfg(not(cauldron_release_bundle))]
 pub fn seed_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/seed")
 }

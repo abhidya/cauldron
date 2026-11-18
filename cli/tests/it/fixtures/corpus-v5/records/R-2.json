@@ -1,0 +1,8 @@
+{
+  "id": "R-2",
+  "handle": "CORPUS FILES - the seed corpus file and its one-record-per-file form.",
+  "boundary": "Inside: the shape of corpus files on disk and how they are found. Outside: the mapping to records (R-1).",
+  "narrows": [
+    "R-1"
+  ]
+}

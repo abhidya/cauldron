@@ -192,6 +192,22 @@ pub fn search_paths(root: &Path) -> Vec<PathBuf> {
 
 /// The version-controlled `mcp/` directory of the repository this binary was
 /// built from.
+///
+/// A release-bundle binary (`--cfg cauldron_release_bundle`, see
+/// `scripts/build-release-bundle`) has no source tree: it reads
+/// `<dir of this executable>/../share/cauldron/mcp` instead.
+/// The executable's path is canonical (symlinks resolved), as for the
+/// service declarations (`env::decl::release_share_dir`).
+#[cfg(cauldron_release_bundle)]
+pub fn shipped_dir() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    exe.parent().and_then(Path::parent).unwrap_or(Path::new("/")).join("share/cauldron/mcp")
+}
+
+/// The version-controlled `mcp/` directory of the repository this binary was
+/// built from (a binary built from a checkout).
+#[cfg(not(cauldron_release_bundle))]
 pub fn shipped_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()

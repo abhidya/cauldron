@@ -37,6 +37,17 @@ recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Next
 
+- **0.1.15: cauldron on an Apple silicon Mac without a Rust toolchain.**
+  Prebuilt, ad-hoc-signed arm64 binaries with checksums and an installer
+  path that uses them (issue #22), a plugin MCP launcher that does not
+  depend on Claude Code's `PATH`, and `cauldron soup import-corpus`, which
+  brings records in the older corpus format into a cauldron's soup (issue
+  #4). In preparation.
+- **0.1.16: clusters claim regions** (issue #1). A cluster type and a
+  `claims` edge from a cluster to a region, kept beside the workspace
+  grammar, which stays as it is; `soup_claim` made real, a region listing
+  the clusters that claim it, `import-corpus` carrying clusters, and a
+  `soup_changes` that can wait for the next change.
 - **Ripples on by default in a fresh install**, once the conditions hold:
   enough real dumps processed and reviewed with a reject rate the owner
   accepts, tokens per dump measured with no cap ever passed silently, the
@@ -46,18 +57,15 @@ recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Open issues, not yet scheduled
 
-- **Claiming work** through the MCP door (`soup_claim`, listed today and
-  always `unsupported`: it needs clusters in the schema).
-- **The old seed corpus and its importer**: bringing earlier knowledge into
-  a cauldron's soup.
 - **Changes as events** (issue #7): streaming what changed in a soup, and a
   history of which write changed what.
 - **Merging cauldrons** (issue #9).
 - **A summary page in the face** (issue #11).
-- **Cross-references to other tools**: records that point at work tracked
-  elsewhere.
-- **Prebuilt binaries** for macOS, so an install need not build from source
-  (issue #22).
+- **Comparisons with two other tools**, as input for design: octomind's
+  cross-session learning (issue #12) and Prospero's headless harness
+  (issue #13).
+- **Notarised binaries**, signed with a developer identity, so a browser
+  download runs without removing the quarantine attribute.
 
 ## 0.2.0
 

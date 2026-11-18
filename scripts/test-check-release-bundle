@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# test-check-release-bundle <tarball>
+#
+# The planted cases for scripts/check-release-bundle. Given a GOOD bundle
+# (one scripts/build-release-bundle made, with its SHA256SUMS beside it),
+# it first checks that the gate passes it, then builds one altered copy per
+# case and checks that the gate FAILS each one, naming the right reason.
+# A binary is altered by replacing a string of it with another of the same
+# length and ad-hoc signing it again; the inner and outer SHA256SUMS are
+# redone, and every other member keeps its metadata, so the one planted
+# fault is the only thing wrong with the copy.
+#
+# Also checks scripts/probe-creatable-paths itself, on a planted file in the
+# shared temporary directory.
+#
+# Runs on macOS only (codesign, sandbox-exec). Writes only under a scratch
+# directory in the per-user temporary directory, removed at the end.
+# Exit 0 every case held, 1 a case did not, 2 usage.
+set -euo pipefail
+
+[[ $# -eq 1 && -f "$1" ]] || { echo "usage: test-check-release-bundle <tarball>" >&2; exit 2; }
+SELF_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+GOOD="$(cd -P "$(dirname "$1")" && pwd -P)/$(basename "$1")"
+NAME="$(basename "${GOOD}" .tar.gz)"
+base="${TMPDIR:-}"
+[[ -n "${base}" && "${base}" != /tmp* && "${base}" != /private/tmp* ]] || base="$(getconf DARWIN_USER_TEMP_DIR)"
+WORK="$(mktemp -d "${base%/}/test-check-release-bundle.XXXXXX")"
+PLANTED_TMP="/private/tmp/test-check-release-bundle.$$"
+trap 'rm -rf "${WORK}" "${PLANTED_TMP}"' EXIT
+
+FAILED=0
+held() { printf '  held  %s\n' "$*"; }
+broke() { printf '  BROKE %s\n' "$*"; FAILED=$((FAILED+1)); }
+
+# expect_fail <case> <reason substring> [env...]: the gate fails the copy in
+# <case>/ and says <reason>.
+expect_fail() {
+    local c="$1" want="$2"; shift 2
+    local out rc=0
+    out="$(env "$@" "${SELF_DIR}/check-release-bundle" "${WORK}/${c}/${NAME}.tar.gz" 2>&1)" || rc=$?
+    if [[ ${rc} -eq 1 ]] && grep -F -- "${want}" <<<"${out}" | grep -q FAIL; then
+        held "${c}: FAIL, ${want}"
+    else
+        broke "${c}: expected a FAIL naming '${want}' (rc ${rc}):"
+        sed 's/^/        /' <<<"${out}" | grep -v '  ok  ' | head -12
+    fi
+}
+
+# plant <case> [--member <rel> <old> <new>]... : a copy of the good tarball
+# with each named binary member's bytes <old> replaced by <new> (same length,
+# exactly one occurrence) and re-signed.
+plant() {
+    local c="$1"; shift
+    mkdir -p "${WORK}/${c}"
+    python3 -I - "${GOOD}" "${WORK}/${c}" "${NAME}" "$@" <<'PY'
+import gzip, hashlib, io, os, subprocess, sys, tarfile
+good, outdir, name = sys.argv[1:4]
+args = sys.argv[4:]
+edits = {}
+meta = {}
+i = 0
+while i < len(args):
+    if args[i] == "--member":
+        edits.setdefault(args[i + 1], []).append((args[i + 2].encode(), args[i + 3].encode())); i += 4
+    elif args[i] == "--append":
+        # --append <rel> <text>: text appended to a non-binary member.
+        meta.setdefault("--append", []).append((args[i + 1], args[i + 2].encode())); i += 3
+    elif args[i] == "--reverse":
+        meta["--reverse"] = True; i += 1
+    elif args[i] == "--meta":
+        # --meta <rel|*> <field> <value>: set a tar header field of a member.
+        meta.setdefault(args[i + 1], []).append((args[i + 2], args[i + 3])); i += 4
+    else:
+        sys.exit("plant: unknown argument " + args[i])
+src = tarfile.open(good, "r:gz")
+members = src.getmembers()
+data = {m.name: src.extractfile(m).read() for m in members if m.isfile()}
+ids = {"bin/tui": "tui", "bin/cauldron": "cauldron", "libexec/threads": "com.harness.threads",
+       "libexec/cauldron-mcp": "cauldron-mcp"}
+top = name + "/"
+for rel, reps in edits.items():
+    if not reps:
+        continue
+    full = top + rel
+    b = data[full]
+    for old, new in reps:
+        assert len(old) == len(new), (old, new)
+        assert b.count(old) >= 1, "plant: %r not in %s" % (old, rel)
+        b = b.replace(old, new, 1)
+    tmp = os.path.join(outdir, "member.bin")
+    open(tmp, "wb").write(b)
+    subprocess.run(["codesign", "--force", "--sign", "-", "--identifier", ids[rel], tmp], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    data[full] = open(tmp, "rb").read()
+    os.remove(tmp)
+for rel, text in meta.pop("--append", []):
+    data[top + rel] = data[top + rel] + text
+    edits.setdefault(rel, [])
+if edits:
+    lines = []
+    for m in members:
+        if m.isfile() and m.name != top + "SHA256SUMS":
+            lines.append("%s  %s\n" % (hashlib.sha256(data[m.name]).hexdigest(), m.name[len(top):]))
+    data[top + "SHA256SUMS"] = "".join(sorted(lines, key=lambda l: l.split("  ", 1)[1].encode())).encode()
+buf = io.BytesIO()
+order = list(reversed(members)) if meta.pop("--reverse", False) else members
+with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as out:
+    for m in order:
+        for sel in ("*", m.name[len(top):] if m.name.startswith(top) else m.name):
+            for field, value in meta.get(sel, []):
+                if field == "mtime" and value.startswith("+"):
+                    m.mtime += int(value[1:])
+                else:
+                    setattr(m, field, int(value, 0) if field in ("mtime", "uid", "gid", "mode") else value)
+        if m.isfile():
+            m.size = len(data[m.name])
+            out.addfile(m, io.BytesIO(data[m.name]))
+        else:
+            out.addfile(m)
+tar_path = os.path.join(outdir, name + ".tar.gz")
+with open(tar_path, "wb") as f:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=f, mtime=0, compresslevel=9) as g:
+        g.write(buf.getvalue())
+digest = hashlib.sha256(open(tar_path, "rb").read()).hexdigest()
+open(os.path.join(outdir, "SHA256SUMS"), "w").write("%s  %s.tar.gz\n" % (digest, name))
+PY
+}
+
+echo "test-check-release-bundle: ${NAME}"
+
+# 0. The good bundle passes, and so does an unaltered copy made by plant.
+if "${SELF_DIR}/check-release-bundle" "${GOOD}" >/dev/null 2>&1; then held "the good bundle: PASS"; else broke "the good bundle does not pass the gate"; fi
+plant copy
+if "${SELF_DIR}/check-release-bundle" "${WORK}/copy/${NAME}.tar.gz" >/dev/null 2>&1; then held "an unaltered copy: PASS"; else broke "an unaltered copy does not pass (the planting itself changes something)"; fi
+
+# 1. A compiled-in path in the shared temporary directory (the shape a
+#    source-tree path of a build in /private/tmp has).
+plant tmp-path --member bin/tui TUI_POOL_ACCOUNTS_TOOL /private/tmp/b/helper1
+expect_fail tmp-path "bin/tui: contains a path in a location another user could create (/private/tmp/b/helper1"
+# 2. The same under /var/tmp and /Users/Shared, in other binaries.
+plant vartmp-path --member libexec/threads THREADS_HOME /var/tmp/x12
+expect_fail vartmp-path "libexec/threads: contains a path in a location another user could create"
+plant shared-path --member bin/cauldron CAULDRON_HOME /Users/Shared
+expect_fail shared-path "bin/cauldron: contains a path in a location another user could create (/Users/Shared"
+# 3. A relative helper path, resolved against wherever the binary runs.
+plant relative-path --member libexec/cauldron-mcp CAULDRON_ISOLATED " ./helper-planted"
+expect_fail relative-path "libexec/cauldron-mcp: contains a path in a location another user could create (./helper-planted"
+# 4. The build's own scratch directory, wherever it was: a literal the
+#    builder passes (here a made-up root outside every shared location).
+plant build-root --member bin/tui TUI_POOL_ACCOUNTS_TOOL /opt/rb-x/cauldron-src
+expect_fail build-root "bin/tui: contains the build's own path /opt/rb-x" CAULDRON_RELEASE_FORBID=/opt/rb-x
+
+# 5. Things only this machine or this builder knows: a host name in a
+#    binary and in a text file, the builder's git user.email, and a library
+#    outside the system's directories. The names are read here at run time
+#    and written nowhere but into the scratch copies.
+HOST="$(hostname -s)"
+pad="TUI_POOL_ACCOUNTS_TOOL"
+if [[ ${#HOST} -ge 3 && ${#HOST} -le ${#pad} ]]; then
+    plant host-bin --member bin/tui "${pad}" "${HOST}${pad:${#HOST}}"
+    expect_fail host-bin "bin/tui: contains this machine's host name"
+else
+    broke "host-bin: this machine's short host name is not 3 to ${#pad} characters long, so it cannot be planted here"
+fi
+plant host-text --append README.md "built on ${HOST}"
+expect_fail host-text "README.md: contains this machine's host name"
+EMAIL="$(git config user.email 2>/dev/null || true)"
+if [[ -n "${EMAIL}" ]]; then
+    plant email-text --append NOTICE "contact ${EMAIL}"
+    expect_fail email-text "NOTICE: contains the git user.email of whoever runs this"
+else
+    held "email-text: no git user.email is set here, so there is none to plant (the gate checks it when there is)"
+fi
+plant odd-library --member bin/tui /usr/lib/libiconv.2.dylib /opt/lib/libiconv.2.dylib
+expect_fail odd-library "bin/tui: links a library outside /usr/lib and /System/Library: /opt/lib/libiconv.2.dylib"
+
+# 6. Tarball metadata that says something about the builder: every mtime
+#    the commit's time plus a UTC offset (Pacific, 8 hours), the builder's
+#    uid and name, a group-writable or setuid mode, an unsorted order.
+plant tz-offset --meta '*' mtime +28800
+expect_fail tz-offset "(off by +28800 s)"
+plant builder-uid --meta README.md uid 501 --meta README.md uname builder
+expect_fail builder-uid "README.md is owned by 501:0 (builder:wheel), not 0:0 (root:wheel)"
+plant group-writable --meta LICENSE mode 0o664
+expect_fail group-writable "LICENSE has mode 664, not 644"
+plant setuid --meta bin/cauldron mode 0o4755
+expect_fail setuid "bin/cauldron has mode 4755, not 755"
+plant unsorted --reverse
+expect_fail unsorted "the entries are not in byte order"
+
+# 7. The runtime probe, on a planted file in the shared temporary directory.
+mkdir -p "${PLANTED_TMP}" && printf 'planted\n' >"${PLANTED_TMP}/helper"
+if ! "${SELF_DIR}/probe-creatable-paths" -- /bin/cat "${PLANTED_TMP}/helper" >/dev/null 2>&1; then
+    held "probe: a command that reads a planted file under /private/tmp is killed"
+else
+    broke "probe: a command that read a planted file under /private/tmp was not caught"
+fi
+if "${SELF_DIR}/probe-creatable-paths" --deny "${WORK}" -- /bin/test -d "${WORK}/copy" >/dev/null 2>&1; then
+    broke "probe: a command that looked into a --deny directory was not caught"
+else
+    held "probe: a command that looks into a --deny directory is killed"
+fi
+if "${SELF_DIR}/probe-creatable-paths" -- /bin/echo fine >/dev/null 2>&1; then held "probe: a command that touches none passes"; else broke "probe: /bin/echo did not pass"; fi
+
+if [[ ${FAILED} -eq 0 ]]; then echo "test-check-release-bundle: every case held"; exit 0; fi
+echo "test-check-release-bundle: ${FAILED} case(s) did not hold"
+exit 1

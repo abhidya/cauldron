@@ -91,10 +91,22 @@ fn main() {
     // this set is deliberately WIDER than the set `classify` counts.
     watch_dirt_sources(scope.as_deref());
 
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_default();
+    // THE BUILD TIME, or the time the builder names. `SOURCE_DATE_EPOCH`
+    // (https://reproducible-builds.org/specs/source-date-epoch/) is set by
+    // scripts/build-release-bundle to the commit's time, so two builds of one
+    // commit compile in the same value and come out byte for byte the same.
+    // Anything but a whole number of seconds there is ignored, and the
+    // clock is used, as before.
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let epoch = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_default()
+        });
     println!("cargo:rustc-env=THREADS_BUILD_EPOCH={epoch}");
 
     // The pin wins. It is a statement of intent by whoever is shipping; the

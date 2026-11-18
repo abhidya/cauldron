@@ -223,7 +223,7 @@ real_of() { local d; for d in /usr/bin /bin /usr/sbin /sbin; do if [[ -x "${d}/$
 # Logging shims for the plain utilities. Mutating ones refuse (98) any
 # absolute path argument outside ${T} (cp: its destination only, since it may
 # read a source elsewhere).
-for c in dirname basename sed uname sw_vers id stat awk grep wc tr cat mkdir cp mv rm chmod bash shasum; do
+for c in dirname basename sed uname sw_vers id stat awk grep wc tr cat mkdir cp mv rm chmod bash shasum tar od cmp ls; do
     r="$(real_of "${c}")"
     cat >"${SEAL}/${c}" <<SHIM
 #!/bin/bash
@@ -237,6 +237,12 @@ case "${c}" in
         fi
         for a in "\$@"; do check "\$a"; done ;;
     mkdir|rm|chmod) for a in "\$@"; do check "\$a"; done ;;
+    # STUB_ARCH: what \`uname -m\` answers (the prebuilt path's arm64 check).
+    uname) if [[ "\${1:-}" == -m && -n "\${STUB_ARCH:-}" ]]; then echo "\${STUB_ARCH}"; exit 0; fi ;;
+    # A fake executable is marked FAKEMACHO:arm64; od reads it as a thin arm64 Mach-O header.
+    od) for a in "\$@"; do f="\$a"; done
+        if /usr/bin/grep -aq 'FAKEMACHO:arm64' "\$f" 2>/dev/null; then echo " cf fa ed fe 0c 00 00 01"; exit 0; fi ;;
+    tar) prev=""; for a in "\$@"; do [[ "\$prev" == -C ]] && check "\$a"; prev="\$a"; done ;;
     cp) check "\${@: -1}" ;;
     sed) case " \$* " in *" -i "*) check "\${@: -1}" ;; esac ;;
     bash) [[ \$# -eq 0 ]] || check "\$1" ;;
@@ -262,13 +268,28 @@ printf 'codesign %s\n' "$*" >>"${EXEC_LOG:?}"
 f="${@: -1}"
 case "$1" in
     --force) id=""; while [[ $# -gt 1 ]]; do [[ "$1" == --identifier ]] && id="$2"; shift; done
-             printf '\nFAKESIGN:%s\n' "${id}" >>"${f}" ;;
-    -dvvv)   id="$(/usr/bin/sed -n 's/^FAKESIGN://p' "${f}" 2>/dev/null | /usr/bin/tail -n 1)"
+             printf '\nFAKESIGN:%s\n' "${id}" >>"${f}"
+             # The sum of everything but itself: \`--verify\` fails once a byte changes.
+             printf 'FAKESUM:%s\n' "$(/usr/bin/grep -av '^FAKESUM:' "${f}" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')" >>"${f}" ;;
+    -dvvv|-dv) id="$(/usr/bin/sed -n 's/^FAKESIGN://p' "${f}" 2>/dev/null | /usr/bin/tail -n 1)"
              if [[ -n "${id}" ]]; then printf 'Identifier=%s\nSignature=adhoc\n' "${id}" >&2; else echo "${f}: code object is not signed at all" >&2; exit 1; fi ;;
+    --verify) want="$(/usr/bin/sed -n 's/^FAKESUM://p' "${f}" 2>/dev/null | /usr/bin/tail -n 1)"
+             have="$(/usr/bin/grep -av '^FAKESUM:' "${f}" 2>/dev/null | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+             if [[ -n "${want}" && "${want}" == "${have}" ]]; then exit 0; fi
+             echo "${f}: invalid signature (code or signature have been modified)" >&2; exit 1 ;;
     *) echo "fake codesign: unexpected $*" >&2; exit 64 ;;
 esac
 FAKE
-/bin/chmod +x "${SEAL}/launchctl" "${SEAL}/git" "${SEAL}/cargo" "${SEAL}/codesign"
+# curl: a fake. \`-o OUT URL\` copies STUB_CURL_FILE to OUT (logged); nothing is fetched.
+cat >"${SEAL}/curl" <<'FAKE'
+#!/bin/bash
+printf 'curl %s\n' "$*" >>"${EXEC_LOG:?}"
+out=""; prev=""; for a in "$@"; do [[ "${prev}" == -o ]] && out="${a}"; prev="${a}"; done
+[[ -n "${out}" && -f "${STUB_CURL_FILE:-}" ]] || { echo "fake curl: no -o or no STUB_CURL_FILE" >&2; exit 22; }
+case "${out}" in "${HOME}"/*) ;; *) printf 'ESCAPE curl %s\n' "${out}" >>"${EXEC_LOG}"; exit 98 ;; esac
+/bin/cp "${STUB_CURL_FILE}" "${out}"
+FAKE
+/bin/chmod +x "${SEAL}/launchctl" "${SEAL}/git" "${SEAL}/cargo" "${SEAL}/codesign" "${SEAL}/curl"
 # The threads signer, at the path install derives from its own location, as
 # a fake that signs through `codesign` ON PATH (the fake) and verifies.
 cat >"${T}/repo/services/threads/scripts/build-threads.sh" <<'FAKE'
@@ -290,7 +311,7 @@ srun() {
     if [[ -d "${home}" ]]; then /bin/cp -Rp "${home}/." "${T}/twin/"; fi
     # REL-4.S5c stub knobs, passed to the run AND its twin. Paths here hold no
     # spaces (all under ${T}), so word splitting is safe.
-    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-} STUB_MCP_REFUSE=${STUB_MCP_REFUSE:-0} STUB_MCP_REPIN_DURING=${STUB_MCP_REPIN_DURING:-0} STUB_NAME_ONLY=${STUB_NAME_ONLY:-0}"
+    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-} STUB_MCP_REFUSE=${STUB_MCP_REFUSE:-0} STUB_MCP_REPIN_DURING=${STUB_MCP_REPIN_DURING:-0} STUB_NAME_ONLY=${STUB_NAME_ONLY:-0} STUB_ARCH=${STUB_ARCH:-} STUB_CURL_FILE=${STUB_CURL_FILE:-}"
     set +e
     OUT="$(cd "${T}" && /usr/bin/env -i HOME="${RUN_HOME:-${T}/home}" PATH="${SEAL}${SRUN_PATH_EXTRA:+:${SRUN_PATH_EXTRA}}" \
         ${RUN_SIGNER:+HARNESS_SIGN_SCRIPT="${RUN_SIGNER}"} \
@@ -361,13 +382,14 @@ if grep -qE '^install: \$ .*/cauldron --env prod install$' <<<"${OUT}"; then ok 
 bridge_ok() {
     # <root> <a line that must come AFTER them> <tag> [<a line that must come BEFORE them>]
     local n c b=0
-    n="$(grep -nF 'MCP:      Claude Code runs the plugin'"'"'s MCP server as the bare command `cauldron mcp stdio`,' <<<"${OUT}" | head -n 1 | cut -d: -f1)"
+    n="$(grep -nF 'MCP:      the plugin'"'"'s MCP server is its launcher, bin/cauldron-mcp, which runs `cauldron mcp stdio`' <<<"${OUT}" | head -n 1 | cut -d: -f1)"
     c="$(grep -nF "${2}" <<<"${OUT}" | tail -n 1 | cut -d: -f1)"
     if [[ -n "${4:-}" ]]; then b="$(grep -nF "${4}" <<<"${OUT}" | head -n 1 | cut -d: -f1)"; fi
-    if [[ -n "${n}" && -n "${c}" && -n "${b}" && ${c} -gt ${n} && ${n} -gt ${b} ]] && has "so \`cauldron\` must be on the PATH that Claude Code itself sees" \
-        && has "to check: \`command -v cauldron\` in the terminal you start Claude Code from prints" \
-        && has "${1}/bin/cauldron, and \`/mcp\` inside a session lists cauldron as connected."; then
-        ok "${3}: closing lines say cauldron must be on Claude Code's PATH, and how to check"
+    if [[ -n "${n}" && -n "${c}" && -n "${b}" && ${c} -gt ${n} && ${n} -gt ${b} ]] && has "without needing \`cauldron\` on the PATH Claude Code was started with. It looks at" \
+        && has "\$CAULDRON_BIN, then the install marker ${1%/.cauldron}/Library/Application Support/cauldron/cauldron-bin (written for prod)," \
+        && has "then ${1}/bin/cauldron, then PATH." \
+        && has "to check: \`/mcp\` inside a session lists cauldron as connected"; then
+        ok "${3}: closing lines say where the plugin's launcher looks for cauldron, and how to check"
     else bad "${3}: no bridge PATH lines (or not at the end)" "${OUT}"; fi
 }
 bridge_ok "${T}/home/.cauldron" "DRY RUN complete" "1 (dry run)"
@@ -678,6 +700,7 @@ if [[ -n "${sh_img}" && "$(sha "${SH}/threads")" == "${sh_img}" && "$(/usr/bin/s
 if [[ -n "${sh_rec}" && "$(sha "${SH}/build.json")" == "${sh_rec}" ]]; then ok "prod's pinned shared build.json: same sha256"; else bad "prod's pinned build.json was rewritten" "$(cat "${SH}/build.json")"; fi
 if [[ "$(sha "${DV}/threads")" == "${dv_img}" && "$(sha "${DV}/build.json")" == "${dv_rec}" && "$(/usr/bin/stat -f %i "${DV}/threads")" == "${ino_d}" ]]; then ok "an existing +dev copy: same sha256 (image, record), same inode"; else bad "an existing per-env copy was written into"; fi
 if grep -q 'FAKESIGN:com.harness.threads' "$(B14 "${H}" feedc0de1234-release+dev.2)/threads" 2>/dev/null; then ok "the new +dev.2 version is the signed one"; else bad "+dev.2 not signed" "$(ls -la "$(B14 "${H}" feedc0de1234-release+dev.2)" 2>&1)"; fi
+if [[ ! -e "${H}/Library/Application Support/cauldron/cauldron-bin" ]]; then ok "14b: no install marker for a non-prod environment"; else bad "14b: a dev install wrote the prod marker"; fi
 sealed_ok "case 14b"
 # 14c. Identity arm with a signer that signs nothing: the verify refuses, so
 # install stops BEFORE the pin; the unsigned version it claimed is removed,
@@ -738,7 +761,7 @@ if grep -qx '\[services.threads\]' "$(ENVT "${H17}")" && grep -qx 'version = "fe
 if [[ ! -e "$(MARK "${H17}")" ]]; then ok "17b: marker cleared after the pin"; else bad "17b: marker left after the pin"; fi
 if grep -q 'FAKESIGN:com.harness.threads' "$(B14 "${H17}" feedc0de1234-release+prod)/threads" 2>/dev/null; then ok "17b: the pinned version is the signed one"; else bad "17b: pinned version not signed"; fi
 if has "PATH:     \`cauldron\` is not on your PATH yet (it is in ${H17}/.cauldron/bin)" && has "echo 'export PATH=\"${H17}/.cauldron/bin:\$PATH\"' >> ~/.zshrc"; then ok "17b: done says exactly how to put cauldron on PATH"; else bad "17b: no PATH instruction" "${OUT}"; fi
-bridge_ok "${H17}/.cauldron" "lists cauldron as connected." "17b (real run)" "install: == done"
+bridge_ok "${H17}/.cauldron" "whose instructions say how to install." "17b (real run)" "install: == done"
 sealed_ok "case 17b"
 cp "$(ENVT "${H17}")" "${T}/env17.before" 2>/dev/null || : >"${T}/env17.before"
 mkdir -p "${H17}/.cauldron/data/prod" "${H17}/.cauldron/bin"; : >"$(MARK "${H17}")"
@@ -1172,6 +1195,189 @@ sealed_ok "case 32"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H31}" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && ! has "only by name" && ! has "install: grants:"; then ok "32: no name-only grant, no grants line"; else bad "32: a grants line with nothing to name" "${OUT}"; fi
+
+# ── THE PREBUILT PATH (--prebuilt), cases 33-39 ─────────────────────────────
+# A FAKE release bundle, made here: bin/cauldron is a stub (FAKEMACHO:arm64,
+# so the od shim reads an arm64 header) that installs `--artifact` images the
+# way the real `cauldron build <service> --artifact` does (a NEW
+# `<commit12>-release+<env>` version, the commit read off the image) and
+# hands every other verb to the stub cauldron above. Every binary is signed
+# by the fake codesign, whose --verify fails once a byte changes. The
+# commits are spelt in pieces (a long hex run reads as a hash).
+PBC1="$(printf 'a1b2%.0s' 1 2 3 4 5 6 7 8 9 10)"
+PBC2="$(printf 'c3d4%.0s' 1 2 3 4 5 6 7 8 9 10)"
+PBV=0.1.99
+PBN="cauldron-${PBV}-aarch64-apple-darwin"
+mkdir -p "${T}/pb"
+cat >"${T}/pb/cauldron.head" <<STUBPB
+#!/bin/bash
+# FAKEMACHO:arm64
+case "\$*" in
+    *" build threads --json --env-copy --artifact "*|*" build mcp --json --env-copy --artifact "*)
+        printf '%s\n' "\$*" >>"\${CLOG:?}"
+        root="\${HOME}/.cauldron"; e="\$2"; svc="\$4"; img="\${@: -1}"
+        [[ "\${svc}" == threads ]] && bin=threads || bin=cauldron-mcp
+        c="\$(/usr/bin/sed -n 's/^STAMP://p' "\${img}")"; [[ -n "\${c}" ]] || { echo "stub: image states no commit" >&2; exit 1; }
+        b="\${root}/data/shared/builds/\${svc}"; base="\${c:0:12}-release"; /bin/mkdir -p "\${b}"
+        k=1; l="\${base}+\${e}"
+        until /bin/mkdir "\${b}/\${l}" 2>/dev/null; do k=\$((k+1)); l="\${base}+\${e}.\${k}"; [[ \${k} -lt 100 ]] || exit 70; done
+        /bin/cp "\${img}" "\${b}/\${l}/\${bin}"
+        printf '{\n  "service": "%s",\n  "label": "%s",\n  "bin": "%s"\n}\n' "\${svc}" "\${l}" "\${bin}" >"\${b}/\${l}/build.json"
+        printf 'name = "%s"\n' "\${svc}" >"\${b}/\${l}/declaration.toml"
+        printf '[\n  {\n    "service": "%s",\n    "label": "%s",\n    "bin": "%s"\n  }\n]\n' "\${svc}" "\${l}" "\${bin}"
+        exit 0 ;;
+esac
+exec "${T}/bin14/cauldron" "\$@"
+STUBPB
+# make_bundle <out-dir> <commit> [<mutation>]: the tarball <out-dir>/${PBN}.tar.gz
+# and <out-dir>/SHA256SUMS. Mutations: tamper-resummed (a byte of
+# libexec/threads changed after signing, every sum made again), tamper (the
+# same, sums left), escape (an entry <top>/../evil), link (a symlink entry).
+make_bundle() {
+    local out="$1" c="$2" mut="${3:-}" st b f
+    st="$(mktemp -d "${T}/pbstage.XXXXXX")"; b="${st}/${PBN}"
+    mkdir -p "${out}" "${b}/bin" "${b}/libexec" "${b}/share/cauldron/services" "${b}/share/cauldron/mcp"
+    cp "${T}/pb/cauldron.head" "${b}/bin/cauldron"
+    printf '#!/bin/bash\n# FAKEMACHO:arm64\nexit 0\n' >"${b}/bin/tui"
+    printf '#!/bin/bash\n# FAKEMACHO:arm64\nexit 0\nSTAMP:%s\n' "${c}" >"${b}/libexec/threads"
+    printf '#!/bin/bash\n# FAKEMACHO:arm64\nexit 0\nSTAMP:%s\n' "${c}" >"${b}/libexec/cauldron-mcp"
+    chmod +x "${b}/bin/cauldron" "${b}/bin/tui" "${b}/libexec/threads" "${b}/libexec/cauldron-mcp"
+    for f in bin/cauldron:cauldron bin/tui:tui libexec/threads:com.harness.threads libexec/cauldron-mcp:cauldron-mcp; do
+        EXEC_LOG=/dev/null "${SEAL}/codesign" --force --sign - --identifier "${f#*:}" "${b}/${f%%:*}"
+    done
+    printf 'name = "threads"\n' >"${b}/share/cauldron/services/threads.toml"
+    printf 'name = "mcp"\n# bundle %s\n' "${c:0:4}" >"${b}/share/cauldron/services/mcp.toml"
+    printf '# no tools\n' >"${b}/share/cauldron/mcp/agents.toml"
+    printf '#!/bin/bash\nexit 0\n' >"${b}/install"; printf 'license\n' >"${b}/LICENSE"
+    printf 'name=cauldron\nversion=%s\ncommit=%s\ntarget=aarch64-apple-darwin\nsigned=adhoc\n' "${PBV}" "${c}" >"${b}/BUNDLE"
+    case "${mut}" in tamper|tamper-resummed) /usr/bin/sed -i '' 's/exit 0/exit 7/' "${b}/libexec/threads" ;; esac
+    pb_sums() { (cd "${b}" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "${f}"; done) >"${st}/sums" && mv "${st}/sums" "${b}/SHA256SUMS"; }
+    if [[ "${mut}" == tamper ]]; then
+        # Sums of the bundle BEFORE the change (recomputed on a pristine copy).
+        /usr/bin/sed -i '' 's/exit 7/exit 0/' "${b}/libexec/threads"; pb_sums; /usr/bin/sed -i '' 's/exit 0/exit 7/' "${b}/libexec/threads"
+    else
+        pb_sums
+    fi
+    case "${mut}" in
+        escape) printf 'evil\n' >"${st}/evil"
+                (cd "${st}" && COPYFILE_DISABLE=1 /usr/bin/tar -czf "${out}/${PBN}.tar.gz" -s "|^evil\$|${PBN}/../evil|" "${PBN}" evil) ;;
+        link)   ln -s /etc/hosts "${b}/share/cauldron/hosts"
+                (cd "${st}" && COPYFILE_DISABLE=1 /usr/bin/tar -czf "${out}/${PBN}.tar.gz" "${PBN}") ;;
+        *)      (cd "${st}" && COPYFILE_DISABLE=1 /usr/bin/tar -czf "${out}/${PBN}.tar.gz" "${PBN}") ;;
+    esac
+    (cd "${out}" && shasum -a 256 "${PBN}.tar.gz") >"${out}/SHA256SUMS"
+    rm -rf "${st}"
+}
+PBSHA() { shasum -a 256 "$1/${PBN}.tar.gz" | awk '{print $1}'; }
+REL() { echo "$1/.cauldron/share/cauldron/releases/${PBV}-$2"; }
+make_bundle "${T}/pb/one" "${PBC1}"
+make_bundle "${T}/pb/two" "${PBC2}"
+L1="${PBC1:0:12}-release"; L2="${PBC2:0:12}-release"
+no_stage() { [[ -z "$(find "$1" -maxdepth 1 -name '.cauldron.prebuilt.*' -print -quit 2>/dev/null)" ]]; }
+
+printf '\n== 33. --prebuilt --dry-run: verifies the tarball, plans --artifact installs, writes nothing\n'
+mkdir -p "${T}/home33" "${T}/pbstub"
+# The unsealed dry run reads the fake binaries through the fake codesign and
+# the od shim, too.
+/bin/cp "${SEAL}/codesign" "${SEAL}/od" "${T}/pbstub/"
+PATH="${T}/pbstub:${PATH}" EXEC_LOG=/dev/null RUN_HOME="${T}/home33" run "" 0 --dry-run --prebuilt "${T}/pb/one/${PBN}.tar.gz"
+if [[ ${RC} -eq 0 ]] && has "checksum   OK: sha256 $(PBSHA "${T}/pb/one")" && has "signatures bin/cauldron, bin/tui, libexec/threads, libexec/cauldron-mcp: arm64, ad-hoc signed, verified"; then ok "33: rc 0; checksum from the SHA256SUMS beside it, signatures verified"; else bad "33: rc ${RC}" "${OUT}"; fi
+if grep -qE '^install: \$ .*/bin/cauldron --env prod build threads --json --env-copy --artifact .*/libexec/threads$' <<<"${OUT}" \
+   && grep -qE '^install: \$ .*/bin/cauldron --env prod build mcp --json --env-copy --artifact .*/libexec/cauldron-mcp$' <<<"${OUT}"; then ok "33: the plan installs threads and mcp from the bundle with --artifact"; else bad "33: no --artifact lines" "${OUT}"; fi
+if ! grep -qE 'cargo build|build-threads\.sh' <<<"${OUT}" && has "would place the bundle at ${T}/home33/.cauldron/share/cauldron/releases/${PBV}-${PBC1:0:12}"; then ok "33: no cargo build and no re-sign in the plan; names where the bundle goes"; else bad "33: plan wrong" "${OUT}"; fi
+if [[ -z "$(find "${T}/home33" -mindepth 1 -print -quit)" ]]; then ok "33: dry run wrote nothing under HOME"; else bad "33: dry run wrote" "$(find "${T}/home33")"; fi
+
+printf '\n== 34. --prebuilt on a FRESH machine (SEALED): no cargo, no git, the same layout and later steps\n'
+mkdir -p "${T}/home34"; : >"${CLOG}"; : >"${EXEC_LOG}"; : >"${SIGN_LOG}"
+RUN_HOME="${T}/home34" srun "" --prebuilt "${T}/pb/one/${PBN}.tar.gz"
+R1="$(REL "${T}/home34" "${PBC1:0:12}")"
+want34="$(printf '%s\n' '--env prod env create prod --auto-restart' "--env prod build threads --json --env-copy --artifact ${R1}/libexec/threads" "--env prod pin threads ${L1}+prod --addr auto" "--env prod build mcp --json --env-copy --artifact ${R1}/libexec/cauldron-mcp" "--env prod pin mcp ${L1}+prod" '--env prod install')"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want34}" ]]; then ok "34: rc 0; env create, threads and mcp from the bundle (--artifact), pinned, then install"; else bad "34: rc ${RC}, cauldron calls wrong" "$(cat "${CLOG}")${OUT}"; fi
+if [[ -f "${R1}/bin/cauldron" && -f "${R1}/libexec/threads" && -f "${T}/home34/.cauldron/share/cauldron/services/threads.toml" && -f "${T}/home34/.cauldron/share/cauldron/mcp/agents.toml" ]]; then ok "34: the bundle at share/cauldron/releases/<version>-<commit>, its declarations at share/cauldron/{services,mcp}"; else bad "34: layout wrong" "$(find "${T}/home34/.cauldron/share" 2>&1)"; fi
+T34="${T}/home34/.cauldron/data/shared/builds/threads/${L1}+prod/threads"
+if EXEC_LOG=/dev/null "${SEAL}/codesign" --verify --strict "${T34}" 2>/dev/null && grep -qx '\[services.threads\]' "$(ENVT "${T}/home34")" && grep -qx '\[services.mcp\]' "$(ENVT "${T}/home34")"; then ok "34: the threads version is the bundle's signed image; threads and mcp pinned"; else bad "34: version or pins wrong" "$(cat "$(ENVT "${T}/home34")" 2>&1)"; fi
+if ! grep -qE '^(git|CARGO) ' "${EXEC_LOG}" && ! grep -q 'signer' "${SIGN_LOG}"; then ok "34: neither git nor cargo nor the threads signer ran"; else bad "34: git, cargo or the signer ran" "$(grep -E '^(git|CARGO) ' "${EXEC_LOG}")"; fi
+if no_stage "${T}/home34" && [[ ! -e "$(MARK "${T}/home34")" ]] && has "services: threads pinned at ${L1}+prod" && has "services: mcp pinned at ${L1}+prod"; then ok "34: no scratch dir or marker left; the done lines name both pins"; else bad "34: leftovers or done lines" "$(ls -a "${T}/home34")${OUT}"; fi
+M34="${T}/home34/Library/Application Support/cauldron/cauldron-bin"
+if [[ "$(cat "${M34}" 2>/dev/null)" == "${T}/home34/.cauldron/bin/cauldron" ]]; then ok "34: the install marker the plugin's launcher reads names <root>/bin/cauldron"; else bad "34: no install marker" "$(cat "${M34}" 2>&1)"; fi
+sealed_ok "case 34"
+
+printf '\n== 35. --prebuilt UPGRADE over a running job: refused without --replace-running; with it mcp moves, once (SEALED)\n'
+cp "$(ENVT "${T}/home34")" "${T}/env35.before"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${T}/home34" srun "ai.broomstick.cauldron:4242" --prebuilt "${T}/pb/two/${PBN}.tar.gz"
+if [[ ${RC} -eq 2 ]] && has "REFUSED: a cauldron job for environment 'prod' is already loaded" && [[ ! -s "${CLOG}" ]] && cmp -s "${T}/env35.before" "$(ENVT "${T}/home34")" && no_stage "${T}/home34"; then ok "35a: refused at 2b; no cauldron call, env.toml byte-identical, nothing staged"; else bad "35a: rc ${RC}" "$(cat "${CLOG}")${OUT}"; fi
+RUN_HOME="${T}/home34" srun "ai.broomstick.cauldron:4242" --prebuilt "${T}/pb/two/${PBN}.tar.gz" --replace-running
+R2="$(REL "${T}/home34" "${PBC2:0:12}")"
+want35="$(printf '%s\n' "--env prod build mcp --json --env-copy --artifact ${R2}/libexec/cauldron-mcp" "--env prod pin mcp ${L2}+prod" '--env prod install --replace-running' '--env prod mcp grants')"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want35}" ]] && has "mcp is pinned at ${L1}+prod, which is NOT this bundle's build"; then ok "35b: mcp installed from the new bundle and re-pinned; threads left; install --replace-running"; else bad "35b: rc ${RC}" "$(cat "${CLOG}")${OUT}"; fi
+if grep -qx "version = \"${L2}+prod\"" "$(ENVT "${T}/home34")" && grep -q "version = \"${L1}+prod\"" "$(ENVT "${T}/home34")" && [[ -d "${R1}" && -d "${R2}" ]] && grep -q "bundle ${PBC2:0:4}" "${T}/home34/.cauldron/share/cauldron/services/mcp.toml" && grep -q "bundle ${PBC1:0:4}" "${T}/home34/.cauldron/share/cauldron/services.prev/mcp.toml"; then ok "35b: mcp at the new build, threads at the old; both releases kept; declarations replaced, the old ones kept as .prev"; else bad "35b: state wrong" "$(cat "$(ENVT "${T}/home34")")"; fi
+sealed_ok "case 35b"
+cp "$(ENVT "${T}/home34")" "${T}/env35.after"; : >"${CLOG}"
+RUN_HOME="${T}/home34" srun "ai.broomstick.cauldron:4242" --prebuilt "${T}/pb/two/${PBN}.tar.gz" --replace-running
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod install --replace-running' '--env prod mcp grants')" ]] && cmp -s "${T}/env35.after" "$(ENVT "${T}/home34")" && has "the bundle is already in place at ${R2} (same contents); kept"; then ok "35c: a re-run changes nothing (no build, no pin; the bundle kept)"; else bad "35c: rc ${RC}" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 35c"
+
+pb_refused() {  # <tag> <home> <expected text>
+    if [[ ${RC} -eq 2 ]] && has "$3" && has "Nothing was installed, written or loaded." && [[ ! -s "${CLOG}" ]] && [[ ! -e "$2/.cauldron" ]] && no_stage "$2"; then
+        ok "$1: refused (rc 2) before any cauldron call; nothing under HOME, no scratch dir left"
+    else bad "$1: rc ${RC}" "$(cat "${CLOG}")${OUT}$(find "$2" 2>&1)"; fi
+}
+printf '\n== 36. a bad checksum is refused before anything is unpacked (SEALED)\n'
+mkdir -p "${T}/home36"; : >"${CLOG}"; : >"${EXEC_LOG}"
+WRONG="$(PBSHA "${T}/pb/two")"
+RUN_HOME="${T}/home36" srun "" --prebuilt "${T}/pb/one/${PBN}.tar.gz" --sha256 "${WRONG}"
+pb_refused "36a (--sha256 of another file)" "${T}/home36" "it is not the file the checksum is for"
+sealed_ok "case 36a"
+make_bundle "${T}/pb/badsum" "${PBC1}"; (cd "${T}/pb/two" && shasum -a 256 "${PBN}.tar.gz") >"${T}/pb/badsum/SHA256SUMS"
+RUN_HOME="${T}/home36" srun "" --prebuilt "${T}/pb/badsum/${PBN}.tar.gz"
+pb_refused "36b (SHA256SUMS beside it names other bytes)" "${T}/home36" "it is not the file the checksum is for"
+mkdir -p "${T}/pb/nosum"; cp "${T}/pb/one/${PBN}.tar.gz" "${T}/pb/nosum/"
+RUN_HOME="${T}/home36" srun "" --prebuilt "${T}/pb/nosum/${PBN}.tar.gz"
+pb_refused "36c (no checksum at all)" "${T}/home36" "no checksum for"
+
+printf '\n== 37. a tampered binary is refused (SEALED)\n'
+make_bundle "${T}/pb/tamper2" "${PBC1}" tamper-resummed
+mkdir -p "${T}/home37"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${T}/home37" srun "" --prebuilt "${T}/pb/tamper2/${PBN}.tar.gz"
+pb_refused "37a (changed after signing, every sum made again)" "${T}/home37" "libexec/threads in the bundle does not carry a valid ad-hoc signature as com.harness.threads"
+sealed_ok "case 37a"
+make_bundle "${T}/pb/tamper1" "${PBC1}" tamper
+RUN_HOME="${T}/home37" srun "" --prebuilt "${T}/pb/tamper1/${PBN}.tar.gz"
+pb_refused "37b (changed after the bundle was built)" "${T}/home37" "does not match the bundle's own SHA256SUMS"
+
+printf '\n== 38. a tarball with an entry escaping its directory (../), or a link, is refused before unpacking (SEALED)\n'
+make_bundle "${T}/pb/escape" "${PBC1}" escape
+if /usr/bin/tar -tzf "${T}/pb/escape/${PBN}.tar.gz" | grep -qx "${PBN}/../evil"; then ok "38: fixture has the entry ${PBN}/../evil"; else bad "38: fixture lacks the escaping entry" "$(/usr/bin/tar -tzf "${T}/pb/escape/${PBN}.tar.gz")"; fi
+mkdir -p "${T}/home38"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${T}/home38" srun "" --prebuilt "${T}/pb/escape/${PBN}.tar.gz"
+pb_refused "38a (../)" "${T}/home38" "has entries outside ${PBN}/"
+if [[ -z "$(find "${T}" -name evil -print -quit)" ]]; then ok "38a: no file named evil was written anywhere in the scratch dir"; else bad "38a: evil written" "$(find "${T}" -name evil)"; fi
+sealed_ok "case 38a"
+make_bundle "${T}/pb/link" "${PBC1}" link
+RUN_HOME="${T}/home38" srun "" --prebuilt "${T}/pb/link/${PBN}.tar.gz"
+pb_refused "38b (a symlink entry)" "${T}/home38" "entries that are not plain files or directories"
+if has "${PBN}/share/cauldron/hosts" && ! has "/etc/hosts"; then ok "38b: the refusal names the link entry itself, not its target"; else bad "38b: the refusal does not name the entry" "${OUT}"; fi
+
+printf '\n== 39. a machine that is not arm64 is refused with a clear message (SEALED), and a URL must be https with --sha256\n'
+mkdir -p "${T}/home39"; : >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_ARCH=x86_64 RUN_HOME="${T}/home39" srun "" --prebuilt "${T}/pb/one/${PBN}.tar.gz"
+pb_refused "39a (x86_64)" "${T}/home39" "the prebuilt bundle holds arm64 (Apple silicon) binaries only, and this machine (or this shell) is x86_64. On an Intel Mac, install from source"
+sealed_ok "case 39a"
+RUN_HOME="${T}/home39" srun "" --prebuilt "http://example.invalid/${PBN}.tar.gz" --sha256 "$(PBSHA "${T}/pb/one")"
+pb_refused "39b (plain http)" "${T}/home39" "is plain http"
+RUN_HOME="${T}/home39" srun "" --prebuilt "https://example.invalid/${PBN}.tar.gz"
+pb_refused "39c (https without --sha256)" "${T}/home39" "a --prebuilt URL needs --sha256"
+STUB_CURL_FILE="${T}/pb/one/${PBN}.tar.gz" RUN_HOME="${T}/home39" srun "" --prebuilt "https://example.invalid/${PBN}.tar.gz" --sha256 "$(PBSHA "${T}/pb/one")"
+if [[ ${RC} -eq 0 ]] && grep -q "^curl --proto =https --proto-redir =https --tlsv1.2 --max-filesize 268435456 -fsSL -o ${T}/home39/.cauldron.prebuilt.[0-9]*/download.tar.gz https://example.invalid/${PBN}.tar.gz$" "${EXEC_LOG}" && grep -qx "\[services.mcp\]" "$(ENVT "${T}/home39")" && no_stage "${T}/home39"; then ok "39d: https + --sha256: downloaded (https only) into the scratch dir, verified, installed; scratch removed"; else bad "39d: rc ${RC}" "$(cat "${EXEC_LOG}")${OUT}"; fi
+sealed_ok "case 39d"
+make_bundle "${T}/pb/quar" "${PBC1}"; /usr/bin/xattr -w com.apple.quarantine "0081;00000000;Example;" "${T}/pb/quar/${PBN}.tar.gz"
+: >"${CLOG}"; mkdir -p "${T}/home39q"
+RUN_HOME="${T}/home39q" srun "" --prebuilt "${T}/pb/quar/${PBN}.tar.gz"
+pb_refused "39f (a quarantined download)" "${T}/home39q" "carries macOS's quarantine attribute"
+if has "xattr -d com.apple.quarantine ${T}/pb/quar/${PBN}.tar.gz"; then ok "39f: names the command that removes the attribute"; else bad "39f: no xattr command" "${OUT}"; fi
+sealed_ok "case 39f"
+RUN_HOME="${T}/home39" run "" 0 --dry-run --prebuilt "${T}/pb/one/${PBN}.tar.gz" --from "${T}/bin14"
+if [[ ${RC} -eq 2 ]] && has "--prebuilt and --from are two different sources"; then ok "39e: --prebuilt with --from is refused"; else bad "39e: rc ${RC}" "${OUT}"; fi
 
 printf '\n== 27. an unset variable aborts install with rc != 0 (bash 3.2 + EXIT trap, REL-4.S5e)\n'
 # A copy with an unset variable read right before 4b's staging mkdir, where

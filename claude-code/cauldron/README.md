@@ -10,14 +10,16 @@ schema-valid soup records and lands them, and the published schema ships with th
 so the session can read it.
 
 Everything runs on the same machine as the cauldron. The MCP server is
-`cauldron mcp stdio`, a bridge to the environment's `mcp` service; the
-`cauldron` CLI works beside it and is the curator's fallback.
+`cauldron mcp stdio`, a bridge to the environment's `mcp` service, started
+through the plugin's launcher `bin/cauldron-mcp`; the `cauldron` CLI works
+beside it and is the curator's fallback.
 
 ## Contents
 
 | path | what |
 |---|---|
-| `.mcp.json` | the MCP server `cauldron`: `cauldron mcp stdio` |
+| `.mcp.json` | the MCP server `cauldron`: `${CLAUDE_PLUGIN_ROOT}/bin/cauldron-mcp`, which runs `cauldron mcp stdio` |
+| `bin/cauldron-mcp` | the launcher: finds the installed `cauldron` without relying on Claude Code's `PATH` (see [The launcher](#the-launcher)) |
 | `agents/curator.md` | the curator subagent (`cauldron:curator`) |
 | `commands/curate.md` | `/cauldron:curate <cauldron> [--env <env>] [what to record]` |
 | `commands/dump.md` | `/cauldron:dump [<cauldron>] [--title <t>] <file or text>`: keep text as a dump |
@@ -41,21 +43,21 @@ Do not edit it here.
 Cauldron's consumers use the environment `prod`, which `scripts/install`
 makes; every command here names it. The path from a fresh machine:
 
-1. Install Cauldron from a checkout (`./scripts/install`; the repository's
-   README has the details). It makes `prod` and runs its `mcp` service. An
+1. Install Cauldron: on an Apple silicon Mac, from the release's prebuilt
+   bundle with no Rust toolchain (`install --prebuilt <tarball>`), or from a
+   checkout (`./scripts/install`); the repository's README, "Install", has
+   both. Either makes `prod` and runs its `mcp` service. An
    environment installed before that service existed gets it from
    `./scripts/install --replace-running`, and one whose `mcp` service is an
    older build has it rebuilt and re-pinned by the same command (without
    the flag, the install says the service is still the old build and
    prints the two commands that upgrade it).
-2. Put `<root>/bin` on your `PATH` (`<root>` is `~/.cauldron`, or
-   `$CAULDRON_HOME`). The plugin starts its server as the bare command
-   `cauldron mcp stdio`, so `cauldron` must be on the `PATH` Claude Code
-   itself sees: start Claude Code from a terminal where `command -v
-   cauldron` finds it. Claude Code started from the Dock, Finder or an IDE
-   may not read your shell startup file, and its sessions then have no
-   cauldron tools. If your cauldrons live under `$CAULDRON_HOME`, set it
-   there too.
+2. Put `<root>/bin` on your terminal's `PATH` (`<root>` is `~/.cauldron`,
+   or `$CAULDRON_HOME`) for the commands below. Claude Code itself does not
+   need it: the plugin's launcher finds `cauldron` on its own (see [The
+   launcher](#the-launcher)), so a Claude Code started from the Dock,
+   Finder or an IDE gets the tools too. If your cauldrons live under
+   `$CAULDRON_HOME`, set it in the environment Claude Code starts with.
 3. Make a cauldron, with an empty soup (one pool, `ws`):
 
    ```sh
@@ -166,9 +168,46 @@ revoke the grant (then grant it again). A `.cauldron` marker naming the old
 name is not updated: run `cauldron link notes --env prod --replace` in that
 project.
 
+## The launcher
+
+`.mcp.json` runs `${CLAUDE_PLUGIN_ROOT}/bin/cauldron-mcp`, a short `sh`
+script, with each session. It looks for the installed `cauldron` in this
+order and runs `cauldron mcp stdio` with the first it finds:
+
+1. `$CAULDRON_BIN`, the path of a `cauldron` binary, when it is set;
+2. the install marker `~/Library/Application Support/cauldron/cauldron-bin`,
+   one line holding the path of `<root>/bin/cauldron`, which
+   `scripts/install` writes for `prod`;
+3. `$CAULDRON_HOME/bin/cauldron`, or `~/.cauldron/bin/cauldron`;
+4. `cauldron` on `PATH`.
+
+Every candidate, from every source, passes the same checks. It must be an
+absolute path to a regular file (not a symbolic link) that is executable,
+is owned by you or by root, and that neither your group nor others can
+write. Every directory on its path, as written and with symbolic links
+resolved, must also be owned by you or root and not writable by group or
+others, so a file of yours in `/tmp` or another shared directory is
+skipped. It runs the file by its resolved path.
+
+The project directory is not trusted to provide `cauldron`, since a cloned
+repository can carry a file of that name. The project directory is the
+current directory the session starts the launcher in (unless that is `/`
+or your home directory itself), and `$CLAUDE_PROJECT_DIR` when it is set.
+`$CAULDRON_BIN` naming a file inside it is skipped. The `PATH` step reads
+`PATH` entry by entry and skips an empty entry or a relative one such as
+`.` (both mean the current directory; an empty entry comes from a leading,
+trailing or doubled `:`), an entry inside the project directory, and an
+entry in a directory others can write to. It names every candidate and
+entry it skips on stderr. It
+prints nothing on stdout but the MCP protocol. When it finds nothing, it
+answers the session itself: a server named `cauldron (not installed)` with
+no tools, whose instructions say where it looked and how to install, so a
+session says what is missing instead of losing the server without a word.
+
 ## The MCP door
 
-The plugin's `.mcp.json` starts `cauldron mcp stdio` with each session. That
+The plugin's `.mcp.json` starts `cauldron mcp stdio` (through the launcher)
+with each session. That
 bridge talks to the environment's `mcp` service, a supervised service that
 listens on `127.0.0.1` only and is the one writer of every soup it holds.
 

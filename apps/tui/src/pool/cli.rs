@@ -173,8 +173,8 @@ async fn interactive(url: &str) -> anyhow::Result<()> {
                         // `perform` names the account by the one masker; a twin
                         // is told apart here, where the board is (V1-ACCT).
                         Outcome::Done(n, t) => app.set_note(n.replace(&crate::pool::model::shown_name(a.label()), &app.shown(a.label())), t),
-                        Outcome::NeedsTerminal(argv) if crate::pool::action::isolated_set_live_refusal(std::path::Path::new(&argv[0])).is_some() => {
-                            let why = crate::pool::action::isolated_set_live_refusal(std::path::Path::new(&argv[0])).unwrap_or_default();
+                        Outcome::NeedsTerminal(argv) if crate::pool::action::local_refusal(std::path::Path::new(&argv[0])).is_some() => {
+                            let why = crate::pool::action::local_refusal(std::path::Path::new(&argv[0])).unwrap_or_default();
                             app.set_note(why, Tone::Bad);
                         }
                         Outcome::NeedsTerminal(argv) => {

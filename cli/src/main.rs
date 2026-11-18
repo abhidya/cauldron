@@ -79,6 +79,8 @@ mod ctl;
 // search | region | dump | dumps | dump-get | dump-remove`, the soup offline, and the
 // dumps kept beside it.
 mod soup;
+// `cauldron soup import-corpus`: the older corpus format, as workspace-v6 records.
+mod corpus5;
 // `cauldron link` and the `.cauldron` project marker the soup verbs read.
 mod link;
 // `cauldron mcp grant | revoke | grants | status | stdio`: which cauldrons the
@@ -211,6 +213,9 @@ cauldron — the Cauldron entry point
     cauldron build  [service]        build and install one version
                     [--env-copy]     ... as a NEW version `<label>+<env>` (or `+<env>.N`)
                                      that no other environment pins; `<label>` is untouched
+    cauldron build <service> --artifact <image> [--env-copy] [--json]
+                                     install a prebuilt image (a release bundle's) as a
+                                     version, with no compiler; the image states its commit
     cauldron build --snapshot-declaration <service> <label> [--force]
                                      BACKFILL: copy the CURRENT declaration into an
                                      existing build dir as its `declaration.toml`
@@ -694,6 +699,13 @@ struct Opts {
     /// over `<label>`, which every environment in the root shares and another
     /// one may be pinned to. `scripts/install` uses it.
     env_copy: bool,
+    /// `build <service> --artifact <image>`: install THAT image as a version
+    /// of the service, with no compiler, instead of building the
+    /// declaration's cargo source. The image states its own commit
+    /// (`<image> --build-stamp`), exactly as a declaration's `[build]
+    /// artifact` with `stamp_args = ["--build-stamp"]` would. The release
+    /// bundle's `scripts/install --prebuilt` uses it.
+    artifact: Option<String>,
     /// `test --test-env <name>`: which environment the test runs in. Never the
     /// caller's — see `verb_test`.
     test_env: Option<String>,
@@ -719,6 +731,7 @@ fn parse(args: &[String]) -> Result<Opts> {
         probe: false,
         allow_dirty: false,
         env_copy: false,
+        artifact: None,
         test_env: None,
         snapshot_declaration: false,
         force: false,
@@ -732,6 +745,12 @@ fn parse(args: &[String]) -> Result<Opts> {
             "--probe" => o.probe = true,
             "--allow-dirty" => o.allow_dirty = true,
             "--env-copy" => o.env_copy = true,
+            "--artifact" => {
+                i += 1;
+                let v = args.get(i).with_context(|| "`--artifact` needs the path of an image after it".to_string())?;
+                o.artifact = Some(v.clone());
+            }
+            s if s.starts_with("--artifact=") => o.artifact = Some(s["--artifact=".len()..].to_string()),
             "--snapshot-declaration" => o.snapshot_declaration = true,
             "--force" => o.force = true,
             "--test-env" => {
@@ -1830,7 +1849,31 @@ fn verb_build(args: &[String]) -> Result<i32> {
             );
         }
     }
-    let decls = owned_targets(&env, &o.services, "build")?;
+    let mut decls = owned_targets(&env, &o.services, "build")?;
+    if let Some(image) = &o.artifact {
+        // ONE named service, and its build source becomes the image: no
+        // cargo, the commit read off the bytes. Everything else in the
+        // declaration (launch, permissions, the snapshot that travels with
+        // the version) is the declaration's own.
+        if o.services.len() != 1 || decls.len() != 1 {
+            bail!("`cauldron build --artifact <image>` installs ONE image: name exactly one service (`cauldron build <service> --artifact <image>`).");
+        }
+        if o.allow_dirty {
+            bail!("`--allow-dirty` is about a working tree; an `--artifact` build compiles nothing and reads the image's own dirt from it.");
+        }
+        let path = std::path::absolute(image).with_context(|| format!("resolving --artifact {image}"))?;
+        let d = &mut decls[0];
+        let b = d.build()?.clone();
+        d.build = Some(decl::Build {
+            workspace: None,
+            package: None,
+            args: Vec::new(),
+            artifact: Some(path.display().to_string()),
+            stamp_args: vec!["--build-stamp".to_string()],
+            target_dir: None,
+            ..b
+        });
+    }
     let mut out = Vec::new();
     for d in &decls {
         let rec = build_one(&env, d, o.json, o.allow_dirty, o.env_copy)?;

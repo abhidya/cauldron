@@ -1,0 +1,225 @@
+#!/bin/sh
+# cauldron-mcp: the plugin's MCP server launcher.
+#
+# Claude Code runs this (.mcp.json: ${CLAUDE_PLUGIN_ROOT}/bin/cauldron-mcp)
+# instead of a bare `cauldron`, so the plugin does not depend on the PATH
+# Claude Code was started with (one started from the Dock, Finder or an IDE
+# often has only /usr/bin:/bin:/usr/sbin:/sbin). It finds the installed
+# `cauldron` in this order and runs `cauldron mcp stdio "$@"` in its place:
+#
+#   1. $CAULDRON_BIN, the path of a cauldron binary, when set;
+#   2. the install marker scripts/install writes for the prod environment,
+#      "$HOME/Library/Application Support/cauldron/cauldron-bin" (one line:
+#      the absolute path of <root>/bin/cauldron);
+#   3. the default install location, ${CAULDRON_HOME:-$HOME/.cauldron}/bin/cauldron;
+#   4. `cauldron` on PATH.
+#
+# Every candidate, from every source, passes the same checks before it is
+# run. It must be an absolute path to a REGULAR file (not a symlink),
+# executable, owned by you or by root, and not writable by group or others;
+# and every directory on its path, as given and with every symlink resolved,
+# must be owned by you or root and not writable by group or others (a
+# world-writable directory such as /tmp fails, sticky bit or not). It is run
+# by its resolved path.
+#
+# The project directory is not trusted: a cloned repository can carry a file
+# named `cauldron`. So $CAULDRON_BIN is refused when it is inside the current
+# directory (where Claude Code starts an MCP server: the project) or inside
+# $CLAUDE_PROJECT_DIR; and the PATH step ignores empty and relative entries
+# (`.`, or a leading, trailing or doubled `:`, which mean the current
+# directory), entries inside the current directory or the project, and
+# entries in a directory others can write to. The current directory counts
+# as a project unless it is / or $HOME itself. Anything skipped is named on
+# stderr.
+#
+# When no candidate qualifies, this answers the MCP handshake itself rather
+# than failing silently: `initialize` gets a server with no tools whose
+# instructions say where it looked and how to install, `tools/list` an empty
+# list, `ping` an empty result, any other request an error, and
+# notifications nothing. Stdout carries nothing but JSON-RPC; every note goes
+# to stderr.
+
+MARKER_REL="Library/Application Support/cauldron/cauldron-bin"
+looked=""
+
+note() { printf 'cauldron-mcp: %s\n' "$*" >&2; }
+add_looked() { looked="${looked}${looked:+; }$1"; }
+
+ME=$(/usr/bin/id -u 2>/dev/null) || ME=""
+HERE=$(pwd -P 2>/dev/null) || HERE=""
+# The directories a candidate may not come from (see above), physical paths.
+PROJECTS=""
+if [ -n "$HERE" ] && [ "$HERE" != / ] && [ "$HERE" != "$(cd -P "${HOME:-/nonexistent}" 2>/dev/null && pwd -P)" ]; then
+    PROJECTS=$HERE
+fi
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+    pd=$(cd -P "$CLAUDE_PROJECT_DIR" 2>/dev/null && pwd -P) || pd=""
+    if [ -n "$pd" ] && [ "$pd" != / ]; then PROJECTS="$PROJECTS${PROJECTS:+
+}$pd"; fi
+fi
+
+# in_project <physical path>: 0 if it is inside one of PROJECTS.
+in_project() {
+    [ -n "$PROJECTS" ] || return 1
+    printf '%s\n' "$PROJECTS" | {
+        while IFS= read -r pr; do
+            case "$1/" in "$pr"/*) exit 0 ;; esac
+        done
+        exit 1
+    }
+}
+
+# dir_of / base_of: dirname and basename without running anything (a PATH
+# lookup of `dirname` could itself find one in the project).
+dir_of() {
+    case "$1" in
+        /*/*) r=${1%/*}; [ -n "$r" ] || r=/; printf '%s' "$r" ;;
+        /*) printf '/' ;;
+        *) printf '.' ;;
+    esac
+}
+base_of() { printf '%s' "${1##*/}"; }
+
+# safe_owner_mode <path>: 0 if it (symlinks followed) is owned by you or root
+# and not writable by group or others. Sets WHY otherwise.
+safe_owner_mode() {
+    om=$(/usr/bin/stat -L -f '%u %Lp' "$1" 2>/dev/null) || { WHY="cannot read $1"; return 1; }
+    o=${om%% *}; m=${om#* }
+    if [ "$o" != "$ME" ] && [ "$o" != 0 ]; then WHY="$1 is owned by uid $o, not by you or root"; return 1; fi
+    case "$m" in
+        *[2367]?|*[2367]) WHY="$1 is writable by group or others (mode $m)"; return 1 ;;
+    esac
+    return 0
+}
+
+# safe_dirs <absolute directory>: it and every directory above it pass
+# safe_owner_mode.
+safe_dirs() {
+    d=$1
+    while :; do
+        safe_owner_mode "$d" || return 1
+        [ "$d" = / ] && return 0
+        d=$(dir_of "$d")
+    done
+}
+
+# usable <path> <where>: 0 if <path> may be executed; sets BIN to its
+# resolved path.
+usable() {
+    p=$1
+    case "$p" in
+        /*) ;;
+        *) note "skipped $2: '$p' is not an absolute path"; return 1 ;;
+    esac
+    if [ -L "$p" ]; then note "skipped $2: $p is a symlink"; return 1; fi
+    if [ ! -f "$p" ]; then return 1; fi
+    if [ -z "$ME" ]; then note "skipped $2: your uid could not be read"; return 1; fi
+    dir=$(dir_of "$p")
+    real=$(cd -P "$dir" 2>/dev/null && pwd -P) || { note "skipped $2: $dir does not resolve"; return 1; }
+    BIN="${real%/}/$(base_of "$p")"
+    if [ -L "$BIN" ] || [ ! -f "$BIN" ]; then note "skipped $2: $BIN is not a regular file"; return 1; fi
+    if ! safe_owner_mode "$BIN"; then note "skipped $2: $WHY"; return 1; fi
+    if [ ! -x "$BIN" ]; then note "skipped $2: $BIN is not executable"; return 1; fi
+    if ! safe_dirs "$dir" || ! safe_dirs "$real"; then note "skipped $2: $WHY, so someone else could replace $p"; return 1; fi
+    return 0
+}
+
+# 1. $CAULDRON_BIN
+if [ -n "${CAULDRON_BIN:-}" ]; then
+    add_looked "CAULDRON_BIN=$CAULDRON_BIN"
+    if usable "$CAULDRON_BIN" CAULDRON_BIN; then
+        if in_project "$BIN"; then
+            note "skipped CAULDRON_BIN: $BIN is inside the project directory, which is not trusted to provide cauldron"
+        else
+            exec "$BIN" mcp stdio "$@"
+        fi
+    fi
+fi
+# 2. the install marker
+if [ -n "${HOME:-}" ]; then
+    m="$HOME/$MARKER_REL"
+    add_looked "the install marker $m"
+    if [ -f "$m" ] && [ ! -L "$m" ] && [ -O "$m" ]; then
+        IFS= read -r bin <"$m" || bin=""
+        if [ -n "$bin" ] && usable "$bin" "the install marker"; then exec "$BIN" mcp stdio "$@"; fi
+    fi
+fi
+# 3. the default install location
+root=${CAULDRON_HOME:-}
+if [ -z "$root" ] && [ -n "${HOME:-}" ]; then root="$HOME/.cauldron"; fi
+if [ -n "$root" ]; then
+    add_looked "$root/bin/cauldron"
+    if usable "$root/bin/cauldron" "the default install location"; then exec "$BIN" mcp stdio "$@"; fi
+fi
+# 4. PATH, one entry at a time, never through the shell's own lookup (which
+# reads an empty entry as the current directory).
+add_looked "cauldron on PATH (${PATH:-unset})"
+rest=""
+if [ -n "${PATH:-}" ]; then rest="$PATH:"; fi
+while [ -n "$rest" ]; do
+    e=${rest%%:*}; rest=${rest#*:}
+    case "$e" in
+        "") note "ignored an empty PATH entry (it means the current directory)"; continue ;;
+        /*) ;;
+        *) note "ignored the relative PATH entry '$e'"; continue ;;
+    esac
+    [ -f "$e/cauldron" ] || continue
+    er=$(cd -P "$e" 2>/dev/null && pwd -P) || continue
+    if in_project "$er"; then note "ignored the PATH entry $e: it is inside the project directory"; continue; fi
+    if usable "$e/cauldron" "PATH entry $e"; then exec "$BIN" mcp stdio "$@"; fi
+done
+
+# Nothing found: a tool-less server that says how to install.
+note "no usable cauldron found (looked in: $looked); answering the MCP handshake with no tools"
+json_escape() { printf '%s' "$1" | /usr/bin/sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | /usr/bin/tr -d '\000-\037'; }
+INSTRUCTIONS="Cauldron is not installed where this plugin can find it, so this server has no tools. Looked in: $(json_escape "$looked"). To install it on an Apple silicon Mac without a Rust toolchain: download cauldron-<version>-aarch64-apple-darwin.tar.gz and SHA256SUMS from the latest release at https://github.com/broomstick-ai/cauldron/releases, check it with \`shasum -a 256 -c SHA256SUMS\`, unpack it with \`tar -xzf\`, and run \`./install --prebuilt <the tarball>\` from the unpacked directory. To build from source instead: clone the repository and run \`scripts/install\`. Then restart Claude Code. If cauldron is installed somewhere else, set CAULDRON_BIN to its path in the environment Claude Code starts with. The README's Install section has the details."
+
+INSTR=$INSTRUCTIONS /usr/bin/awk '
+BEGIN { instr = ENVIRON["INSTR"] }
+# A small JSON scanner: the top-level "id" and "method" of each request
+# line, and params.protocolVersion. Strings are skipped as wholes, so a key
+# inside params never counts as a top-level one.
+function scan(s,    i, c, depth, instr_, key, want, val, start, n, path1) {
+    ID = ""; METHOD = ""; PROTO = ""; depth = 0; n = length(s); key = ""; path1 = ""
+    for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\"") {
+            start = i; i++
+            while (i <= n) { c = substr(s, i, 1); if (c == "\\") { i += 2; continue } if (c == "\"") break; i++ }
+            tok = substr(s, start, i - start + 1)
+            # A string followed by a colon is a key.
+            j = i + 1; while (substr(s, j, 1) ~ /[ \t\r]/) j++
+            if (substr(s, j, 1) == ":") { key = tok; continue }
+            if (depth == 1 && key == "\"id\"") ID = tok
+            if (depth == 1 && key == "\"method\"") METHOD = substr(tok, 2, length(tok) - 2)
+            if (depth == 2 && path1 == "\"params\"" && key == "\"protocolVersion\"") PROTO = tok
+            key = ""; continue
+        }
+        if (c == "{" || c == "[") { if (depth == 1) path1 = key; depth++; key = ""; continue }
+        if (c == "}" || c == "]") { depth--; key = ""; continue }
+        if (c == ",") { key = ""; continue }
+        if (c ~ /[-0-9a-z]/) {
+            start = i; while (i <= n && substr(s, i + 1, 1) ~ /[-+.0-9a-zA-Z]/) i++
+            tok = substr(s, start, i - start + 1)
+            if (depth == 1 && key == "\"id\"") ID = tok
+            key = ""; continue
+        }
+    }
+}
+{
+    line = $0
+    if (line ~ /^[ \t\r]*$/) next
+    scan(line)
+    if (ID == "" || ID == "null") next          # a notification: no answer
+    if (METHOD == "initialize") {
+        pv = (PROTO ~ /^"[0-9]{4}-[0-9]{2}-[0-9]{2}"$/) ? PROTO : "\"2025-06-18\""
+        printf "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"protocolVersion\":%s,\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"cauldron (not installed)\",\"version\":\"0\"},\"instructions\":\"%s\"}}\n", ID, pv, instr
+    } else if (METHOD == "tools/list") {
+        printf "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"tools\":[]}}\n", ID
+    } else if (METHOD == "ping") {
+        printf "{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{}}\n", ID
+    } else {
+        printf "{\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":-32601,\"message\":\"cauldron is not installed, so this server has no methods but initialize, tools/list and ping. %s\"}}\n", ID, instr
+    }
+    fflush()
+}'

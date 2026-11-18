@@ -1649,7 +1649,7 @@ fn rv4_the_real_older_mcp_service_rejects_nothing_and_says_why() {
 /// whenever the workspace version is not this constant, so every release
 /// bump makes someone check rv3 and rv4 against the new relation and move
 /// it.
-const OLDER_SERVICE_TESTS_CHECKED_AT: &str = "0.1.14";
+const OLDER_SERVICE_TESTS_CHECKED_AT: &str = "0.1.15";
 
 #[test]
 fn rv0_the_older_service_tests_were_checked_against_the_workspace_version() {
@@ -1833,5 +1833,41 @@ fn rv6_the_interactive_pass_decides_a_group_whole_or_not_at_all() {
     let q = s.queue(&[]);
     assert_eq!((q["counts"]["unreviewed"].clone(), q["counts"]["approved"].clone(), q["counts"]["rejected"].clone()), (json!(0), json!(1), json!(1)), "{q}");
     let _ = a;
+    svc.stop();
+}
+
+// --------------------------------------------------------------------- F3
+
+/// `soup import-corpus` while the service holds the cauldron: sent to it as
+/// one `soup_put` under `--remint`, landed through it, printed with
+/// `forwarded_to` and the `corpus` report; the same batch again is refused
+/// through it as `batch-already-landed`.
+#[test]
+fn f3_a_corpus_import_is_sent_to_the_service_that_holds_the_soup() {
+    let s = Scratch::new("f3", &["kb"]);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let ex = s.write("example.json", &json!(example()));
+    assert_eq!(s.import("kb", &ex, &[], &pids).rc, 0);
+    let r = svc.call(&s, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "Opens the writer")]}));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert!(!lock_free(&s, "kb"), "the service holds the soup");
+    let before = s.node_count("kb");
+    let input = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/it/fixtures/corpus-v5/records");
+    let args = ["soup", "import-corpus", input.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"];
+    let o = s.run(&args, &pids);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    let d = o.json();
+    assert_eq!(d["outcome"], "landed", "{d}");
+    assert_eq!(d["forwarded_to"], json!({"service": "mcp", "pid": svc.pid()}));
+    assert_eq!(d["corpus"]["carried"]["nodes"], 4, "{d}");
+    assert_eq!(d["corpus"]["id_map"].as_object().map(|m| m.len()), Some(7), "{d}");
+    assert_eq!(s.node_count("kb"), before + 7);
+    let o = s.run(&args, &pids);
+    assert_eq!(o.rc, 1, "{}\n{}", o.out, o.err);
+    let d = o.json();
+    assert_eq!((d["refusal"].clone(), d["forwarded_to"]["pid"].clone()), (json!("batch-already-landed"), json!(svc.pid())), "{d}");
+    assert_eq!(s.node_count("kb"), before + 7);
     svc.stop();
 }

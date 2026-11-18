@@ -22,11 +22,131 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.14, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.15, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.14, only an
+  the disable and trigger a fresh usage reading. Through 0.1.15, only an
   explicit enable clears it.
+
+## [0.1.15] — 2026-11-18
+
+Cauldron on an Apple silicon Mac without a Rust toolchain, a plugin that
+finds it without the `PATH` Claude Code was started with, and the older
+corpus format brought into a cauldron's soup.
+
+### Added
+
+- **Prebuilt binaries for Apple silicon.** `scripts/build-release-bundle
+  <commit> <out-dir>` builds the public archive of a commit in a scratch
+  directory and compiles `cauldron`, `tui`, `threads` and `cauldron-mcp`
+  there, never in a working tree, with the build machine's paths remapped,
+  no debug information and no local symbols. Each binary is ad-hoc signed.
+  It writes `cauldron-<version>-aarch64-apple-darwin.tar.gz` and
+  `SHA256SUMS`. The tarball's metadata does not depend on the builder:
+  every member's mtime is the commit's own time in UTC (`BUNDLE` records it
+  as `commit_time`), owners are 0:0 root:wheel, modes are 0755 or 0644
+  whatever the builder's umask, entries are in byte order, the format is
+  ustar, and gzip stores no name or time. The build runs under `TZ=UTC` and
+  `LC_ALL=C` with `SOURCE_DATE_EPOCH` set to the commit's time.
+  `scripts/check-release-bundle` fails a bundle whose checksum, entries,
+  contents, signatures, architecture or tarball metadata are wrong; whose
+  files hold the home directory of whoever runs it, `/Users/` or the
+  repository's path, this machine's host names or the git `user.email` of
+  whoever runs it; whose binaries hold that user's name, a personal
+  pattern, the build's own scratch directory, or a path in a location
+  another user could create (under `/tmp`, `/private/tmp`, `/var/tmp`,
+  `/var/folders` or `/Users/Shared`, or a relative `./` or `../` path);
+  or whose binaries, run with `--help`, `--build-stamp` or `--self-check`
+  under macOS's unprivileged sandbox, touch such a location
+  (`scripts/probe-creatable-paths`), or which link a library outside
+  `/usr/lib` and `/System/Library`. The build refuses a scratch root that
+  another user owns or can write to, or whose path holds the builder's
+  user name.
+- **`scripts/install --prebuilt <tarball-or-url> [--sha256 <sum>]`.** It
+  installs from the bundle with no cargo, git or compiler. It checks the
+  tarball's sha256 (from `--sha256`, or from a `SHA256SUMS` beside a local
+  tarball; a URL needs `--sha256` and must be https). It refuses a tarball
+  with an entry outside its directory or a link, one that carries macOS's
+  quarantine attribute, and a machine that is not arm64. Every binary must
+  be a thin arm64 executable whose ad-hoc signature verifies. It places the
+  bundle under `<root>/share/cauldron/`, installs `threads` and `mcp` as
+  versions from it, and runs the same environment, pin, supervisor and
+  closing steps as the from-source install, which stays the default. The
+  bundle's declarations go to `<root>/share/cauldron/{services,mcp}` as the
+  last write before the supervisor step, so a run that stops earlier
+  leaves an installed cauldron on the declarations it came with. A
+  download is cut off past 256 MiB. The bundle's own `install`, run
+  without `--prebuilt`, refuses and says to pass it the tarball.
+- **`cauldron build <service> --artifact <image>`** installs a prebuilt
+  image as a version of a service, with no compiler; the version is named
+  by the commit the image states (`--build-stamp`).
+- **The plugin's MCP launcher.** `.mcp.json` now runs
+  `${CLAUDE_PLUGIN_ROOT}/bin/cauldron-mcp`. It finds `cauldron` at
+  `$CAULDRON_BIN`, then the install marker the installer writes for `prod`
+  (`~/Library/Application Support/cauldron/cauldron-bin`), then
+  `<root>/bin/cauldron`, then `PATH`. Every candidate must be a regular
+  file, not a symlink, owned by the user or root, that group and others
+  cannot write, in directories owned by the user or root that group and
+  others cannot write. `$CAULDRON_BIN` inside the project directory is
+  refused. The `PATH` step skips empty and relative entries, entries
+  inside the project directory, and entries in directories others can
+  write. With none found, it answers the
+  MCP handshake itself as a server with no tools whose instructions say how
+  to install. A Claude Code started from the Dock or an IDE gets the tools
+  without `cauldron` on its `PATH` (issue #22).
+- **`cauldron soup import-corpus <file-or-dir>`** lands records in the older
+  corpus format (corpus schema version 5: a seed file, a bare corpus, one
+  record or a directory of one-record files) in a cauldron's soup, as
+  workspace-v6 records with new ids and the old id in `meta.imported_from`.
+  It goes through `cauldron soup import --remint`: the same door, all or
+  nothing, the batch-already-landed guard, the refusal of a write aimed by
+  a tracked marker, and forwarding to the `mcp` service. Its JSON lists
+  what was not carried and why, under `corpus.not_carried`: clusters,
+  node types outside the ten, references to ids not in the input, a
+  symbolic link in a directory input (not followed), the seed's messages
+  and dashboards. A `regions`, `nodes` or `clusters` that is not an array
+  refuses the import. It gives the old-to-new `corpus.id_map`
+  (issue #4).
+
+### Changed
+
+- `scripts/install`'s closing lines say where the plugin's launcher looks
+  for `cauldron`, instead of saying that `cauldron` must be on Claude Code's
+  `PATH`.
+- A binary built with `--cfg cauldron_release_bundle` (the bundle's) reads
+  its shipped service and MCP tool declarations from `../share/cauldron/`
+  beside its own path with symlinks resolved, so a symlink to it elsewhere
+  reads the same ones. A binary built from a checkout reads them from the checkout,
+  as before.
+- The terminal UI runs the `claude-accounts` helper only from an absolute
+  path to a regular file you own that group and others cannot write, in
+  directories owned by you or root that nobody else can write, whether the
+  path is its default or `TUI_POOL_ACCOUNTS_TOOL`. A release-bundle build
+  compiles in no default for it.
+- `threads` compiles in `SOURCE_DATE_EPOCH` as its build time when that is
+  set, and the clock otherwise, as before.
+- `scripts/install` writes the install marker the plugin's launcher reads,
+  for `prod`, after the supervisor step, on the from-source path as well as
+  the prebuilt one.
+
+### Known limitations
+
+- The prebuilt binaries are for arm64 only and are ad-hoc signed, not
+  notarised: a tarball downloaded by a browser must have its quarantine
+  attribute removed (`xattr -d com.apple.quarantine <tarball>`) before it
+  is unpacked.
+- A prebuilt `threads` keeps the bundle's ad-hoc signature; the installer
+  does not re-sign it with `HARNESS_SIGN_SCRIPT`.
+- In a prebuilt install, the account board's "make this the machine's
+  login" action (`tui pool`, key `s`) runs no helper by default: the
+  `claude-accounts` script it needs ships only in the source tree. The
+  action refuses, runs nothing, and says how to name a clone's copy with
+  `TUI_POOL_ACCOUNTS_TOOL`.
+- `import-corpus` does not carry clusters: workspace-v6 has no cluster type.
+- Two builds of one commit on one machine, in different build directories
+  and under different time zones, give the same tarball byte for byte. Builds
+  on two machines, or with another Rust toolchain or another macOS `tar` or
+  `gzip`, have not been compared.
 
 ## [0.1.14] — 2026-11-18
 
@@ -1574,7 +1694,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.14...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.15...HEAD
+[0.1.15]: https://github.com/broomstick-ai/cauldron/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/broomstick-ai/cauldron/compare/v0.1.13...v0.1.14
 [0.1.13]: https://github.com/broomstick-ai/cauldron/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/broomstick-ai/cauldron/compare/v0.1.11...v0.1.12

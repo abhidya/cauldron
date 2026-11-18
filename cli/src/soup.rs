@@ -166,6 +166,19 @@ cauldron soup — a cauldron's soup, offline
         is refused whole as `region_locked`, at once, naming the holder and until when, with
         nothing written. Try again after that time, or, if the records belong in another
         region, write them there.
+    cauldron soup import-corpus <file-or-dir> [--cauldron <name>] [--env <env>] [--dry-run]
+                         [--allow-duplicate] [--agent <label>]
+        Land the older corpus format (the terminal interface's seed corpus, schema version 5):
+        a seed file (`clusters`, `corpus`), a bare corpus (`regions`, `nodes`), one record, or a
+        directory of one-record files (searched recursively). Each region and node becomes a
+        workspace-v6 record (`narrows` and `in_region` become edges, `cite: <thread>#<msg>`
+        becomes `operator`, the old id is kept in `meta.imported_from`), and the batch goes
+        through `soup import --remint`: the same judgement, all or nothing, the same refusals
+        and forwarding, new ids for every record. The JSON adds `corpus`: what was carried,
+        `id_map` by old id (when the ids hold), and `not_carried`, every part of the input the
+        schema cannot hold, each with its reason: clusters (there is no cluster type), a node
+        type outside the ten, a reference to an id not in the input, the seed's messages and
+        dashboards, and every unknown key (carried verbatim in meta.imported_from.unmapped).
     cauldron soup recover [--cauldron <name>] [--env <env>]
         Settle a soup that an interrupted import left not at rest: an import that never
         reached its commit decision is rolled back (none of it lands), one that did is
@@ -317,6 +330,7 @@ pub(crate) fn verb_soup(args: &[String]) -> Result<i32> {
             Ok(0)
         }
         Some("import") => import(&args[1..]),
+        Some("import-corpus") => import_corpus(&args[1..]),
         Some("regions") => regions(&args[1..]),
         Some("region") => region(&args[1..]),
         Some("nodes") => nodes(&args[1..]),
@@ -334,7 +348,7 @@ pub(crate) fn verb_soup(args: &[String]) -> Result<i32> {
         }
         Some(other) => {
             eprintln!(
-                "cauldron soup: no verb `{other}` (import | recover | regions | region | nodes | search | get | dump | dumps | dump-get | dump-remove | approve | help)"
+                "cauldron soup: no verb `{other}` (import | import-corpus | recover | regions | region | nodes | search | get | dump | dumps | dump-get | dump-remove | approve | help)"
             );
             Ok(2)
         }
@@ -467,6 +481,13 @@ static RESOLVED_FROM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn print(v: &Value) -> Result<()> {
     let mut v = v.clone();
+    if let (Some(report), Some(obj)) = (CORPUS_REPORT.get(), v.as_object_mut()) {
+        let mut report = report.clone();
+        if let Some(map) = obj.get("id_map") {
+            report["id_map"] = crate::corpus5::corpus_id_map(map);
+        }
+        obj.insert("corpus".to_string(), report);
+    }
     if let (Some(from), Some(obj)) = (RESOLVED_FROM.get(), v.as_object_mut()) {
         obj.insert("resolved_from".to_string(), json!(from));
     }
@@ -503,10 +524,47 @@ fn import(args: &[String]) -> Result<i32> {
         bail!("`cauldron soup import` takes ONE file or directory (got {}); `cauldron soup help`", a.pos.len());
     };
     let records = soup_door::import::read_records(Path::new(input))?;
+    import_records(&a, input, &records)
+}
+
+/// **`cauldron soup import-corpus`**: the older corpus format
+/// (`crate::corpus5`), converted to workspace-v6 records and landed through
+/// exactly the import above, always under `--remint`: the same door, all or
+/// nothing, the batch-already-landed guard, the write refusals for a target
+/// the project marker resolved, and the forwarding to a running `mcp`
+/// service. Every JSON it prints carries `corpus`: what was carried, what was
+/// not and why, and (when the ids hold) the old-id to new-id map.
+fn import_corpus(args: &[String]) -> Result<i32> {
+    let mut a = parse(
+        "import-corpus",
+        args,
+        &["--env", "--cauldron", "-c", "--pool", "--agent", "--dry-run", "--allow-duplicate"],
+    )?;
+    let [input] = a.pos.as_slice() else {
+        bail!("`cauldron soup import-corpus` takes ONE file or directory (got {}); `cauldron soup help`", a.pos.len());
+    };
+    let input = input.clone();
+    let converted = crate::corpus5::convert_path(Path::new(&input))?;
+    let nc = converted.report["not_carried"].as_array().map_or(0, Vec::len);
+    if nc > 0 {
+        eprintln!(
+            "cauldron soup import-corpus: {nc} item(s) of the input are not carried (listed under corpus.not_carried, each with its reason)"
+        );
+    }
+    let _ = CORPUS_REPORT.set(converted.report);
+    a.remint = true;
+    import_records(&a, &input, &converted.records)
+}
+
+/// Set by [`import_corpus`]: merged into the document [`print`] prints.
+static CORPUS_REPORT: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+
+fn import_records(a: &Args, input: &str, records: &[Value]) -> Result<i32> {
+    let records = records.to_vec();
     // Checked here, before the batch can be forwarded to a running service
     // (which may be an older one that does not check it).
     soup_door::review::refuse_review_flags(&records)?;
-    let t = target("import", &a, !a.dry_run)?;
+    let t = target("import", a, !a.dry_run)?;
     let opts = ImportOptions {
         pool: a.pool.clone(),
         dry_run: a.dry_run,

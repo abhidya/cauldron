@@ -1,0 +1,18 @@
+{
+  "id": "Q-1",
+  "type": "question",
+  "state": "open",
+  "handle": "Should clusters be imported once the schema has them?",
+  "in_region": [
+    "R-1"
+  ],
+  "refs": [
+    "DEC-1"
+  ],
+  "cites": [
+    {
+      "kind": "url",
+      "url": "https://example.com/corpus-notes"
+    }
+  ]
+}

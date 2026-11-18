@@ -69,6 +69,8 @@ pub mod ripples_auto;
 pub mod seams;
 pub mod supervisions;
 pub mod tccd;
+// Whether a helper path may be executed: owner, mode and every directory on it.
+pub mod trust;
 pub mod warnings;
 
 pub use paths::Environment;

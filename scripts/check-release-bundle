@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# check-release-bundle <tarball>
+#
+# The gate a release bundle (scripts/build-release-bundle) passes before it is
+# attached to a release. It FAILS (exit 1) when:
+#   - a `SHA256SUMS` beside the tarball does not match it;
+#   - the tarball has an entry outside its one top directory
+#     (`cauldron-<version>-aarch64-apple-darwin/`), an absolute path, a `..`
+#     component, a link, or a device or fifo;
+#   - a file the installer needs is missing, or the inner SHA256SUMS does not
+#     match the files;
+#   - any binary (bin/*, libexec/*) is not a thin arm64 Mach-O, does not
+#     verify (`codesign --verify --strict`), is not ad-hoc signed, or carries
+#     another identifier than the installer expects;
+#   - any BINARY (bin/*, libexec/*) contains, as bytes (and as UTF-16): the
+#     home directory or the user name of whoever RUNS this check (read from
+#     the environment and `id` at run time, never written here), the text
+#     `/Users/`, this repository's own path or its main checkout's path, or a
+#     match of a `personal` pattern in scripts/personal-patterns.private
+#     (when that file is present; it is never shipped, so a check run from a
+#     public clone says that it is absent and checks the rest);
+#   - any BINARY contains a path in a location some non-root user could
+#     create, which a binary would then trust: anything under /tmp,
+#     /private/tmp, /var/tmp, /private/var/tmp, /var/folders (per-user
+#     scratch), /Users/Shared, or a relative `./name` or `../name` (resolved
+#     against whatever directory the binary runs in); or any literal in
+#     CAULDRON_RELEASE_FORBID (newline-separated; build-release-bundle passes
+#     its scratch build root and source directory, so a compile-time path of
+#     the build is caught wherever the build ran);
+#   - a binary, run with arguments that read and write nothing
+#     (`--help`, `--build-stamp`, `--self-check`), touches any of those
+#     locations that exists (scripts/probe-creatable-paths, under macOS's
+#     unprivileged sandbox);
+#   - any binary links a library outside /usr/lib and /System/Library
+#     (`otool -L`): a library path is loaded at launch, so it must be one
+#     only the system can write;
+#   - ANY file of the bundle contains this machine's host names (`hostname
+#     -s`, and `scutil --get LocalHostName` and `ComputerName`) or the git
+#     user.email of whoever runs this, all read at run time;
+#   - any other file of the bundle contains the home directory, `/Users/` or
+#     either repository path. Those files are byte copies of files in the
+#     public archive, which scripts/check-no-personal-data.sh gates.
+# A tarball that carries macOS's quarantine attribute is refused before it is
+# unpacked: its binaries would inherit it, and running one (this check runs
+# them) would wait on a Gatekeeper dialog.
+#   - `libexec/threads --build-stamp` states another build time than
+#     BUNDLE's commit_time (it compiles in SOURCE_DATE_EPOCH);
+#   - the tarball's metadata says anything about the builder or differs
+#     from the normal form build-release-bundle writes: every member owned
+#     by uid 0 / gid 0 / root / wheel, every mtime exactly BUNDLE's
+#     commit_time (the commit's own second, UTC), entries in byte order,
+#     modes 0755 for directories, the four binaries and `install` and 0644
+#     for every other file (so no setuid, setgid or group/other write), no
+#     pax or GNU extension headers, and a gzip header with no name and no
+#     time;
+# Prints one line per check and a closing verdict. Exit 0 clean, 1 a check
+# failed, 2 usage or a tool missing.
+set -euo pipefail
+
+FINISHED=0
+TMP=""
+on_exit() {
+    local rc=$?
+    [[ -z "${TMP}" ]] || rm -rf "${TMP}" || :
+    if [[ ${rc} -eq 0 && ${FINISHED} -ne 1 ]]; then echo "check-release-bundle: ABORTED (internal error above); not a clean check. rc 70." >&2; rc=70; fi
+    exit "${rc}"
+}
+trap on_exit EXIT
+
+[[ $# -eq 1 ]] || { echo "usage: check-release-bundle <tarball>" >&2; exit 2; }
+for c in tar shasum codesign od python3 id otool; do
+    command -v "${c}" >/dev/null 2>&1 || { echo "check-release-bundle: ${c} is not on PATH" >&2; exit 2; }
+done
+TARBALL="$(cd -P "$(dirname "$1")" && pwd -P)/$(basename "$1")"
+[[ -f "${TARBALL}" ]] || { echo "check-release-bundle: no file ${TARBALL}" >&2; exit 2; }
+SELF_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+FAILS=0
+pass() { printf '  ok    %s\n' "$*"; }
+fail() { printf '  FAIL  %s\n' "$*"; FAILS=$((FAILS+1)); }
+
+echo "check-release-bundle: $(basename "${TARBALL}")"
+SUMS="$(dirname "${TARBALL}")/SHA256SUMS"
+if [[ -f "${SUMS}" ]]; then
+    if (cd "$(dirname "${TARBALL}")" && grep -F "  $(basename "${TARBALL}")" SHA256SUMS | shasum -a 256 -c - >/dev/null 2>&1); then
+        pass "SHA256SUMS beside the tarball matches it"
+    else
+        fail "SHA256SUMS beside the tarball does not match it (or does not name it)"
+    fi
+else
+    fail "no SHA256SUMS beside the tarball"
+fi
+
+BASE="$(basename "${TARBALL}" .tar.gz)"
+[[ "${BASE}" =~ ^cauldron-[0-9]+\.[0-9]+\.[0-9]+-aarch64-apple-darwin$ ]] || fail "the tarball's name is not cauldron-<version>-aarch64-apple-darwin.tar.gz"
+
+# Entries: one top directory, no absolute path, no `..`, no link or special file.
+listing="$(tar -tvzf "${TARBALL}")"
+names="$(tar -tzf "${TARBALL}")"
+bad_names="$(awk -v top="${BASE}" '{ n=$0; sub(/\/$/,"",n); if (n ~ /^\// || n ~ /(^|\/)\.\.(\/|$)/ || (n != top && index(n, top "/") != 1)) print }' <<<"${names}")"
+if [[ -z "${bad_names}" ]]; then pass "every entry is under ${BASE}/ (no absolute path, no ..)"; else fail "entries outside ${BASE}/: ${bad_names}"; fi
+bad_types="$(awk '{ t=substr($1,1,1); if (t != "-" && t != "d") print }' <<<"${listing}")"
+if [[ -z "${bad_types}" ]]; then pass "only regular files and directories (no link, device or fifo)"; else fail "entries that are not plain files or directories: ${bad_types}"; fi
+if ls -l@ "${TARBALL}" 2>/dev/null | grep -q 'com\.apple\.quarantine'; then
+    fail "the tarball carries macOS's quarantine attribute; its unpacked binaries would too, and running them waits on Gatekeeper. Remove it first: xattr -d com.apple.quarantine ${TARBALL}"
+fi
+[[ ${FAILS} -eq 0 ]] || { echo "check-release-bundle: FAIL (${FAILS}); not unpacked"; FINISHED=1; exit 1; }
+
+# Unpacked in the per-user temporary directory, never the shared /tmp, so
+# the probe below can deny /private/tmp without denying the bundle itself.
+TMPBASE="${TMPDIR:-}"
+[[ -n "${TMPBASE}" && "${TMPBASE}" != /tmp* && "${TMPBASE}" != /private/tmp* ]] || TMPBASE="$(getconf DARWIN_USER_TEMP_DIR)"
+TMP="$(mktemp -d "${TMPBASE%/}/check-release-bundle.XXXXXX")"
+tar -xzf "${TARBALL}" -C "${TMP}"
+B="${TMP}/${BASE}"
+
+need=(bin/cauldron bin/tui libexec/threads libexec/cauldron-mcp share/cauldron/services/threads.toml
+      share/cauldron/services/mcp.toml share/cauldron/mcp/agents.toml install BUNDLE SHA256SUMS LICENSE)
+missing=()
+for f in "${need[@]}"; do [[ -f "${B}/${f}" ]] || missing+=("${f}"); done
+if [[ ${#missing[@]} -eq 0 ]]; then pass "every file the installer needs is present"; else fail "missing: ${missing[*]}"; fi
+if (cd "${B}" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1); then pass "the inner SHA256SUMS matches every file"; else fail "the inner SHA256SUMS does not match"; fi
+listed="$(cd "${B}" && awk '{ sub(/^[0-9a-f]+  /,""); print }' SHA256SUMS | LC_ALL=C sort)"
+present="$(cd "${B}" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort)"
+if [[ "${listed}" == "${present}" ]]; then pass "the inner SHA256SUMS lists exactly the files present"; else fail "the inner SHA256SUMS and the files differ"; fi
+commit="$(sed -n 's/^commit=//p' "${B}/BUNDLE" 2>/dev/null || true)"
+version="$(sed -n 's/^version=//p' "${B}/BUNDLE" 2>/dev/null || true)"
+if [[ "${commit}" =~ ^[0-9a-f]{40}$ && "cauldron-${version}-aarch64-apple-darwin" == "${BASE}" ]]; then pass "BUNDLE names version ${version} and a full commit"; else fail "BUNDLE does not name the tarball's version and a full commit"; fi
+
+# The tarball's metadata, in its normal form (see the header).
+commit_time="$(sed -n 's/^commit_time=//p' "${B}/BUNDLE" 2>/dev/null || true)"
+if [[ "${commit_time}" =~ ^[0-9]+$ ]]; then
+    meta_out="$(python3 -I - "${TARBALL}" "${BASE}" "${commit_time}" <<'PY2'
+import sys, tarfile
+path, top, when = sys.argv[1], sys.argv[2], int(sys.argv[3])
+raw = open(path, "rb").read(10)
+bad = []
+if raw[:2] != b"\x1f\x8b" or raw[3] & 0x08 or raw[4:8] != b"\0\0\0\0":
+    bad.append("the gzip header carries a file name or a time")
+execs = {top + "/" + p for p in ("bin/cauldron", "bin/tui", "libexec/threads", "libexec/cauldron-mcp", "install")}
+names = []
+with tarfile.open(path, "r:gz") as t:
+    for m in t:
+        n = m.name.rstrip("/")
+        names.append(n)
+        if (m.uid, m.gid, m.uname, m.gname) != (0, 0, "root", "wheel"):
+            bad.append("%s is owned by %s:%s (%s:%s), not 0:0 (root:wheel)" % (n, m.uid, m.gid, m.uname, m.gname))
+        if m.mtime != when:
+            bad.append("%s has mtime %d, not the commit time %d (off by %+d s)" % (n, m.mtime, when, m.mtime - when))
+        want = 0o755 if (m.isdir() or n in execs) else 0o644
+        if m.mode != want:
+            bad.append("%s has mode %o, not %o" % (n, m.mode, want))
+        if m.pax_headers:
+            bad.append("%s carries pax headers %s" % (n, sorted(m.pax_headers)))
+        if m.type in (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE, tarfile.XGLTYPE):
+            bad.append("%s is an extension header" % n)
+if names != sorted(names, key=lambda x: x.encode()):
+    bad.append("the entries are not in byte order")
+for b in bad[:12]:
+    print(b)
+sys.exit(1 if bad else 0)
+PY2
+)" && meta_rc=0 || meta_rc=$?
+    if [[ ${meta_rc} -eq 0 ]]; then
+        pass "tarball metadata: owner 0:0 root:wheel, mtime ${commit_time} (the commit, UTC), modes 0755/0644, byte order, no extension headers, gzip without name or time"
+    else
+        while IFS= read -r line; do fail "tarball metadata: ${line}"; done <<<"${meta_out}"
+    fi
+else
+    fail "BUNDLE has no commit_time, so the tarball's mtimes cannot be checked against the commit"
+fi
+
+# Binaries: thin arm64 Mach-O, verifies, ad-hoc, expected identifier, and
+# each states the bundle's commit.
+expect_id() { case "$1" in libexec/threads) echo com.harness.threads ;; *) basename "$1" ;; esac; }
+for rel in bin/cauldron bin/tui libexec/threads libexec/cauldron-mcp; do
+    f="${B}/${rel}"
+    [[ -f "${f}" ]] || continue
+    head8="$(od -An -tx1 -N8 "${f}" | tr -d ' \n')"
+    if [[ "${head8}" == cffaedfe0c000001 ]]; then pass "${rel}: thin arm64 Mach-O"; else fail "${rel}: not a thin arm64 Mach-O (header ${head8})"; fi
+    if codesign --verify --strict "${f}" 2>/dev/null; then pass "${rel}: signature verifies"; else fail "${rel}: signature does not verify"; fi
+    info="$(codesign -dv "${f}" 2>&1 || true)"
+    id="$(sed -n 's/^Identifier=//p' <<<"${info}")"
+    if grep -qx 'Signature=adhoc' <<<"${info}" && [[ "${id}" == "$(expect_id "${rel}")" ]]; then
+        pass "${rel}: ad-hoc signed, identifier ${id}"
+    else
+        fail "${rel}: not ad-hoc signed as $(expect_id "${rel}") (identifier '${id}')"
+    fi
+done
+if [[ -f "${B}/libexec/threads" && "${commit_time:-}" =~ ^[0-9]+$ ]]; then
+    st="$("${B}/libexec/threads" --build-stamp 2>/dev/null || true)"
+    if grep -q "epoch=${commit_time}\b" <<<"${st}"; then pass "libexec/threads states the commit's time as its build time (epoch=${commit_time})"; else fail "libexec/threads --build-stamp does not state the commit's time ${commit_time} as its build time: ${st}"; fi
+fi
+if [[ -f "${B}/bin/cauldron" ]]; then
+    st="$("${B}/bin/cauldron" --build-stamp 2>/dev/null || true)"
+    if grep -q "commit=${commit}" <<<"${st}" && grep -q 'dirty=0' <<<"${st}"; then pass "bin/cauldron states commit ${commit:0:12}… and dirty=0"; else fail "bin/cauldron --build-stamp: ${st}"; fi
+fi
+
+# The byte scan. The forbidden literals come from the environment of the
+# person running this, at run time.
+PATTERNS="${SELF_DIR}/personal-patterns.private"
+[[ -f "${PATTERNS}" ]] || { PATTERNS=""; echo "  note  scripts/personal-patterns.private is absent (a public clone): the personal patterns are not checked here"; }
+REPO_TOP="$(git -C "${SELF_DIR}" rev-parse --show-toplevel 2>/dev/null || true)"
+REPO_MAIN="$(cd "$(git -C "${SELF_DIR}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo /nonexistent)/.." 2>/dev/null && pwd -P || true)"
+scan_out="$(HOME_LIT="${HOME:-}" USER_LIT="$(id -un)" REPO_TOP="${REPO_TOP}" REPO_MAIN="${REPO_MAIN}" PATTERNS="${PATTERNS}" \
+    FORBID="${CAULDRON_RELEASE_FORBID:-}" HOST_LITS="$(hostname -s 2>/dev/null || true)
+$(scutil --get LocalHostName 2>/dev/null || true)
+$(scutil --get ComputerName 2>/dev/null || true)" EMAIL_LIT="$(git config user.email 2>/dev/null || true)" \
+    python3 -I - "${B}" <<'PY'
+import os, re, sys
+root = sys.argv[1]
+lits = []
+for label, key in (("the home directory", "HOME_LIT"), ("the user name", "USER_LIT"),
+                   ("this repository's path", "REPO_TOP"), ("the main checkout's path", "REPO_MAIN")):
+    v = os.environ.get(key, "")
+    if v and v != "/":
+        lits.append((label, v.encode()))
+lits.append(("the text /Users/", b"/Users/"))
+for h in sorted({h.strip() for h in os.environ.get("HOST_LITS", "").split("\n") if len(h.strip()) >= 3}):
+    lits.append(("this machine's host name", h.encode()))
+if len(os.environ.get("EMAIL_LIT", "")) >= 3:
+    lits.append(("the git user.email of whoever runs this", os.environ["EMAIL_LIT"].encode()))
+forbid = [f for f in os.environ.get("FORBID", "").split("\n") if f and f != "/"]
+for f in forbid:
+    lits.append(("the build's own path " + f, f.encode()))
+# A path some non-root user could create, which a binary would then trust:
+# below a shared or per-user scratch directory, /Users/Shared, or relative.
+creatable = re.compile(
+    rb"(?:/private)?/(?:tmp|var/tmp|var/folders)/[\x21-\x7e]{1,100}"
+    rb"|/Users/Shared"
+    # A relative path at the start of a string or after a space, quote, = or
+    # similar (not inside a word or a longer path: `../x` within `a/../x`).
+    rb"|(?<![A-Za-z0-9_.~/-])\.\.?/[A-Za-z_][A-Za-z0-9_.-]{2,}"
+)
+pats = []
+pf = os.environ.get("PATTERNS", "")
+if pf:
+    for line in open(pf, encoding="utf-8"):
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) == 3 and parts[0] == "personal":
+            pats.append((parts[1], re.compile(parts[2].encode(), re.IGNORECASE)))
+bad = 0
+for dirpath, _, files in os.walk(root):
+    for name in sorted(files):
+        p = os.path.join(dirpath, name)
+        rel = os.path.relpath(p, root)
+        data = open(p, "rb").read()
+        binary = rel.startswith("bin/") or rel.startswith("libexec/")
+        views = [data]
+        # UTF-16LE views of the bytes, both alignments, for wide strings.
+        for off in (0, 1):
+            views.append(data[off:].decode("utf-16-le", "ignore").encode("utf-8", "ignore"))
+        hits = []
+        for label, lit in lits:
+            if label == "the user name" and not binary:
+                continue
+            folded = label in ("the user name", "this machine's host name", "the git user.email of whoever runs this")
+            if any(lit in v for v in views) or (folded and lit.lower() in data.lower()):
+                hits.append(label)
+        for kind, rx in (pats if binary else []):
+            if any(rx.search(v) for v in views):
+                hits.append("a personal pattern of kind " + kind)
+        if binary:
+            found = sorted({m.group(0).decode("ascii", "replace") for v in views for m in creatable.finditer(v)})
+            if found:
+                hits.append("a path in a location another user could create (" + ", ".join(found[:5]) + ")")
+        if hits:
+            bad += 1
+            print("FAIL\t%s\t%s" % (rel, ", ".join(sorted(set(hits)))))
+        else:
+            print("ok\t%s" % rel)
+print("PATTERNS\t%d" % len(pats))
+sys.exit(1 if bad else 0)
+PY
+)" && scan_rc=0 || scan_rc=$?
+npat="$(sed -n 's/^PATTERNS\t//p' <<<"${scan_out}")"
+scanned="$(grep -c '^ok\|^FAIL' <<<"${scan_out}" || true)"
+while IFS=$'\t' read -r verdict rel why; do
+    case "${verdict}" in
+        FAIL) fail "${rel}: contains ${why}" ;;
+    esac
+done <<<"${scan_out}"
+if [[ ${scan_rc} -eq 0 ]]; then
+    pass "byte scan of ${scanned} files: no home directory, /Users/ or repository path anywhere, and no user name, personal pattern (${npat} patterns), build path or path another user could create in the 4 binaries, and no host name or git user.email anywhere"
+fi
+
+# Libraries: each binary links only what the system ships.
+for rel in bin/cauldron bin/tui libexec/threads libexec/cauldron-mcp; do
+    [[ -f "${B}/${rel}" ]] || continue
+    libs="$(otool -L "${B}/${rel}" 2>/dev/null | sed -n '2,$p' | awk '{print $1}')"
+    odd="$(grep -vE '^(/usr/lib/|/System/Library/)' <<<"${libs}" || true)"
+    if [[ -z "${libs}" ]]; then
+        fail "${rel}: otool -L lists no library (not a linked executable, or otool failed)"
+    elif [[ -z "${odd}" ]]; then
+        pass "${rel}: links only /usr/lib and /System/Library ($(wc -l <<<"${libs}" | tr -d ' ') libraries)"
+    else
+        fail "${rel}: links a library outside /usr/lib and /System/Library: $(tr '\n' ' ' <<<"${odd}")"
+    fi
+done
+
+# The runtime probe: each binary, run with arguments that read and write
+# nothing, under a sandbox that kills it for touching a creatable location.
+deny=()
+while IFS= read -r f; do [[ -n "${f}" && -d "${f}" ]] && deny+=(--deny "${f}"); done <<<"${CAULDRON_RELEASE_FORBID:-}"
+if [[ -x /usr/bin/sandbox-exec ]]; then
+    for run in "bin/cauldron --help" "bin/cauldron --build-stamp" "bin/tui --build-stamp" \
+               "libexec/threads --build-stamp" "libexec/threads --self-check" "libexec/cauldron-mcp --build-stamp"; do
+        rel="${run%% *}"; arg="${run#* }"
+        [[ -f "${B}/${rel}" ]] || continue
+        if out="$("${SELF_DIR}/probe-creatable-paths" ${deny[@]+"${deny[@]}"} -- "${B}/${rel}" "${arg}" 2>&1)"; then
+            pass "${rel} ${arg}: touches no shared or scratch location"
+        else
+            fail "${rel} ${arg}: ${out}"
+        fi
+    done
+else
+    echo "  note  /usr/bin/sandbox-exec is not available: the runtime probe did not run (the byte scan above still did)"
+fi
+
+if [[ ${FAILS} -eq 0 ]]; then echo "check-release-bundle: PASS"; FINISHED=1; exit 0; fi
+echo "check-release-bundle: FAIL (${FAILS})"
+FINISHED=1
+exit 1

@@ -90,6 +90,7 @@ REQUIRED_PATHS='
 .claude-plugin/marketplace.json
 claude-code/cauldron/.claude-plugin/plugin.json
 claude-code/cauldron/.mcp.json
+claude-code/cauldron/bin/cauldron-mcp
 docs/images/cauldron.png
 README.md
 CHANGELOG.md
