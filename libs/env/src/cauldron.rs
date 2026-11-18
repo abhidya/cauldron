@@ -7,7 +7,7 @@
 //!
 //! ```text
 //!   data/<env>/cauldrons/<cauldron>/
-//!       cauldron.toml        name, created_at, enabled, budget, seed
+//!       cauldron.toml        name, id, created_at, enabled, budget, seed
 //!       soup/                its OWN soup: the spine `Cauldron` dir (spine.db + ws.db)
 //!       events/log/          its own commit stream
 //!       tui/                 bucket.json, dumps.jsonl, clusters.json, settings.toml, seed/, ...
@@ -227,6 +227,12 @@ impl Cauldron {
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
+    /// **The cauldron's id** (`cauldron.toml` `id`; [`CauldronMeta::id`]), if
+    /// it has one. Writes nothing.
+    pub fn id(&self) -> Option<String> {
+        self.meta().ok().and_then(|m| m.id)
+    }
+
     /// **Whether this cauldron holds a SEED** (`cauldron.toml` `seed` is
     /// set, e.g. `"cauldron-build"` for the curated demo). Writes nothing. A
     /// seeded cauldron is read-only demo data: nothing is dumped into it, its
@@ -271,6 +277,13 @@ impl Cauldron {
 #[serde(default)]
 pub struct CauldronMeta {
     pub name: Option<String>,
+    /// **The cauldron's id**: 128 random bits, in hex, minted when it is
+    /// made (`cauldron create`), or for a cauldron made before ids existed
+    /// the first time a writer opens it. Kept across a rename and a move
+    /// (it travels in this file), never copied to another cauldron by any
+    /// command. MCP grants and the automatic ripples setting are bound to
+    /// it. `None` for the legacy cauldron, which has no manifest.
+    pub id: Option<String>,
     pub created_at: Option<String>,
     /// The "Cauldron enabled" setting.
     pub enabled: bool,
@@ -281,8 +294,22 @@ pub struct CauldronMeta {
 
 impl Default for CauldronMeta {
     fn default() -> Self {
-        Self { name: None, created_at: None, enabled: true, budget: None, seed: None }
+        Self { name: None, id: None, created_at: None, enabled: true, budget: None, seed: None }
     }
+}
+
+/// **A new cauldron id**: 128 bits from the system's random source
+/// (`/dev/urandom`), as 32 lower-case hex digits.
+pub fn new_cauldron_id() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// Is `s` a cauldron id's shape (32 lower-case hex digits)?
+pub fn cauldron_id_ok(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl CauldronMeta {

@@ -31,7 +31,7 @@ use soup_door::Target;
 
 use crate::access::Access;
 use crate::audit::{Audit, Line};
-use crate::dumps::{Dumps, LogOnly};
+use crate::dumps::{Dumps, NotifyRipples};
 use crate::catalogue::{self, Needs, Tool};
 use crate::ctx::{self, Ctx};
 use crate::secret::Secret;
@@ -61,7 +61,7 @@ impl Door {
         let access = Arc::new(Access::new(&env));
         Arc::new(Door {
             writers: Writers::new(audit.clone(), access.clone()),
-            dumps: Dumps::new(audit.clone(), access.clone(), Arc::new(LogOnly)),
+            dumps: Dumps::new(audit.clone(), access.clone(), Arc::new(NotifyRipples { env: env.clone() })),
             access,
             env,
             secret,
@@ -108,7 +108,7 @@ impl Door {
     /// re-read first, as for every call.
     pub fn ripple_target(&self, cauldron: &str) -> Result<Target, Refusal> {
         self.refresh();
-        let grants = self.access.grants().map_err(refusal)?;
+        let grants = self.adopted(self.access.grants().map_err(refusal)?, cauldron)?;
         for s in [Scope::Read, Scope::Write, Scope::Dump] {
             grants.authorize(&self.env, cauldron, s).map_err(refusal)?;
         }
@@ -126,7 +126,7 @@ impl Door {
     /// door's writer for it lands). Grants are re-read first.
     pub fn owner_target(&self, cauldron: &str) -> Result<Target, Refusal> {
         self.refresh();
-        let grants = self.access.grants().map_err(refusal)?;
+        let grants = self.adopted(self.access.grants().map_err(refusal)?, cauldron)?;
         grants.authorize(&self.env, cauldron, Scope::Write).map_err(refusal)?;
         let c = self
             .env
@@ -135,6 +135,27 @@ impl Door {
             .flatten()
             .ok_or_else(|| Refusal::new("cauldron_gone", format!("cauldron `{cauldron}` no longer exists. Nothing was written.")))?;
         Ok(Target { env: self.env.clone(), cauldron: c, resolved_from: None })
+    }
+
+    /// **A granted cauldron is given its id** before a call reaches it, if
+    /// it has none yet (`soup_door::grants::adopt`: this service is the
+    /// writer that opens it), and the grants read again when that carried
+    /// its grant onto the id. A cauldron with no grant is left as it is.
+    fn adopted(&self, grants: soup_door::grants::Grants, cauldron: &str) -> Result<soup_door::grants::Grants, Refusal> {
+        if grants.get(cauldron).is_none() {
+            return Ok(grants);
+        }
+        let Ok(Some(c)) = self.env.find_cauldron(cauldron) else { return Ok(grants) };
+        if c.id().is_some() || c.manifest().is_none_or(|m| !m.is_file()) {
+            return Ok(grants);
+        }
+        match soup_door::grants::adopt(&self.env, &c) {
+            Ok(_) => self.access.grants().map_err(refusal),
+            Err(err) => {
+                tracing::warn!(cauldron, %err, "cannot give the cauldron its id; its grant is checked by its creation time until a writer can");
+                Ok(grants)
+            }
+        }
     }
 
     /// Append a line to the audit log (`calls.jsonl`).
@@ -184,6 +205,7 @@ impl Door {
         let grants = self.access.grants().map_err(refusal)?;
         let res = grants.resolve(&self.env.name, ctx.cwd.as_deref(), explicit, ctx.cauldron_var.as_deref()).map_err(refusal)?;
         *named = Some(res.cauldron.clone());
+        let grants = self.adopted(grants, &res.cauldron)?;
         let mut grant = None;
         for s in scopes {
             grant = Some(grants.authorize(&self.env, &res.cauldron, *s).map_err(refusal)?.clone());
@@ -319,10 +341,21 @@ impl Door {
                     Some(Value::Array(v)) if v.iter().all(Value::is_string) => v.into_iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
                     Some(_) => return Err(usage("`refs` of soup_dump must be a list of node ids")),
                 };
+                let wait = a.count("wait_secs")?.unwrap_or(0) as u64;
                 a.done()?;
+                if wait > soup_door::dumps::WAIT_MAX_SECS {
+                    return Err(usage(&format!("`wait_secs` of soup_dump is 0 to {}", soup_door::dumps::WAIT_MAX_SECS)));
+                }
                 soup_door::dumps::check_text(&text).map_err(refusal)?;
                 soup_door::dumps::check_extras(title.as_deref(), from.as_deref(), cite.as_ref(), &refs).map_err(refusal)?;
-                self.dump_text(&t, ctx, text, title, from, cite, refs)?
+                let mut r = self.dump_text(&t, ctx, text, title, from, cite, refs)?;
+                // The bounded wait: the records automatic processing made.
+                if wait > 0 && r["automatic"]["takes_this_dump"] == json!(true) {
+                    if let Some(id) = r["dump_id"].as_str().map(str::to_string) {
+                        r["processing"] = soup_door::dumps::wait_processing(&t.cauldron, &id, wait).map_err(refusal)?;
+                    }
+                }
+                r
             }
             "soup_dump_session" => {
                 return Err(usage(

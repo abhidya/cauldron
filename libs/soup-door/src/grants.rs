@@ -21,10 +21,21 @@
 //! call; [`Grants::authorize`] then checks that call's scope.
 //!
 //! A grant is bound to the cauldron it was made for, not only to its name:
-//! it records that cauldron's `created_at` (from its `cauldron.toml`, the
-//! same identity the change cursor uses). A cauldron removed and made again
-//! under the same name has another, and its predecessor's grant does not
-//! open it ([`Code::CauldronGone`]); the owner grants the new one.
+//! it records that cauldron's id (`cauldron.toml` `id`, 128 random bits
+//! minted when the cauldron is made, kept across a rename and a move of the
+//! data root, never copied to another cauldron), and its `created_at`. A
+//! cauldron removed and made again under the same name has another id, even
+//! when its `cauldron.toml` names the same `created_at`, and its
+//! predecessor's grant does not open it ([`Code::CauldronGone`]); the owner
+//! grants the new one.
+//!
+//! A cauldron made before cauldrons had ids is given its id by the first
+//! writer that opens it ([`adopt`]); at that moment, and only then, a grant
+//! that records its `created_at` is carried onto the id. A grant that does
+//! not match then is refused ([`Code::NotGranted`]), naming the `cauldron
+//! mcp grant` that makes it again. Anyone who can write the data root can
+//! write this store too: the terminal check of `cauldron mcp grant` guards
+//! the command, not the file.
 //!
 //! A grant that records no identity (written before grants carried this
 //! field, which every release that made grants has done) is NOT honoured
@@ -126,6 +137,11 @@ pub struct Grant {
     pub granted_at: String,
     /// How the grant was made (`tty`: by a person at a terminal).
     pub by: String,
+    /// The id of the cauldron this grant was made for (`cauldron.toml`
+    /// `id`; see the module docs). Absent in a grant written before
+    /// cauldrons had ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cauldron_id: Option<String>,
     /// The `created_at` of the cauldron this grant was made for (see the
     /// module docs). Absent in a grant written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,17 +157,33 @@ impl Grant {
     /// A grant that recorded no identity is, only when `c` has none either
     /// (module docs).
     pub fn is_for(&self, c: &env::Cauldron) -> bool {
-        match (&self.cauldron_created_at, identity(c)) {
-            (None, None) => true,
+        match (&self.cauldron_id, c.id()) {
+            (Some(want), Some(have)) => *want == have,
+            // Bound to an id: never a cauldron without that id.
+            (Some(_), None) => false,
+            // Written before ids, and the cauldron has one: bound to it only
+            // when it was given (`adopt`), so this one was not carried.
             (None, Some(_)) => false,
-            (Some(want), have) => have.as_deref() == Some(want.as_str()),
+            // Neither has an id yet (before the cauldron's first writer):
+            // the creation time, as before.
+            (None, None) => match (&self.cauldron_created_at, identity(c)) {
+                (None, None) => true,
+                (None, Some(_)) => false,
+                (Some(want), have) => have.as_deref() == Some(want.as_str()),
+            },
         }
     }
 
     /// Does this grant name its cauldron only by name, while that cauldron
     /// has an identity (a grant to make again)?
     pub fn name_only_for(&self, c: &env::Cauldron) -> bool {
-        self.cauldron_created_at.is_none() && identity(c).is_some()
+        self.cauldron_id.is_none() && self.cauldron_created_at.is_none() && identity(c).is_some()
+    }
+
+    /// Was this grant written before cauldrons had ids, and not carried onto
+    /// the id its cauldron has now (a grant to make again)?
+    pub fn not_carried_for(&self, c: &env::Cauldron) -> bool {
+        self.cauldron_id.is_none() && self.cauldron_created_at.is_some() && c.id().is_some()
     }
 }
 
@@ -373,6 +405,16 @@ impl Grants {
                 grant_command(env, cauldron, &g.scopes, &g.projects)
             );
         }
+        if g.not_carried_for(&c) {
+            refuse!(
+                Code::NotGranted,
+                "Cauldron `{cauldron}` in environment `{env}` has a grant written before cauldrons had ids, and when \
+                 this cauldron was given its id the grant did not match it (it records another creation time), so it \
+                 was not carried onto it and is not honoured. Nothing was read or written. The owner grants it again \
+                 from a terminal on this machine with `{}`.",
+                grant_command(env, cauldron, &g.scopes, &g.projects)
+            );
+        }
         if !g.is_for(&c) {
             refuse!(
                 Code::CauldronGone,
@@ -488,11 +530,19 @@ pub fn name_only(e: &env::Environment, g: &Grants) -> Vec<serde_json::Value> {
         .iter()
         .filter_map(|gr| {
             let c = e.find_cauldron(&gr.cauldron).ok().flatten()?;
-            gr.name_only_for(&c).then(|| {
+            (gr.name_only_for(&c) || gr.not_carried_for(&c)).then(|| {
                 let regrant = grant_command(&e.name, &gr.cauldron, &gr.scopes, &gr.projects);
+                let note = if gr.name_only_for(&c) {
+                    name_only_note(&gr.cauldron, &e.name, &regrant)
+                } else {
+                    format!(
+                        "the grant of cauldron `{}` in environment `{}` was written before cauldrons had ids and was not carried onto the id the cauldron was given (it records another creation time), so every call to it through the MCP door is refused until it is granted again, in a terminal: {regrant}",
+                        gr.cauldron, e.name
+                    )
+                };
                 serde_json::json!({
                     "cauldron": gr.cauldron,
-                    "note": name_only_note(&gr.cauldron, &e.name, &regrant),
+                    "note": note,
                     "regrant": regrant,
                 })
             })
@@ -534,7 +584,13 @@ fn shell_word(p: &str) -> String {
 /// scopes. Answers the grant as stored and whether it is new.
 pub fn grant(e: &Environment, cauldron: &str, scopes: &[Scope], projects: &[String], by: &str) -> Result<(Grant, bool)> {
     require_cauldron(e, cauldron)?;
-    let created_at = e.find_cauldron(cauldron).ok().flatten().and_then(|c| identity(&c));
+    let c = e.find_cauldron(cauldron).ok().flatten();
+    // The cauldron's id, minted now if it has none yet (a grant is a writer).
+    let id = match &c {
+        Some(c) => adopt(e, c)?,
+        None => None,
+    };
+    let created_at = c.as_ref().and_then(identity);
     let scopes = sorted(scopes.to_vec());
     if scopes.is_empty() {
         refuse!(Code::Usage, "REFUSED: a grant needs at least one scope (read, write, dump)");
@@ -549,6 +605,7 @@ pub fn grant(e: &Environment, cauldron: &str, scopes: &[Scope], projects: &[Stri
                 projects: Vec::new(),
                 granted_at: String::new(),
                 by: String::new(),
+                cauldron_id: None,
                 cauldron_created_at: None,
             });
         }
@@ -562,6 +619,7 @@ pub fn grant(e: &Environment, cauldron: &str, scopes: &[Scope], projects: &[Stri
         entry.granted_at = now.clone();
         entry.by = by.to_string();
         // Granting again binds the grant to the cauldron that has the name now.
+        entry.cauldron_id = id.clone();
         entry.cauldron_created_at = created_at.clone();
         g.grants.sort_by(|a, b| a.cauldron.cmp(&b.cauldron));
         Ok((g.get(cauldron).expect("present").clone(), created))
@@ -639,6 +697,83 @@ pub fn rename(e: &Environment, old: &str, new: &str, created_at: Option<&str>) -
     })
 }
 
+/// **Give cauldron `c` its id, if it has none yet** (a cauldron made before
+/// cauldrons had ids), and answer it; `None` for a cauldron with no
+/// manifest (the legacy cauldron, or a directory without `cauldron.toml`),
+/// which has nothing to hold one. Called by every writer that opens a
+/// cauldron: the `mcp` service before a call reaches a granted one, and
+/// `cauldron mcp grant`, `cauldron ripples on` and `cauldron rename`.
+///
+/// At that moment, and only then, what was bound to the cauldron before
+/// ids is carried onto the new id: its grant, when the grant records the
+/// cauldron's `created_at`; its automatic ripples setting, when the setting
+/// records its `created_at` and directory inode
+/// (`env::ripples_auto::adopt_id`). Whatever does not match stays unbound
+/// and is refused, naming the command that makes it again. Done under the
+/// grant store's lock, so two writers mint one id. The manifest is written
+/// whole (a new file renamed over the old one, owner-only).
+pub fn adopt(e: &Environment, c: &env::Cauldron) -> Result<Option<String>> {
+    let Some(manifest) = c.manifest().filter(|m| m.is_file()) else { return Ok(None) };
+    if let Some(id) = c.id() {
+        return Ok(Some(id));
+    }
+    let dir = store_dir(e);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|err| store_err(format!("creating {}", dir.display()), &err))?;
+    let lock_path = dir.join(LOCK);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|err| store_err(format!("opening {}", lock_path.display()), &err))?;
+    lock.lock().map_err(|err| store_err(format!("locking {}", lock_path.display()), &err))?;
+    let mut meta = c.meta().map_err(|err| Error::from_anyhow(Code::Store, err))?;
+    if let Some(id) = meta.id.clone() {
+        return Ok(Some(id));
+    }
+    let id = env::cauldron::new_cauldron_id().map_err(|err| store_err("minting a cauldron id".to_string(), &err))?;
+    meta.id = Some(id.clone());
+    let text = meta.to_toml().map_err(|err| Error::from_anyhow(Code::Store, err))?;
+    let tmp = manifest.with_file_name(format!(".{}.id-{}", env::cauldron::CAULDRON_MANIFEST, std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &manifest)?;
+        if let Some(d) = manifest.parent() {
+            File::open(d)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(store_err(format!("writing the cauldron's id into {}", manifest.display()), &err));
+    }
+    // The grant and the setting written for this very cauldron, onto it.
+    let path = dir.join(FILE);
+    if path.exists() {
+        let mut g = Grants::load_from(&path)?;
+        let mut changed = false;
+        for x in g.grants.iter_mut().filter(|x| x.cauldron == c.name && x.cauldron_id.is_none()) {
+            if x.cauldron_created_at.is_some() && x.cauldron_created_at == meta.created_at {
+                x.cauldron_id = Some(id.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            write_store(&dir, &path, &g)?;
+        }
+    }
+    env::ripples_auto::adopt_id(e, c, &id).map_err(|err| store_err("carrying the automatic ripples setting onto the cauldron's id".to_string(), &err))?;
+    drop(lock);
+    Ok(Some(id))
+}
+
 /// Follow a cauldron's removal: drop its grant. Answers whether one was
 /// dropped. Writes nothing when there is no store.
 pub fn forget(e: &Environment, cauldron: &str) -> Result<bool> {
@@ -663,6 +798,7 @@ mod tests {
             projects: projects.iter().map(|p| p.to_string()).collect(),
             granted_at: "2026-01-01T00:00:00Z".into(),
             by: "tty".into(),
+            cauldron_id: None,
             cauldron_created_at: None,
         }
     }

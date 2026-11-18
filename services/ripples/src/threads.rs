@@ -506,13 +506,20 @@ impl Inference for Threads {
                         }
                     }
                     "turn_parked" => {
-                        return Err(give_up(Failure::Parked(format!(
-                            "threads parked the call ({}): {}",
-                            ev["cause"].as_str().unwrap_or("?"),
-                            ev["reason"].as_str().unwrap_or("")
-                        ))))
+                        let cause = ev["cause"].as_str().unwrap_or("?");
+                        return Err(give_up(Failure::Parked {
+                            message: format!("threads parked the call ({cause}): {}", scrubbed(ev["reason"].as_str().unwrap_or(""))),
+                            cause: crate::inference::park_cause(cause),
+                            usage,
+                        }))
                     }
-                    "budget_tripped" => return Err(give_up(Failure::Parked(format!("threads' budget `{}` tripped", ev["budget_key"].as_str().unwrap_or("?"))))),
+                    "budget_tripped" => {
+                        return Err(give_up(Failure::Parked {
+                            message: format!("threads' budget `{}` tripped", ev["budget_key"].as_str().unwrap_or("?")),
+                            cause: "budget",
+                            usage,
+                        }))
+                    }
                     // A ripple's call is one delivery. A threads that would
                     // run it again (an older one, or a limit on the account)
                     // ends the call here: re-running the same command line
@@ -521,7 +528,11 @@ impl Inference for Threads {
                         let kind = ev["error_kind"].as_str().unwrap_or("?");
                         let why = scrubbed(ev["reason"].as_str().unwrap_or(""));
                         if matches!(kind, "usage_limit" | "credit_balance" | "login_expired") {
-                            return Err(give_up(Failure::Parked(format!("threads would run the call again later ({kind}): {why}"))));
+                            return Err(give_up(Failure::Parked {
+                                message: format!("threads would run the call again later ({kind}): {why}"),
+                                cause: crate::inference::park_cause(kind),
+                                usage,
+                            }));
                         }
                         return Err(give_up(Failure::Failed {
                             message: format!("the call ended in threads without an answer ({kind}); threads would run it again, which a ripple's call never does: {why}"),

@@ -47,7 +47,9 @@ fn dm1_a_text_dump_lands_received_beside_the_soup_and_reads_back() {
     assert_eq!((r["dump_id"].clone(), r["state"].clone(), r["kind"].clone()), (json!("DM-1"), json!("received"), json!("text")), "{r}");
     assert_eq!(r["bytes"], json!(text.len()));
     assert_eq!(r["sha256"], json!(sha256_hex(text.as_bytes())));
-    assert!(r["next"].as_str().unwrap().contains("later release"), "{r}");
+    assert!(r["next"].as_str().unwrap().contains("cauldron ripples run"), "{r}");
+    // Automatic processing is off unless the owner turned it on.
+    assert_eq!((r["automatic"]["on"].clone(), r["automatic"]["takes_this_dump"].clone()), (json!(false), json!(false)), "{r}");
     assert!(!r.to_string().contains("worth keeping"), "a receipt never holds the text");
     assert!(r["cursor"].as_str().unwrap().ends_with(".1"), "{r}");
     assert_eq!(s.node_count("kb"), held, "nothing lands in the soup");

@@ -69,8 +69,10 @@ Planned, in no fixed order:
 Ripples and the soup engine arrive in 0.2.0:
 
 - **Ripples live:** dumps set off ripples, and ripples write to the soup. The
-  soup engine is hardened, and the Ledger shows real ripple events. A dump's
-  state moves on from `received` only then. (Not in any 0.1.x release.)
+  soup engine is hardened, and the Ledger shows real ripple events. (0.1.10
+  has the first ripple, the dump ripple, run by hand, and 0.1.12 lets an
+  owner have it run on its own for a cauldron; the other ripples and the
+  Ledger's ripple events are not in any 0.1.x release.)
 
 ## Later, each to its own design
 

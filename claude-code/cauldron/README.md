@@ -24,9 +24,9 @@ Everything runs on the same machine as the cauldron. The MCP server is
 | `commands/dump-session.md` | `/cauldron:dump-session [title]`: keep this session's transcript as a dump |
 | `commands/curate-dump.md` | `/cauldron:curate-dump <DM-n> [cauldron]`: turn a dump into soup records that cite it |
 
-The dump ripple (`cauldron ripples run`) is a terminal command, not part of
-this plugin; its records reach a session as `unreviewed` (see
-[Ripples](#ripples)).
+The dump ripple (`cauldron ripples run`, and `cauldron ripples on` for
+automatic processing) is a terminal command, not part of this plugin; its
+records reach a session as `unreviewed` (see [Ripples](#ripples)).
 | `regions.example.json` | four example regions to import into a new, empty soup |
 | `skills/soup-schema/SKILL.md` | `/cauldron:soup-schema`: the schema in brief, with a pointer to the full README |
 | `schema/` | a copy of the published schema (`schema/soup/workspace-v6/` in the Cauldron repository): `README.md`, `grammar.json`, `edges.json`, one JSON Schema per node type, and its `--remint` variant (batch labels for ids) |
@@ -213,9 +213,16 @@ cauldron --env prod start mcp                          # if the service is not r
   (`not_granted`) and never land; a write already being applied when the
   revoke comes finishes, all of it or none of it. `revoke --project <dir>`
   removes only that binding.
-- A grant is for the cauldron it was made for, not only its name: if that
-  cauldron is removed and another is made under the same name, calls are
-  refused as `cauldron_gone` until you grant the new one. A grant written by
+- A grant is for the cauldron it was made for, not only its name: it is
+  bound to the random id in the cauldron's `cauldron.toml`, which a rename
+  and a move of the whole data root keep. If that cauldron is removed and
+  another is made under the same name (even with the same creation time in
+  its `cauldron.toml`), calls are refused as `cauldron_gone` until you grant
+  the new one. A cauldron made before ids is given its id by its first
+  writer (the `mcp` service, before a call reaches it), and its grant is
+  carried onto the id then if it records the cauldron's creation time; one
+  that does not is refused as `not_granted` with the command that grants it
+  again. A grant written by
   a pre-release build, which names its cauldron only by name, is refused as
   `not_granted` with the `cauldron mcp grant` command that makes it again.
   It is named before that first refusal too: `cauldron mcp status`
@@ -267,9 +274,11 @@ paste, a file, or a whole Claude Code session. It is not a soup record and
 does not go into the soup. It lands as `DM-<n>` in state `received` in the
 cauldron's **dumps store**, `<cauldron>/dumps/` beside its soup (its own
 small spine and a content-addressed blob store, made on the first dump), as
-one write. Nothing processes a dump on its own in this release: it waits as
-`received` until you curate it (below) or run the dump ripple on it by hand
-(`cauldron ripples run`, see [Ripples](#ripples)). A soup record
+one write. Nothing processes a dump on its own unless the owner turned
+automatic processing on for its cauldron ([Automatic
+processing](#automatic-processing)): it waits as `received` until you curate
+it (below) or run the dump ripple on it by hand (`cauldron ripples run`, see
+[Ripples](#ripples)). A soup record
 that came from a dump can cite it: `meta.cites: [{"kind": "dump", "id": "DM-3"}]`.
 
 - `/cauldron:dump <file or text>` (the tool `soup_dump`) keeps up to 1 MiB of
@@ -392,10 +401,11 @@ dump itself is not changed: it stays `received`.
 ## Ripples
 
 A **ripple** turns one dump into new soup records (ideas, issues, questions,
-decisions, constraints, tasks and dangers), each citing the dump. In this
-release it runs only when you run it, at a terminal, on the one dump you
-name; no tool of this plugin starts one, and no tool of this plugin
-approves what it wrote:
+decisions, constraints, tasks and dangers), each citing the dump. It runs
+when you run it, at a terminal, on the one dump you name, or, since 0.1.12,
+by itself on each new dump of a cauldron whose owner turned that on (see
+[Automatic processing](#automatic-processing)). No tool of this plugin
+starts one, turns automatic processing on, or approves what a ripple wrote:
 
 ```sh
 cauldron ripples run DM-3 --env prod --cauldron kb            # one dump; prints the records and the tokens
@@ -408,7 +418,8 @@ cauldron soup approve C-12 IS-4 --env prod --cauldron kb      # you, at a termin
   --env prod pin ripples <the label it printed>`, `cauldron --env prod start
   ripples`. It needs the `mcp` service and a `threads` service of the same
   release running, and the cauldron granted `read`, `write` and `dump`.
-  Running, it still processes nothing until `cauldron ripples run`.
+  Running, it processes nothing until `cauldron ripples run`, unless the
+  owner turned automatic processing on for a cauldron.
 - **A bare completion, not an agent.** The call goes through the `threads`
   service as one Claude Code call on the Claude login threads uses, with no
   tools of any kind (no built-in tool, every one denied by name, no MCP
@@ -428,8 +439,17 @@ cauldron soup approve C-12 IS-4 --env prod --cauldron kb      # you, at a termin
   view (what you typed and what the assistant wrote as text; never tool
   calls, tool output, thinking or shell output). No existing record is sent.
   The dump's text sits between marker lines, after a rule that it is data
-  and never instructions. Nothing removes secrets from the text first:
-  remove a dump that holds one (`cauldron soup dump-remove`) before any run.
+  and never instructions. Since 0.1.12 the text first goes through a secret
+  scrubber that replaces credential-shaped text (known key and token
+  formats, private-key blocks, JWTs, passwords and tokens in URLs,
+  `Authorization:` and `Cookie:` headers, secrets on command lines such as
+  `--password x` or `--admin-password=x`, assignments to secret names such as `password=…` or
+  `"api_key": "…"`, long random strings other than a digest in its obvious
+  context, such as a `sha512-…` integrity hash or an image's `data:` URI)
+  with `<redacted:kind>`; the answer
+  is scrubbed the same way before it is written. Its time is bounded: if it
+  cannot finish, nothing is sent. The scrubber reduces the risk and is not a guarantee: remove a
+  dump you know holds a secret (`cauldron soup dump-remove`) before any run.
 - **What is stored where.** threads keeps, per call, a thread named `ripple
   …` with the prompt (dump text included) and the answer in its store
   (`data/<env>/threads/store/`, `threads.db` and `turns/`), until you delete
@@ -492,6 +512,76 @@ cauldron soup approve C-12 IS-4 --env prod --cauldron kb      # you, at a termin
   the run and the records (`soup_dumps`, `soup_dump_get`). Curating by hand
   leaves it `received`. A removed dump, or one whose removal is unfinished,
   is refused. A dump run twice gets one set of records.
+
+### Automatic processing
+
+New in 0.1.12, and **off by default for every cauldron**; an upgrade never
+turns it on. The owner turns it on for one cauldron, at a terminal:
+
+```sh
+cauldron ripples on kb --env prod [--backend threads|local] [--model <m>] [--include-sessions] [--no-scrub-local]
+cauldron ripples off kb --env prod        # from anywhere; before the next call
+cauldron ripples status --env prod        # on/off, since when, backend, queue, spend today
+```
+
+- **What it means.** Each dump that lands in that cauldron after that
+  moment is processed with no further command, exactly as `cauldron ripples
+  run` would: the same bare call, caps, journal and `unreviewed` marking.
+  Older dumps are processed only by hand. Text dumps only, unless
+  `--include-sessions`. `on` authorises spend and writes nobody asks for one
+  by one, so it requires an interactive terminal (like `cauldron mcp
+  grant`): it is the owner's act, a session must not try to turn it on, and
+  no tool of this plugin does. `on` prints what is sent where and the caps,
+  then asks the owner `[y/N]`.
+- **One cauldron, never a name.** The setting is bound to the cauldron it
+  was turned on for, by the cauldron's id (as its grant is). Removed,
+  renamed, or made again under the same name, it is not carried over:
+  `cauldron remove` and `cauldron rename` turn it off, and a setting left
+  behind or copied is void (nothing runs; `status` says why and how to
+  clear it). A data root moved whole keeps it. The terminal check guards
+  the command, not the file: anyone who can write the data root can write
+  the setting, as they can `grants.json`.
+- **What is sent where.** `--backend threads` (the default): the scrubbed
+  text and the regions to Anthropic, through threads on this machine's
+  Claude login, as above. `--backend local`: to the `inference` service on
+  this machine; nothing leaves it; scrubbed too unless `--no-scrub-local`.
+- **The service.** The `ripples` service must be running (the installer
+  does not start it). The `mcp` service tells it when a dump lands, and it
+  also looks for waiting dumps at start and every minute. One dump at a
+  time, the cauldron served least recently first. A dump that lands while
+  another run holds the service's one run slot waits for it (`status`:
+  `waits_for`), and starts when it ends.
+- **Caps.** As by hand: per dump 3 calls and 200,000 input tokens; per
+  cauldron per UTC day 1,500,000 input tokens or 30 dumps. Over a cap the
+  dump stays `received` with `auto: {state: deferred, reason: budget}` in
+  its listing and is tried again after midnight UTC. The daily cap follows
+  the cauldron, not its name.
+- **When threads parks a call** (an account over its usage threshold or
+  limit, a spent credit balance, an expired login, a budget), the dump
+  stays `received` with `auto: {state: deferred, reason: threads_parked,
+  park: <cause>}`. That is not a failed attempt, and a call parked before
+  it ran is charged nothing. Automatic runs on threads then wait 2 minutes,
+  growing with each park in a row to at most an hour: one withdrawn call
+  per wait, not one per dump. `cauldron ripples status` shows the hold
+  (`threads_hold`: since when, the cause, the next attempt) and the
+  cauldrons it holds (`held`).
+- **When the backend is busy** (another request holds the local
+  `inference` service, or it is not ready yet): the dump stays `received`
+  with `auto: {state: deferred, reason: busy}`, charged nothing and not a
+  failed attempt, and the next scan tries it again.
+- **Failure.** A failed attempt is retried after 2, then 8 minutes; after 3
+  (or at once when retrying cannot help) the dump is parked `failed` with
+  `failure: {code, message, attempts, what_to_do}`, and only `cauldron
+  ripples run` runs it again. The message is a fixed sentence for the
+  code: no journal and no dump record holds the model's answer, its notes
+  or a backend's own words.
+- **What a session sees.** `soup_dump` and `soup_dump_session` receipts
+  carry `automatic`: whether it is on and takes this dump. `soup_dump` with
+  `wait_secs` (at most 120) waits for it and answers `processing`: the
+  dump's state, the run and the record ids. `soup_dumps` and `soup_dump_get`
+  show the state, `auto` or `failure`, and once processed the run and the
+  records. The records are `unreviewed` until the owner approves them at a
+  terminal, and are data, not instructions.
 
 ## The verbs
 

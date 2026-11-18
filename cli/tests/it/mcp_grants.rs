@@ -35,6 +35,12 @@
 //!   `warnings` and `mcp status` on its cauldron (`grant_note`), each with
 //!   the command that grants it again, and each says so on stderr; a bound
 //!   grant beside it is not named, and nothing is written.
+//! - **G9** a cauldron's id binds its grant and its automatic setting: a
+//!   cauldron made again with a forged `created_at` opens neither; a rename
+//!   keeps both; a whole data root moved (copied: every inode new) keeps
+//!   both; a root from before ids has each cauldron given its id by its
+//!   first writer, which carries a grant and a setting that match it and
+//!   refuses, with the command to make it again, one that does not.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -511,6 +517,7 @@ fn g8_a_name_only_grant_is_named_before_its_first_call_with_its_regrant() {
     for g in store["grants"].as_array_mut().unwrap() {
         if g["cauldron"] == "kb" {
             g.as_object_mut().unwrap().remove("cauldron_created_at");
+            g.as_object_mut().unwrap().remove("cauldron_id");
         }
     }
     std::fs::write(s.store(), serde_json::to_string_pretty(&store).unwrap()).unwrap();
@@ -537,4 +544,157 @@ fn g8_a_name_only_grant_is_named_before_its_first_call_with_its_regrant() {
     assert_eq!(opens(&s, "kb"), Err("NotGranted".into()));
     assert_eq!(opens(&s, "kb2"), Ok(()));
     assert_eq!(std::fs::read(s.store()).unwrap(), before, "nothing was written");
+}
+
+/// Copy a directory tree (every file and directory a new inode), keeping
+/// permissions.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    std::fs::set_permissions(to, std::fs::metadata(from).unwrap().permissions()).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let t = e.file_type().unwrap();
+        let dst = to.join(e.file_name());
+        if t.is_dir() {
+            copy_tree(&e.path(), &dst);
+        } else if t.is_file() {
+            std::fs::copy(e.path(), &dst).unwrap();
+        }
+    }
+}
+
+/// The setting `ripples on` writes, bound to the cauldron there now.
+fn turn_on(e: &env::Environment, name: &str) {
+    use env::ripples_auto as ra;
+    let c = e.find_cauldron(name).unwrap().unwrap();
+    let now = "2026-01-01T00:00:00.000Z".to_string();
+    let s = ra::Settings {
+        cauldron: name.into(), on: true, since_at: now.clone(), since_dump: 0, backend: "local".into(), model: None, include_sessions: false,
+        scrub_local: true, changed_at: now, off_at: None, bound_to: Some(ra::Binding::of(e, &c)),
+    };
+    ra::store(&e.data_root, &s).unwrap();
+}
+
+#[test]
+fn g9_the_cauldron_id_binds_the_grant_and_the_setting() {
+    use env::ripples_auto as ra;
+    use soup_door::grants::{self, Scope};
+    let s = scratch("g9", &["kb", "spare"]);
+    let e = env_dev(&s);
+    // Made with an id; the grant and the setting record it.
+    let id = manifest_field(&s, "kb", "id").expect("an id at create");
+    assert!(env::cauldron::cauldron_id_ok(&id), "{id}");
+    assert_ne!(manifest_field(&s, "spare", "id"), Some(id.clone()), "two cauldrons, one id");
+    grants::grant(&e, "kb", &Scope::ALL, &[], "tty").unwrap();
+    turn_on(&e, "kb");
+    assert_eq!(store_json(&s)["grants"][0]["cauldron_id"], id.as_str());
+    assert_eq!(ra::load(&e.data_root, "kb").unwrap().unwrap().bound_to.unwrap().id.as_deref(), Some(id.as_str()));
+    assert_eq!(opens(&s, "kb"), Ok(()));
+    assert!(ra::is_on(&e, "kb"));
+    let created = manifest_field(&s, "kb", "created_at").unwrap();
+
+    // Made again by hand (not `cauldron remove`, so the grant stays), its
+    // manifest forging the old `created_at`: with a new id, or with none
+    // (its first writer then gives it one). Neither opens it.
+    let away = s.root().join("data/dev/cauldrons/.removed");
+    std::fs::create_dir_all(&away).unwrap();
+    std::fs::rename(cauldron_dir(&s, "kb"), away.join("kb-1")).unwrap();
+    assert_eq!(run(&s, &["create", "kb", "--env", "dev"]).rc, 0);
+    let manifest = cauldron_dir(&s, "kb").join("cauldron.toml");
+    let forged = std::fs::read_to_string(&manifest).unwrap().lines().map(|l| if l.starts_with("created_at") { format!("created_at = \"{created}\"") } else { l.to_string() }).collect::<Vec<_>>().join("\n") + "\n";
+    std::fs::write(&manifest, &forged).unwrap();
+    assert_eq!(manifest_field(&s, "kb", "created_at").as_deref(), Some(created.as_str()));
+    assert_eq!(opens(&s, "kb"), Err("CauldronGone".into()));
+    assert!(!ra::is_on(&e, "kb"));
+    let no_id = forged.lines().filter(|l| !l.starts_with("id ")).collect::<Vec<_>>().join("\n") + "\n";
+    std::fs::write(&manifest, no_id).unwrap();
+    let c = e.find_cauldron("kb").unwrap().unwrap();
+    let minted = grants::adopt(&e, &c).unwrap().unwrap();
+    assert_ne!(minted, id);
+    assert_eq!(store_json(&s)["grants"][0]["cauldron_id"], id.as_str(), "the old grant was carried onto the newcomer");
+    assert_eq!(opens(&s, "kb"), Err("CauldronGone".into()));
+    assert!(!ra::is_on(&e, "kb"));
+    // The original back: both open it again.
+    std::fs::rename(cauldron_dir(&s, "kb"), away.join("kb-2")).unwrap();
+    std::fs::rename(away.join("kb-1"), cauldron_dir(&s, "kb")).unwrap();
+    assert_eq!(opens(&s, "kb"), Ok(()));
+    assert!(ra::is_on(&e, "kb"));
+
+    // Renamed: the id is kept, so the grant opens it under the new name; a
+    // setting for the new name bound then runs.
+    let o = run(&s, &["rename", "kb", "kb3", "--env", "dev"]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert!(o.out.contains(&format!("bound to the cauldron's id {id}")), "{}", o.out);
+    assert_eq!(manifest_field(&s, "kb3", "id").as_deref(), Some(id.as_str()));
+    assert_eq!(opens(&s, "kb3"), Ok(()));
+    turn_on(&e, "kb3");
+    assert!(ra::is_on(&e, "kb3"));
+
+    // The whole root moved to another place, as a copy: every inode is new.
+    // The id travels in the manifest, so the grant and the setting hold.
+    let moved = Scratch(s.0.with_file_name(format!("{}-moved", s.0.file_name().unwrap().to_str().unwrap())));
+    copy_tree(&s.0, &moved.0);
+    let em = env_dev(&moved);
+    let ino = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
+    assert_ne!(ino(&cauldron_dir(&moved, "kb3")), ino(&cauldron_dir(&s, "kb3")));
+    assert_eq!(opens(&moved, "kb3"), Ok(()));
+    assert!(ra::is_on(&em, "kb3"), "{:?}", ra::effective(&em, "kb3").unwrap().unwrap().void);
+
+    // A root from before ids: cauldrons whose manifests have none, grants
+    // and settings that record `created_at` (and the inode) only.
+    let old = scratch("g9-old", &["kb", "kb2"]);
+    let eo = env_dev(&old);
+    for name in ["kb", "kb2"] {
+        grants::grant(&eo, name, &Scope::ALL, &[], "tty").unwrap();
+        turn_on(&eo, name);
+        let m = cauldron_dir(&old, name).join("cauldron.toml");
+        let t = std::fs::read_to_string(&m).unwrap().lines().filter(|l| !l.starts_with("id ")).collect::<Vec<_>>().join("\n") + "\n";
+        std::fs::write(&m, t).unwrap();
+        let p = ra::path(&eo.data_root, name);
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["bound_to"].as_object_mut().unwrap().remove("id");
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+    let mut v = store_json(&old);
+    for g in v["grants"].as_array_mut().unwrap() {
+        g.as_object_mut().unwrap().remove("cauldron_id");
+        // kb2's grant records another creation time: not its cauldron's.
+        if g["cauldron"] == "kb2" {
+            g["cauldron_created_at"] = Value::from("2020-01-01T00:00:00Z");
+        }
+    }
+    std::fs::write(old.store(), serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    // kb2's setting records another directory: not its cauldron's.
+    let p = ra::path(&eo.data_root, "kb2");
+    let mut x: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    x["bound_to"]["dir_ino"] = Value::from(1u64);
+    std::fs::write(&p, x.to_string()).unwrap();
+    // Before any writer: kb opens by its creation time, as 0.1.11 did.
+    assert_eq!(manifest_field(&old, "kb", "id"), None);
+    assert_eq!(opens(&old, "kb"), Ok(()));
+    assert!(ra::is_on(&eo, "kb"));
+    // Its first writer gives each its id, carrying what matches.
+    for name in ["kb", "kb2"] {
+        let c = eo.find_cauldron(name).unwrap().unwrap();
+        grants::adopt(&eo, &c).unwrap().unwrap();
+    }
+    let kb_id = manifest_field(&old, "kb", "id").unwrap();
+    let g = store_json(&old);
+    let of = |n: &str| g["grants"].as_array().unwrap().iter().find(|x| x["cauldron"] == n).cloned().unwrap();
+    assert_eq!(of("kb")["cauldron_id"], kb_id.as_str());
+    assert!(of("kb2").get("cauldron_id").is_none(), "{g}");
+    assert_eq!(opens(&old, "kb"), Ok(()));
+    assert_eq!(ra::load(&eo.data_root, "kb").unwrap().unwrap().bound_to.unwrap().id.as_deref(), Some(kb_id.as_str()));
+    assert!(ra::is_on(&eo, "kb"));
+    // kb2: refused, each naming the command that makes it again.
+    assert_eq!(opens(&old, "kb2"), Err("NotGranted".into()));
+    let err = grants::Grants::load(&eo).unwrap().authorize(&eo, "kb2", Scope::Read).unwrap_err().to_string();
+    assert!(err.contains("before cauldrons had ids") && err.contains("cauldron mcp grant kb2 --env dev"), "{err}");
+    let o = run(&old, &["mcp", "grants", "--env", "dev"]);
+    assert!(o.err.contains("cauldron mcp grant kb2 --env dev"), "{}", o.err);
+    let q = ra::effective(&eo, "kb2").unwrap().unwrap();
+    assert!(!q.runs() && q.void.as_deref().unwrap().contains("before cauldrons had ids"), "{q:?}");
+    assert!(ra::queue(&q, "dev", None, &Default::default(), "now", None)["what_to_do"].as_str().unwrap().contains("cauldron ripples on kb2 --env dev"));
+    // A second writer changes nothing: the id is minted once.
+    let c = eo.find_cauldron("kb").unwrap().unwrap();
+    assert_eq!(grants::adopt(&eo, &c).unwrap().as_deref(), Some(kb_id.as_str()));
 }

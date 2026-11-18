@@ -170,3 +170,24 @@ fn s4_calls_killed_mid_way_count_against_the_cap() {
     assert_eq!(st["possibly_running"], json!([]), "each start cancelled the call the kill left");
     assert!(s.ripple_nodes().is_empty());
 }
+
+/// **One service per environment.** A second ripples service started on
+/// the same data root refuses at once, naming the first's pid, and leaves
+/// the first's run key alone; once the first is gone, a new one starts.
+#[test]
+fn s_two_services_on_one_environment_the_second_refuses() {
+    let s = Scratch::new("two");
+    let door = Door::start(&s);
+    let script = s.script("two", json!([]));
+    let vars = [("CAULDRON_RIPPLES_INFERENCE", format!("scripted:{}", script.display()))];
+    let first = Service::start(&s, &door, &vars);
+    let key = Service::key(&s);
+    let out = Service::command(&s, &door, &vars).output().unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("another ripples service") && err.contains(&format!("pid {}", first.child.id())), "{err}");
+    assert_eq!(Service::key(&s), key, "the first's run key is untouched");
+    drop(first);
+    let again = Service::start(&s, &door, &vars);
+    drop(again);
+}

@@ -17,7 +17,7 @@ use cauldron_ripples::threads::{Threads, DENIED_TOOLS, INJECTIONS};
 
 /// How the fake behaves.
 #[derive(Clone, Copy, PartialEq)]
-enum Mode {
+pub(crate) enum Mode {
     /// The current threads: keeps every setting it was sent.
     Current,
     /// An older threads: drops the settings it does not know (`completion`)
@@ -31,12 +31,21 @@ enum Mode {
 
 /// A fake chassis: answers every request, records them, and hands out
 /// `events` on the first history read after the send.
-struct Fake {
-    addr: SocketAddr,
+pub(crate) struct Fake {
+    pub(crate) addr: SocketAddr,
     seen: Arc<Mutex<Vec<Value>>>,
 }
 
+/// What the fake hands on a call's history read: the events of call `n`
+/// (0, 1, …), given the settings the call's thread was created with.
+pub(crate) type Gen = Arc<dyn Fn(usize, &Value) -> Vec<Value> + Send + Sync>;
+
 impl Fake {
+    /// The calls sent so far.
+    pub(crate) fn sends(&self) -> usize {
+        self.seen.lock().unwrap().iter().filter(|f| f["method"].as_str().is_some_and(|m| m.ends_with("/send"))).count()
+    }
+
     fn methods(&self) -> Vec<String> {
         self.seen.lock().unwrap().iter().filter_map(|f| f["method"].as_str().map(|m| m.replace("t-fake", "<t>"))).collect()
     }
@@ -47,6 +56,11 @@ impl Fake {
 }
 
 fn fake_with(secret: Option<&'static str>, events: Vec<Value>, mode: Mode) -> Fake {
+    fake_gen(secret, Arc::new(move |_, _| events.clone()), mode)
+}
+
+/// A fake whose every call answers what `gen` gives it.
+pub(crate) fn fake_gen(secret: Option<&'static str>, gen: Gen, mode: Mode) -> Fake {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     env::egress::grant_addr(addr).unwrap();
@@ -56,12 +70,13 @@ fn fake_with(secret: Option<&'static str>, events: Vec<Value>, mode: Mode) -> Fa
     let cancelled = Arc::new(Mutex::new(false));
     std::thread::spawn(move || {
         for stream in l.incoming().flatten() {
-            let (log, events, stored, cancelled) = (log.clone(), events.clone(), stored.clone(), cancelled.clone());
+            let (log, gen, stored, cancelled) = (log.clone(), gen.clone(), stored.clone(), cancelled.clone());
             std::thread::spawn(move || {
                 let mut ws = tungstenite::accept(stream).unwrap();
                 let send = |ws: &mut tungstenite::WebSocket<std::net::TcpStream>, v: Value| ws.send(tungstenite::Message::Text(v.to_string())).is_ok();
                 send(&mut ws, json!({"type": "welcome", "proto": 1, "daemon": "threads", "daemon_version": "0", "boot_id": "b", "auth_required": secret.is_some()}));
                 let mut handed = false;
+                let mut given = 0usize;
                 loop {
                     let Ok(tungstenite::Message::Text(t)) = ws.read() else { return };
                     let f: Value = serde_json::from_str(&t).unwrap();
@@ -89,6 +104,7 @@ fn fake_with(secret: Option<&'static str>, events: Vec<Value>, mode: Mode) -> Fa
                             s.as_object_mut().unwrap().remove("completion");
                         }
                         *stored.lock().unwrap() = s;
+                        *cancelled.lock().unwrap() = false;
                         json!({"thread_id": "t-fake", "promise_id": "p", "visible": true})
                     } else if m == "threads/list" {
                         let idle = *cancelled.lock().unwrap() && mode != Mode::Stuck;
@@ -105,9 +121,13 @@ fn fake_with(secret: Option<&'static str>, events: Vec<Value>, mode: Mode) -> Fa
                         json!({"accepted": true, "thread_id": "t-fake", "message_id": 7})
                     } else if m.ends_with("/history") && !handed {
                         handed = true;
-                        json!({"thread_id": "t-fake", "events": events, "next_after": events.len()})
+                        let n = log.lock().unwrap().iter().filter(|f| f["method"].as_str().is_some_and(|m| m.ends_with("/send"))).count().saturating_sub(1);
+                        let settings = stored.lock().unwrap().clone();
+                        let events = gen(n, &settings);
+                        given = events.len();
+                        json!({"thread_id": "t-fake", "events": events, "next_after": given})
                     } else {
-                        json!({"thread_id": "t-fake", "events": [], "next_after": events.len()})
+                        json!({"thread_id": "t-fake", "events": [], "next_after": given})
                     };
                     send(&mut ws, json!({"type": "response", "correlate": f["id"], "outcome": {"type": "success", "payload": payload}}));
                 }
@@ -121,15 +141,15 @@ fn fake(secret: Option<&'static str>, events: Vec<Value>) -> Fake {
     fake_with(secret, events, Mode::Current)
 }
 
-fn ev(seq: u64, event: Value) -> Value {
+pub(crate) fn ev(seq: u64, event: Value) -> Value {
     json!({"seq": seq, "message_id": 7, "ts": "2026-01-01T00:00:00Z", "event": event})
 }
 
-fn usage_ev(seq: u64, id: &str, input: u64, output: u64) -> Value {
+pub(crate) fn usage_ev(seq: u64, id: &str, input: u64, output: u64) -> Value {
     ev(seq, json!({"kind": "message_usage", "model": "claude-sonnet-x", "input_tokens": input, "output_tokens": output, "cache_read_tokens": 100, "cache_creation_tokens": 0, "api_message_id": id}))
 }
 
-fn answer(seq: u64, attempt: u64, status: &str, value: Value) -> Value {
+pub(crate) fn answer(seq: u64, attempt: u64, status: &str, value: Value) -> Value {
     ev(seq, json!({"kind": "custom", "event_type": "cauldron.threads/structured_output",
         "data": {"turn": 1, "for_message": 7, "attempt": attempt, "schema_sha": "s", "status": status, "value": value, "errors": []}}))
 }
@@ -263,7 +283,10 @@ fn t2_unmet_parked_and_unreachable_and_every_give_up_cancels() {
     let f = fake(None, vec![ev(1, json!({"kind": "turn_parked", "cause": "budget", "reason": "over", "message_ids": [7]}))]);
     let t = Threads::new(&f.addr.to_string(), None, None, Duration::from_secs(30));
     let (r, notes) = req_noting();
-    assert!(matches!(t.call(&r), Err(Failure::Parked(_))));
+    match t.call(&r) {
+        Err(Failure::Parked { cause, usage, .. }) => assert_eq!((cause, usage.input_total()), ("budget", 0)),
+        other => panic!("{other:?}"),
+    }
     let m = f.methods();
     let (c, q) = (m.iter().position(|x| x == "threads/<t>/cancel").unwrap(), m.iter().position(|x| x == "threads/<t>/queue_cancel").unwrap());
     assert!(c < q, "{m:?}");
@@ -328,7 +351,10 @@ fn t8_a_scheduled_re_delivery_ends_the_call() {
                 assert!(!message.contains(&home), "{message}");
                 assert_eq!(usage.input_tokens, 7);
             }
-            (Err(Failure::Parked(m)), true) => assert!(m.contains(kind), "{m}"),
+            (Err(Failure::Parked { message, cause, usage }), true) => {
+                assert!(message.contains(kind), "{message}");
+                assert_eq!((cause, usage.input_tokens), ("usage_limit", 7), "a park after the call began keeps what it spent");
+            }
             (other, _) => panic!("{kind}: {other:?}"),
         }
         assert!(started.elapsed() < Duration::from_secs(20), "{kind} waited {:?}", started.elapsed());

@@ -214,7 +214,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "soup_dump",
         needs: Needs::Scope(Scope::Dump),
-        description: "Keep a piece of raw text in the cauldron as a dump, for later processing: it lands as `DM-<n>` in state `received`, in the cauldron's dumps store beside its soup (not as a soup node). One dump is one write. At most 1 MiB of text (larger is refused as `too_large`; split it). `title` names it; `source` says where the text came from; `cite` (meta.cites form) and `refs` (soup ids) are kept with it. Answers a receipt (id, bytes, sha256, cursor), never the text. A dump is processed into records only when its owner runs `cauldron ripples run <id>` at a terminal; automatic processing comes in a later release.",
+        description: "Keep a piece of raw text in the cauldron as a dump, for later processing: it lands as `DM-<n>` in state `received`, in the cauldron's dumps store beside its soup (not as a soup node). One dump is one write. At most 1 MiB of text (larger is refused as `too_large`; split it). `title` names it; `source` says where the text came from; `cite` (meta.cites form) and `refs` (soup ids) are kept with it. Answers a receipt (id, bytes, sha256, cursor), never the text. A dump becomes records when its owner runs `cauldron ripples run <id>`, or, when its owner turned automatic processing on for the cauldron (`cauldron ripples on`, at a terminal), by the ripples service with no further command: the receipt's `automatic` says whether it is on and takes this dump. `wait_secs` (0 to 120) waits that long at most for it, and the receipt's `processing` then gives the dump's state, the run and the record ids made (records stay marked `unreviewed` until the owner approves them).",
         schema: || {
             object(
                 json!({"cauldron": cauldron(),
@@ -222,7 +222,8 @@ pub const TOOLS: &[Tool] = &[
                        "title": {"type": "string", "description": "A short name for the dump (at most 200 characters)."},
                        "source": {"type": "string", "description": "Where the text came from, in a few words (at most 500 characters)."},
                        "cite": {"type": "object", "description": "One citation in `meta.cites` form, e.g. {\"kind\":\"url\",\"url\":\"…\"}."},
-                       "refs": {"type": "array", "items": {"type": "string"}, "description": "Ids of soup nodes this text is about."}}),
+                       "refs": {"type": "array", "items": {"type": "string"}, "description": "Ids of soup nodes this text is about."},
+                       "wait_secs": {"type": "integer", "minimum": 0, "maximum": 120, "description": "When automatic processing is on for the cauldron, wait at most this many seconds for it and answer the records it made (`processing`). Default 0: answer at once."}}),
                 &["text"],
             )
         },
@@ -230,7 +231,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "soup_dump_session",
         needs: Needs::Scope(Scope::Dump),
-        description: "Keep a Claude Code session's transcript in the cauldron as a dump, verbatim, for later processing (at most 64 MiB). The session is `session_id`, else this session. Its transcript is found on this machine under the Claude Code config directory's `projects` store, by the bridge, never by a path. A transcript holds tool output and anything pasted into the session; it is stored as it is. Answers a receipt (id, bytes, sha256 equal to the transcript file's, lines, cwd). `session_unknown` when no transcript has that id.",
+        description: "Keep a Claude Code session's transcript in the cauldron as a dump, verbatim, for later processing (at most 64 MiB). The session is `session_id`, else this session. Its transcript is found on this machine under the Claude Code config directory's `projects` store, by the bridge, never by a path. A transcript holds tool output and anything pasted into the session; it is stored as it is. Answers a receipt (id, bytes, sha256 equal to the transcript file's, lines, cwd, and `automatic`: whether automatic processing is on and takes this dump, which needs the owner's `--include-sessions`). `session_unknown` when no transcript has that id.",
         schema: || {
             object(
                 json!({"cauldron": cauldron(),

@@ -173,21 +173,24 @@ fn l2_the_retry_of_a_local_run_stays_local() {
     assert_eq!(s.dump_state(&id)["state"], "received");
 }
 
-/// l3: local tokens cost nothing, and the caps still hold: a backend that is
-/// always busy is called 3 times for the dump, then the run is deferred.
+/// l3: a local backend that is always busy (another request holds it) is
+/// tried 3 times by a run, which then ends `deferred` (reason `busy`); a
+/// busy answer reached no model, so it is charged nothing and the dump's
+/// caps are untouched. A run makes at most those 3 tries.
 #[test]
-fn l3_the_per_dump_call_cap_bounds_a_local_loop() {
+fn l3_a_busy_local_backend_is_tried_a_bounded_number_of_times_and_charged_nothing() {
     let s = Scratch::new("l3");
     let door = Door::start(&s);
     let id = door.dump("a note");
     let fake = FakeInference::start(&s, vec![json!({"ok": false, "code": "busy", "message": "another request is in progress"})]);
     let (ctx, _) = local_engine(&s, &door, Some(&fake), Caps::default());
     let out = engine::run(&ctx, &ask_local(&id));
-    assert_eq!((out["outcome"].clone(), out["reason"].clone()), (json!("deferred"), json!("budget")), "{out}");
-    assert_eq!(fake.completes().len(), 3);
+    assert_eq!((out["outcome"].clone(), out["reason"].clone()), (json!("deferred"), json!("busy")), "{out}");
+    assert_eq!(fake.completes().len(), engine::BUSY_TRIES as usize);
+    assert_eq!(cauldron_ripples::journal::spent(&s.journal(), out["run"].as_str().unwrap()), (0, 0));
     let again = engine::run(&ctx, &ask_local(&id));
-    assert_eq!(again["outcome"], "deferred");
-    assert_eq!(fake.completes().len(), 3, "counted across runs");
+    assert_eq!((again["outcome"].clone(), again["reason"].clone()), (json!("deferred"), json!("busy")));
+    assert_eq!(fake.completes().len(), 2 * engine::BUSY_TRIES as usize, "a run's tries are bounded");
 }
 
 /// l4: no inference service: failed, with how to start it; nothing sent,

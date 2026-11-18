@@ -25,9 +25,17 @@
 //! - Everything inside the directory moves with it: its soup, its dumps
 //!   store, its face's files.
 //! - The MCP door's grants follow the move (`soup_door::grants`): a rename
-//!   carries the grant to the new name, bound to the cauldron's identity
-//!   (its `created_at`, which a rename keeps), so it still opens it and never
-//!   a cauldron made later under either name; a remove drops it.
+//!   carries the grant to the new name, bound to the cauldron's id (in its
+//!   `cauldron.toml`, which a rename keeps; a cauldron made before ids is
+//!   given one first), so it still opens it and never a cauldron made later
+//!   under either name; a remove drops it.
+//! - Automatic ripples processing (`env::ripples_auto`) does NOT follow the
+//!   move: `remove` and `rename` turn it off for the old name and say so
+//!   (an authorisation of automatic model spend is the owner's act at a
+//!   terminal, for one cauldron, and never moves silently); `rename` prints
+//!   the `cauldron ripples on` command for the new name. A setting left
+//!   behind by any other path is void anyway: it is bound to the cauldron's
+//!   identity and checked before every automatic run.
 //! - A project's `.cauldron` marker (`cauldron link`) that names the old name
 //!   is NOT updated: markers are not tracked. Both verbs say so.
 //! - The implicit LEGACY cauldron is never renamed (`check_renamable`)
@@ -225,6 +233,9 @@ fn create_with<T>(
         }
         let meta = CauldronMeta {
             name: Some(name.to_string()),
+            // Its own id, never another cauldron's: what its MCP grant and
+            // its automatic ripples setting are bound to.
+            id: Some(env::cauldron::new_cauldron_id().context("minting the cauldron's id")?),
             created_at: Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             seed: seed.clone(),
             ..CauldronMeta::default()
@@ -557,6 +568,9 @@ pub(crate) fn verb_rename(args: &[String]) -> Result<i32> {
     refuse_held_tranche(&c)?;
     refuse_live_soup(&e, "rename")?;
     let _writers = take_writer_locks(&e, &c, "rename")?;
+    // A cauldron made before ids is given its id now (a rename is a writer),
+    // so its grant follows it by that id.
+    let id = soup_door::grants::adopt(&e, &c).map_err(door_err)?;
     let identity = soup_door::grants::identity(&c);
     // Read before anything moves: a grant store that cannot be read refuses here.
     let granted = soup_door::grants::Grants::load(&e).map_err(door_err)?.get(old).is_some();
@@ -598,8 +612,8 @@ pub(crate) fn verb_rename(args: &[String]) -> Result<i32> {
     // leaves a grant naming a cauldron that is not there.
     match soup_door::grants::rename(&e, old, new, identity.as_deref()) {
         Ok(_) if granted => println!(
-            "cauldron: its MCP grant now names `{new}` and still opens it (bound to the cauldron created {})",
-            identity.as_deref().unwrap_or("at an unknown time")
+            "cauldron: its MCP grant now names `{new}` and still opens it (bound to the cauldron's id {}, which a rename keeps)",
+            id.as_deref().unwrap_or("(none: the cauldron has no manifest)")
         ),
         Ok(_) => println!("cauldron: it has no MCP grant; nothing to carry"),
         Err(err) => bail!(
@@ -611,8 +625,39 @@ pub(crate) fn verb_rename(args: &[String]) -> Result<i32> {
             e.name
         ),
     }
+    ripples_auto_off(&e, old, Some(new))?;
     println!("{}", marker_note(&e, old, &format!("re-link such a project with `cauldron link {new} --env {} --replace` there", e.name)));
     Ok(0)
+}
+
+/// **Automatic ripples processing does not follow a cauldron that moves**
+/// (`remove`, `rename`): turned off for `old`, and said; for a rename, the
+/// command that turns it on for `new`, at a terminal. A failure to write the
+/// setting is said and is not fatal: the setting is bound to the cauldron's
+/// identity, so it runs nothing for a cauldron that is gone either way.
+fn ripples_auto_off(e: &Environment, old: &str, new: Option<&str>) -> Result<()> {
+    if env::ripples_auto::load(&e.data_root, old).ok().flatten().is_none_or(|s| !s.on) {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    match env::ripples_auto::turn_off(&e.data_root, old, &now) {
+        Ok(Some(was)) => {
+            println!("cauldron: automatic ripples processing was on for `{old}`; it is now OFF (it never follows a cauldron that moves)");
+            if let Some(new) = new {
+                println!(
+                    "cauldron: to process `{new}`'s dumps automatically, its owner turns it on again at a terminal:\n    {}",
+                    env::ripples_auto::on_command(&was, new, &e.name)
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(err) => eprintln!(
+            "cauldron: WARNING: automatic ripples processing could not be turned off for `{old}` ({err}); it runs nothing \
+             for a cauldron that is gone, and `cauldron ripples off {old} --env {}` clears it",
+            e.name
+        ),
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------- remove
@@ -649,6 +694,9 @@ pub(crate) fn verb_remove(args: &[String]) -> Result<i32> {
         if granted {
             println!("  MCP grant      dropped (the MCP door no longer opens `{name}`)");
         }
+        if env::ripples_auto::load(&e.data_root, &name).ok().flatten().is_some_and(|s| s.on) {
+            println!("  ripples        automatic processing turned off for `{name}`");
+        }
         println!("  untouched      every other cauldron, and the environment itself");
         println!("cauldron: re-run with `--yes` to do it.");
         return Ok(2);
@@ -670,6 +718,7 @@ pub(crate) fn verb_remove(args: &[String]) -> Result<i32> {
             e.name
         ),
     }
+    ripples_auto_off(&e, &name, None)?;
     println!("{}", marker_note(&e, &name, "`cauldron soup` run in such a project now refuses it"));
     Ok(0)
 }

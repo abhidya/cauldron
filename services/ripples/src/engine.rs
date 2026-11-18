@@ -77,6 +77,11 @@ impl Default for Caps {
 /// The most tokens one answer may have.
 pub const MAX_OUTPUT_TOKENS: u32 = crate::threads::MAX_OUTPUT_TOKENS;
 
+/// The most calls one run makes to a busy backend by hand (an automatic
+/// run makes one, and waits for the next scan). A busy answer is charged
+/// nothing and is not a call against the caps.
+pub const BUSY_TRIES: u32 = 3;
+
 /// The model of the first call, unless asked otherwise.
 pub const FIRST_MODEL: &str = "sonnet";
 /// The model of the one retry.
@@ -117,6 +122,42 @@ pub struct Prepared {
     pub dump: Value,
     /// A text dump's text, read with the dump.
     pub text: Option<String>,
+    /// The cauldron's identity ([`cauldron_identity`]): what its daily cap
+    /// is counted by.
+    pub identity: String,
+    /// Every identity its calls were journaled under ([`cauldron_identities`]).
+    pub identities: Vec<String>,
+}
+
+/// **A cauldron's identity**, as its daily cap counts it: the binding its
+/// automatic setting and MCP grant are bound to (the environment and the
+/// cauldron's id; for a cauldron with no id yet, its `created_at` and its
+/// directory's inode; `env::ripples_auto::Binding`), so a cauldron removed
+/// and made again under the same name starts its day clean, and one renamed
+/// or moved keeps what it spent. A name that is no cauldron there now is its
+/// name.
+pub fn cauldron_identity(e: &env::Environment, cauldron: &str) -> String {
+    cauldron_identities(e, cauldron).remove(0)
+}
+
+/// [`cauldron_identity`], then the identity the cauldron's calls carried
+/// before it was given its id (its `created_at` and inode), so the calls of
+/// the day it was given one still count.
+pub fn cauldron_identities(e: &env::Environment, cauldron: &str) -> Vec<String> {
+    match e.find_cauldron(cauldron) {
+        Ok(Some(c)) => {
+            let b = env::ripples_auto::Binding::of(e, &c);
+            if b.id.is_none() && b.created_at.is_none() && b.dir_ino.is_none() {
+                return vec![format!("name:{cauldron}")];
+            }
+            let mut out = vec![format!("id:{}", b.key())];
+            if b.id.is_some() && b.created_at.is_some() {
+                out.push(format!("id:{}", b.legacy_key()));
+            }
+            out
+        }
+        _ => vec![format!("name:{cauldron}")],
+    }
 }
 
 /// Is `model` a local model id (`local:<name>`, run by the `inference`
@@ -151,10 +192,72 @@ fn outcome(ask: &Ask, run: &str, what: &str) -> Value {
 
 fn refused_outcome(ask: &Ask, run: &str, r: &Refused, what_to_do: &str) -> Value {
     let mut v = outcome(ask, run, "failed");
-    v["code"] = json!(r.code);
-    v["message"] = json!(r.message);
+    let code = if code_ok(&r.code) { r.code.as_str() } else { "refused" };
+    v["code"] = json!(code);
+    v["message"] = json!(fixed_message(code));
+    v["detail"] = json!(r.message);
     v["what_to_do"] = json!(what_to_do);
     v
+}
+
+/// A code is a short word of the fixed vocabulary's shape.
+fn code_ok(c: &str) -> bool {
+    !c.is_empty() && c.len() <= 40 && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
+
+/// **The message an outcome carries for a code**: a fixed sentence, never
+/// a backend's or the `mcp` service's own words, and never the model's
+/// answer or the dump's text, so what is journaled or written into a
+/// dump's record (`meta.failure`, `meta.auto`) holds none of either. The
+/// words a backend or the soup gave are in the outcome's `detail`, which
+/// only the caller of a run by hand is shown and which is never written
+/// (`--debug-keep-answer` keeps it, in a private file, for a run by hand).
+pub fn fixed_message(code: &str) -> String {
+    match code {
+        "answer_refused" => "the model's answer was refused again after the retry (it did not meet the package's schema, or the soup refused its records); the answer's text is not kept".into(),
+        "inference_failed" => "the model call failed".into(),
+        "inference_unavailable" => "the backend could not be reached; nothing was sent".into(),
+        "threads_unsupported" => "the threads service does not take this call (an older release); nothing was sent".into(),
+        "threads_budget" | "threads_parked" => park_message("parked", false),
+        "scrub_timeout" => "the secret scrubber did not finish within its time budget, so nothing was sent".into(),
+        "busy" => "the backend was busy (another request held it, or it was not ready yet) and refused the call before it ran; nothing reached a model and nothing was charged; the dump waits to be tried again".into(),
+        "mcp_down" => "the mcp service could not be reached".into(),
+        "not_granted" => "the cauldron is not granted to the MCP door with read, write and dump".into(),
+        "not_found" => "no such dump in this cauldron".into(),
+        "dump_removed" => "the dump was removed (or its removal is unfinished); it is never processed".into(),
+        "unauthorized" => "the mcp service did not take the run key".into(),
+        "batch_refused" | "records_refused" => "the soup refused the answer's records".into(),
+        other => format!("the mcp service refused the request ({other})"),
+    }
+}
+
+/// **The message of a call threads parked**, by its cause (a word of
+/// [`crate::inference::PARK_CAUSES`]): fixed sentences, never threads' own
+/// words (which name accounts).
+pub fn park_message(cause: &str, held: bool) -> String {
+    let why = match cause {
+        "threshold" => "every account it may use is over its usage threshold",
+        "usage_limit" => "an account reached its usage limit",
+        "credit_balance" => "the account's credit balance is spent",
+        "login_expired" => "the account's login has expired",
+        "budget" => "one of its budgets tripped",
+        _ => "it holds calls for now",
+    };
+    let sent = if held { "nothing reached a model and nothing was charged" } else { "the call was cut short and what it spent is charged" };
+    format!("threads parked the call: {why}; the call was withdrawn, {sent}; it is not a failure and the dump waits to be tried again")
+}
+
+/// **What of an outcome is written down** (the run journal's `done` line,
+/// the automatic journal, a dump's record): everything but the words a
+/// backend or the soup gave (`detail`) and the model's `notes`.
+pub fn journal_view(v: &Value) -> Value {
+    let mut x = v.clone();
+    if let Some(o) = x.as_object_mut() {
+        for k in ["detail", "notes"] {
+            o.remove(k);
+        }
+    }
+    x
 }
 
 /// What to do about a refusal from the `mcp` service, in a sentence.
@@ -199,7 +302,9 @@ pub fn prepare(ctx: &Ctx, ask: &Ask) -> Result<Prepared, Value> {
         }
         _ => {}
     }
-    Ok(Prepared { ask: ask.clone(), run, text: d["text"].as_str().map(str::to_string), dump })
+    let identities = cauldron_identities(&ctx.env, &ask.cauldron);
+    let identity = identities[0].clone();
+    Ok(Prepared { ask: ask.clone(), run, text: d["text"].as_str().map(str::to_string), dump, identity, identities })
 }
 
 /// A session dump's text view, whole, as `[role] text` turns; stops early
@@ -242,8 +347,13 @@ pub(crate) struct Workdir(pub(crate) PathBuf);
 impl Workdir {
     pub(crate) fn make(root: &std::path::Path, run: &str) -> std::io::Result<Workdir> {
         use std::os::unix::fs::DirBuilderExt;
+        // The clock alone does not tell two calls apart (macOS gives it in
+        // microseconds, so concurrent runs of one dump in one process could
+        // pick one name): a count of the directories this process made does.
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        let p = root.join(format!("cauldron-ripple-{}-{}-{nanos}", &run[..run.len().min(8)], std::process::id()));
+        let p = root.join(format!("cauldron-ripple-{}-{}-{nanos}-{n}", &run[..run.len().min(8)], std::process::id()));
         std::fs::DirBuilder::new().mode(0o700).create(&p)?;
         Ok(Workdir(p))
     }
@@ -280,8 +390,80 @@ pub fn settle(ctx: &Ctx) -> Vec<Value> {
     out
 }
 
+/// How a run is held beyond its [`Ask`]: what an automatic run adds.
+#[derive(Default, Clone, Copy)]
+pub struct Opts<'a> {
+    /// Started by automatic processing, not by the owner.
+    pub automatic: bool,
+    /// Asked before every model call (under the journal's lock, with the
+    /// caps) and before the batch is put: `Some(why)` stops the run there as
+    /// `deferred` with reason `off`, and nothing more is sent or written
+    /// (`cauldron ripples off` takes effect before the next call).
+    pub gate: Option<&'a (dyn Fn() -> Option<String> + Sync)>,
+    /// Send a local model the text unscrubbed (`cauldron ripples on
+    /// --no-scrub-local`). What goes through threads is always scrubbed, and
+    /// the answer always is.
+    pub no_scrub_local: bool,
+    /// `cauldron ripples run --debug-keep-answer` (by hand only, never an
+    /// automatic run): the model's answers and the refusals, which are
+    /// otherwise written nowhere, kept in one private file
+    /// (`<data root>/ripples/debug/`, 0600), its path in the outcome.
+    pub keep_answer: bool,
+    /// The secret scrubber's time for this run, instead of
+    /// [`crate::scrub::budget_for`] the text's size (tests).
+    pub scrub_budget: Option<Duration>,
+}
+
+/// The run's outcome when the scrubber ran out of time: failed
+/// `scrub_timeout`, nothing sent (or, for the answer, nothing written).
+fn scrub_timeout(ask: &Ask, run: &str, x: &crate::scrub::Exhausted, what: &str) -> Value {
+    let mut v = outcome(ask, run, "failed");
+    v["code"] = json!("scrub_timeout");
+    v["message"] = json!(fixed_message("scrub_timeout"));
+    v["scrub"] = json!({"bytes": x.bytes, "budget_ms": x.budget_ms, "of": what});
+    v["what_to_do"] = json!(if what == "sent" {
+        "nothing was sent to a model and the dump stays `received`; curate it by hand (`/cauldron:curate-dump`)"
+    } else {
+        "the answer was not written and the dump stays `received`; curate it by hand (`/cauldron:curate-dump`)"
+    });
+    v
+}
+
+/// Write what `--debug-keep-answer` kept; its path.
+fn keep_answer(ctx: &Ctx, opts: &Opts<'_>, run: &str, kept: &std::sync::Mutex<Vec<Value>>) -> Option<String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if !opts.keep_answer || opts.automatic {
+        return None;
+    }
+    let items = std::mem::take(&mut *kept.lock().unwrap_or_else(|p| p.into_inner()));
+    let dir = ctx.env.data_root.join(crate::SERVICE).join("debug");
+    env::private::make_dir(&ctx.env.data_root.join(crate::SERVICE)).ok()?;
+    env::private::make_dir(&dir).ok()?;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let path = dir.join(format!("answer-{}-{nanos}.json", &run[..run.len().min(12)]));
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(env::private::FILE_MODE).open(&path).ok()?;
+    let doc = json!({"run": run, "note": "kept by `--debug-keep-answer`: the model's answers and the refusals, unscrubbed; delete this file when done", "items": items});
+    f.write_all(serde_json::to_string_pretty(&doc).ok()?.as_bytes()).ok()?;
+    f.sync_all().ok()?;
+    Some(path.display().to_string())
+}
+
+fn gated(ask: &Ask, run: &str, why: String) -> Value {
+    let mut v = outcome(ask, run, "deferred");
+    v["reason"] = json!("off");
+    v["message"] = json!(why);
+    v["what_to_do"] = json!("nothing more was sent or written and the dump stays `received`; turn automatic processing on again, or run it by hand (`cauldron ripples run`)");
+    v
+}
+
 /// **Steps 3-5.** Answers the run's outcome (also the journal's `done`).
 pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
+    execute_with(ctx, p, &Opts::default())
+}
+
+/// [`execute`], held by `opts`.
+pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
     let (ask, run) = (&p.ask, p.run.as_str());
     let j = |event: &str, extra: Value| ctx.journal.write(run, &ask.cauldron, &ask.dump, event, extra);
     let first = ask.model.clone().unwrap_or_else(|| FIRST_MODEL.to_string());
@@ -289,6 +471,9 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
     let mut started = json!({"model": first, "package": format!("{}@{}", package::PACKAGE, package::VERSION), "backend": backend});
     if let Some(n) = ask.force_budget {
         started["force_budget"] = json!(n);
+    }
+    if opts.automatic {
+        started["automatic"] = json!(true);
     }
     if let Err(e) = j("started", started) {
         let mut v = outcome(ask, run, "failed");
@@ -311,12 +496,23 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
             }
         })
     };
+    // `--debug-keep-answer` (a run by hand only): each answer and refusal,
+    // kept in a private file when the run ends; nowhere otherwise.
+    let kept: std::sync::Mutex<Vec<Value>> = Default::default();
+    let keep = |what: &str, v: Value| {
+        if opts.keep_answer {
+            kept.lock().unwrap_or_else(|p| p.into_inner()).push(json!({"what": what, "value": v}));
+        }
+    };
     let done = |mut v: Value, usage: &Usage, calls: u32, models: &[String]| -> Value {
         v["usage"] = json!(usage);
         v["input_total"] = json!(usage.input_total());
         v["calls"] = json!(calls);
         v["models"] = json!(models);
         v["backend"] = json!(backend);
+        if let Some(path) = keep_answer(ctx, opts, run, &kept) {
+            v["debug_file"] = json!(path);
+        }
         if let Some(c) = cancelled.lock().unwrap_or_else(|p| p.into_inner()).clone() {
             if c["confirmed"] != json!(true) {
                 let todo = v["what_to_do"].as_str().unwrap_or("").to_string();
@@ -324,7 +520,7 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
             }
             v["cancel"] = c;
         }
-        let mut extra = v.clone();
+        let mut extra = journal_view(&v);
         if let Some(o) = extra.as_object_mut() {
             for k in ["run", "cauldron", "dump"] {
                 o.remove(k);
@@ -399,22 +595,58 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
         return done(v, &usage, calls, &models);
     }
     let kind = p.dump["kind"].as_str().unwrap_or("text");
-    let prompt = package::prompt(&ask.dump, kind, regions, &text);
-    let est = estimate(prompt.chars().count());
-    let _ = j("read", json!({"prompt_chars": prompt.chars().count(), "estimated_input_tokens": est, "text_cut": cut, "regions": regions.len().min(package::MAX_REGIONS), "spent_before": {"calls": calls_before, "charged_input_tokens": tokens_before}}));
+    // Too long for the dump's cap: deferred before the text is scrubbed, so
+    // a dump that is not sent costs no scrubbing either.
     if cut {
+        let _ = j("read", json!({"text_cut": true, "regions": regions.len().min(package::MAX_REGIONS), "spent_before": {"calls": calls_before, "charged_input_tokens": tokens_before}}));
         let mut v = outcome(ask, run, "deferred");
         v["reason"] = json!("budget");
         v["message"] = json!(format!("this dump's text is longer than {budget_note} leaves room for ({room} input tokens); nothing was sent to a model"));
         v["what_to_do"] = json!("curate it by hand (`/cauldron:curate-dump`), or give this run more with `--force-budget <tokens>`; the dump stays `received`");
         return done(v, &usage, calls, &models);
     }
+    // The secret scrubber (`crate::scrub`) on what is sent: always through
+    // threads, and to a local model unless the owner said otherwise. The
+    // stored dump is never changed: this is the run's copy. Held to a time
+    // budget in proportion to the text; out of time, nothing is sent (it
+    // fails closed, whatever the backend).
+    let scrub_sent = !is_local(&first) || !opts.no_scrub_local;
+    let mut regions = regions.clone();
+    let text = if scrub_sent {
+        let bytes = text.len() + regions.iter().map(crate::scrub::value_bytes).sum::<usize>();
+        let deadline = std::time::Instant::now() + opts.scrub_budget.unwrap_or_else(|| crate::scrub::budget_for(bytes));
+        let scrubbed = crate::scrub::scrub_within(&text, deadline).and_then(|(t, mut counts)| {
+            for r in regions.iter_mut() {
+                for k in ["handle", "boundary"] {
+                    crate::scrub::add(&mut counts, &crate::scrub::scrub_value_within(&mut r[k], deadline)?);
+                }
+            }
+            Ok((t, counts))
+        });
+        match scrubbed {
+            Ok((t, counts)) => {
+                if !counts.is_empty() {
+                    let _ = j("redacted", json!({"in": "sent", "counts": counts}));
+                }
+                t
+            }
+            Err(x) => return done(scrub_timeout(ask, run, &x, "sent"), &usage, calls, &models),
+        }
+    } else {
+        text
+    };
+    let regions = &regions;
+    let prompt = package::prompt(&ask.dump, kind, regions, &text);
+    let est = estimate(prompt.chars().count());
+    let _ = j("read", json!({"prompt_chars": prompt.chars().count(), "estimated_input_tokens": est, "text_cut": cut, "regions": regions.len().min(package::MAX_REGIONS), "spent_before": {"calls": calls_before, "charged_input_tokens": tokens_before}}));
 
     // Step 4: the calls.
     let schema = package::schema();
     let mut model = first.clone();
     let mut retried = false;
     let mut feedback: Option<String> = None;
+    let mut refused_by: &str;
+    let mut busy = 0u32;
     loop {
         let this_prompt = match &feedback {
             None => prompt.clone(),
@@ -436,6 +668,9 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
         // no other run can count the same last slot.
         let call_id = format!("{}-{}-{}", std::process::id(), calls + 1, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         let begun = ctx.journal.begin(run, &ask.cauldron, &ask.dump, |lines| {
+            if let Some(why) = opts.gate.and_then(|g| g()) {
+                return Err(gated(ask, run, why));
+            }
             let (spent_calls, spent_tokens) = crate::journal::spent(lines, run);
             if spent_calls >= calls_cap || spent_tokens + this_est > tokens_cap {
                 let mut v = outcome(ask, run, "deferred");
@@ -447,7 +682,7 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
                 return Err(v);
             }
             let date = crate::journal::today();
-            let today = crate::journal::day(lines, &ask.cauldron, &date);
+            let today = crate::journal::day_of(lines, &ask.cauldron, &p.identities, &date);
             let new_dump = !today.dumps.contains(&ask.dump);
             if today.tokens + this_est > ctx.caps.day_tokens || (new_dump && today.dumps.len() >= ctx.caps.day_dumps) {
                 let mut v = outcome(ask, run, "deferred");
@@ -463,7 +698,7 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
                 v["what_to_do"] = json!("the dump stays `received`; run it again after midnight UTC, or curate it by hand (`/cauldron:curate-dump`)");
                 return Err(v);
             }
-            Ok(json!({"n": calls + 1, "call_id": call_id, "model": model, "estimated_input_tokens": this_est}))
+            Ok(json!({"n": calls + 1, "call_id": call_id, "model": model, "estimated_input_tokens": this_est, "cauldron_id": p.identity}))
         });
         match begun {
             Ok(Ok(())) => {}
@@ -496,17 +731,44 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
             Err(f) => (f.usage(), model.clone()),
         };
         usage.add(&call_usage);
-        // Nothing was sent when the backend refused the restricted request.
-        let charged = if matches!(answer, Err(Failure::Unsupported(_)) | Err(Failure::Unavailable(_))) { call_usage.input_total() } else { call_usage.input_total().max(this_est) };
+        // Nothing was sent when the backend refused the restricted request,
+        // and nothing reached a model when threads held the call before it
+        // ran (a park with no tokens reported: an account over its usage
+        // threshold, at admission). Such a call is `held`: charged nothing,
+        // and not counted as a call against any cap.
+        // A busy backend (another request holds it, or it is not ready)
+        // refused the call before it ran: held too.
+        let busy_now = matches!(answer, Err(Failure::Busy(_)));
+        let held = (busy_now || matches!(answer, Err(Failure::Parked { .. }))) && call_usage.input_total() == 0 && call_usage.output_tokens == 0;
+        let charged = if held || matches!(answer, Err(Failure::Unsupported(_)) | Err(Failure::Unavailable(_))) { call_usage.input_total() } else { call_usage.input_total().max(this_est) };
         let mut called = json!({"n": calls, "call_id": call_id, "model": model, "answered_by": answered_by, "usage": call_usage, "input_total": call_usage.input_total(), "charged": charged});
         if let Err(f) = &answer {
             called["failure"] = json!(f.code());
         }
+        if held {
+            called["held"] = json!(true);
+        }
+        if busy_now {
+            called["busy"] = json!(true);
+        }
         let _ = j("called", called);
+        match &answer {
+            Ok(reply) => keep("answer", reply.output.clone()),
+            Err(f) => keep("failure", json!({"code": f.code(), "message": f.message()})),
+        }
         let refusal: String = match answer {
             Ok(reply) => match package::to_records(&reply.output) {
-                Err(why) => why,
-                Ok(records) => match ctx.mcp.ask("RPUT", &put_args(p, "put", &model, json!(records))) {
+                Err(why) => {
+                    refused_by = "schema";
+                    why
+                }
+                Ok(_) if opts.gate.and_then(|g| g()).is_some() => {
+                    let why = opts.gate.and_then(|g| g()).unwrap_or_default();
+                    return done(gated(ask, run, why), &usage, calls, &models);
+                }
+                Ok(records) => match scrub_answer(&j, records, opts.scrub_budget) {
+                    Err(x) => return done(scrub_timeout(ask, run, &x, "answer"), &usage, calls, &models),
+                    Ok(records) => match ctx.mcp.ask("RPUT", &put_args(p, "put", &model, records)) {
                     Ok(v) => {
                         fault_point("after-put");
                         let mut o = outcome(ask, run, "processed");
@@ -518,28 +780,52 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
                     }
                     Err(r) if matches!(r.code.as_str(), "batch_refused" | "records_refused") => {
                         let _ = j("refused", json!({"code": r.code}));
+                        refused_by = "soup";
                         format!("{}: {}", r.message, clip(&r.detail.to_string(), 4000))
                     }
                     Err(r) => return done(fail(&r), &usage, calls, &models),
+                    },
                 },
             },
             Err(Failure::Busy(m)) => {
+                busy += 1;
+                // An automatic run gives the backend back at once and waits
+                // for the next scan; one by hand tries a few times first.
+                if opts.automatic || busy >= BUSY_TRIES {
+                    let mut v = outcome(ask, run, "deferred");
+                    v["reason"] = json!("busy");
+                    v["message"] = json!(fixed_message("busy"));
+                    v["detail"] = json!(m);
+                    v["what_to_do"] = json!(if opts.automatic {
+                        "the dump stays `received`; automatic processing tries it again at its next scan"
+                    } else {
+                        "the dump stays `received`; run this again in a moment (another request held the backend, or it was not ready yet)"
+                    });
+                    return done(v, &usage, calls, &models);
+                }
                 std::thread::sleep(ctx.backoff);
-                let _ = m;
                 continue;
             }
-            Err(Failure::Parked(m)) => {
+            Err(Failure::Parked { message: m, cause, .. }) => {
                 let mut v = outcome(ask, run, "deferred");
-                v["reason"] = json!("budget");
-                v["message"] = json!(m);
-                v["what_to_do"] = json!("threads held the call under its budget and the call was cancelled; the dump stays `received`. Run this again once the budget allows (`threads` decides).");
+                v["reason"] = json!("threads_parked");
+                v["held_by"] = json!("threads");
+                v["park"] = json!(cause);
+                v["reached_model"] = json!(!held);
+                v["message"] = json!(park_message(cause, held));
+                v["detail"] = json!(m);
+                v["what_to_do"] = json!("the dump stays `received`; run this again once threads takes calls again (`cauldron threads status` shows the accounts); automatic processing tries again by itself");
                 return done(v, &usage, calls, &models);
             }
-            Err(Failure::SchemaUnmet { message, .. }) => message,
+            Err(Failure::SchemaUnmet { message, .. }) => {
+                refused_by = "schema";
+                message
+            }
             Err(Failure::Unavailable(m)) => {
                 let mut v = outcome(ask, run, "failed");
                 v["code"] = json!("inference_unavailable");
-                v["message"] = json!(m);
+                v["message"] = json!(fixed_message("inference_unavailable"));
+                v["detail"] = json!(m);
                 v["what_to_do"] = json!(if is_local(&model) {
                     format!("start the inference service in this environment (`cauldron --env {} start inference`), then run this again; nothing was sent", ctx.env.name)
                 } else {
@@ -550,14 +836,16 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
             Err(Failure::Unsupported(m)) => {
                 let mut v = outcome(ask, run, "failed");
                 v["code"] = json!("threads_unsupported");
-                v["message"] = json!(m);
+                v["message"] = json!(fixed_message("threads_unsupported"));
+                v["detail"] = json!(m);
                 v["what_to_do"] = json!("run a threads service from the same cauldron release as ripples (0.1.10 or later), then run this again; nothing was sent");
                 return done(v, &usage, calls, &models);
             }
             Err(Failure::Failed { message, .. }) => {
                 let mut v = outcome(ask, run, "failed");
                 v["code"] = json!("inference_failed");
-                v["message"] = json!(message);
+                v["message"] = json!(fixed_message("inference_failed"));
+                v["detail"] = json!(message);
                 v["what_to_do"] = json!("nothing was written and the dump stays `received`; run this again, or curate it by hand (`/cauldron:curate-dump`)");
                 return done(v, &usage, calls, &models);
             }
@@ -566,14 +854,20 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
         if retried {
             let mut v = outcome(ask, run, "failed");
             v["code"] = json!("answer_refused");
-            v["message"] = json!(format!("the answer was refused again after the retry: {}", clip(&refusal, 1000)));
+            v["refused_by"] = json!(refused_by);
+            v["message"] = json!(fixed_message("answer_refused"));
+            v["detail"] = json!(format!("the answer was refused again after the retry: {}", clip(&refusal, 1000)));
+            keep("refusal", json!(refusal));
             v["what_to_do"] = json!("nothing was written and the dump stays `received`; curate it by hand (`/cauldron:curate-dump`)");
             return done(v, &usage, calls, &models);
         }
         retried = true;
+        keep("refusal", json!(refusal));
         // A local run stays local: its retry is the same model.
         model = if is_local(&first) { first.clone() } else { RETRY_MODEL.to_string() };
-        feedback = Some(refusal);
+        // The refusal quotes the answer: scrubbed like the rest of the
+        // prompt before it is sent back.
+        feedback = Some(if scrub_sent { crate::scrub::scrub(&refusal).0 } else { refusal });
     }
 }
 
@@ -584,6 +878,18 @@ fn fault_point(point: &str) {
     if env::egress::process_isolation().is_some() && std::env::var("CAULDRON_RIPPLES_FAULT").as_deref() == Ok(point) {
         std::process::abort();
     }
+}
+
+/// The answer's records with the secret scrubber run on every string, the
+/// counts journaled (`redacted`, `in: answer`) when anything was replaced.
+fn scrub_answer(j: &dyn Fn(&str, Value) -> std::io::Result<()>, records: Vec<Value>, budget: Option<Duration>) -> Result<Value, crate::scrub::Exhausted> {
+    let mut v = json!(records);
+    let deadline = std::time::Instant::now() + budget.unwrap_or_else(|| crate::scrub::budget_for(crate::scrub::value_bytes(&v)));
+    let counts = crate::scrub::scrub_value_within(&mut v, deadline)?;
+    if !counts.is_empty() {
+        let _ = j("redacted", json!({"in": "answer", "counts": counts}));
+    }
+    Ok(v)
 }
 
 /// At most `n` characters of `s`.

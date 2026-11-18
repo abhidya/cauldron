@@ -62,6 +62,8 @@ pub mod identity;
 pub mod lock;
 pub mod paths;
 pub mod private;
+// Automatic processing of dumps: the per-cauldron setting and its journal.
+pub mod ripples_auto;
 pub mod seams;
 pub mod supervisions;
 pub mod tccd;

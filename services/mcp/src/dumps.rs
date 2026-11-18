@@ -24,9 +24,9 @@
 //! transcript still arriving when its grant is revoked stops being read. Its commit ends the
 //! write and the store is let go for the next dump. Only after that is
 //! [`SideEffects::after_commit`] called: whatever a dump sets off later runs
-//! after its write, never inside it, and the write never waits on it. In
-//! this release the only side effect is a log line ([`LogOnly`]); processing
-//! comes in a later release, and picks up the dumps still `received`.
+//! after its write, never inside it, and the write never waits on it. The
+//! side effects are a log line and, when automatic processing is on for the
+//! cauldron, a word to the `ripples` service ([`NotifyRipples`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -66,6 +66,59 @@ impl SideEffects for LogOnly {
                 "dump received; it waits as `received` until its owner processes it (`cauldron ripples run`)"
             ),
         }
+    }
+}
+
+/// **The side effects of a landed dump**: the log line [`LogOnly`] writes,
+/// and, when automatic processing is on for the dump's cauldron
+/// (`env::ripples_auto`), a `DUMP` line to the `ripples` service's seam, so
+/// it looks at that cauldron now rather than at its next scan. The line goes
+/// from its own thread, with short timeouts: it never delays or fails the
+/// dump, and a line that is lost (the service is not running, or does not
+/// answer) costs only the wait until the service's next scan, which finds
+/// every dump still `received`. The line carries the service's run key
+/// (`<data root>/ripples/run.secret`) and names only the cauldron and the
+/// dump; the service reads everything else through the ripple seam.
+pub struct NotifyRipples {
+    pub env: env::Environment,
+}
+
+impl SideEffects for NotifyRipples {
+    fn after_commit(&self, landed: &Landing<'_>) {
+        LogOnly.after_commit(landed);
+        let Landing::Dump { cauldron, id, kind, .. } = landed;
+        if !env::ripples_auto::is_on(&self.env, cauldron) {
+            return;
+        }
+        let (e, line) = (self.env.clone(), json!({"cauldron": cauldron, "dump": id, "kind": kind}));
+        let _ = std::thread::Builder::new().name("notify-ripples".into()).spawn(move || match notify(&e, &line) {
+            Ok(()) => tracing::info!(dump = %line["dump"], "told the ripples service a dump landed"),
+            Err(why) => tracing::info!(dump = %line["dump"], %why, "could not tell the ripples service a dump landed; its next scan finds it"),
+        });
+    }
+}
+
+/// One `DUMP` line to the `ripples` seam of `e` (loopback only), and its
+/// answer read, all within a few seconds.
+fn notify(e: &env::Environment, line: &Value) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Write};
+    let t = env::seams::Table::load(&e.name, &e.data_root, &e.seams()).map_err(|x| format!("the seam table: {x:#}"))?;
+    let row = t.seams.get("ripples").ok_or("the ripples service is not running")?;
+    let addr: std::net::SocketAddr = row.addr.parse().map_err(|_| format!("the ripples seam `{}` is not ip:port", row.addr))?;
+    if !addr.ip().is_loopback() {
+        return Err(format!("the ripples seam `{addr}` is not a loopback address; nothing was sent"));
+    }
+    let key = std::fs::read_to_string(e.data_root.join("ripples").join("run.secret")).map_err(|x| format!("the ripples run key: {x}"))?;
+    let s = env::egress::connect_tcp("ripples seam (dump landed)", &addr, std::time::Duration::from_secs(2)).map_err(|x| x.to_string())?;
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut w = s.try_clone().map_err(|x| x.to_string())?;
+    w.write_all(format!("DUMP {} {line}\n", key.trim()).as_bytes()).and_then(|_| w.flush()).map_err(|x| x.to_string())?;
+    let mut answer = String::new();
+    BufReader::new(s).read_line(&mut answer).map_err(|x| x.to_string())?;
+    match serde_json::from_str::<Value>(answer.trim()) {
+        Ok(v) if v["ok"] == json!(true) => Ok(()),
+        _ => Err(format!("the ripples service answered `{}`", answer.trim())),
     }
 }
 
@@ -213,6 +266,17 @@ impl Dumps {
         let cursor = crate::cursor::now(&t.cauldron).unwrap_or_default();
         let mut receipt = dumps::receipt(&t.cauldron.name, &t.env.name, &dump, &landed);
         receipt["cursor"] = json!(cursor);
+        // Whether automatic processing takes this dump (`env::ripples_auto`).
+        let mut auto = env::ripples_auto::receipt(&t.env, &t.cauldron.name, &landed.id, dump.kind().as_str());
+        if auto["takes_this_dump"] == json!(true) {
+            let registered = env::seams::Table::load(&t.env.name, &t.env.data_root, &t.env.seams()).map(|x| x.seams.contains_key("ripples")).unwrap_or(false);
+            auto["service"] = json!(if registered {
+                "registered in the seam table".to_string()
+            } else {
+                format!("not running: nothing is processed until it is started (`cauldron --env {} start ripples`)", t.env.name)
+            });
+        }
+        receipt["automatic"] = auto;
         self.effects.after_commit(&Landing::Dump {
             env: &t.env.name,
             cauldron: &t.cauldron.name,

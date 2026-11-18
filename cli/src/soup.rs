@@ -201,9 +201,14 @@ cauldron soup — a cauldron's soup, offline
         `superseded_by: [ids]`, which is read from the edges and is not a field: leave it out
         when writing the record again.
     cauldron soup dump <file|-> [--cauldron <name>] [--env <env>] [--title <t>] [--source <s>]
+                       [--wait-secs N]
         Keep the file's text (or stdin's, with -) as a dump in the cauldron's dumps store,
         beside its soup (not as a soup node): DM-<n>, in state `received`, as one write,
-        for later processing (by hand: `cauldron ripples run <id>`). At most 1 MiB
+        for later processing: by hand (`cauldron ripples run <id>`), or automatically when
+        the owner turned that on for the cauldron (`cauldron ripples on`); the receipt's
+        `automatic` says which. --wait-secs N (at most 120) waits that long at most for
+        automatic processing and prints what it made (`processing`: the state, the run, the
+        record ids). At most 1 MiB
         of UTF-8 text; a larger one is refused as `too_large` (split it). Prints a receipt
         (id, bytes, sha256), never the text. While the `mcp` service holds the cauldron's
         dumps store (`cauldron mcp status`), the dump is sent to it and lands through it,
@@ -340,6 +345,7 @@ struct Args {
     unapprove: bool,
     view: Option<String>,
     turn_offset: Option<usize>,
+    wait_secs: Option<usize>,
     pos: Vec<String>,
 }
 
@@ -389,6 +395,7 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--unapprove" => a.unapprove = true,
             "--view" => a.view = Some(take(&mut it)?),
             "--turn-offset" => a.turn_offset = Some(count(flag, &take(&mut it)?)?),
+            "--wait-secs" => a.wait_secs = Some(count(flag, &take(&mut it)?)?),
             _ => a.pos.push(s.clone()),
         }
     }
@@ -707,7 +714,10 @@ fn region(args: &[String]) -> Result<i32> {
 
 /// **`cauldron soup dump <file|->`**: keep its text as a dump.
 fn dump(args: &[String]) -> Result<i32> {
-    let a = parse("dump", args, &["--env", "--cauldron", "-c", "--title", "--source"])?;
+    let a = parse("dump", args, &["--env", "--cauldron", "-c", "--title", "--source", "--wait-secs"])?;
+    if a.wait_secs.is_some_and(|w| w as u64 > soup_door::dumps::WAIT_MAX_SECS) {
+        bail!("`--wait-secs` is 0 to {}", soup_door::dumps::WAIT_MAX_SECS);
+    }
     let [input] = a.pos.as_slice() else {
         bail!("`cauldron soup dump` takes ONE file, or - for stdin (got {}); `cauldron soup help`", a.pos.len());
     };
@@ -735,7 +745,9 @@ fn dump(args: &[String]) -> Result<i32> {
     let t = target("dump", &a, true)?;
     match soup_door::dumps::Store::open(&t.cauldron, &format!("cli {}", std::process::id())) {
         Ok(store) => {
-            print(&dump_direct(&t, &store, text, &a)?)?;
+            let r = dump_direct(&t, &store, text, &a)?;
+            drop(store);
+            print(&waited(&t, r, &a)?)?;
             Ok(0)
         }
         Err(e) if e.code == soup_door::Code::Locked => match soup_door::dumps::held_by_service(&t.cauldron) {
@@ -744,7 +756,9 @@ fn dump(args: &[String]) -> Result<i32> {
                 // The service let the store go between the lock and the call.
                 None => {
                     let store = soup_door::dumps::Store::open(&t.cauldron, &format!("cli {}", std::process::id()))?;
-                    print(&dump_direct(&t, &store, text, &a)?)?;
+                    let r = dump_direct(&t, &store, text, &a)?;
+                    drop(store);
+                    print(&waited(&t, r, &a)?)?;
                     Ok(0)
                 }
             },
@@ -777,7 +791,26 @@ fn dump_direct(t: &Target, store: &soup_door::dumps::Store, text: String, a: &Ar
         })
     };
     let (d, landed) = store.commit(w, || Ok(()), make, &by, |e| e)?;
-    Ok(soup_door::dumps::receipt(&t.cauldron.name, &t.env.name, &d, &landed))
+    let mut r = soup_door::dumps::receipt(&t.cauldron.name, &t.env.name, &d, &landed);
+    let mut auto = env::ripples_auto::receipt(&t.env, &t.cauldron.name, &landed.id, d.kind().as_str());
+    if auto["takes_this_dump"] == json!(true) {
+        // Written here, no service told: the ripples service's scan finds it.
+        auto["picked_up"] = json!("written straight to the store, so the ripples service finds it at its next scan (within a minute) if it is running");
+    }
+    r["automatic"] = auto;
+    Ok(r)
+}
+
+/// `--wait-secs`: the receipt with what automatic processing made of the
+/// dump within the wait (`processing`), when it takes it.
+fn waited(t: &Target, mut r: Value, a: &Args) -> Result<Value> {
+    let wait = a.wait_secs.unwrap_or(0) as u64;
+    if wait > 0 && r["automatic"]["takes_this_dump"] == json!(true) {
+        if let Some(id) = r["dump_id"].as_str().map(str::to_string) {
+            r["processing"] = soup_door::dumps::wait_processing(&t.cauldron, &id, wait)?;
+        }
+    }
+    Ok(r)
 }
 
 /// The dump, sent to the `mcp` service that holds the store as one
@@ -805,6 +838,9 @@ fn dump_forward(t: &Target, text: &str, a: &Args, pid: u32) -> Result<Option<i32
     }
     if let Some(x) = &a.source {
         args["source"] = json!(x);
+    }
+    if let Some(w) = a.wait_secs {
+        args["wait_secs"] = json!(w);
     }
     if let Ok(cwd) = std::env::current_dir() {
         args["_ctx"]["cwd"] = json!(cwd.display().to_string());

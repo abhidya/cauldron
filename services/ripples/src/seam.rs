@@ -7,7 +7,10 @@
 //!   service on this machine, whose `model` is a registered model's name,
 //!   or the only one registered when none is given; `force_budget`: the
 //!   input tokens the owner let this run spend beyond the dump's cap, from
-//!   `cauldron ripples run --force-budget`). A dump already
+//!   `cauldron ripples run --force-budget`; `keep_answer: true`, from
+//!   `cauldron ripples run --debug-keep-answer`: the model's answers and
+//!   the refusals kept in one private file, its path in the outcome,
+//!   `crate::engine::Opts::keep_answer`). A dump already
 //!   processed (or removed, or unreadable) is answered at once (`done:
 //!   true`, `result`); otherwise the run starts on its own thread and the
 //!   answer names it (`done: false`, `run`). One run at a time: another
@@ -29,9 +32,18 @@
 //!   (`crate::eval::plan`) and starts nothing. It takes the run slot (one
 //!   run or evaluation at a time) and is followed like a run: `STATUS {run:
 //!   <the eval id>}`.
+//! - `DUMP <key> {cauldron, dump}`: the `mcp` service's word that a dump
+//!   landed; wakes automatic processing (`crate::auto`) when it is on for
+//!   that cauldron. Answers `{ok, automatic: on|off}`; a lost word costs
+//!   only the wait until the next scan.
 //! - `PING`.
 //!
-//! `RUN` and `STATUS` answer only a line carrying the run key
+//! `STATUS` also shows automatic processing (`automatic`: per cauldron
+//! with a setting, on or off, since when, the backend, the queue, and
+//! `held` while the threads hold holds it; and `threads_hold`: since when,
+//! the cause, the next attempt, which dump set it).
+//!
+//! `RUN`, `STATUS` and `DUMP` answer only a line carrying the run key
 //! (`crate::key`), which `cauldron ripples` reads.
 
 use std::collections::HashMap;
@@ -53,12 +65,64 @@ pub struct State {
     pub key: Key,
     /// The run in progress: `(run, cauldron, dump)`.
     active: Mutex<Option<(String, String, String)>>,
+    /// Is the run in progress an automatic one ([`State::take_slot`])?
+    active_auto: std::sync::atomic::AtomicBool,
     /// Outcomes of the runs this process finished, by run.
     results: Mutex<HashMap<String, Value>>,
     pub started_at: String,
+    /// Wakes the automatic worker (`crate::auto`), once it runs.
+    wake: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl State {
+    /// Take the one run slot for `run` (an automatic run); `false` when a
+    /// run holds it.
+    pub fn take_slot(&self, run: &str, cauldron: &str, dump: &str) -> bool {
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        if active.is_some() {
+            return false;
+        }
+        *active = Some((run.to_string(), cauldron.to_string(), dump.to_string()));
+        self.active_auto.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// Let the slot go after `run`, keeping its outcome.
+    pub fn finish(&self, run: &str, result: Value) {
+        if !run.is_empty() {
+            self.results.lock().unwrap_or_else(|p| p.into_inner()).insert(run.to_string(), result);
+        }
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        self.active_auto.store(false, std::sync::atomic::Ordering::SeqCst);
+        *active = None;
+    }
+
+    /// Where [`State::wake`] sends.
+    pub fn set_wake(&self, tx: std::sync::mpsc::Sender<()>) {
+        *self.wake.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+    }
+
+    /// Wake the automatic worker, if it runs.
+    pub fn wake(&self) {
+        if let Some(tx) = self.wake.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// `DUMP`: a word from the `mcp` service that a dump landed.
+    pub fn dump(&self, rest: &str) -> Value {
+        let a = match self.args(rest) {
+            Ok(a) => a,
+            Err(v) => return v,
+        };
+        let cauldron = a.get("cauldron").and_then(Value::as_str).unwrap_or("");
+        let on = env::ripples_auto::is_on(&self.ctx.env, cauldron);
+        if on {
+            self.wake();
+        }
+        json!({"ok": true, "automatic": if on { "on" } else { "off" }})
+    }
+
     pub fn new(ctx: Ctx, key: Key) -> Arc<State> {
         Arc::new(State {
             ctx,
@@ -66,6 +130,8 @@ impl State {
             active: Mutex::new(None),
             results: Mutex::new(HashMap::new()),
             started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            wake: Mutex::new(None),
+            active_auto: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -109,10 +175,22 @@ impl State {
             },
             Some(other) => return State::refuse("usage", format!("`backend` is `threads` or `local`, not `{other}`")),
         };
+        let keep_answer = a.get("keep_answer") == Some(&json!(true));
         let ask = Ask { cauldron, dump, model, force_budget };
         let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((run, c, d)) = active.as_ref() {
-            return State::refuse("busy", format!("run {run} (dump {d} of cauldron {c}) is running; one run at a time. `cauldron ripples status` follows it."));
+            if self.active_auto.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut v = State::refuse(
+                    "busy",
+                    format!(
+                        "automatic processing holds the run slot (dump {d} of cauldron {c}); one run at a time. Try again in a moment: the slot is let go between dumps. Or turn automatic processing off for that cauldron (`cauldron ripples off {c} --env {}`).",
+                        self.ctx.env.name
+                    ),
+                );
+                v["held_by"] = json!("automatic");
+                return v;
+            }
+            return State::refuse("busy", format!("run {run} (dump {d} of cauldron {c}) is running; one run at a time. Try again when it ends; `cauldron ripples status` follows it."));
         }
         // Nothing runs while a call an earlier run left may still be spending.
         engine::settle(&self.ctx);
@@ -127,10 +205,12 @@ impl State {
         std::thread::Builder::new()
             .name("ripple-run".into())
             .spawn(move || {
-                let result = engine::execute(&me.ctx, &p);
+                let result = engine::execute_with(&me.ctx, &p, &engine::Opts { keep_answer, ..engine::Opts::default() });
                 tracing::info!(run = %p.run, outcome = %result["outcome"], "a ripple run ended");
                 me.results.lock().unwrap_or_else(|p| p.into_inner()).insert(p.run.clone(), result);
                 *me.active.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                // Automatic processing may have waited for the slot.
+                me.wake();
             })
             .map(|_| json!({"ok": true, "done": false, "run": run}))
             .unwrap_or_else(|e| State::refuse("internal", format!("cannot start the run: {e}")))
@@ -214,6 +294,8 @@ impl State {
                 tracing::info!(eval = %eval_id, outcome = %result["outcome"], "an evaluation ended");
                 me.results.lock().unwrap_or_else(|p| p.into_inner()).insert(eval_id, result);
                 *me.active.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                // Automatic processing may have waited for the slot.
+                me.wake();
             })
             .map(|_| json!({"ok": true, "done": false, "run": id, "out": out}))
             .unwrap_or_else(|e| State::refuse("internal", format!("cannot start the evaluation: {e}")))
@@ -265,6 +347,44 @@ impl State {
             "possibly_running": unsettled,
             "caps": caps_json(&self.ctx.caps),
             "journal": self.ctx.journal.path().display().to_string(),
+            "automatic": self.automatic(cauldron),
+        })
+    }
+}
+
+impl State {
+    /// Automatic processing, per cauldron with a setting (or `cauldron`
+    /// only): `env::ripples_auto::queue`, its dumps read through the `mcp`
+    /// service.
+    pub fn automatic(&self, cauldron: Option<&str>) -> Value {
+        let root = &self.ctx.env.data_root;
+        let lines = env::ripples_auto::read(root);
+        let now = crate::auto::now();
+        let active = self.active.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let hold = env::ripples_auto::threads_hold(&lines);
+        let list: Vec<Value> = env::ripples_auto::all(&self.ctx.env)
+            .into_iter()
+            .filter(|x| cauldron.is_none_or(|c| x.name == c))
+            .map(|x| {
+                let rs = if x.void.is_none() { crate::auto::received(self, &x.settings).ok() } else { None };
+                let running = active.as_ref().filter(|(_, c, _)| *c == x.name).map(|(_, _, d)| d.as_str());
+                let mut q = env::ripples_auto::queue(&x, &self.ctx.env.name, rs.as_deref(), &env::ripples_auto::dump_states(&lines, &x.settings), &now, running);
+                hold.mark(&mut q, &x.settings, &now);
+                // The one run slot taken by another run (by hand, an
+                // evaluation, or another cauldron's): why its dumps wait.
+                if let Some((r, c, d)) = active.as_ref().filter(|(_, c, _)| *c != x.name || !self.active_auto.load(std::sync::atomic::Ordering::SeqCst)) {
+                    if q["waiting"].as_array().is_some_and(|w| !w.is_empty()) {
+                        q["waits_for"] = json!({"run_slot": {"run": r, "cauldron": c, "dump": d}, "note": "one run at a time: the waiting dumps start when that run ends (or at the next scan)"});
+                    }
+                }
+                q
+            })
+            .collect();
+        json!({
+            "threads_hold": hold.view(&now),
+            "cauldrons": list,
+            "off_elsewhere": "every cauldron not listed here is off: nothing is processed automatically unless its owner turned it on (`cauldron ripples on`)",
+            "journal": env::ripples_auto::journal_path(root).display().to_string(),
         })
     }
 }
@@ -310,7 +430,7 @@ pub fn today(lines: &[Value], cauldron: Option<&str>) -> Value {
     let mut u = crate::inference::Usage::default();
     let mut per = serde_json::Map::new();
     for c in names.iter().filter(|c| cauldron.is_none_or(|x| x == c.as_str())) {
-        let d = journal::day(lines, c, &day);
+        let d = journal::day(lines, c, None, &day);
         if d.calls == 0 {
             continue;
         }
@@ -350,7 +470,7 @@ impl ServesWarnings for RipplesSeam {
 }
 
 impl Service for RipplesSeam {
-    const VERBS: &'static [Verb<RipplesSeam>] = &[Verb::new("RUN", RipplesSeam::v_run), Verb::new("STATUS", RipplesSeam::v_status), Verb::new("EVAL", RipplesSeam::v_eval), Verb::new("PING", RipplesSeam::v_ping)];
+    const VERBS: &'static [Verb<RipplesSeam>] = &[Verb::new("RUN", RipplesSeam::v_run), Verb::new("STATUS", RipplesSeam::v_status), Verb::new("EVAL", RipplesSeam::v_eval), Verb::new("PING", RipplesSeam::v_ping), Verb::new("DUMP", RipplesSeam::v_dump)];
 
     fn service_env(&self) -> &ServiceEnv {
         &self.se
@@ -374,6 +494,11 @@ impl RipplesSeam {
 
     fn v_eval(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
         c.line(&self.state.eval(rest).to_string())?;
+        Ok(())
+    }
+
+    fn v_dump(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        c.line(&self.state.dump(rest).to_string())?;
         Ok(())
     }
 

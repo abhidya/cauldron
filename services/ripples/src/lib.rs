@@ -19,8 +19,12 @@
 //! - [`package`]: the dump package (`package/dump/v1`: one prompt file and the
 //!   batch's JSON schema);
 //! - [`journal`]: the run journal (`runs.jsonl`);
+//! - [`scrub`]: the secret scrubber, on what is sent and on the answer;
+//! - [`auto`]: automatic processing, for a cauldron whose owner turned it
+//!   on (`cauldron ripples on`);
 //! - [`seam`], [`daemon`], [`key`]: the service itself.
 
+pub mod auto;
 pub mod daemon;
 pub mod engine;
 pub mod eval;
@@ -30,6 +34,7 @@ pub mod key;
 pub mod local;
 pub mod mcp;
 pub mod package;
+pub mod scrub;
 pub mod seam;
 pub mod threads;
 

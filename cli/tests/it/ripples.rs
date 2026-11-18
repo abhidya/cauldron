@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const CAULDRON: &str = env!("CARGO_BIN_EXE_cauldron");
 
@@ -147,5 +147,228 @@ fn rp1_ripples_without_its_service() {
     );
     assert_eq!(spend["per_dump"][0]["unsettled_calls"].as_u64(), Some(0), "{spend}");
     assert_eq!(spend["caps"]["input_tokens_per_cauldron_per_day"].as_u64(), Some(1_500_000));
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// The verb on a pseudo-terminal: `script -q /dev/null cauldron <args>`
+/// (the in-test way to give a command a terminal). Everything it prints
+/// arrives on stdout.
+fn on_tty(root: &std::path::Path, args: &[&str]) -> (i32, String) {
+    on_tty_answering(root, args, "y")
+}
+
+/// `args` at a terminal (`script(1)`), answering its question with `answer`.
+fn on_tty_answering(root: &std::path::Path, args: &[&str], answer: &str) -> (i32, String) {
+    use std::io::Write;
+    let mut full = vec!["-q", "/dev/null", CAULDRON];
+    full.extend_from_slice(args);
+    let mut child = Command::new("/usr/bin/script")
+        .args(&full)
+        .env("CAULDRON_HOME", root.join("root"))
+        .env("HOME", root.join("home"))
+        .env_remove("CAULDRON_ENV")
+        .env_remove("ENV")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The answer goes in once the question is on the terminal (sent
+    // earlier, the terminal may take the end of input first).
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader = {
+        let (out, mut stdout) = (out.clone(), child.stdout.take().unwrap());
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                out.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        })
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut stdin = child.stdin.take().unwrap();
+    loop {
+        let asked = String::from_utf8_lossy(&out.lock().unwrap()).contains("[y/N]");
+        if asked || child.try_wait().unwrap().is_some() || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = stdin.write_all(format!("{answer}\n").as_bytes());
+    let status = child.wait().unwrap();
+    drop(stdin);
+    reader.join().unwrap();
+    let text = String::from_utf8_lossy(&out.lock().unwrap()).replace("\r\n", "\n");
+    (status.code().unwrap_or(-1), text)
+}
+
+/// **`ripples on | off`, and `status` with the service stopped.** `on`
+/// needs a terminal and names the command to run otherwise; at one, it
+/// stores the setting owner-only with the `since` mark at the newest dump
+/// and says what is sent where and the caps; `off` works from anywhere;
+/// `status` shows the setting and the queue.
+#[test]
+fn rp2_on_off_and_the_queue() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = scratch("rp2");
+    assert_eq!(run(&s, &["env", "create", "dev", "--no-engine"]).0, 0);
+    assert_eq!(run(&s, &["create", "kb", "--env", "dev"]).0, 0, "create");
+    let note = s.join("note.txt");
+    std::fs::write(&note, "a note from before it was turned on").unwrap();
+    let (rc, out, err) = run(&s, &["soup", "dump", note.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"]);
+    assert_eq!(rc, 0, "{out}{err}");
+    // No terminal: refused, with the exact command, nothing written.
+    let (rc, out, err) = run(&s, &["ripples", "on", "kb", "--env", "dev", "--include-sessions"]);
+    assert_ne!(rc, 0);
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("owner's act at a terminal") && err.contains("no option skips this") && err.contains("cauldron ripples on kb --env dev --include-sessions"), "{err}");
+    let setting = s.join("root/data/dev/ripples/auto/kb.json");
+    assert!(!setting.exists());
+    // Checked before the terminal.
+    let (rc, _, err) = run(&s, &["ripples", "on", "kb", "--env", "dev", "--no-scrub-local"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("`--no-scrub-local` goes with `--backend local`"), "{err}");
+    let (rc, _, err) = run(&s, &["ripples", "on", "nope", "--env", "dev"]);
+    assert_ne!(rc, 0, "{err}");
+    // At a terminal, answered no: what it means is shown, nothing written.
+    let (rc, out) = on_tty_answering(&s, &["ripples", "on", "kb", "--env", "dev"], "n");
+    assert_eq!(rc, 1, "{out}");
+    assert!(out.contains("What is sent where") && out.contains("[y/N]") && out.contains("nothing was changed"), "{out}");
+    assert!(!setting.exists());
+    // Answered yes: on, owner-only, since the newest dump; what it means
+    // shown before the question.
+    let (rc, out) = on_tty(&s, &["ripples", "on", "kb", "--env", "dev"]);
+    assert!(out.find("What is sent where").unwrap() < out.find("[y/N]").unwrap(), "{out}");
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("Automatic processing is ON for cauldron `kb`") && out.contains("after DM-1"), "{out}");
+    assert!(out.contains("What is sent where") && out.contains("`threads` service") && out.contains("scrubbed") && out.contains("not a guarantee"), "{out}");
+    assert!(out.contains("3 calls and 200000 input tokens") && out.contains("1500000 input tokens or 30 dumps"), "{out}");
+    assert!(out.contains("cauldron ripples off kb --env dev") && out.contains("session dumps are not taken"), "{out}");
+    assert!(out.contains("not running") && out.contains("start ripples"), "{out}");
+    assert_eq!(std::fs::metadata(&setting).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::fs::metadata(setting.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&setting).unwrap()).unwrap();
+    assert_eq!((v["on"].clone(), v["since_dump"].clone(), v["backend"].clone(), v["include_sessions"].clone()), (json!(true), json!(1), json!("threads"), json!(false)));
+    // A dump after it: waiting, with the service stopped.
+    std::fs::write(&note, "a note from after it was turned on").unwrap();
+    assert_eq!(run(&s, &["soup", "dump", note.to_str().unwrap(), "--env", "dev", "--cauldron", "kb"]).0, 0);
+    let (rc, out, err) = run(&s, &["ripples", "status", "--env", "dev", "--cauldron", "kb"]);
+    assert_eq!(rc, 0, "{err}");
+    let st: Value = serde_json::from_str(&out).unwrap();
+    let a = &st["automatic"]["cauldrons"][0];
+    assert_eq!((a["automatic"].clone(), a["waiting"].clone(), a["since"]["after_dump"].clone()), (json!("on"), json!(["DM-2"]), json!("DM-1")), "{st}");
+    // On again (another backend option): the `since` mark is kept.
+    let (rc, out) = on_tty(&s, &["ripples", "on", "kb", "--env", "dev", "--include-sessions"]);
+    assert_eq!(rc, 0, "{out}");
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&setting).unwrap()).unwrap();
+    assert_eq!((v["since_dump"].clone(), v["include_sessions"].clone()), (json!(1), json!(true)));
+    // Off, from anywhere (no terminal).
+    let (rc, out, err) = run(&s, &["ripples", "off", "kb", "--env", "dev"]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(out.contains("\"outcome\": \"off\""), "{out}");
+    let (rc, out, _) = run(&s, &["ripples", "off", "kb", "--env", "dev"]);
+    assert_eq!(rc, 0);
+    assert!(out.contains("already_off"), "{out}");
+    let (_, out, _) = run(&s, &["ripples", "status", "--env", "dev"]);
+    let st: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(st["automatic"]["cauldrons"][0]["automatic"], "off", "{st}");
+    // Turned on again: only dumps after that moment.
+    let (rc, _) = on_tty(&s, &["ripples", "on", "kb", "--env", "dev"]);
+    assert_eq!(rc, 0);
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(&setting).unwrap()).unwrap();
+    assert_eq!(v["since_dump"], 2);
+    let (_, out, _) = run(&s, &["ripples", "help"]);
+    assert!(out.contains("cauldron ripples on <cauldron> --env <env>") && out.contains("cauldron ripples off <cauldron> --env <env>") && out.contains("an upgrade never"), "{out}");
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// **"On" belongs to one cauldron, never to a name.** `cauldron remove`
+/// turns it off and says so, and a cauldron made again under the name
+/// starts off; `cauldron rename` turns it off and prints the `on` command
+/// for the new name; renaming back does not turn it on; a setting left
+/// behind or copied (to another cauldron's name, or into another
+/// environment) is void: `status` says the setting belonged to a cauldron
+/// that is gone and how to clear it, and a dump's receipt says it is not
+/// taken.
+#[test]
+fn rp3_on_follows_no_remove_rename_or_copy() {
+    let s = scratch("rp3");
+    let auto = |env: &str, name: &str| s.join(format!("root/data/{env}/ripples/auto/{name}.json"));
+    let status = |cauldron: &str| -> Value {
+        let (rc, out, err) = run(&s, &["ripples", "status", "--env", "dev", "--cauldron", cauldron]);
+        assert_eq!(rc, 0, "{err}");
+        serde_json::from_str(&out).unwrap()
+    };
+    let dump = |cauldron: &str| -> Value {
+        let note = s.join("note.txt");
+        std::fs::write(&note, "a note").unwrap();
+        let (rc, out, err) = run(&s, &["soup", "dump", note.to_str().unwrap(), "--env", "dev", "--cauldron", cauldron]);
+        assert_eq!(rc, 0, "{out}{err}");
+        serde_json::from_str(&out).unwrap()
+    };
+    assert_eq!(run(&s, &["env", "create", "dev", "--no-engine"]).0, 0);
+    assert_eq!(run(&s, &["create", "kb", "--env", "dev"]).0, 0);
+    assert_eq!(on_tty(&s, &["ripples", "on", "kb", "--env", "dev", "--include-sessions"]).0, 0);
+    let saved = std::fs::read_to_string(auto("dev", "kb")).unwrap();
+    assert_eq!(dump("kb")["automatic"]["takes_this_dump"], true);
+    // Remove: off, and said (in the dry run too).
+    let (rc, out, _) = run(&s, &["remove", "kb", "--env", "dev"]);
+    assert_eq!(rc, 2);
+    assert!(out.contains("automatic processing turned off for `kb`"), "{out}");
+    let (rc, out, err) = run(&s, &["remove", "kb", "--env", "dev", "--yes"]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(out.contains("automatic ripples processing was on for `kb`; it is now OFF"), "{out}");
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(auto("dev", "kb")).unwrap()).unwrap();
+    assert_eq!(v["on"], false);
+    // Made again: off, and its dumps are not taken.
+    assert_eq!(run(&s, &["create", "kb", "--env", "dev"]).0, 0);
+    assert_eq!(dump("kb")["automatic"]["on"], false);
+    assert_eq!(status("kb")["automatic"]["cauldrons"][0]["automatic"], "off");
+    // A setting left behind "on" (written back by hand): void, not taken.
+    std::fs::write(auto("dev", "kb"), &saved).unwrap();
+    let r = dump("kb");
+    assert_eq!((r["automatic"]["on"].clone(), r["automatic"]["takes_this_dump"].clone()), (json!(false), json!(false)), "{r}");
+    let q = &status("kb")["automatic"]["cauldrons"][0];
+    assert_eq!(q["automatic"], "void", "{q}");
+    assert!(q["why"].as_str().unwrap().contains("which is gone") && q["what_to_do"].as_str().unwrap().contains("cauldron ripples off kb --env dev"), "{q}");
+    // Cleared with `off`, from anywhere.
+    let (rc, out, _) = run(&s, &["ripples", "off", "kb", "--env", "dev"]);
+    assert_eq!(rc, 0);
+    assert!(out.contains("\"outcome\": \"off\""), "{out}");
+    assert_eq!(status("kb")["automatic"]["cauldrons"][0]["automatic"], "off");
+    // Rename: off, with the command for the new name.
+    assert_eq!(on_tty(&s, &["ripples", "on", "kb", "--env", "dev", "--include-sessions"]).0, 0);
+    let (rc, out, err) = run(&s, &["rename", "kb", "kb2", "--env", "dev"]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(out.contains("it is now OFF") && out.contains("cauldron ripples on kb2 --env dev --include-sessions"), "{out}");
+    assert_eq!(dump("kb2")["automatic"]["on"], false);
+    assert!(status("kb2")["automatic"]["cauldrons"].as_array().unwrap().is_empty());
+    // Renamed back: still off.
+    let (rc, out, err) = run(&s, &["rename", "kb2", "kb", "--env", "dev"]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(!out.contains("now OFF"), "nothing was on: {out}");
+    assert_eq!(dump("kb")["automatic"]["on"], false);
+    assert_eq!(status("kb")["automatic"]["cauldrons"][0]["automatic"], "off");
+    // Copied to another cauldron's name: void there.
+    assert_eq!(on_tty(&s, &["ripples", "on", "kb", "--env", "dev"]).0, 0);
+    assert_eq!(run(&s, &["create", "other", "--env", "dev"]).0, 0);
+    std::fs::copy(auto("dev", "kb"), auto("dev", "other")).unwrap();
+    assert_eq!(dump("other")["automatic"]["takes_this_dump"], false);
+    assert_eq!(status("other")["automatic"]["cauldrons"][0]["automatic"], "void");
+    assert_eq!(dump("kb")["automatic"]["takes_this_dump"], true, "kb's own setting still holds");
+    // Copied into another environment's cauldron of the same name: void.
+    assert_eq!(run(&s, &["env", "create", "prod", "--no-engine"]).0, 0);
+    assert_eq!(run(&s, &["create", "kb", "--env", "prod"]).0, 0);
+    std::fs::create_dir_all(auto("prod", "kb").parent().unwrap()).unwrap();
+    std::fs::copy(auto("dev", "kb"), auto("prod", "kb")).unwrap();
+    let note = s.join("note.txt");
+    let (rc, out, err) = run(&s, &["soup", "dump", note.to_str().unwrap(), "--env", "prod", "--cauldron", "kb"]);
+    assert_eq!(rc, 0, "{err}");
+    let r: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(r["automatic"]["takes_this_dump"], false, "{r}");
+    assert!(r["automatic"]["void"].as_str().unwrap().contains("environment `dev`"), "{r}");
     let _ = std::fs::remove_dir_all(&s);
 }

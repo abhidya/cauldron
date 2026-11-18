@@ -22,11 +22,198 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.11, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.12, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.11, only an
+  the disable and trigger a fresh usage reading. Through 0.1.12, only an
   explicit enable clears it.
+
+## [0.1.12] — 2026-11-17
+
+Automatic processing of dumps, per cauldron, behind a setting that is off
+by default, and a secret scrubber on what a ripple sends and writes.
+Nothing changes for a cauldron until its owner turns it on, and an upgrade
+turns nothing on.
+
+### Added
+
+- **`cauldron ripples on <cauldron> --env <env>`: a dump is processed when
+  it lands.** For that cauldron, each dump received after that moment is
+  processed by the `ripples` service with no further command, as `cauldron
+  ripples run` would process it: the same call, caps, journal and
+  `unreviewed` marking. Dumps received before it are processed only by
+  hand. Text dumps only, unless `--include-sessions`. `--backend threads`
+  (the default) or `--backend local` (the `inference` service on this
+  machine; nothing leaves it), and `--model`. It authorises model spend and
+  writes, so it requires an interactive terminal, like `cauldron mcp
+  grant`: it prints what will be sent where, the caps and the failure
+  policy, asks `[y/N]`, and writes the setting only on yes. The setting is
+  one owner-only file per cauldron, written whole and renamed into place.
+- **The setting belongs to one cauldron, never to its name.** It records
+  the cauldron it was turned on for (the environment and the cauldron's
+  id, which its MCP grant is bound to too) and is checked before every
+  automatic run and every model call of one. A cauldron that is gone, one
+  made again under the name (even with the same creation time in its
+  `cauldron.toml`), or a setting copied from another cauldron or
+  environment makes it void: nothing runs,
+  the dump receipt says the dump is not taken, and `status` says why and
+  how to clear it. `cauldron remove` turns automatic processing off for
+  the cauldron and says so; `cauldron rename` turns it off and prints the
+  `on` command for the new name. A cauldron made again under an old name
+  starts with a clean queue. A data root moved whole keeps it on, once the
+  cauldron has its id.
+- **Every cauldron has an id**, 128 random bits that `cauldron create`
+  writes into its `cauldron.toml`. A rename keeps it and it moves with the
+  cauldron's directory; no command copies it to another cauldron. MCP
+  grants are now bound to it, as the automatic setting is, so a cauldron
+  made again under an old name, even with the old creation time in its
+  `cauldron.toml`, is opened by neither. A cauldron made before ids is
+  given its id by its first writer (the `mcp` service before a call
+  reaches a granted cauldron, `cauldron mcp grant`, `cauldron ripples on`,
+  `cauldron rename`); at that moment only, its grant is carried onto the
+  id if it records the cauldron's creation time, and its automatic setting
+  if it records its creation time and directory. Anything that does not
+  match is refused with the `cauldron mcp grant` or `cauldron ripples on`
+  command that makes it again, and `cauldron mcp grants` and `mcp status`
+  name such a grant beforehand.
+- **`cauldron ripples off <cauldron> --env <env>`**, from anywhere. It
+  takes effect before the next model call: a run in progress stops before
+  its next call and before it would write its records.
+- **How the service finds dumps.** The `mcp` service tells the `ripples`
+  service when a dump lands through it; the `ripples` service also looks
+  for dumps still `received` when it starts and every minute, which finds
+  dumps that landed while it was down and dumps `cauldron soup dump` wrote
+  straight to the store. One dump at a time, oldest first, the cauldron
+  served least recently first. A dump that lands while a run by hand or an
+  evaluation holds the service's one run slot waits, `status` says so, and
+  it starts when that run ends. A dump lands at
+  most one set of records, whatever is killed when: kill tests stop the
+  service during the scan, before a run, during the model call, after the
+  records landed, and after the run ended, and land the records with the
+  dump's state not yet flipped; each ends with one record set. One
+  `ripples` service per environment: a second one refuses to start and
+  names the first's pid.
+- **Caps and failures, without a retry storm.** The caps are those of a
+  run by hand, charged before each call. Over a cap a dump stays
+  `received`, its listing shows `auto: {state: deferred, reason: budget}`,
+  and it is tried again after midnight UTC. A failed attempt is retried
+  after 2 minutes, then 8; after 3 failed attempts, or at once when trying
+  again cannot help, the dump is parked `failed` with the reason and is run
+  again only by hand. A call that fails at once (a `claude` that exits
+  before it answers, as one refusing its command line does) is a failed
+  attempt like any other. A call the backend refuses as busy (another
+  request holds the local `inference` service, or it is not ready yet;
+  threads refusing it as busy or overloaded) is charged nothing and is no
+  call against a cap: an automatic attempt ends at once as `auto: {state:
+  deferred, reason: busy}`, not a failed attempt, and the next scan tries
+  the dump again; a run by hand tries at most 3 times, then ends `deferred`
+  `busy`. If the automatic journal cannot be written,
+  nothing is run until it can. The daily cap is counted per cauldron, not
+  per name: a cauldron made again under an old name starts its day clean,
+  and a renamed one keeps what it spent.
+- **A call threads parks is a deferral, not a failure.** When threads holds
+  a call (every account over its usage threshold, a usage limit, a spent
+  credit balance, an expired login, a budget), the dump stays `received`,
+  its listing shows `auto: {state: deferred, reason: threads_parked, park:
+  <cause>}`, and the attempt is not counted as a failed one. A call threads
+  parked before it ran, with no tokens reported, is charged nothing and
+  does not count against any cap. After a park, no automatic run on
+  threads, of any cauldron in the environment, starts until the wait is
+  over: 2 minutes, growing fourfold with each park in a row, at most an
+  hour. A parked account costs one withdrawn call per wait, never one per
+  dump. When the wait is over, the cauldron served least recently is tried
+  first, so one whose calls keep being parked keeps no other waiting.
+- **`cauldron ripples status`** shows, per cauldron with a setting: on,
+  off or void, since when, the backend, and the queue (waiting, running,
+  deferred with the reason, retrying, failed with the reason, session dumps
+  not taken, the last ten processed), with the service running or stopped;
+  the threads hold (`threads_hold`: since when, the cause, the dump that
+  set it, the next attempt) and, on each cauldron it holds, `held`; and,
+  from the running service, what a waiting dump waits for (`waits_for`).
+- **Journals keep codes, never words.** The run journal, the automatic
+  journal and a dump's own record of what automatic processing did with it
+  (`auto`, `failure`) hold ids, codes, counts, times and fixed reasons;
+  never the dump's text, the model's answer or its notes, or a backend's
+  own words, including the end of a failed `claude`'s stderr that threads
+  hands back (a test plants a word in a fake `claude`'s stderr and finds it
+  in no file under the root). A run by hand shows those words on the terminal (`detail`,
+  `notes`), and `cauldron ripples run --debug-keep-answer` keeps one run's
+  answers and refusals in one owner-only file whose path it prints.
+- **A secret scrubber.** What a ripple sends to a model (always through
+  threads; to a local model unless `on` was given `--no-scrub-local`), by
+  hand or automatically, and every string of the model's answer before it
+  is written, have credential-shaped text replaced by `<redacted:kind>`:
+  private-key blocks, JWTs, keys and tokens with well-known prefixes
+  (Anthropic, OpenAI, AWS, Google, GitHub, GitLab, Slack, Stripe, npm, PyPI,
+  Hugging Face, SendGrid, DigitalOcean, Shopify), passwords and tokens in
+  URLs, `Authorization:` and `Cookie:` header values (whole, a token inside
+  included), secrets on command lines (the value of a long flag whose name
+  holds a credential word as one of its parts, as `--password x`,
+  `--admin-password=x` or `--client-secret "x"`, but not `--api-key-id`,
+  `--password-file` and the other named look-alikes; `mysql -p…`; a quoted
+  `-p'…'` after any tool), values assigned to `SECRET`, `TOKEN`,
+  `PASSWORD`, `PWD` and similar names in upper or lower case, quoted (a
+  passphrase of any length, a key inside it included), dotted or YAML-ish,
+  and long random strings (except a digest in its obvious context: a hash
+  of exactly that digest's length after `sha1`, `sha224`, `sha256`,
+  `sha384`, `sha512` or `md5`, with or without a hyphen after `sha`,
+  followed by `-`, `=` or `=:`, as `sha512-…` and `sha-256=…`, a go.sum
+  `h1:` hash, and the body of an image, font, audio or video `data:` URI).
+  Matches that overlap are replaced as their union, so no match is dropped
+  for overlapping another. The answer's
+  records are written with the placeholders in them. The run journal
+  counts each kind, never the text. The stored dump is never changed. Its
+  time is linear in the text and bounded in proportion to it; if it runs
+  out, nothing is sent. Its test corpus misses none of its generated
+  samples of each shape and leaves a list of look-alikes untouched, and
+  touches none of its generated digests, git commit ids and UUIDs in their
+  usual places (100 of 180 such samples were replaced before the digest
+  rule); planted beside and inside one another in every pairing (about
+  34,000 texts), it leaves no run of 8 characters of any of them; on
+  this repository's own docs and code it replaced nothing in about a
+  million characters of prose and about one string per million of code. It
+  reduces the risk and is not a guarantee.
+- **The dump receipt says whether automatic processing takes the dump.**
+  `soup_dump`, `soup_dump_session` and `cauldron soup dump` answer
+  `automatic` (on or off, and whether it takes this dump). `soup_dump`
+  with `wait_secs` and `cauldron soup dump --wait-secs`, at most 120
+  seconds, wait for it and answer the dump's state, the run and the record
+  ids. The plugin's `/cauldron:dump` and `/cauldron:dump-session` say so.
+
+### Known limitations
+
+- **Tested with stand-ins only.** Automatic runs, kills, retries and caps
+  are tested against a scripted backend, and parks, fast failures and token
+  counts against a fake threads service, with the real `mcp` door; no
+  automatic run has been made against a real model or a real threads.
+- **The installer does not start the `ripples` service.** Start it
+  yourself; until it runs, nothing is processed, turned on or not.
+- **The scrubber misses secrets in other shapes**: a format it does not
+  know, a short one not given to a name or a flag it knows, one written in
+  words outside an assignment, split across lines, made only of hex
+  digits, glued to the word before it, or written with look-alike
+  characters. A secret written after a digest label with exactly a
+  digest's length is taken for that digest and left.
+- **One run at a time per environment.** An automatic run and a run by
+  hand share the service's one run slot, so `cauldron ripples run` is
+  refused as `busy` (saying automatic processing holds it) while an
+  automatic run is in progress; the slot is let go between dumps.
+- **An answer received after `off` is discarded**, and its call stays
+  charged; the dump stays `received`.
+- **Spend lines written before this release carry no cauldron identity**,
+  so the daily cap counts them by name; `status` shows a day's spend under
+  the name it was spent under.
+- **The threads hold is per environment**: a park on one account holds
+  automatic runs of every cauldron on threads there, even one whose calls
+  another account could take.
+- **The terminal check guards the commands, not the files.** Anyone who
+  can write the data root can write an automatic setting, as they can
+  write `grants.json`.
+- **A copy of a whole data root keeps its settings on**: the id travels in
+  each `cauldron.toml`, and the directory no longer binds a setting that
+  has one.
+- **A dump's run is named after the cauldron's name**, so after a rename a
+  dump gets a new run, and its own caps count again from nothing.
 
 ## [0.1.11] — 2026-11-17
 
@@ -1088,7 +1275,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.11...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.12...HEAD
+[0.1.12]: https://github.com/broomstick-ai/cauldron/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/broomstick-ai/cauldron/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/broomstick-ai/cauldron/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/broomstick-ai/cauldron/compare/v0.1.8...v0.1.9

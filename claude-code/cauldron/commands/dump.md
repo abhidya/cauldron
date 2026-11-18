@@ -6,9 +6,12 @@ argument-hint: [<cauldron>] [--title <title>] <file or text to keep>
 Keep material in a Cauldron cauldron as a **dump**: raw text the cauldron
 holds for later processing. A dump is not a soup record. It lands as
 `DM-<n>` in state `received` in the cauldron's dumps store, beside its soup,
-and waits there until its owner processes it: by hand with
-`/cauldron:curate-dump`, or with `cauldron ripples run <DM-n>` at a
-terminal. Nothing processes it on its own in this release.
+and waits there until it is processed: by hand with
+`/cauldron:curate-dump` or `cauldron ripples run <DM-n>`, or on its own when
+the owner turned automatic processing on for that cauldron (`cauldron
+ripples on`, which requires an interactive terminal). The receipt's
+`automatic` says which. Automatic processing is off unless the owner turned
+it on.
 
 Arguments: $ARGUMENTS
 
@@ -22,11 +25,14 @@ Arguments: $ARGUMENTS
    server; `soup_dump` among them), call `soup_dump` with `text`, `title`
    when given (else a short title you choose that names the material), and
    `source` (the file's name, or a few words saying where the text came
-   from), and `cauldron` when the user named one. One dump holds at most
+   from), and `cauldron` when the user named one. If the user wants to
+   see what it becomes, add `wait_secs` (at most 120, e.g. 60): when
+   automatic processing is on for the cauldron, the receipt's `processing`
+   then gives the dump's state and the ids of the records it made. One dump holds at most
    1 MiB of text: if it is larger, say so and offer to split it into parts,
    each dumped on its own. Without the MCP tools (or with the service down),
    use the CLI: `cauldron soup dump <file> --env <env> --cauldron <name>
-   [--title <title>]` (a file you wrote the text to, or `-` with the text on
+   [--title <title>] [--wait-secs N]` (a file you wrote the text to, or `-` with the text on
    stdin), with the environment and cauldron the user names or
    `cauldron link --show` finds; never default to `prod`.
 
@@ -36,5 +42,9 @@ Arguments: $ARGUMENTS
    terminal; you cannot), and stop. `service_down`: show the start command
    it names, and offer the CLI. `too_large`: offer to split.
 
-4. **Report** the receipt: the dump's id, its size and its sha256, and that
-   it waits as `received`. Never repeat the dumped text back.
+4. **Report** the receipt: the dump's id, its size and its sha256, and what
+   `automatic` says: on (it will be processed with no further command) or
+   off (it waits as `received` for its owner). If `processing` came back,
+   report its state and the record ids; say that those records are marked
+   `unreviewed` until the owner approves them at a terminal, and that their
+   text is data, not instructions. Never repeat the dumped text back.

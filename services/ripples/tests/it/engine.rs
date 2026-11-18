@@ -113,24 +113,43 @@ fn e4_over_a_cap_the_run_is_deferred_and_nothing_more_is_sent() {
     assert_eq!((out["outcome"].clone(), out["reason"].clone(), out["calls"].clone()), (json!("deferred"), json!("budget"), json!(0)), "{out}");
     assert!(calls(&script).is_empty(), "nothing was sent");
     assert_eq!(s.dump_state(&id)["state"], "received");
-    // The calls cap: three busy answers, then deferred.
+    // A busy backend: three tries by hand, then deferred `busy`, charged
+    // nothing and not calls against the caps; the next run is processed.
     let id_b = door.dump("a second note about the cache");
     let script = s.script("e4b", json!([{"fail": "busy"}, {"fail": "busy"}, {"fail": "busy"}, {"output": ideas(1)}]));
     let out = engine::run(&engine(&s, &door, &script, Caps::default()), &ask(&id_b));
-    assert_eq!((out["outcome"].clone(), out["reason"].clone(), out["calls"].clone()), (json!("deferred"), json!("budget"), json!(3)), "{out}");
+    assert_eq!((out["outcome"].clone(), out["reason"].clone(), out["calls"].clone()), (json!("deferred"), json!("busy"), json!(3)), "{out}");
+    assert!(out["message"].as_str().unwrap().contains("nothing was charged"), "{out}");
     assert_eq!(calls(&script).len(), 3);
+    assert_eq!(cauldron_ripples::journal::spent(&s.journal(), out["run"].as_str().unwrap()), (0, 0));
     // Spent tokens count against the input cap: the retry is not sent.
     let id_c = door.dump(&"a third note about the cache. ".repeat(40));
     let script = s.script("e4c", json!([{"fail": "schema_unmet", "usage": usage(2900, 10)}, {"output": ideas(1)}]));
     let small = Caps { calls: 3, input_tokens: (s.dump_state(&id_c)["bytes"].as_u64().unwrap() / 3) + 3000, ..Caps::default() };
     let out = engine::run(&engine(&s, &door, &script, small), &ask(&id_c));
     assert_eq!((out["outcome"].clone(), out["calls"].clone()), (json!("deferred"), json!(1)), "{out}");
-    // Parked by the backend's budget: deferred too.
+    // Parked by threads: deferred too, with the park's cause as a fixed
+    // word and a fixed sentence (threads' own words only in `detail`).
     let id_d = door.dump("a fourth note");
-    let script = s.script("e4d", json!([{"fail": "parked", "message": "over the budget key"}]));
+    let script = s.script("e4d", json!([{"fail": "parked", "cause": "threshold", "message": "over the budget key"}]));
     let out = engine::run(&engine(&s, &door, &script, Caps::default()), &ask(&id_d));
-    assert_eq!((out["outcome"].clone(), out["reason"].clone()), (json!("deferred"), json!("budget")), "{out}");
+    assert_eq!((out["outcome"].clone(), out["reason"].clone(), out["park"].clone()), (json!("deferred"), json!("threads_parked"), json!("threshold")), "{out}");
+    assert_eq!((out["held_by"].clone(), out["reached_model"].clone()), (json!("threads"), json!(false)), "{out}");
+    assert!(out["message"].as_str().unwrap().contains("usage threshold") && !out["message"].as_str().unwrap().contains("budget key"), "{out}");
     assert!(s.ripple_nodes().is_empty());
+    // Held at admission: charged nothing and not a call against the caps.
+    let lines = s.journal();
+    let run = out["run"].as_str().unwrap();
+    assert_eq!(cauldron_ripples::journal::spent(&lines, run), (0, 0));
+    let called = lines.iter().find(|l| l["run"] == run && l["event"] == "called").unwrap();
+    assert_eq!((called["held"].clone(), called["charged"].clone()), (json!(true), json!(0)), "{called}");
+    // A park after the call spent tokens is charged, and counted.
+    let id_e = door.dump("a fifth note");
+    let script = s.script("e4e", json!([{"fail": "parked", "cause": "usage_limit", "usage": usage(500, 3)}]));
+    let out = engine::run(&engine(&s, &door, &script, Caps::default()), &ask(&id_e));
+    assert_eq!((out["reason"].clone(), out["park"].clone(), out["reached_model"].clone()), (json!("threads_parked"), json!("usage_limit"), json!(true)), "{out}");
+    let (n, t) = cauldron_ripples::journal::spent(&s.journal(), out["run"].as_str().unwrap());
+    assert!(n == 1 && t >= 500, "{n} {t}");
 }
 
 /// **The caps hold across runs**: a dump run again and again never gets
@@ -140,15 +159,17 @@ fn e4_over_a_cap_the_run_is_deferred_and_nothing_more_is_sent() {
 fn e8_a_dumps_caps_add_up_across_runs_until_the_owner_forces_more() {
     let s = Scratch::new("e8");
     let door = Door::start(&s);
-    // Four runs against a busy backend: 3 calls in all, not 12.
+    // Four runs against a busy backend: each tries it 3 times and is
+    // deferred `busy`; a busy answer never reached a model, so none of them
+    // uses up the dump's caps.
     let id = door.dump("a note for a busy backend");
     let script = s.script("e8a", json!(vec![json!({"fail": "busy"}); 12]));
     for i in 0..4 {
         let out = engine::run(&engine(&s, &door, &script, Caps::default()), &ask(&id));
-        assert_eq!((out["outcome"].clone(), out["reason"].clone()), (json!("deferred"), json!("budget")), "run {i}: {out}");
-        assert_eq!(out["calls"], json!(if i == 0 { 3 } else { 0 }), "run {i}: {out}");
+        assert_eq!((out["outcome"].clone(), out["reason"].clone(), out["calls"].clone()), (json!("deferred"), json!("busy"), json!(3)), "run {i}: {out}");
+        assert_eq!(cauldron_ripples::journal::spent(&s.journal(), out["run"].as_str().unwrap()), (0, 0), "run {i}");
     }
-    assert_eq!(calls(&script).len(), 3, "three calls in all");
+    assert_eq!(calls(&script).len(), 12, "three tries a run");
     // Every call reports a large input: the first run goes past the cap
     // within its retry (one call can), and the later runs send nothing.
     let id2 = door.dump("a note whose answers miss the schema");
@@ -200,8 +221,61 @@ fn e9_the_daily_cap_defers_a_cauldrons_calls_past_its_tokens_or_dumps() {
     // Under the defaults it runs.
     let out = engine::run(&engine(&s, &door, &script, Caps::default()), &ask(&b));
     assert_eq!(out["outcome"], "processed", "{out}");
-    let today = cauldron_ripples::journal::day(&s.journal(), "kb", &cauldron_ripples::journal::today());
+    let today = cauldron_ripples::journal::day(&s.journal(), "kb", None, &cauldron_ripples::journal::today());
     assert_eq!((today.calls, today.dumps.len()), (2, 2));
+}
+
+/// **The daily cap follows the cauldron, not its name.** With one dump a
+/// day: a cauldron renamed keeps what it spent (its next dump waits), and a
+/// cauldron removed and made again under the old name starts clean. A line
+/// an earlier build wrote (no identity) is counted by its name.
+#[test]
+fn e15_the_daily_cap_follows_the_cauldron_not_its_name() {
+    let s = Scratch::new("e15");
+    let door = Door::start(&s);
+    let script = s.script("e15", json!([{"output": ideas(1), "usage": usage(100, 10)}, {"output": ideas(1), "usage": usage(100, 10)}, {"output": ideas(1), "usage": usage(100, 10)}]));
+    let one = Caps { day_dumps: 1, ..Caps::default() };
+    let a = door.dump("a note before the rename");
+    let out = engine::run(&engine(&s, &door, &script, one), &ask(&a));
+    assert_eq!(out["outcome"], "processed", "{out}");
+    let first_id = s.journal().iter().find(|l| l["event"] == "call").unwrap()["cauldron_id"].as_str().unwrap().to_string();
+    assert!(first_id.starts_with("id:dev|"), "{first_id}");
+
+    // Renamed (as `cauldron rename` does: the manifest's name, then the
+    // directory moved): the same cauldron, its day's dump spent.
+    door.release_dumps();
+    let cauldrons = s.data().join("cauldrons");
+    let manifest = std::fs::read_to_string(cauldrons.join("kb/cauldron.toml")).unwrap().replace("name = \"kb\"", "name = \"kb2\"");
+    std::fs::write(cauldrons.join("kb/cauldron.toml"), manifest).unwrap();
+    std::fs::rename(cauldrons.join("kb"), cauldrons.join("kb2")).unwrap();
+    soup_door::grants::grant(&s.env(), "kb2", &[Scope::Read, Scope::Write, Scope::Dump], &[], "tty").unwrap();
+    let b = door.tool("soup_dump", json!({"cauldron": "kb2", "text": "a note after the rename"}))["dump_id"].as_str().unwrap().to_string();
+    let ask_b = cauldron_ripples::engine::Ask { cauldron: "kb2".into(), dump: b.clone(), model: None, force_budget: None };
+    let out = engine::run(&engine(&s, &door, &script, one), &ask_b);
+    assert_eq!((out["outcome"].clone(), out["reason"].clone(), out["calls"].clone()), (json!("deferred"), json!("daily_cap"), json!(0)), "a renamed cauldron keeps its spend: {out}");
+    assert_eq!(cauldron_ripples::engine::cauldron_identity(&s.env(), "kb2"), first_id);
+
+    // A new `kb`: another cauldron, its day clean, though the journal holds
+    // today's call under that name.
+    s.make_kb();
+    assert_ne!(cauldron_ripples::engine::cauldron_identity(&s.env(), "kb"), first_id);
+    let c = door.dump("a note in the new cauldron of the old name");
+    let out = engine::run(&engine(&s, &door, &script, one), &ask(&c));
+    assert_eq!(out["outcome"], "processed", "a cauldron made again starts clean: {out}");
+    assert_eq!(calls(&script).len(), 2);
+
+    // An earlier build's line (no identity) counts by its name.
+    let mut lines = s.journal();
+    for l in lines.iter_mut() {
+        if let Some(o) = l.as_object_mut() {
+            o.remove("cauldron_id");
+        }
+    }
+    let today = cauldron_ripples::journal::today();
+    let new_id = cauldron_ripples::engine::cauldron_identity(&s.env(), "kb");
+    assert_eq!(cauldron_ripples::journal::day(&lines, "kb", Some(&new_id), &today).calls, 2);
+    assert_eq!(cauldron_ripples::journal::day(&s.journal(), "kb", Some(&new_id), &today).calls, 1);
+    assert_eq!(cauldron_ripples::journal::day(&s.journal(), "kb2", Some(&first_id), &today).calls, 1);
 }
 
 /// **Each call runs in an empty private directory made for it**, removed
@@ -395,7 +469,8 @@ fn e13_repeated_or_shadowing_labels_land_nothing() {
     let script = s.script("e13a", json!([{"output": twice.clone()}, {"output": twice}]));
     let out = engine::run(&engine(&s, &door, &script, Caps::default()), &ask(&id));
     assert_eq!((out["outcome"].clone(), out["code"].clone()), (json!("failed"), json!("answer_refused")), "{out}");
-    assert!(out["message"].as_str().unwrap().contains("duplicate-id-in-batch"), "{out}");
+    assert!(out["detail"].as_str().unwrap().contains("duplicate-id-in-batch"), "{out}");
+    assert_eq!(out["refused_by"], "soup", "{out}");
     assert!(s.ripple_nodes().is_empty());
     let id2 = door.dump("another note");
     let shadow = json!({"records": [{"label": "C-1", "type": "idea", "state": "idea", "handle": "x", "regions": ["R-1"], "derived_from": ["C-1"]}]});

@@ -126,14 +126,14 @@ fn ev1_backends_side_by_side_with_nothing_written() {
     // the run journal, so nothing against the cauldron's caps for runs.
     let j = s.journal();
     assert!(j.is_empty(), "the run journal is untouched: {j:?}");
-    assert_eq!(cauldron_ripples::journal::day(&j, "kb", &cauldron_ripples::journal::today()), Default::default());
+    assert_eq!(cauldron_ripples::journal::day(&j, "kb", None, &cauldron_ripples::journal::today()), Default::default());
     let l = s.eval_ledger();
     let called: Vec<&Value> = l.iter().filter(|l| l["event"] == "called").collect();
     assert_eq!(called.len(), 3, "{l:?}");
     assert!(called.iter().all(|l| l["eval_id"] == "eval-test-1" && l["model"] == "sonnet" && l["cauldron"] == "kb"));
     let events: Vec<&str> = l.iter().map(|l| l["event"].as_str().unwrap()).collect();
     assert_eq!(events, ["call", "called", "call", "called", "call", "called"], "charged before each call");
-    let d = cauldron_ripples::journal::day(&l, "kb", &cauldron_ripples::journal::today());
+    let d = cauldron_ripples::journal::day(&l, "kb", None, &cauldron_ripples::journal::today());
     assert_eq!(d.calls, 3);
     assert_eq!(d.tokens, called.iter().map(|l| l["charged"].as_u64().unwrap()).sum::<u64>(), "settled to what each `called` line charged");
     assert!(d.tokens >= 3000 + 3100 + 2500);

@@ -99,7 +99,7 @@ pub const TEXT_MEDIA: &str = "text/plain; charset=utf-8";
 pub const TRANSCRIPT_MEDIA: &str = "application/x-claude-code-transcript+jsonl";
 
 /// What every receipt says about what happens next.
-pub const NEXT: &str = "this dump waits in state `received`; in this release a dump is processed only when its owner runs `cauldron ripples run <id>` on it, and automatic processing comes in a later release";
+pub const NEXT: &str = "this dump waits in state `received` until it is processed: by its owner (`cauldron ripples run <id>`), or by the ripples service with no further command when its owner turned automatic processing on for the cauldron (`automatic` says which)";
 
 /// The dumps store of `c`: `<cauldron>/dumps/` (the legacy cauldron's is
 /// `data/<env>/soup/dumps/`, beside its soup).
@@ -364,7 +364,10 @@ impl Store {
     /// transaction sets its state to `processed` and its `meta.processed` to
     /// `processed`, written under `initiator`. Only a dump in state
     /// `received` (or `failed`) is marked; a removed dump is refused, and a
-    /// dump already `processed` is left as it is (answers `false`).
+    /// dump already `processed` is left as it is (answers `false`). What
+    /// automatic processing noted on it is over: `meta.auto` goes, and a
+    /// `meta.failure` from a park goes too, its code kept as
+    /// `meta.processed.after_failure`.
     pub fn mark_processed(&self, id: &str, processed: Value, initiator: Initiator) -> Result<bool> {
         let c = &self.cauldron;
         let n = find(c, id)?;
@@ -379,6 +382,15 @@ impl Store {
             meta = json!({});
         }
         meta["processed"] = processed;
+        // What automatic processing noted while it waited is over.
+        if let Some(m) = meta.as_object_mut() {
+            m.remove("auto");
+            if let Some(f) = m.remove("failure") {
+                if meta["processed"].is_object() {
+                    meta["processed"]["after_failure"] = f["code"].clone();
+                }
+            }
+        }
         let mut b = Bindings::new();
         b.insert("id".into(), json!(id));
         b.insert("meta".into(), meta);
@@ -397,6 +409,63 @@ impl Store {
                 Err(store_err(c, format!("the dumps store refused to mark the dump processed: {}", json!(witnesses))))
             }
             Err(e) => Err(store_err(c, format!("marking the dump processed: {e}"))),
+        }
+    }
+
+    /// **Note what automatic processing is doing with a dump that waits**
+    /// (`deferred` with its reason, or `retrying` after a failed attempt):
+    /// ONE transaction sets its `meta.auto` to `auto`, written under
+    /// `initiator`. Only a dump in state `received` is noted (answers
+    /// `false` otherwise); its state does not change.
+    pub fn note_auto(&self, id: &str, auto: Value, initiator: Initiator) -> Result<bool> {
+        self.set_auto_state(id, None, "auto", auto, initiator)
+    }
+
+    /// **Park a dump `failed`** (automatic processing gave up on it): ONE
+    /// transaction sets its state to `failed` and its `meta.failure` to
+    /// `failure`. Only a dump in state `received` is parked (answers
+    /// `false` otherwise); a removed dump is refused. A parked dump can
+    /// still be processed by hand, which marks it `processed`.
+    pub fn mark_failed(&self, id: &str, failure: Value, initiator: Initiator) -> Result<bool> {
+        self.set_auto_state(id, Some("failed"), "failure", failure, initiator)
+    }
+
+    fn set_auto_state(&self, id: &str, state: Option<&str>, key: &str, value: Value, initiator: Initiator) -> Result<bool> {
+        let c = &self.cauldron;
+        let n = find(c, id)?;
+        if is_tombstone(&n) {
+            refuse!(Code::NotFound, "REFUSED: dump `{id}` was removed");
+        }
+        if n.state.as_deref() != Some(RECEIVED) {
+            return Ok(false);
+        }
+        let mut meta = field(&n, "meta").cloned().unwrap_or_else(|| json!({}));
+        if !meta.is_object() {
+            meta = json!({});
+        }
+        meta[key] = value;
+        if state.is_some() {
+            if let Some(m) = meta.as_object_mut() {
+                m.remove("auto");
+            }
+        }
+        let mut b = Bindings::new();
+        b.insert("id".into(), json!(id));
+        b.insert("meta".into(), meta);
+        let set_state = state.map(|s| format!(" SET d.state = \"{s}\"")).unwrap_or_default();
+        let env = Envelope {
+            statement: format!("MATCH (d: {POOL}/{DUMP} {{ id: $id }}){set_state} SET d.meta = $meta RETURN d.id"),
+            bindings: b,
+            format_version: ENVELOPE_FORMAT_VERSION,
+            provenance: Provenance { initiator, instrument: Instrument { name: "cauldron-mcp".into(), version: env!("CARGO_PKG_VERSION").into() } },
+            mode: Mode::Commit,
+            idempotency_nonce: Some(format!("dump-{key}:{id}:{}", next_serial())),
+        };
+        match self.spine.submit(env) {
+            Ok(spine::Outcome::Committed { .. }) => Ok(true),
+            Ok(_) => Err(store_err(c, format!("setting the dump's `{key}` was validated and not committed"))),
+            Err(spine::error::SpineError::Refused { witnesses }) => Err(store_err(c, format!("the dumps store refused the dump's `{key}`: {}", json!(witnesses)))),
+            Err(e) => Err(store_err(c, format!("setting the dump's `{key}`: {e}"))),
         }
     }
 
@@ -1422,6 +1491,16 @@ fn summary_of(n: &NodeRecord) -> Value {
     if let Some(p) = meta.get("processed") {
         s["processed"] = p.clone();
     }
+    // Set by automatic processing: what it is doing with a dump that waits
+    // (`auto`), or why it parked it `failed` (`failure`).
+    if n.state.as_deref() == Some(RECEIVED) {
+        if let Some(a) = meta.get("auto") {
+            s["auto"] = a.clone();
+        }
+    }
+    if let Some(f) = meta.get("failure") {
+        s["failure"] = f.clone();
+    }
     s
 }
 
@@ -2104,6 +2183,41 @@ pub fn open_content(c: &env::Cauldron, id: &str) -> Result<Box<dyn Read>> {
             let path = dir(c).join(BLOBS).join(format!("{sha}.{}", kind.ext()));
             Ok(Box::new(File::open(&path).map_err(|e| store_err(c, format!("reading the transcript of `{id}`: {e}")))?))
         }
+    }
+}
+
+/// The most a dump's receipt waits for automatic processing (`wait_secs`).
+pub const WAIT_MAX_SECS: u64 = 120;
+
+/// **Wait, at most `secs` (bounded by [`WAIT_MAX_SECS`]), for automatic
+/// processing to settle a dump**: until it is no longer `received`, or it
+/// carries an automatic note (`deferred`, `retrying`). Answers `{state,
+/// done, waited_secs, run?, records?, auto?, failure?}`; `done` is `true`
+/// when it is `processed` or parked `failed`.
+pub fn wait_processing(c: &env::Cauldron, id: &str, secs: u64) -> Result<Value> {
+    let start = std::time::Instant::now();
+    let limit = std::time::Duration::from_secs(secs.min(WAIT_MAX_SECS));
+    loop {
+        let s = summary(c, id)?;
+        let state = s["state"].as_str().unwrap_or("").to_string();
+        let settled = state != RECEIVED || s.get("auto").is_some();
+        if settled || start.elapsed() >= limit {
+            let mut v = json!({"state": state, "done": matches!(state.as_str(), "processed" | "failed"), "waited_secs": start.elapsed().as_secs()});
+            if let Some(p) = s.get("processed") {
+                v["run"] = p["run"].clone();
+                v["records"] = p["records"].clone();
+            }
+            for k in ["auto", "failure"] {
+                if let Some(x) = s.get(k) {
+                    v[k] = x.clone();
+                }
+            }
+            if !settled {
+                v["note"] = json!("not processed yet when the wait ended; `cauldron ripples status` or the dump's listing (`soup_dump_get`) shows it later");
+            }
+            return Ok(v);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }
 

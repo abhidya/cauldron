@@ -41,18 +41,38 @@ impl Scratch {
             std::fs::create_dir_all(p.join(d)).unwrap();
         }
         let s = Scratch(p.canonicalize().unwrap());
-        let dir = s.data().join("cauldrons").join("kb");
+        s.make_kb();
+        s
+    }
+
+    /// Cauldron `kb` with the worked example, made (again) now, granted
+    /// read, write and dump.
+    pub fn make_kb(&self) {
+        self.make_cauldron("kb");
+    }
+
+    /// Cauldron `name` with the worked example, made (again) now, granted
+    /// read, write and dump.
+    pub fn make_cauldron(&self, name: &str) {
+        let s = self;
+        let dir = s.data().join("cauldrons").join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cauldron.toml"), format!("name = \"kb\"\ncreated_at = \"{}\"\nenabled = true\n", chrono::Utc::now().to_rfc3339())).unwrap();
+        std::fs::write(dir.join("cauldron.toml"), format!("name = \"{name}\"\ncreated_at = \"{}\"\nenabled = true\n", chrono::Utc::now().to_rfc3339())).unwrap();
         drop(spine::Cauldron::create(&dir.join("soup"), &[spine::grammar_v6::workspace_v6("ws")], spine::config::SpineConfig::default()).unwrap());
         let o = soup_door::import::ImportOptions { remint: true, agent: "fixture".into(), dispatch: "fixture".into(), ..Default::default() };
         let records = example();
-        match soup_door::import::import(&s.target(), &records, &o).unwrap() {
+        let e = s.env();
+        let t = soup_door::Target { cauldron: e.find_cauldron(name).unwrap().unwrap(), env: e, resolved_from: None };
+        match soup_door::import::import(&t, &records, &o).unwrap() {
             soup_door::import::ImportOutcome::Judged { ok: true, .. } => {}
             other => panic!("fixture: {other:?}"),
         }
-        s.grant(&[Scope::Read, Scope::Write, Scope::Dump]);
-        s
+        soup_door::grants::grant(&s.env(), name, &[Scope::Read, Scope::Write, Scope::Dump], &[], "tty").unwrap();
+    }
+
+    /// The summary of dump `id` of cauldron `name`.
+    pub fn dump_state_in(&self, name: &str, id: &str) -> Value {
+        soup_door::dumps::summary(&self.env().find_cauldron(name).unwrap().unwrap(), id).unwrap()
     }
 
     pub fn root(&self) -> PathBuf {
@@ -179,7 +199,7 @@ impl Door {
         Door { door, seam }
     }
 
-    fn tool(&self, name: &str, args: Value) -> Value {
+    pub fn tool(&self, name: &str, args: Value) -> Value {
         let mut args = args;
         args["_ctx"] = json!({"client": "test"});
         self.door.call(cauldron_mcp::catalogue::find(name).unwrap(), args).unwrap_or_else(|r| panic!("{name}: {r:?}"))
@@ -187,7 +207,12 @@ impl Door {
 
     /// A text dump; its id.
     pub fn dump(&self, text: &str) -> String {
-        self.tool("soup_dump", json!({"cauldron": "kb", "text": text}))["dump_id"].as_str().unwrap().to_string()
+        self.dump_in("kb", text)
+    }
+
+    /// A text dump into cauldron `name`; its id.
+    pub fn dump_in(&self, name: &str, text: &str) -> String {
+        self.tool("soup_dump", json!({"cauldron": name, "text": text}))["dump_id"].as_str().unwrap().to_string()
     }
 
     /// A session dump of `transcript`; its id.

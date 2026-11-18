@@ -110,8 +110,12 @@ pub struct Reply {
 pub enum Failure {
     /// Busy or overloaded: worth trying again (within the run's caps).
     Busy(String),
-    /// Held by the backend's budget (threads parked it): the run waits.
-    Parked(String),
+    /// Held by the backend (threads parked it: an account over its usage
+    /// threshold or limit, a spent credit balance, an expired login, a
+    /// budget): the run waits. `cause` is a word of [`PARK_CAUSES`]; `usage`
+    /// is what the call spent before it was held (none when threads parked
+    /// it at admission, before any `claude` ran).
+    Parked { message: String, cause: &'static str, usage: Usage },
     /// An answer came, and did not meet the schema after the backend's own
     /// corrective turn.
     SchemaUnmet { message: String, usage: Usage, model: String },
@@ -124,11 +128,29 @@ pub enum Failure {
     Failed { message: String, usage: Usage },
 }
 
+/// **Why threads held a call**, as a fixed word: `threshold` (every account
+/// it may use is over its usage threshold), `usage_limit` (an account hit
+/// its limit), `credit_balance`, `login_expired`, `budget` (a threads
+/// budget tripped), or `parked` (any other cause).
+pub const PARK_CAUSES: &[&str] = &["threshold", "usage_limit", "credit_balance", "login_expired", "budget", "parked"];
+
+/// The word of [`PARK_CAUSES`] for a cause as threads names it.
+pub fn park_cause(threads_word: &str) -> &'static str {
+    match threads_word {
+        "threshold" => "threshold",
+        "usage_limit" | "rate_limit" | "limit" => "usage_limit",
+        "credit_balance" => "credit_balance",
+        "login_expired" => "login_expired",
+        "budget" => "budget",
+        _ => "parked",
+    }
+}
+
 impl Failure {
     pub fn code(&self) -> &'static str {
         match self {
             Failure::Busy(_) => "busy",
-            Failure::Parked(_) => "parked",
+            Failure::Parked { .. } => "parked",
             Failure::SchemaUnmet { .. } => "schema_unmet",
             Failure::Unavailable(_) => "unavailable",
             Failure::Unsupported(_) => "unsupported",
@@ -138,7 +160,8 @@ impl Failure {
 
     pub fn message(&self) -> &str {
         match self {
-            Failure::Busy(m) | Failure::Parked(m) | Failure::Unavailable(m) | Failure::Unsupported(m) => m,
+            Failure::Busy(m) | Failure::Unavailable(m) | Failure::Unsupported(m) => m,
+            Failure::Parked { message, .. } => message,
             Failure::SchemaUnmet { message, .. } | Failure::Failed { message, .. } => message,
         }
     }
@@ -146,7 +169,7 @@ impl Failure {
     /// The tokens it spent anyway.
     pub fn usage(&self) -> Usage {
         match self {
-            Failure::SchemaUnmet { usage, .. } | Failure::Failed { usage, .. } => usage.clone(),
+            Failure::SchemaUnmet { usage, .. } | Failure::Failed { usage, .. } | Failure::Parked { usage, .. } => usage.clone(),
             _ => Usage::default(),
         }
     }
@@ -203,7 +226,7 @@ pub fn default_from_env(e: &env::Environment) -> anyhow::Result<Box<dyn Inferenc
 /// in a file, and appends what it was asked to `<file>.calls.jsonl`, so a
 /// test can read the prompt and the model of every call. An entry is
 /// `{"output": …, "usage": {…}, "model": "…", "sleep_ms": n}` or `{"fail":
-/// "busy"|"parked"|"schema_unmet"|"unavailable"|"unsupported"|"failed", "message": "…",
+/// "busy"|"parked"|"schema_unmet"|"unavailable"|"unsupported"|"failed", "message": "…", "cause": "…" (a park's),
 /// "usage": {…}, "sleep_ms": n}`; `"sent": true` on an entry reports a call
 /// handle (event `sent`) before it answers. No entry left is `failed`.
 pub struct Scripted {
@@ -257,7 +280,7 @@ impl Inference for Scripted {
         match e["fail"].as_str() {
             None => Ok(Reply { output: e["output"].clone(), usage, model }),
             Some("busy") => Err(Failure::Busy(message)),
-            Some("parked") => Err(Failure::Parked(message)),
+            Some("parked") => Err(Failure::Parked { message, cause: park_cause(e["cause"].as_str().unwrap_or("")), usage }),
             Some("schema_unmet") => Err(Failure::SchemaUnmet { message, usage, model }),
             Some("unavailable") => Err(Failure::Unavailable(message)),
             Some("unsupported") => Err(Failure::Unsupported(message)),

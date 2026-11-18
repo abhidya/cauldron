@@ -5,9 +5,12 @@ argument-hint: [title]
 
 Keep this session's transcript in a Cauldron cauldron as a **dump**, for
 later processing. It lands as `DM-<n>` in state `received` in the
-cauldron's dumps store, beside its soup, and waits there until its owner
-processes it (`/cauldron:curate-dump`, or `cauldron ripples run <DM-n>` at a
-terminal).
+cauldron's dumps store, beside its soup, and waits there until it is
+processed: by its owner (`/cauldron:curate-dump`, or `cauldron ripples run
+<DM-n>` at a terminal), or on its own when the owner turned automatic
+processing on for that cauldron with `--include-sessions` (the receipt's
+`automatic` says whether it takes this dump; it is off unless the owner
+turned it on).
 
 Title: $ARGUMENTS
 
@@ -35,5 +38,6 @@ so). There is no CLI route for this one.
 A dump cannot be deleted in this release; the plugin's README says how to
 remove a cauldron's dumps by hand.
 
-Report the receipt: the dump's id, the session id, its lines and bytes, and
-its sha256. Never repeat the transcript back.
+Report the receipt: the dump's id, the session id, its lines and bytes, its
+sha256, and what `automatic` says (processed on its own, or waiting for its
+owner). Never repeat the transcript back.

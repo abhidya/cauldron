@@ -253,7 +253,9 @@ fn prepare_out(out: &Path) -> Result<(), String> {
 /// One backend run of one fixture: up to two answers, each judged.
 #[allow(clippy::too_many_arguments)]
 fn one_run(ctx: &Ctx, spec: &Spec, f: &Fixture, backend: &str, model: &str, k: u32, regions: &[Value], offered: &[String]) -> Value {
-    let base_prompt = package::prompt(&format!("fixture:{}", f.label), "text", regions, &f.text);
+    // What goes through threads is scrubbed, as a run's is (`crate::scrub`).
+    let text = if backend == "threads" { crate::scrub::scrub(&f.text).0 } else { f.text.clone() };
+    let base_prompt = package::prompt(&format!("fixture:{}", f.label), "text", regions, &text);
     let est = estimate(base_prompt.chars().count());
     let mut result = json!({"dump": f.label, "file": f.file, "backend": backend, "model": model, "repeat": k, "estimated_input_tokens": est});
     if est > ctx.caps.input_tokens {
@@ -309,7 +311,7 @@ fn one_run(ctx: &Ctx, spec: &Spec, f: &Fixture, backend: &str, model: &str, k: u
                 if made >= max {
                     return Err(format!("the evaluation's bound of {max} threads calls (`--max-calls`) is reached; nothing more was sent"));
                 }
-                let day = crate::journal::day(lines, &spec.cauldron, &crate::journal::today());
+                let day = crate::journal::day(lines, &spec.cauldron, None, &crate::journal::today());
                 if day.tokens + this_est > ctx.caps.day_tokens {
                     return Err(format!("the next call would pass the evaluations' own daily cap of {} input tokens for cauldron `{}` ({} spent today); nothing more was sent", ctx.caps.day_tokens, spec.cauldron, day.tokens));
                 }

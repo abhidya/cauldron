@@ -55,6 +55,17 @@
 //!   answered `would_land` with how many records would land, or refused
 //!   as `RPUT` would refuse them. Nothing is written and no dump is marked;
 //!   the dump is optional (a fixture outside the soup has none).
+//! - `RDUMPS {cauldron, after?, limit?}`: the dumps still `received` whose
+//!   serial is above `after` (default 0), oldest first, at most `limit`
+//!   (default 50, at most 500), as summaries (never text): what the
+//!   service's automatic processing picks from.
+//! - `RNOTE {cauldron, dump, run, auto}`: note on a `received` dump what
+//!   automatic processing is doing with it (`meta.auto`: deferred and why,
+//!   or retrying); its state does not change. Answers `noted` (`false` when
+//!   the dump is no longer `received`).
+//! - `RFAIL {cauldron, dump, run, failure}`: park a `received` dump
+//!   `failed`, with `meta.failure` (the code, the message, the attempts);
+//!   automatic processing gave up on it. It can still be run by hand.
 //!
 //! Every answer is `{"ok": true, ...}` or `{"ok": false, "code", "message",
 //! "detail"?}`. Every call after the key is checked is a line in
@@ -75,7 +86,7 @@ use crate::secret::Secret;
 use crate::writer::Who;
 
 /// The verbs, in the order the seam lists them.
-pub const VERBS: [&str; 6] = ["RDUMP", "RTEXT", "RREAD", "RRUN", "RPUT", "RCHECK"];
+pub const VERBS: [&str; 9] = ["RDUMP", "RTEXT", "RREAD", "RRUN", "RPUT", "RCHECK", "RDUMPS", "RNOTE", "RFAIL"];
 
 /// The client name every ripple call is audited under.
 pub const CLIENT: &str = "ripples";
@@ -188,6 +199,8 @@ fn run(door: &Door, verb: &str, a: &Map<String, Value>) -> Result<Value, Refusal
         }
         "RPUT" => rput(door, &t, a),
         "RCHECK" => rcheck(door, &t, a),
+        "RDUMPS" => rdumps(&t, a),
+        "RNOTE" | "RFAIL" => rnote(door, &t, verb, a),
         other => Err(usage(format!("`{other}` is not a ripple verb"))),
     }
 }
@@ -387,6 +400,54 @@ fn rput(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusa
     v["tx"] = doc["tx"].clone();
     v["dump_marked"] = json!(marked);
     Ok(v)
+}
+
+/// **`RDUMPS`**: the `received` dumps above `after`, oldest first.
+fn rdumps(t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let after = n(a, "after")?.unwrap_or(0);
+    let limit = n(a, "limit")?.unwrap_or(50).clamp(1, 500) as usize;
+    let o = soup_door::dumps::ListOpts { state: Some(spine::grammar_dump::RECEIVED.into()), kind: None, limit: Some(usize::MAX) };
+    let doc = soup_door::dumps::list(&t.cauldron, &o).map_err(refusal)?;
+    let mut v: Vec<Value> = doc["dumps"].as_array().cloned().unwrap_or_default().into_iter().filter(|d| env::ripples_auto::serial(d["id"].as_str().unwrap_or("")) > after).collect();
+    v.sort_by_key(|d| env::ripples_auto::serial(d["id"].as_str().unwrap_or("")));
+    let more = v.len() > limit;
+    v.truncate(limit);
+    Ok(json!({"env": t.env.name, "cauldron": t.cauldron.name, "dumps": v, "more": more}))
+}
+
+/// **`RNOTE`** and **`RFAIL`**: what automatic processing did with a dump
+/// that waits, in the dumps store.
+fn rnote(door: &Door, t: &Target, verb: &str, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let dump = dump_id(a)?;
+    let run = plain_id(a, "run")?;
+    let (key, outcome) = if verb == "RFAIL" { ("failure", "parked") } else { ("auto", "noted") };
+    let value = match a.get(key) {
+        Some(Value::Object(m)) => {
+            let text = Value::Object(m.clone()).to_string();
+            if text.len() > 4096 {
+                return Err(usage(format!("`{key}` is at most 4096 bytes of JSON")));
+            }
+            let mut m = m.clone();
+            m.insert("run".into(), json!(run));
+            m.insert("by".into(), json!("automatic"));
+            m.insert("at".into(), json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)));
+            Value::Object(m)
+        }
+        _ => return Err(usage(format!("`{key}` must be an object"))),
+    };
+    let summary = soup_door::dumps::summary(&t.cauldron, &dump).map_err(refusal)?;
+    if removed(&summary) {
+        return Err(Refusal::new("dump_removed", format!("dump `{dump}` was removed (or its removal is unfinished). Nothing was written.")));
+    }
+    let step = format!("auto:{}", key);
+    let done = door.dumps.with_store(t, &who(), |store| {
+        if verb == "RFAIL" {
+            store.mark_failed(&dump, value, initiator(&run, &step)).map_err(refusal)
+        } else {
+            store.note_auto(&dump, value, initiator(&run, &step)).map_err(refusal)
+        }
+    })?;
+    Ok(json!({"env": t.env.name, "cauldron": t.cauldron.name, "dump": dump, "run": run, "outcome": outcome, outcome: done}))
 }
 
 /// **`RCHECK`**: `RPUT` judged and never landed (module docs).

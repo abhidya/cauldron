@@ -144,7 +144,7 @@ pub fn runs(lines: &[Value], live: &dyn Fn(&str, u64) -> bool) -> Vec<Value> {
         v.insert("last_at".into(), l["at"].clone());
         v.insert("pid".into(), l["pid"].clone());
         if l["event"] == "started" {
-            for k in ["model", "package", "backend"] {
+            for k in ["model", "package", "backend", "automatic"] {
                 if let Some(x) = l.get(k) {
                     v.insert(k.into(), x.clone());
                 }
@@ -187,6 +187,10 @@ pub fn charged(l: &Value) -> u64 {
 pub struct Charge {
     pub run: String,
     pub cauldron: String,
+    /// The cauldron's identity its `call` line carries (`cauldron_id`,
+    /// [`crate::engine::cauldron_identity`]); `None` on a line an earlier
+    /// build wrote.
+    pub identity: Option<String>,
     pub dump: String,
     /// When the call began (its `call` line), UTC.
     pub at: String,
@@ -207,6 +211,7 @@ pub struct Charge {
 pub fn charges(lines: &[Value]) -> Vec<Charge> {
     let mut out: Vec<Charge> = Vec::new();
     let mut open: Vec<(usize, Value)> = Vec::new();
+    let mut dropped: Vec<usize> = Vec::new();
     let s = |v: &Value| v.as_str().unwrap_or("").to_string();
     for l in lines {
         // An evaluation's call journaled here by an earlier build: spend of
@@ -220,6 +225,7 @@ pub fn charges(lines: &[Value]) -> Vec<Charge> {
                 out.push(Charge {
                     run: s(&l["run"]),
                     cauldron: s(&l["cauldron"]),
+                    identity: l["cauldron_id"].as_str().map(str::to_string),
                     dump: s(&l["dump"]),
                     at: s(&l["at"]),
                     tokens: l["estimated_input_tokens"].as_u64().unwrap_or(0),
@@ -229,18 +235,29 @@ pub fn charges(lines: &[Value]) -> Vec<Charge> {
             Some("called") => {
                 let run = s(&l["run"]);
                 let found = open.iter().rposition(|(i, id)| out[*i].run == run && (l["call_id"].is_null() || *id == l["call_id"]));
+                // A call threads held before it ran (`held`) never was one.
+                let held = l["held"] == json!(true);
                 match found {
                     Some(k) => {
                         let (i, _) = open.remove(k);
+                        if held {
+                            dropped.push(i);
+                        }
                         out[i].tokens = charged(l);
                         out[i].settled = true;
                     }
-                    None => out.push(Charge { run, cauldron: s(&l["cauldron"]), dump: s(&l["dump"]), at: s(&l["at"]), tokens: charged(l), settled: true }),
+                    None if held => {}
+                    None => out.push(Charge { run, cauldron: s(&l["cauldron"]), identity: None, dump: s(&l["dump"]), at: s(&l["at"]), tokens: charged(l), settled: true }),
                 }
             }
             _ => {}
         }
     }
+    let mut i = 0;
+    out.retain(|_| {
+        i += 1;
+        !dropped.contains(&(i - 1))
+    });
     out
 }
 
@@ -261,10 +278,25 @@ pub struct Day {
 }
 
 /// **The spend of `cauldron` on `date`** (UTC, `YYYY-MM-DD`): every call
-/// that began that day ([`charges`]).
-pub fn day(lines: &[Value], cauldron: &str, date: &str) -> Day {
+/// that began that day ([`charges`]). With `identity` (the daily cap's
+/// count), a call is the cauldron's when its line carries that identity,
+/// whatever name it was made under; a line with no identity (an earlier
+/// build's) is counted by its name. Without, by name.
+pub fn day(lines: &[Value], cauldron: &str, identity: Option<&str>, date: &str) -> Day {
+    let ids: Vec<String> = identity.into_iter().map(str::to_string).collect();
+    day_of(lines, cauldron, &ids, date)
+}
+
+/// [`day`], a call counting as the cauldron's when its line carries any of
+/// `identities` (the cauldron's identity now, and the one it had before it
+/// was given its id); by name when `identities` is empty.
+pub fn day_of(lines: &[Value], cauldron: &str, identities: &[String], date: &str) -> Day {
     let mut d = Day::default();
-    for c in charges(lines).into_iter().filter(|c| c.cauldron == cauldron && c.at.starts_with(date)) {
+    let mine = |c: &Charge| match (identities.is_empty(), c.identity.as_deref()) {
+        (false, Some(had)) => identities.iter().any(|w| w == had),
+        _ => c.cauldron == cauldron,
+    };
+    for c in charges(lines).into_iter().filter(|c| mine(c) && c.at.starts_with(date)) {
         d.calls += 1;
         d.tokens += c.tokens;
         d.dumps.insert(c.dump);

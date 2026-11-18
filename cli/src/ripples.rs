@@ -1,10 +1,13 @@
-//! **`cauldron ripples run | status`**: the dump ripple, by hand.
+//! **`cauldron ripples run | status | on | off`**: the dump ripple, by hand
+//! or, for a cauldron whose owner turned it on, automatically.
 //!
-//! In this release nothing is processed unless the owner asks: `run` sends
+//! Nothing is processed unless the owner asks: `run` sends
 //! one dump to the `ripples` service of the environment (which must be
 //! running, as must `mcp` and `threads`) and follows it to its outcome;
 //! `status` shows the service, the run in progress, the last runs and
-//! the spend. The owner approves a ripple's records with
+//! the spend and automatic processing per cauldron; `on` (the owner's act,
+//! at a terminal) turns automatic processing on for one cauldron, from now
+//! on, and `off` (from anywhere) turns it off. The owner approves a ripple's records with
 //! `cauldron soup approve`, at a terminal.
 //!
 //! The service is found through the environment's seam table (its `ripples`
@@ -20,14 +23,17 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use env::seams::{self, SeamState, Table};
 use env::Environment;
+use env::ripples_auto as ra;
 use serde_json::{json, Value};
+use std::io::IsTerminal;
 
 const SERVICE: &str = "ripples";
 
 const USAGE: &str = "\
-cauldron ripples — turn a dump into knowledge-graph records, by hand
+cauldron ripples — turn a dump into knowledge-graph records, by hand or automatically
 
     cauldron ripples run <DM-n> --env <env> --cauldron <name> [--backend threads|local] [--model <model>] [--force-budget <tokens>]
+                         [--debug-keep-answer]
         Process one dump: its text (a session dump: only what the person typed and what
         the assistant wrote as text) goes to a model, through the `threads` service on
         this machine's Claude login, as a bare completion with no tools, no MCP server and
@@ -50,7 +56,12 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand
         answer) is cancelled in threads, and the outcome says whether threads confirmed it.
         A dump already processed is answered as it is; a removed dump is refused. Prints
         the outcome as JSON (the records, the tokens: input, output, cached, the calls and
-        the models) and, on a failure, what to do. Needs the `ripples`, `mcp` and `threads`
+        the models) and, on a failure, what to do (`detail`: what the backend or the soup
+        said, shown here and written nowhere). The journal keeps codes, counts, ids and
+        fixed reasons only, never the model's answer or the dump's text.
+        --debug-keep-answer keeps this run's model answers and refusals, unscrubbed, in one
+        owner-only file under data/<env>/ripples/debug/, whose path is printed; for a run by
+        hand only (automatic processing never keeps them). Needs the `ripples`, `mcp` and `threads`
         services running in the environment (threads from this release) and the cauldron
         granted to the MCP door with read, write and dump. Exit 0 processed, 3 deferred,
         1 failed.
@@ -92,11 +103,42 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand
         needs neither; its calls are not journaled. The evaluation runs in the service:
         Ctrl-C stops this command following it, not the evaluation, which ends when it is
         done or when the service is stopped (`cauldron --env <env> stop ripples`).
+    cauldron ripples on <cauldron> --env <env> [--backend threads|local] [--model <model>]
+                        [--include-sessions] [--no-scrub-local]
+        Turn automatic processing on for one cauldron: from this moment, each dump that lands
+        in it is processed without a further command, as `run` would process it (the same
+        call, caps, journal and `unreviewed` marking). Only dumps received AFTER this moment
+        are taken; older ones only by hand (`run`). Text dumps only, unless
+        --include-sessions (session transcripts too: their text view). It authorises
+        automatic model spend and automatic writes, so it requires an interactive terminal,
+        like `cauldron mcp grant`: it prints what will be sent where and the caps, asks
+        [y/N], and writes the setting only on yes. The setting belongs to that cauldron,
+        never to its name: `cauldron remove` and `cauldron rename` turn it off, and a
+        setting left behind or copied from another cauldron or environment is void (runs
+        nothing; `status` says why).
+        --backend threads (the default): the scrubbed text goes through the `threads`
+        service on this machine's Claude login. --backend local: to the `inference` service
+        on this machine (--model: a registered model; default the only one); nothing leaves
+        the machine, and the text is scrubbed too unless --no-scrub-local. The scrubber
+        replaces credential-shaped text (known key formats, private keys, tokens, passwords
+        and keys in assignments, on command lines, in URLs, Authorization and Cookie
+        headers, long random strings) with `<redacted:kind>` in what is sent and in the
+        answer; it reduces the risk and is not a guarantee, and if it cannot finish in its
+        time nothing is sent. Needs the `ripples` service running (it is not started for
+        you; one per environment).
+    cauldron ripples off <cauldron> --env <env>
+        Turn it off, from anywhere: no further model call starts for that cauldron, and a run
+        in progress stops before its next call and writes nothing more. Dumps then wait
+        `received`; turning it on again takes only dumps received after that moment.
     cauldron ripples help
 
   The `ripples` service is off unless started (`cauldron --env <env> build ripples`,
-  `pin`, then `start ripples`); the installer does not start it, and in this release it
-  processes a dump only when this command asks.
+  `pin`, then `start ripples`); the installer does not start it. Automatic processing
+  is off for every cauldron until its owner runs `cauldron ripples on`; an upgrade never
+  turns it on. `status` shows, per cauldron, whether it is on, off or void, since when,
+  the backend and the queue (waiting, running, deferred with the reason, retrying,
+  failed with the reason). The journals keep codes, counts, ids and fixed reasons,
+  never the dump's text or the model's answer.
 ";
 
 pub(crate) fn verb_ripples(args: &[String]) -> Result<i32> {
@@ -108,12 +150,14 @@ pub(crate) fn verb_ripples(args: &[String]) -> Result<i32> {
         Some("run") => run(&args[1..]),
         Some("status") => status(&args[1..]),
         Some("eval") => eval(&args[1..]),
+        Some("on") => turn_on(&args[1..]),
+        Some("off") => turn_off(&args[1..]),
         None => {
             eprint!("{USAGE}");
             Ok(2)
         }
         Some(other) => {
-            eprintln!("cauldron ripples: no verb `{other}` (run | status | eval | help)");
+            eprintln!("cauldron ripples: no verb `{other}` (run | status | eval | on | off | help)");
             Ok(2)
         }
     }
@@ -135,6 +179,9 @@ struct Args {
     repeat: Option<String>,
     max_calls: Option<String>,
     yes: bool,
+    include_sessions: bool,
+    no_scrub_local: bool,
+    debug_keep_answer: bool,
     pos: Vec<String>,
 }
 
@@ -149,11 +196,16 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
         if flag.starts_with('-') && !allow.contains(&flag) {
             bail!("unknown option `{s}` for `cauldron ripples {verb}` (`cauldron ripples help`)");
         }
-        if flag == "--yes" {
+        if matches!(flag, "--yes" | "--include-sessions" | "--no-scrub-local" | "--debug-keep-answer") {
             if inline.is_some() {
-                bail!("`--yes` takes no value");
+                bail!("`{flag}` takes no value");
             }
-            a.yes = true;
+            match flag {
+                "--yes" => a.yes = true,
+                "--include-sessions" => a.include_sessions = true,
+                "--debug-keep-answer" => a.debug_keep_answer = true,
+                _ => a.no_scrub_local = true,
+            }
             continue;
         }
         let mut value = || -> Result<String> {
@@ -227,6 +279,9 @@ fn print(v: &Value) -> Result<()> {
 /// How a finished run's outcome exits, with a line on stderr.
 fn finish(v: &Value) -> Result<i32> {
     print(v)?;
+    if let Some(p) = v["debug_file"].as_str() {
+        eprintln!("cauldron ripples: --debug-keep-answer: the model's answers and the refusals, unscrubbed, are in {p} (owner-only); delete it when done");
+    }
     let o = v["outcome"].as_str().unwrap_or("");
     let n = v["records"].as_array().map_or(0, Vec::len);
     match o {
@@ -244,13 +299,16 @@ fn finish(v: &Value) -> Result<i32> {
         }
         _ => {
             eprintln!("cauldron ripples: failed ({}): {} What to do: {}", v["code"].as_str().unwrap_or("?"), v["message"].as_str().unwrap_or(""), v["what_to_do"].as_str().unwrap_or("read the message"));
+            if let Some(d) = v["detail"].as_str() {
+                eprintln!("cauldron ripples: detail (shown here only, written nowhere): {d}");
+            }
             Ok(1)
         }
     }
 }
 
 fn run(args: &[String]) -> Result<i32> {
-    let a = parse("run", args, &["--env", "--cauldron", "--model", "--backend", "--force-budget"])?;
+    let a = parse("run", args, &["--env", "--cauldron", "--model", "--backend", "--force-budget", "--debug-keep-answer"])?;
     let (Some(env_name), Some(cauldron)) = (a.env.as_deref(), a.cauldron.as_deref()) else {
         bail!("`cauldron ripples run` needs --env and --cauldron, given as flags (`cauldron ripples help`)");
     };
@@ -281,6 +339,9 @@ fn run(args: &[String]) -> Result<i32> {
     }
     if let Some(n) = force_budget {
         req["force_budget"] = json!(n);
+    }
+    if a.debug_keep_answer {
+        req["keep_answer"] = json!(true);
     }
     let first = ask(&e, addr, "RUN", &req)?;
     if first["ok"] != json!(true) {
@@ -372,11 +433,229 @@ fn status(args: &[String]) -> Result<i32> {
                 "evaluations_spend": spend(&eval_lines, a.cauldron.as_deref())["today"].clone(),
                 "journal": path.display().to_string(),
                 "evaluations_ledger": eval_path.display().to_string(),
+                "automatic": automatic_offline(&e, a.cauldron.as_deref()),
             }))?;
             eprintln!("cauldron ripples: {why}. {}", start_hint(&e.name));
             Ok(0)
         }
     }
+}
+
+/// Automatic processing per cauldron with a setting, read with the service
+/// stopped: the setting, the automatic journal, and the dumps read from the
+/// cauldron's store (`env::ripples_auto::queue`).
+fn automatic_offline(e: &Environment, cauldron: Option<&str>) -> Value {
+    let root = &e.data_root;
+    let lines = ra::read(root);
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let hold = ra::threads_hold(&lines);
+    let list: Vec<Value> = ra::all(e)
+        .into_iter()
+        .filter(|x| cauldron.is_none_or(|c| x.name == c))
+        .map(|x| {
+            let rs = if x.void.is_none() { received_dumps(e, &x.settings.cauldron) } else { None };
+            // The service is not running: an open attempt was cut short.
+            let mut q = ra::queue(&x, &e.name, rs.as_deref(), &ra::dump_states(&lines, &x.settings), &now, None);
+            hold.mark(&mut q, &x.settings, &now);
+            if x.runs() {
+                q["service"] = json!("not running: nothing is processed until it is started");
+            }
+            q
+        })
+        .collect();
+    json!({"threads_hold": hold.view(&now), "cauldrons": list, "off_elsewhere": "every cauldron not listed here is off", "journal": ra::journal_path(root).display().to_string()})
+}
+
+/// A cauldron's dumps still `received`, read from its store.
+fn received_dumps(e: &Environment, cauldron: &str) -> Option<Vec<Value>> {
+    let c = e.find_cauldron(cauldron).ok().flatten()?;
+    let o = soup_door::dumps::ListOpts { state: Some("received".into()), kind: None, limit: Some(usize::MAX) };
+    soup_door::dumps::list(&c, &o).ok().and_then(|d| d["dumps"].as_array().cloned())
+}
+
+/// The highest dump serial `cauldron` holds (any state, removed ones
+/// included): the `since` rule's mark.
+fn highest_dump(c: &env::Cauldron) -> Result<u64> {
+    let o = soup_door::dumps::ListOpts { state: None, kind: None, limit: Some(usize::MAX) };
+    let d = soup_door::dumps::list(c, &o)?;
+    Ok(d["dumps"].as_array().into_iter().flatten().map(|x| ra::serial(x["id"].as_str().unwrap_or(""))).max().unwrap_or(0))
+}
+
+fn one(verb: &str, a: &Args) -> Result<String> {
+    match a.pos.as_slice() {
+        [c] => Ok(c.clone()),
+        _ => bail!("`cauldron ripples {verb}` takes ONE cauldron name (got {}); `cauldron ripples help`", a.pos.len()),
+    }
+}
+
+/// What turning it on means, in words: what is sent where, the caps, and
+/// how to turn it off.
+fn what_it_means(s: &ra::Settings, env_name: &str, service: &str) -> String {
+    let kinds = if s.include_sessions {
+        "each text dump (its whole text) and each session dump (only what the person typed and what the assistant wrote as text: no tool output, thinking or shell output)"
+    } else {
+        "each text dump (its whole text); session dumps are not taken (--include-sessions was not given) and wait for `cauldron ripples run`"
+    };
+    let where_to = if s.backend == "local" {
+        format!(
+            "goes to the `inference` service on this machine, model `{}`, as one structured call (and one retry on the same model when the answer is refused). Nothing leaves this machine. The text {} scrubbed first.",
+            s.model.as_deref().unwrap_or("(the only registered model)"),
+            if s.scrub_local { "is" } else { "is NOT (--no-scrub-local)" }
+        )
+    } else {
+        format!(
+            "goes through the `threads` service, on this machine's Claude login, to Anthropic as one bare completion with no tools, no MCP server and no settings, plugins, hooks or CLAUDE.md, on `{}` (one retry on `opus` when the answer is refused). The text is scrubbed first: credential-shaped text is replaced by `<redacted:kind>`. The scrubber reduces the risk and is not a guarantee. threads keeps a copy of each call's prompt and answer in its own store.",
+            s.model.as_deref().unwrap_or("sonnet")
+        )
+    };
+    format!(
+        "Turning automatic processing on for cauldron `{c}` in environment `{env_name}` means, for dumps received after DM-{since}:
+         
+         What is sent where: {kinds}, with the cauldron's regions (id, handle, boundary; at most 50) and the package's instructions, {where_to} No existing record is sent.
+         What is written: the answer's records, each scrubbed, citing the dump and marked `unreviewed` until you approve them at a terminal (`cauldron soup approve`); the dump becomes `processed` with the run and the record ids.
+         Caps, charged before each call: per dump, 3 calls and 200000 input tokens across every run of it; per cauldron per UTC day, 1500000 input tokens or 30 dumps. Over a cap a dump stays `received` with `deferred: budget` and is tried again after midnight UTC.
+         Failures: a failed attempt is retried after 2, then 8 minutes; after 3 failed attempts the dump is parked `failed` with the reason, and only `cauldron ripples run` runs it again.
+         The `ripples` service: {service}
+         Turn it off, from anywhere: cauldron ripples off {c} --env {env_name}
+         See it: cauldron ripples status --env {env_name} --cauldron {c}",
+        c = s.cauldron,
+        since = s.since_dump,
+    )
+}
+
+/// **`cauldron ripples on`**.
+fn turn_on(args: &[String]) -> Result<i32> {
+    let a = parse("on", args, &["--env", "--backend", "--model", "--include-sessions", "--no-scrub-local"])?;
+    let cauldron = one("on", &a)?;
+    let Some(env_name) = a.env.as_deref() else {
+        bail!("`cauldron ripples on` needs --env, given as a flag (`cauldron ripples help`)");
+    };
+    let backend = a.backend.clone().unwrap_or_else(|| "threads".into());
+    if !matches!(backend.as_str(), "threads" | "local") {
+        bail!("`--backend` is `threads` (the default) or `local`, not `{backend}`");
+    }
+    if a.no_scrub_local && backend != "local" {
+        bail!("`--no-scrub-local` goes with `--backend local`: what goes through threads is always scrubbed");
+    }
+    if let Some(m) = &a.model {
+        let ok = if backend == "local" { inference_registry::name_ok(m.strip_prefix("local:").unwrap_or(m)) } else { !m.is_empty() && m.len() <= 64 && m.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) };
+        if !ok {
+            bail!("`{m}` is not a model id for the {backend} backend");
+        }
+    }
+    let e = crate::mcp::environment(Some(env_name))?;
+    soup_door::grants::require_cauldron(&e, &cauldron)?;
+    let c = e.find_cauldron(&cauldron)?.with_context(|| format!("no cauldron `{cauldron}` in environment `{}`", e.name))?;
+    let mut cmd = format!("cauldron ripples on {cauldron} --env {}", e.name);
+    if backend != "threads" {
+        cmd.push_str(&format!(" --backend {backend}"));
+    }
+    if let Some(m) = &a.model {
+        cmd.push_str(&format!(" --model {m}"));
+    }
+    if a.include_sessions {
+        cmd.push_str(" --include-sessions");
+    }
+    if a.no_scrub_local {
+        cmd.push_str(" --no-scrub-local");
+    }
+    // Checked last, so the command the refusal names is one that would work.
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!(
+            "REFUSED: turning automatic processing on is the owner's act at a terminal: it authorises model spend and \
+             writes into the cauldron with no further command. `cauldron ripples on` requires an interactive terminal \
+             (its input and output), shows what it means there and asks for a yes, and no option skips this. \
+             Nothing was changed. Ask the user to run, in a terminal on this machine:\n    {cmd}"
+        );
+    }
+    // The cauldron's id, given now if it has none yet: the setting is bound
+    // to it.
+    soup_door::grants::adopt(&e, &c)?;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let before = ra::effective(&e, &cauldron)?;
+    // Already on for this very cauldron: the same `since`, so nothing older
+    // is taken; else (off, or a void setting of a cauldron that is gone)
+    // from now.
+    let (since_at, since_dump, kept) = match &before {
+        Some(b) if b.runs() => (b.settings.since_at.clone(), b.settings.since_dump, true),
+        _ => (now.clone(), highest_dump(&c)?, false),
+    };
+    let s = ra::Settings {
+        cauldron: cauldron.clone(),
+        on: true,
+        since_at,
+        since_dump,
+        backend,
+        model: a.model.clone(),
+        include_sessions: a.include_sessions,
+        scrub_local: !a.no_scrub_local,
+        changed_at: now,
+        off_at: None,
+        bound_to: Some(ra::Binding::of(&e, &c)),
+    };
+    let service = match find(&e) {
+        Ok(_) => "running; it takes dumps from the moment you say yes.".to_string(),
+        Err(why) => format!("{why}. Nothing is processed until it runs: {}", start_hint(&e.name)),
+    };
+    let granted = soup_door::grants::Grants::load(&e).ok().and_then(|g| g.get(&cauldron).map(|x| x.scopes.len() >= 3)).unwrap_or(false);
+    let mut text = what_it_means(&s, &e.name, &service);
+    if !granted {
+        text.push_str(&format!("\nThe cauldron must be granted to the MCP door with read, write and dump for this to run: `cauldron mcp grant {cauldron} --env {}`.", e.name));
+    }
+    // What it means first; then the owner's yes, at the terminal; only then
+    // is anything written.
+    println!("{text}\n");
+    print!("Turn automatic processing on for cauldron `{cauldron}`? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("cauldron ripples: not turned on; nothing was changed.");
+        return Ok(1);
+    }
+    // Already on for this cauldron, and the setting not changed meanwhile:
+    // the same `since` (read again, after the wait at the prompt).
+    let s = match ra::effective(&e, &cauldron)? {
+        Some(b) if b.runs() && kept => ra::Settings { since_at: b.settings.since_at, since_dump: b.settings.since_dump, ..s },
+        _ => s,
+    };
+    ra::store(&e.data_root, &s)?;
+    print(&json!({
+        "outcome": if kept { "updated" } else { "on" },
+        "env": e.name,
+        "setting": s,
+        "store": ra::path(&e.data_root, &cauldron).display().to_string(),
+    }))?;
+    println!(
+        "Automatic processing is ON for cauldron `{cauldron}` in environment `{}`, for dumps received after DM-{} (from {}). Turn it off, from anywhere: cauldron ripples off {cauldron} --env {}",
+        e.name, s.since_dump, s.since_at, e.name
+    );
+    Ok(0)
+}
+
+/// **`cauldron ripples off`**: from anywhere; takes effect before the next
+/// model call.
+fn turn_off(args: &[String]) -> Result<i32> {
+    let a = parse("off", args, &["--env"])?;
+    let cauldron = one("off", &a)?;
+    let Some(env_name) = a.env.as_deref() else {
+        bail!("`cauldron ripples off` needs --env, given as a flag (`cauldron ripples help`)");
+    };
+    let e = crate::mcp::environment(Some(env_name))?;
+    if !ra::name_ok(&cauldron) {
+        bail!("REFUSED: `{cauldron}` is not a usable cauldron name");
+    }
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let doc = match ra::turn_off(&e.data_root, &cauldron, &now)? {
+        Some(_) => {
+            let s = ra::load(&e.data_root, &cauldron)?;
+            json!({"outcome": "off", "env": e.name, "cauldron": cauldron, "setting": s,
+                   "note": format!("automatic processing is off for cauldron `{cauldron}`: no further model call starts, a run in progress stops before its next call, and dumps wait `received` (`cauldron ripples run` still processes one by hand)")})
+        }
+        _ => json!({"outcome": "already_off", "env": e.name, "cauldron": cauldron, "note": format!("automatic processing was not on for cauldron `{cauldron}`; nothing changed")}),
+    };
+    print(&doc)?;
+    Ok(0)
 }
 
 /// What the journal says was spent: today per cauldron, and per dump
@@ -397,11 +676,17 @@ fn spend(lines: &[Value], cauldron: Option<&str>) -> Value {
         match l["event"].as_str() {
             Some("call") => calls.push((l.clone(), l["estimated_input_tokens"].as_u64().unwrap_or(0), false)),
             Some("called") => {
-                match calls.iter_mut().rev().find(|(b, _, settled)| !settled && b["run"] == l["run"] && (l["call_id"].is_null() || b["call_id"] == l["call_id"])) {
-                    Some(c) => {
-                        c.1 = charged(l);
-                        c.2 = true;
+                let open = calls.iter().rposition(|(b, _, settled)| !settled && b["run"] == l["run"] && (l["call_id"].is_null() || b["call_id"] == l["call_id"]));
+                match open {
+                    // A call threads held before it ran (`held`) never was one.
+                    Some(i) if l["held"] == json!(true) => {
+                        calls.remove(i);
                     }
+                    Some(i) => {
+                        calls[i].1 = charged(l);
+                        calls[i].2 = true;
+                    }
+                    None if l["held"] == json!(true) => {}
                     None => calls.push((l.clone(), charged(l), true)),
                 }
             }

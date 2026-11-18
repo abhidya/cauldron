@@ -25,6 +25,8 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 # The answer is checked against the package's schema here, whatever the backend judged.
 jsonschema = { version = "0.49", default-features = false }
+# The secret scrubber's patterns (`src/scrub.rs`). The version the lockfile holds.
+regex = "1"
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
@@ -48,6 +50,9 @@ test-isolation = { path = "../../testkit/test-isolation" }
 cauldron-mcp = { path = "../mcp" }
 soup-door = { path = "../../libs/soup-door" }
 spine = { path = "../../libs/spine" }
+# The automatic tests build a failed call's text the way threads does
+# (`threads::retry::stderr_tail`), from a fake `claude`'s stderr.
+threads = { path = "../threads" }
 
 [lints.rust]
 unsafe_code = "forbid"

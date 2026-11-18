@@ -89,7 +89,7 @@ mod mcp;
 mod mcp_door;
 // `cauldron mcp stdio`: the bridge Claude Code launches.
 mod mcp_bridge;
-// `cauldron ripples`: a dump into records, by hand, through the ripples service.
+// `cauldron ripples`: a dump into records, by hand or automatically, through the ripples service.
 mod ripples;
 // `cauldron inference`: local model files registered by hand, and the
 // `inference` service that runs them on demand.
@@ -144,7 +144,7 @@ const VERBS: &[(&str, &str)] = &[
     ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get | dump-remove | approve (`soup help`)"),
     ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
     ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
-    ("ripples", "a dump into knowledge-graph records, by hand: run | status | eval (`ripples help`); approve them with `soup approve`"),
+    ("ripples", "a dump into knowledge-graph records: run | status | eval | on | off (`ripples help`); approve them with `soup approve`"),
     ("inference", "local models on this machine: models add | list | remove, status, unload (`inference help`)"),
 ];
 
