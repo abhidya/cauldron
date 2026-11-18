@@ -18,10 +18,15 @@
 pub mod error;
 pub mod budget;
 pub mod catalogue;
+pub mod changes;
+pub mod clusters;
+pub mod corpus;
+pub mod cursor;
 pub mod cut;
 pub mod dumps;
 pub mod grants;
 pub mod import;
+pub mod notes;
 pub mod lock;
 pub mod marker;
 pub mod reads;

@@ -6,8 +6,8 @@
 //! marker, the default install location, PATH), run `cauldron mcp stdio`
 //! with its own arguments, refuse a path that is not a regular file owned by
 //! the user or root (a symlink, a group-writable file, a file in a directory
-//! others can write, a file in the project directory, a PATH entry that is
-//! empty, relative or inside the project), and, with
+//! others can write, a file in the project directory from any source, a PATH
+//! entry that is empty, relative or inside the project), and, with
 //! nothing found, answer the MCP handshake itself with a tool-less server
 //! whose instructions say how to install, printing nothing but JSON-RPC on
 //! stdout.
@@ -321,4 +321,77 @@ fn every_source_refuses_a_file_in_a_directory_others_can_write() {
     std::fs::set_permissions(&ww, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (_, out, _) = run(&[("HOME", h), ("CAULDRON_BIN", link.join("cauldron").to_str().unwrap())], &[], "");
     assert_eq!(out, "WORLD mcp stdio\n");
+}
+
+/// CAULDRON_HOME and the install marker follow the project rule too: a
+/// `bin/cauldron` the project carries is never run when CAULDRON_HOME names
+/// the project (directly, through a symlink outside it, or with the project
+/// named by CLAUDE_PROJECT_DIR), nor when the marker names a file in it; the
+/// next source is used, and the refusal is named on stderr.
+#[test]
+fn cauldron_home_and_the_marker_inside_the_project_are_refused() {
+    let s = Scratch::new("projhome");
+    let home = s.0.join("home");
+    let h = home.to_str().unwrap();
+    let proj = s.0.join("proj");
+    fake(&proj.join("bin/cauldron"), "PROJECT-HOME");
+    fake(&proj.join("tools/cauldron"), "PROJECT-MARKED");
+    let pathdir = s.0.join("pathdir");
+    fake(&pathdir.join("cauldron"), "path");
+    let path = format!("{}:/usr/bin:/bin", pathdir.display());
+    let pr = proj.to_str().unwrap();
+
+    // CAULDRON_HOME is the project, started in it: PATH is used instead.
+    let (rc, out, err) = run_in(Some(&proj), &[("HOME", h), ("CAULDRON_HOME", pr), ("PATH", &path)], &[], "");
+    assert_eq!((rc, out.as_str()), (0, "path mcp stdio\n"), "{err}");
+    assert!(err.contains("skipped the default install location") && err.contains("inside the project directory"), "{err}");
+    // Started in a subdirectory of the project, CAULDRON_HOME the project: the file is not inside the
+    // current directory, so only CLAUDE_PROJECT_DIR says it is the project.
+    let sub = proj.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let (_, out, _) = run_in(Some(&sub), &[("HOME", h), ("CAULDRON_HOME", pr), ("PATH", &path), ("CLAUDE_PROJECT_DIR", pr)], &[], "");
+    assert_eq!(out, "path mcp stdio\n");
+    // Started elsewhere with the project named by CLAUDE_PROJECT_DIR.
+    let elsewhere = s.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let (_, out, _) = run_in(Some(&elsewhere), &[("HOME", h), ("CAULDRON_HOME", pr), ("PATH", &path), ("CLAUDE_PROJECT_DIR", pr)], &[], "");
+    assert_eq!(out, "path mcp stdio\n");
+    // CAULDRON_HOME through a symlink that sits outside the project and points into it.
+    let link = s.0.join("rootlink");
+    std::os::unix::fs::symlink(&proj, &link).unwrap();
+    let (_, out, err) = run_in(Some(&proj), &[("HOME", h), ("CAULDRON_HOME", link.to_str().unwrap())], &[], LIST);
+    assert!(answered_tool_less(&out), "{out}");
+    assert!(err.contains("inside the project directory"), "{err}");
+    // The same CAULDRON_HOME, started outside the project with no project named: it is an install like any other.
+    let (_, out, _) = run_in(Some(&elsewhere), &[("HOME", h), ("CAULDRON_HOME", pr)], &[], "");
+    assert_eq!(out, "PROJECT-HOME mcp stdio\n");
+
+    // The install marker names a file in the project: the default location is used instead.
+    fake(&home.join(".cauldron/bin/cauldron"), "default");
+    let marker = home.join(MARKER_REL);
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, format!("{}\n", proj.join("tools/cauldron").display())).unwrap();
+    let (_, out, err) = run_in(Some(&proj), &[("HOME", h)], &[], "");
+    assert_eq!(out, "default mcp stdio\n", "{err}");
+    assert!(err.contains("skipped the install marker") && err.contains("inside the project directory"), "{err}");
+    let (_, out, _) = run_in(Some(&elsewhere), &[("HOME", h), ("CLAUDE_PROJECT_DIR", pr)], &[], "");
+    assert_eq!(out, "default mcp stdio\n");
+    // Marker and CAULDRON_HOME both in the project, nothing else: nothing from it runs.
+    let (_, out, _) = run_in(Some(&proj), &[("HOME", h), ("CAULDRON_HOME", pr)], &[], LIST);
+    assert!(answered_tool_less(&out), "{out}");
+    // Outside the project the marker is honoured.
+    let (_, out, _) = run_in(Some(&elsewhere), &[("HOME", h)], &[], "");
+    assert_eq!(out, "PROJECT-MARKED mcp stdio\n");
+}
+
+/// A session started in HOME (CLAUDE_PROJECT_DIR is HOME itself) is not a
+/// project: the default install under HOME is used.
+#[test]
+fn a_session_in_home_still_finds_the_default_install() {
+    let s = Scratch::new("homeproj");
+    let home = s.0.join("home");
+    fake(&home.join(".cauldron/bin/cauldron"), "default");
+    let h = home.to_str().unwrap();
+    let (_, out, err) = run_in(Some(&home), &[("HOME", h), ("CLAUDE_PROJECT_DIR", h)], &[], "");
+    assert_eq!(out, "default mcp stdio\n", "{err}");
 }

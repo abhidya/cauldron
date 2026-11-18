@@ -86,6 +86,9 @@ scripts/prove-alarm-hosted
 # installed from the repository by its root marketplace (`/plugin
 # marketplace add <owner>/<repo>` reads .claude-plugin/marketplace.json at the
 # root), another dot path, and the plugin manifest that marketplace points at.
+# The published record schemas (workspace-v6 and cauldron-v1) and the
+# plugin's copy of them are what a session and an outside writer read to
+# write records; nothing fails to build without them, so they are listed.
 REQUIRED_PATHS='
 .claude-plugin/marketplace.json
 claude-code/cauldron/.claude-plugin/plugin.json
@@ -111,6 +114,19 @@ services/inference/Cargo.toml
 services/inference/src/lib.rs
 libs/inference-registry/Cargo.toml
 libs/inference-registry/src/lib.rs
+schema/soup/workspace-v6/grammar.json
+schema/soup/workspace-v6/README.md
+schema/soup/cauldron-v1/grammar.json
+schema/soup/cauldron-v1/edges.json
+schema/soup/cauldron-v1/node.cluster.schema.json
+schema/soup/cauldron-v1/remint.cluster.schema.json
+schema/soup/cauldron-v1/README.md
+claude-code/cauldron/schema/grammar.json
+claude-code/cauldron/schema/cauldron-v1/grammar.json
+claude-code/cauldron/schema/cauldron-v1/edges.json
+claude-code/cauldron/schema/cauldron-v1/node.cluster.schema.json
+claude-code/cauldron/schema/cauldron-v1/remint.cluster.schema.json
+claude-code/cauldron/schema/cauldron-v1/README.md
 '
 # A path every archive of this repo must contain: the positive sentinel that
 # proves the archive listing and the match below can find a path at all.

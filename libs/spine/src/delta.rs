@@ -228,9 +228,12 @@ pub type BoundIdentities = BTreeMap<String, Vec<QualifiedNodeId>>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompiledPayload {
     /// One part per touched pool. Parts land in THIS vector's order, which
-    /// is frozen as ascending pool name — deterministic, so the
-    /// between-landings kill window is reproducible (the atomicity
-    /// tests).
+    /// is frozen at compile time: a part holding a cross-pool edge into
+    /// another touched pool lands after that pool's part (the far end of an
+    /// edge is readable before the edge is), and otherwise ascending pool
+    /// name — deterministic, so the between-landings kill window is
+    /// reproducible (the atomicity tests). A row keeps the order it was
+    /// compiled with, so recovery lands a stored payload as it was frozen.
     pub parts: Vec<CompiledPart>,
     /// Binding name -> the identifier minted for each CREATEd node, so
     /// RETURN hands identifiers back without a second read.

@@ -4,7 +4,7 @@
     {
       "id": "import",
       "name": "Import",
-      "description": "Bringing older records in.",
+      "description": "Inside: bringing records from older stores into a soup, end to end.",
       "regions": [
         "R-1",
         "R-2"
@@ -20,9 +20,10 @@
         {
           "id": "files",
           "name": "Files",
-          "description": "The files.",
+          "description": "Inside: the corpus files on disk, and the records no longer kept.",
           "regions": [
-            "R-2"
+            "R-2",
+            "R-7"
           ]
         }
       ]

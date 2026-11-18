@@ -1088,6 +1088,206 @@ fn the_projected_namespace_is_a_pool_kind_with_a_code_defined_grammar() {
 }
 
 // ---------------------------------------------------------------------------
+// the cauldron grammar: a cluster in pool `cauldron` claims a region of `ws`
+// ---------------------------------------------------------------------------
+
+const BOUNDARY: &str = "Inside: everything about releases and how they ship. Outside: what they contain.";
+
+fn soup(name: &str, with_cauldron_pool: bool) -> (PathBuf, Cauldron) {
+    let dir = root(name);
+    let mut g = vec![spine::grammar_v6::workspace_v6("ws")];
+    if with_cauldron_pool {
+        g.push(spine::grammar_cauldron::cauldron_v1("cauldron"));
+    }
+    let c = fresh_cauldron(&dir, g);
+    (dir, c)
+}
+
+fn region(c: &Cauldron) -> NodeId {
+    let (_, rows) = committed(c, commit(r#"CREATE (r: ws/region { handle: "releases", boundary: $b }) RETURN r.id"#, &[("b", serde_json::json!(BOUNDARY))]));
+    returned_id(&rows, "r.id")
+}
+
+fn cluster(c: &Cauldron) -> NodeId {
+    let (_, rows) = committed(c, commit(r#"CREATE (k: cauldron/cluster { handle: "shipping", boundary: $b }) RETURN k.id"#, &[("b", serde_json::json!(BOUNDARY))]));
+    returned_id(&rows, "k.id")
+}
+
+fn claim(c: &Cauldron, verb: &str, k: &NodeId, ty: &str, r: &NodeId) -> Result<Outcome, SpineError> {
+    c.submit(commit(
+        &format!("MATCH (k: cauldron/cluster {{ id: $k }}) MATCH (r: ws/{ty} {{ id: $r }}) {verb} (k) -[claims]-> (r)"),
+        &[("k", serde_json::json!(k.0)), ("r", serde_json::json!(r.0))],
+    ))
+}
+
+/// A cluster claims a region of the workspace pool across pools; the edge is
+/// stored once, in the cauldron pool, and a region's claimants are read from
+/// the reverse index. Removing the claim lands too.
+#[test]
+fn a_cluster_claims_a_workspace_region_across_pools_and_the_claim_is_removed() {
+    let (dir, c) = soup("claims", true);
+    let (r, k) = (region(&c), cluster(&c));
+    assert!(k.0.starts_with("CL-"), "{k}");
+    claim(&c, "CREATE", &k, "region", &r).expect("the cross-pool claim lands");
+    let edges = edges_from(&dir, "cauldron", &k);
+    assert_eq!(edges.len(), 1);
+    assert_eq!((edges[0].kind.as_str(), edges[0].dst.pool.as_str(), edges[0].dst.id.0.as_str()), ("claims", "ws", r.0.as_str()));
+    let p = Pool::open(&Pool::path_in(&dir, &PoolName::new("cauldron"))).unwrap();
+    let back = p.snapshot().unwrap().edges_to(&spine::pool::QualifiedNodeId { pool: PoolName::new("ws"), id: r.clone() }, Some("claims")).unwrap();
+    assert_eq!(back.iter().map(|e| e.src.0.clone()).collect::<Vec<_>>(), [k.0.clone()]);
+    claim(&c, "REMOVE", &k, "region", &r).expect("removing the claim lands");
+    assert!(edges_from(&dir, "cauldron", &k).is_empty());
+}
+
+/// A statement making a region and a cluster's claim of it lands the
+/// workspace part FIRST and the claim-bearing part second, though `cauldron`
+/// sorts before `ws`: the far end of a cross-pool edge is readable before
+/// the edge is. The order is frozen on the row, so recovery lands it the
+/// same way.
+// RED: the compiler's parts back in ascending pool name (`cauldron` first).
+#[test]
+fn a_part_lands_after_the_pool_its_cross_pool_edges_point_into() {
+    let (dir, c) = soup("claims-order", true);
+    committed(
+        &c,
+        commit(
+            r#"CREATE (r: ws/region { handle: "releases", boundary: $b })
+               CREATE (k: cauldron/cluster { handle: "shipping", boundary: $b })
+               CREATE (k) -[claims]-> (r)"#,
+            &[("b", serde_json::json!(BOUNDARY))],
+        ),
+    );
+    let conn = spine::offline::read_only_connection(&dir.join(spine::spine_db::SPINE_FILE)).unwrap();
+    let payload: String = conn
+        .query_row("SELECT payload FROM transactions WHERE decided = 1 ORDER BY seq DESC LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let p: spine::delta::CompiledPayload = serde_json::from_str(&payload).unwrap();
+    let order: Vec<&str> = p.parts.iter().map(|x| x.pool.as_str()).collect();
+    assert_eq!(order, ["ws", "cauldron"], "the region's pool lands before the claim's");
+    // A cluster alone (no edge into `ws`) is one part, and a claim of a
+    // region already held is one part too: nothing to order.
+    committed(&c, commit(r#"CREATE (k: cauldron/cluster { handle: "docs", boundary: $b })"#, &[("b", serde_json::json!(BOUNDARY))]));
+}
+
+/// A claim of a workspace node that is not a region is refused by the
+/// grammar, and nothing lands.
+#[test]
+fn a_claim_of_a_non_region_is_refused() {
+    let (dir, c) = soup("claims-non-region", true);
+    let k = cluster(&c);
+    let (_, rows) = committed(&c, commit(
+        r#"MATCH (r: ws/region { id: $r }) CREATE (q: ws/question { handle: "which?", state: "open" }) CREATE (q) -[in_region]-> (r) RETURN q.id"#,
+        &[("r", serde_json::json!(region(&c).0))],
+    ));
+    let q = returned_id(&rows, "q.id");
+    let err = claim(&c, "CREATE", &k, "question", &q).expect_err("a question cannot be claimed");
+    assert!(matches!(err, SpineError::Refused { .. }), "{err:?}");
+    assert!(edges_from(&dir, "cauldron", &k).is_empty());
+}
+
+/// A cluster carries no state, and its boundary keeps the region's rule.
+#[test]
+fn a_cluster_takes_no_state_and_a_short_boundary_is_refused() {
+    let (_dir, c) = soup("cluster-shape", true);
+    for stmt in [
+        r#"CREATE (k: cauldron/cluster { handle: "h", boundary: $b, state: "open" })"#,
+        r#"CREATE (k: cauldron/cluster { handle: "h", boundary: "too short" })"#,
+        r#"CREATE (k: cauldron/cluster { boundary: $b })"#,
+    ] {
+        let err = c.submit(commit(stmt, &[("b", serde_json::json!(BOUNDARY))])).expect_err(stmt);
+        assert!(matches!(err, SpineError::Refused { .. }), "{stmt}: {err:?}");
+    }
+}
+
+/// An older cauldron (workspace pool only) gets the cauldron pool by one
+/// additive act: nothing else in the store moves, the handle can then write
+/// a cluster and its claim, and a fresh open discovers the pool. Adding it
+/// again is a no-op; a different grammar under the same name is refused.
+#[test]
+fn add_pool_adds_the_cauldron_pool_to_an_older_store_and_changes_nothing_else() {
+    let (dir, mut c) = soup("add-pool", false);
+    let r = region(&c);
+    let counter = c.committed_commit_counter().unwrap();
+    let ws_bytes = std::fs::read(dir.join("ws.db")).unwrap();
+    let g = spine::grammar_cauldron::cauldron_v1("cauldron");
+    assert!(c.add_pool(&g).expect("the pool is added"));
+    assert_eq!(c.committed_commit_counter().unwrap(), counter, "adding a pool writes no spine row");
+    assert_eq!(std::fs::read(dir.join("ws.db")).unwrap(), ws_bytes, "the workspace pool is not touched");
+    assert!(!dir.join(".adding-cauldron").exists(), "the staging is gone");
+    assert!(!dir.join("cauldron.db-wal").exists(), "the pool was moved in whole, with no log beside it");
+    assert!(!c.add_pool(&g).unwrap(), "adding it again is a no-op");
+    let mut other = g.clone();
+    other.version = 2;
+    assert!(c.add_pool(&other).is_err(), "a different pin under the same name is refused");
+    let k = cluster(&c);
+    claim(&c, "CREATE", &k, "region", &r).expect("the claim lands through the same handle");
+    drop(c);
+    let reopened = Cauldron::open(&dir, SpineConfig::default()).expect("the store opens");
+    assert_eq!(reopened.pools().map(|p| p.as_str().to_string()).collect::<Vec<_>>(), ["cauldron", "ws"]);
+    assert_eq!(reopened.committed_commit_counter().unwrap(), counter + 2, "one counter across both pools");
+}
+
+/// `add_pool` adds the cluster pool and nothing else: another grammar, or
+/// `cauldron@1` under another name, is refused, whatever the cauldron holds.
+// RED: the grammar check removed from `add_pool`.
+#[test]
+fn add_pool_adds_only_the_cluster_pool() {
+    let (_dir, mut c) = soup("add-pool-only", false);
+    let err = c.add_pool(&spine::grammar_v6::workspace_v6("ws2")).expect_err("a second workspace pool is not added");
+    assert!(format!("{err}").contains("only as `cauldron`"), "{err}");
+    assert!(c.add_pool(&spine::grammar_cauldron::cauldron_v1("other")).is_err(), "nor the cluster grammar under another name");
+    assert!(c.add_pool(&spine::grammar_cauldron::cauldron_v1("cauldron")).unwrap());
+}
+
+/// An add that died after its rename and before removing its staging
+/// leaves a second name for the live pool file; the next add (which finds
+/// the pool in place) removes it.
+// RED: `clear_staging` removed from the already-pinned path.
+#[test]
+fn a_staging_left_after_the_rename_is_removed_by_the_next_add() {
+    let (dir, mut c) = soup("add-pool-stale-link", false);
+    let g = spine::grammar_cauldron::cauldron_v1("cauldron");
+    assert!(c.add_pool(&g).unwrap());
+    let staging = dir.join(".adding-cauldron");
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::hard_link(dir.join("cauldron.db"), staging.join("cauldron.db")).unwrap();
+    assert!(!c.add_pool(&g).unwrap(), "already there");
+    assert!(!staging.exists(), "the stale staging is gone");
+    drop(c);
+    let mut c = Cauldron::open(&dir, SpineConfig::default()).unwrap();
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::hard_link(dir.join("cauldron.db"), staging.join("cauldron.db")).unwrap();
+    assert!(!c.add_pool(&g).unwrap());
+    assert!(!staging.exists(), "removed by an add through a fresh handle too");
+}
+
+/// An add that died after staging the pool and before moving it in leaves
+/// only a directory no open reads: the store opens with its old pools, and
+/// the next add removes the staging and adds the pool.
+#[test]
+fn an_add_cut_short_before_the_move_leaves_the_store_as_it_was_and_the_next_add_finishes() {
+    let (dir, c) = soup("add-pool-crash", false);
+    let g = spine::grammar_cauldron::cauldron_v1("cauldron");
+    let staging = c.stage_pool(&g).expect("staged");
+    assert!(staging.join("cauldron.db").is_file());
+    drop(c);
+    let mut c = Cauldron::open(&dir, SpineConfig::default()).expect("a store with a staging directory opens");
+    assert_eq!(c.pools().map(|p| p.as_str().to_string()).collect::<Vec<_>>(), ["ws"]);
+    assert!(spine::offline::rest_check(&dir).unwrap().is_empty(), "and is at rest");
+    let mut copy = root("add-pool-crash-copy");
+    let _ = std::fs::remove_dir_all(&copy);
+    std::fs::create_dir_all(&copy).unwrap();
+    spine::offline::snapshot_copy(&dir, &copy).expect("a snapshot copy skips the staging");
+    assert!(!copy.join(".adding-cauldron").exists());
+    copy.push("cauldron.db");
+    assert!(!copy.exists());
+    assert!(c.add_pool(&g).expect("the next add finishes"));
+    assert!(!staging.exists());
+    region(&c);
+    cluster(&c);
+}
+
+// ---------------------------------------------------------------------------
 // harness
 // ---------------------------------------------------------------------------
 

@@ -43,6 +43,11 @@ use crate::reads::DEFAULT_POOL;
 use crate::target::Target;
 use crate::{refuse, Code, Error, Result};
 
+/// What a refused first cluster write on a store made before clusters says
+/// it was judged on (`judged_on`).
+pub const JUDGED_BEFORE_THE_POOL: &str = "a snapshot copy of the soup given the cluster pool it does not have yet, judged before the pool \
+     is added; the batch was refused, so nothing was written and the pool was not added";
+
 /// How to import.
 #[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
@@ -90,6 +95,7 @@ pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<Import
     // Before any lock or proof: a batch carrying a review flag is refused
     // whatever holds the soup (`submit` checks again).
     crate::review::refuse_review_flags(records)?;
+    crate::notes::refuse_long_notes(records)?;
     let (e, c) = (&t.env, &t.cauldron);
     let soup = c.soup();
     let pool = o.pool_name();
@@ -102,8 +108,15 @@ pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<Import
         spine::offline::snapshot_copy(&soup, &dir.0).map_err(|err| {
             store(format!("cannot take a read-only snapshot of cauldron `{}`'s soup to judge the dry run on: {err}", c.name))
         })?;
-        let opened = spine::Cauldron::open(&dir.0, spine::config::SpineConfig::default())
+        let mut opened = spine::Cauldron::open(&dir.0, spine::config::SpineConfig::default())
             .map_err(|err| store(format!("opening the snapshot of cauldron `{}`'s soup: {err}", c.name)))?;
+        // A store made before clusters, judged on its copy: the copy gets the
+        // cluster pool the real import would add (the live store is untouched).
+        if crate::clusters::wants_pool(records) {
+            opened
+                .add_pool(&spine::grammar_cauldron::cauldron_v1(crate::clusters::POOL))
+                .map_err(|err| store(format!("adding the cluster pool to the snapshot: {err}")))?;
+        }
         // The same duplicate-batch judgement the real import makes, on the copy.
         if !o.allow_duplicate {
             let earlier = landed_before(&dir.0, &c.name, &digest)?;
@@ -159,6 +172,21 @@ pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<Import
                 c.name
             );
         }
+        // The first cluster write of a store made before clusters gives it
+        // the cluster pool, under the writer lock held above; but a batch
+        // is judged first on a snapshot copy given the pool, and one refused
+        // there adds nothing, not even the pool.
+        if crate::clusters::wants_pool(records) {
+            if !crate::clusters::has_pool(c) {
+                let dry = ImportOptions { dry_run: true, ..o.clone() };
+                if let ImportOutcome::Judged { mut doc, ok: false } = import(t, records, &dry)? {
+                    doc["dry_run"] = json!(false);
+                    doc["judged_on"] = json!(JUDGED_BEFORE_THE_POOL);
+                    return Ok(ImportOutcome::Judged { doc, ok: false });
+                }
+            }
+            crate::clusters::ensure_pool(&mut cauldron, c)?;
+        }
         cauldron
     };
     let (doc, ok) = submit(&cauldron, t, records, o, &digest)?;
@@ -172,6 +200,7 @@ pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<Import
 pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &ImportOptions, digest: &str) -> Result<(Value, bool)> {
     // The review flags are the owner's: no record write sets or clears one.
     crate::review::refuse_review_flags(records)?;
+    crate::notes::refuse_long_notes(records)?;
     let (e, c) = (&t.env, &t.cauldron);
     let mut plan = MigrationPlan::new(spine::envelope::Initiator::Agent {
         thread: o.agent.clone(),
@@ -183,7 +212,10 @@ pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &Imp
         std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
     ));
-    let opts = RecordsOptions { pool: o.pool_name(), remint: o.remint, commit: !o.dry_run };
+    // Records go to their pool by type (a cluster to the cluster pool) when
+    // the batch is aimed at the soup's own pool.
+    let routes = if o.pool_name().as_str() == DEFAULT_POOL { crate::clusters::routes() } else { BTreeMap::new() };
+    let opts = RecordsOptions { pool: o.pool_name(), routes, remint: o.remint, commit: !o.dry_run };
     let run = import_records(cauldron, &plan, records, &opts).map_err(crate::region_lock::spine_error)?;
 
     let accepted = run.records.iter().filter(|r| r.disposition == "accepted").count();

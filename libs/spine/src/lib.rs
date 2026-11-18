@@ -36,6 +36,7 @@ pub mod erase;
 pub mod exec;
 pub mod fault;
 pub mod flags;
+pub mod grammar_cauldron;
 pub mod grammar_dump;
 pub mod grammar_v6;
 pub mod ladle;
@@ -201,6 +202,130 @@ impl Cauldron {
             tranches_at_open: TranchePassReport::default(),
             region_guard: None,
         })
+    }
+
+    /// **Add a pool to an existing cauldron**, as one additive act: a pool
+    /// file for `grammar` is built whole in a staging directory inside the
+    /// cauldron (`.adding-<pool>`, which no open reads: it is not a `*.db`
+    /// file at the top), and then linked into place in one step, so a
+    /// reader finds either no such pool or the whole of it. Nothing else in
+    /// the cauldron is read or written: no spine row, no other pool, no
+    /// counter. Answers `true` when it added the pool, `false` when the
+    /// cauldron already has it pinned to exactly this grammar (including one
+    /// another handle added meanwhile); a pool of that name pinned to any
+    /// other grammar is refused.
+    ///
+    /// THE CALLER HOLDS THE CAULDRON'S WRITER: this is a write, and the one
+    /// write the door does not arbitrate (two adders of one pool would race
+    /// on the rename; the loser's file is never moved over the winner's,
+    /// and it then finds the pool added). A crash at any point leaves either
+    /// no pool and a staging directory (which the next add removes and
+    /// builds again; an open never reads it) or the whole pool.
+    ///
+    /// ONLY THE CLUSTER POOL: the one grammar a cauldron may gain after it
+    /// was made is `cauldron@1` under its own name, `cauldron`
+    /// ([`crate::grammar_cauldron::cauldron_v1`] of
+    /// [`crate::grammar_cauldron::POOL`]); any other grammar or name is
+    /// refused, so this is not a second, general door to the pool set
+    /// (`Cauldron::create` makes every other pool). A staging directory left
+    /// by an add that died after its rename (a second name for the live pool
+    /// file) is removed whenever the pool is found already in place.
+    pub fn add_pool(&mut self, grammar: &PoolGrammar) -> Result<bool> {
+        grammar.check_wellformed()?;
+        let name = grammar.pool.clone();
+        let only = crate::grammar_cauldron::cauldron_v1(crate::grammar_cauldron::POOL);
+        if grammar != &only {
+            return Err(SpineError::usage(format!(
+                "a pool can be added to an existing cauldron only as `{}` pinned to `{}` v{} (the cluster pool); `{name}` \
+                 pinned to `{}` v{} is not one, and is made only with the cauldron",
+                only.pool, only.kind, only.version, grammar.kind, grammar.version
+            )));
+        }
+        if let Some(pinned) = self.grammars.get(&name) {
+            return if pinned == grammar {
+                self.clear_staging(&name);
+                Ok(false)
+            } else {
+                Err(SpineError::usage(format!(
+                    "this cauldron already has a pool `{name}` pinned to `{}` v{}; it is not replaced by `{}` v{}",
+                    pinned.kind, pinned.version, grammar.kind, grammar.version
+                )))
+            };
+        }
+        let target = Pool::path_in(&self.root, &name);
+        if !target.exists() {
+            let staging = self.stage_pool(grammar)?;
+            let built = Pool::path_in(&staging, &name);
+            // Never over a file that appeared meanwhile: link, then unlink
+            // the staged name, so an existing target refuses the link.
+            match std::fs::hard_link(&built, &target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(SpineError::hard(format!(
+                        "moving the new pool file into `{}`: {e}",
+                        target.display()
+                    )))
+                }
+            }
+            std::fs::File::open(&self.root).and_then(|d| d.sync_all()).map_err(|e| {
+                SpineError::hard(format!("syncing `{}` after adding pool `{name}`: {e}", self.root.display()))
+            })?;
+            let _ = std::fs::remove_dir_all(&staging);
+        } else {
+            self.clear_staging(&name);
+        }
+        // The pool on disk, whoever put it there, must be this grammar's.
+        let found = Pool::open(&target)?;
+        if found.grammar() != grammar {
+            return Err(SpineError::usage(format!(
+                "pool file `{}` holds `{}` v{}, not the `{}` v{} asked for; refusing rather than guessing",
+                target.display(),
+                found.grammar().kind,
+                found.grammar().version,
+                grammar.kind,
+                grammar.version
+            )));
+        }
+        drop(found);
+        let added = !self.grammars.contains_key(&name);
+        self.grammars.insert(name, grammar.clone());
+        Ok(added)
+    }
+
+    /// The staging half of [`Cauldron::add_pool`]: the whole pool file built
+    /// in `.adding-<pool>` (a stale one, left by an add that died, removed
+    /// first), and the directory's path. `pub` ONLY under `test-support`, so
+    /// a test can stop exactly where a crash before the rename would.
+    #[cfg(feature = "test-support")]
+    pub fn stage_pool(&self, grammar: &PoolGrammar) -> Result<PathBuf> {
+        self.stage_pool_interior(grammar)
+    }
+    #[cfg(not(feature = "test-support"))]
+    fn stage_pool(&self, grammar: &PoolGrammar) -> Result<PathBuf> {
+        self.stage_pool_interior(grammar)
+    }
+
+    /// Remove `.adding-<name>` if an add that died left it (best effort: no
+    /// open reads it, so a failure here leaves nothing wrong).
+    fn clear_staging(&self, name: &PoolName) {
+        let staging = self.root.join(format!(".adding-{name}"));
+        if staging.exists() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+    }
+
+    fn stage_pool_interior(&self, grammar: &PoolGrammar) -> Result<PathBuf> {
+        let staging = self.root.join(format!(".adding-{}", grammar.pool));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging).map_err(|e| {
+                SpineError::hard(format!("removing the staging left by an earlier add, `{}`: {e}", staging.display()))
+            })?;
+        }
+        std::fs::create_dir(&staging)
+            .map_err(|e| SpineError::hard(format!("creating `{}`: {e}", staging.display())))?;
+        Pool::build_whole(&staging, grammar)?;
+        Ok(staging)
     }
 
     /// Open an existing cauldron directory, discovering its pools by their

@@ -1,4 +1,4 @@
-//! **The older corpus format, converted to workspace-v6 records**
+//! **The older corpus format, converted to workspace-v6 and cauldron@1 records**
 //! (`cauldron soup import-corpus`).
 //!
 //! The format is the terminal interface's seed corpus, `corpus.schema_version
@@ -32,13 +32,21 @@
 //!   record a fresh id and prints the map (no label can equal an id the soup
 //!   holds); every reference to an id of the input, and every `[[id]]` link in
 //!   a body, is rewritten to that label, and each linked node also gets the
-//!   `ref` edge the schema's rule asks for.
+//!   `ref` edge the schema's rule asks for;
+//! - a cluster -> a `cauldron@1` `cluster` record (`handle` its name,
+//!   `boundary` its description) with a `claims` edge to each region of the
+//!   input it names, and each child as a cluster of its own
+//!   (`soup_door::corpus::cluster_records`); the import lands them in the
+//!   same all-or-nothing batch, through the same door, in the cluster pool.
 //!
 //! What it cannot represent is LISTED in the report (`not_carried`), never
 //! dropped silently:
 //!
-//! - clusters (`clusters`, with everything inside them): workspace-v6 has no
-//!   cluster type and no edge for a cluster's claim on a region;
+//! - of a cluster (`clusters`): what a `cluster` record cannot hold (its
+//!   tasks, nodes and other parts, by key and count), a claim of a region the
+//!   input does not carry, a child's nesting under its parent, and a whole
+//!   cluster whose name or description is outside the grammar's bounds or
+//!   that is incomplete;
 //! - a node whose `type` is not one of workspace-v6's ten content types;
 //! - a reference (`narrows`, `in_region`, `refs`, a `[[link]]`) to an id that is
 //!   not in the input: it would otherwise name whatever record the soup holds
@@ -416,8 +424,12 @@ fn convert(input: Input) -> Result<Converted> {
         n_nodes += 1;
     }
 
+    let mut n_clusters = 0usize;
     for (c, at) in &input.clusters {
-        not_carried.push(cluster_entry(c, at));
+        let mapped = soup_door::corpus::cluster_records(c, at, &label, &|r| region_ids.contains(r), &mut not_carried);
+        n_clusters += mapped.len();
+        n_edges += mapped.iter().map(|r| r["edges"].as_array().map_or(0, Vec::len)).sum::<usize>();
+        records.extend(mapped);
     }
     not_carried.extend(input.skipped.iter().cloned());
     for o in &input.other {
@@ -447,7 +459,7 @@ fn convert(input: Input) -> Result<Converted> {
         "format": "corpus-v5",
         "schema_version": input.schema_version.unwrap_or(5),
         "label_prefix": LABEL_PREFIX,
-        "carried": {"regions": n_regions, "nodes": n_nodes, "edges": n_edges, "ref_edges_added_for_links": n_link_refs},
+        "carried": {"regions": n_regions, "nodes": n_nodes, "clusters": n_clusters, "edges": n_edges, "ref_edges_added_for_links": n_link_refs},
         "not_carried": not_carried,
     });
     Ok(Converted { records, report })
@@ -474,41 +486,6 @@ fn unmapped(m: &Map<String, Value>, known: &[&str], id: &str, at: &str, not_carr
         }
     }
     out
-}
-
-/// A cluster, and what it holds, as one `not_carried` entry.
-fn cluster_entry(c: &Value, at: &str) -> Value {
-    let mut holds = Map::new();
-    let mut children = Vec::new();
-    if let Some(m) = c.as_object() {
-        for (k, v) in m {
-            match (k.as_str(), v) {
-                ("children", Value::Array(a)) => {
-                    for (i, ch) in a.iter().enumerate() {
-                        children.push(cluster_entry(ch, &format!("{at}.children[{i}]")));
-                    }
-                }
-                ("id" | "name" | "description" | "regions", _) => {}
-                (_, Value::Array(a)) if !a.is_empty() => {
-                    holds.insert(k.clone(), json!(a.len()));
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut e = json!({
-        "what": "cluster",
-        "id": c.get("id"),
-        "name": c.get("name"),
-        "claims_regions": c.get("regions").cloned().unwrap_or(json!([])),
-        "holds": holds,
-        "file": at,
-        "reason": "cluster-not-in-workspace-v6: workspace-v6 has no cluster type and no edge for a cluster's claim on a region, so the cluster, its claims and everything it holds are not imported",
-    });
-    if !children.is_empty() {
-        e["children"] = Value::Array(children);
-    }
-    e
 }
 
 /// `[[ID]]` links in `body`: those whose target is converted are rewritten to
@@ -587,11 +564,14 @@ mod tests {
         json!({"id": id, "handle": format!("Region {id}"), "boundary": "Inside: anything about the test topic here. Outside: nothing else.", "narrows": narrows})
     }
 
+    const CLUSTER_TEXT: &str = "Inside: everything that builds and ships the product, end to end.";
+
     #[test]
-    fn a_seed_maps_regions_nodes_edges_and_lists_clusters() {
+    fn a_seed_maps_regions_nodes_edges_and_clusters() {
         let c = conv(json!({
-            "clusters": [{"id": "build", "name": "Build", "description": "d", "regions": ["R-1"], "tasks": [{"id": "T-9"}],
-                          "children": [{"id": "ui", "name": "UI", "description": "d", "regions": ["R-2"]}]}],
+            "clusters": [{"id": "build", "name": "Build", "description": CLUSTER_TEXT, "regions": ["R-1", "R-9"], "tasks": [{"id": "T-9"}],
+                          "children": [{"id": "ui", "name": "Interface", "description": CLUSTER_TEXT, "regions": ["R-2"]}]},
+                         {"id": "tiny", "name": "Tiny", "description": "d", "regions": ["R-1"]}],
             "corpus": {"schema_version": 5, "regions": [region("R-1", &[]), region("R-2", &["R-1"])],
                        "nodes": [{"id": "DEC-1", "type": "decision", "state": "decided", "handle": "A call.", "body": "See [[IS-2]] and [[Q-77]].",
                                   "in_region": ["R-2"], "cite": "build#4"},
@@ -600,7 +580,7 @@ mod tests {
             "messages": {"build#4": {"date": "d", "text": "t"}},
         }));
         let by: BTreeMap<String, &Value> = c.records.iter().map(|r| (r["id"].as_str().unwrap().to_string(), r)).collect();
-        assert_eq!(by.len(), 4, "two regions and two nodes; the incident is not carried");
+        assert_eq!(by.len(), 6, "two regions, two nodes and two clusters; the incident and the out-of-bounds cluster are not carried");
         assert_eq!(by["v5:R-2"]["edges"], json!([{"kind": "narrows", "to": "v5:R-1"}]));
         let dec = by["v5:DEC-1"];
         assert_eq!(dec["operator"], json!({"thread": "build", "msg": 4}));
@@ -608,15 +588,20 @@ mod tests {
         assert!(dec["edges"].as_array().unwrap().contains(&json!({"kind": "ref", "to": "v5:IS-2"})));
         assert_eq!(dec["meta"]["imported_from"]["id"], "DEC-1");
         assert_eq!(by["v5:IS-2"]["edges"], json!([{"kind": "in_region", "to": "v5:R-1"}]), "the edge to R-9, not in the input, is not made");
+        let build = by["v5:cluster:build"];
+        assert_eq!((build["type"].clone(), build["handle"].clone(), build["boundary"].clone()), (json!("cluster"), json!("Build"), json!(CLUSTER_TEXT)));
+        assert_eq!(build["edges"], json!([{"kind": "claims", "to": "v5:R-1"}]), "the claim of R-9, not in the input, is not made");
+        assert_eq!(build["meta"]["imported_from"]["not_carried"], json!({"tasks": 1}));
+        assert_eq!(by["v5:cluster:ui"]["edges"], json!([{"kind": "claims", "to": "v5:R-2"}]));
+        assert_eq!(c.report["carried"]["clusters"], 2, "{}", c.report);
         let nc = c.report["not_carried"].as_array().unwrap();
         let reasons: Vec<&str> = nc.iter().map(|e| e["reason"].as_str().unwrap().split(':').next().unwrap()).collect();
-        for want in ["type-not-in-workspace-v6", "target-not-in-input", "cluster-not-in-workspace-v6", "seed-messages"] {
+        for want in ["type-not-in-workspace-v6", "target-not-in-input", "cluster-out-of-bounds", "not-in-cauldron-v1", "no-cluster-nesting-in-cauldron-v1", "seed-messages"] {
             assert!(reasons.contains(&want), "{want} not listed: {reasons:?}");
         }
-        let cl = nc.iter().find(|e| e["what"] == "cluster").unwrap();
-        assert_eq!(cl["claims_regions"], json!(["R-1"]));
-        assert_eq!(cl["holds"], json!({"tasks": 1}));
-        assert_eq!(cl["children"][0]["id"], "ui");
+        assert!(!reasons.contains(&"cluster-not-in-workspace-v6"), "{reasons:?}");
+        assert!(nc.iter().any(|e| e["what"] == "claim" && e["from"] == "build" && e["to"] == "R-9"), "{nc:?}");
+        assert!(nc.iter().any(|e| e["what"] == "cluster" && e["id"] == "tiny"), "{nc:?}");
         assert!(nc.iter().any(|e| e["what"] == "link" && e["to"] == "Q-77"));
     }
 

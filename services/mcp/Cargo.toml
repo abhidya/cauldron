@@ -52,6 +52,9 @@ path = "tests/it/main.rs"
 [dev-dependencies]
 # Every child a test spawns is isolated (CAULDRON_ISOLATED=1).
 test-isolation = { path = "../../testkit/test-isolation" }
+# A test plants a note stored before the door bounded notes straight into a
+# pool file (the version spine already links).
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [lints.rust]
 unsafe_code = "forbid"

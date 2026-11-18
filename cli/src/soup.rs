@@ -123,9 +123,11 @@ cauldron soup — a cauldron's soup, offline
 
     cauldron soup import <file-or-dir> [--cauldron <name>] [--env <env>] [--dry-run] [--remint]
                          [--allow-duplicate] [--agent <label>]
-        Land records written in the published shape (schema/soup/workspace-v6/README.md):
-        one file holding a list (or one record), or a directory of one-record files; JSON,
-        or YAML for .yaml/.yml. Every record is judged by the soup's own door; the JSON
+        Land records written in the published shape (schema/soup/workspace-v6/README.md;
+        a record of type `cluster` in schema/soup/cauldron-v1/README.md's, which lands in the
+        soup's cluster pool in the same write, so one batch may hold a region, a cluster and
+        its `claims` of that region): one file holding a list (or one record), or a directory
+        of one-record files; JSON, or YAML for .yaml/.yml. Every record is judged by the soup's own door; the JSON
         printed gives each one's disposition (accepted, or refused with the grammar's
         reason). A `meta.cites` entry whose kind is not in the README's table, or that lacks
         its kind's keys, refuses its record as `bad-cite`. Without --dry-run the whole set
@@ -157,7 +159,8 @@ cauldron soup — a cauldron's soup, offline
         open (`cauldron mcp status`), a real import is sent to that service and lands
         through it: the same judgement, the same JSON (with `forwarded_to`), the same
         batch-already-landed check and --allow-duplicate; the service records the writer
-        as `mcp:cli`, not --agent, and writes only the `ws` pool. A dry run is never sent.
+        as `mcp:cli`, not --agent, and writes only the soup's own pools (`ws`, and the cluster
+        pool for cluster records). A dry run is never sent.
         A batch over the 16 MiB the service reads in one request is refused before it is
         sent (never split): import it in smaller files, or revoke the grant (or stop the
         service) and import directly.
@@ -172,13 +175,17 @@ cauldron soup — a cauldron's soup, offline
         a seed file (`clusters`, `corpus`), a bare corpus (`regions`, `nodes`), one record, or a
         directory of one-record files (searched recursively). Each region and node becomes a
         workspace-v6 record (`narrows` and `in_region` become edges, `cite: <thread>#<msg>`
-        becomes `operator`, the old id is kept in `meta.imported_from`), and the batch goes
+        becomes `operator`, the old id is kept in `meta.imported_from`), and each cluster (and
+        each child cluster) a cauldron@1 `cluster` record, its name the handle, its description
+        the boundary, with a `claims` edge to each region of the input it names. The batch goes
         through `soup import --remint`: the same judgement, all or nothing, the same refusals
         and forwarding, new ids for every record. The JSON adds `corpus`: what was carried,
         `id_map` by old id (when the ids hold), and `not_carried`, every part of the input the
-        schema cannot hold, each with its reason: clusters (there is no cluster type), a node
-        type outside the ten, a reference to an id not in the input, the seed's messages and
-        dashboards, and every unknown key (carried verbatim in meta.imported_from.unmapped).
+        schemas cannot hold, each with its reason: a cluster's tasks and other parts, its claim
+        of a region not in the input, a child's nesting, a cluster whose name or description is
+        outside the grammar's bounds, a node type outside the ten, a reference to an id not in
+        the input, the seed's messages and dashboards, and every unknown key (carried verbatim
+        in meta.imported_from.unmapped).
     cauldron soup recover [--cauldron <name>] [--env <env>]
         Settle a soup that an interrupted import left not at rest: an import that never
         reached its commit decision is rolled back (none of it lands), one that did is
@@ -207,17 +214,20 @@ cauldron soup — a cauldron's soup, offline
                          [--include-superseded] [--include-rejected]
         One region: its record, the regions it narrows (parents) and that narrow it
         (children) to --depth levels (default 1), the regions it relates to either way, and
-        its direct members (id, type, state, handle), newest first, at most --limit (50).
+        its direct members (id, type, state, handle), newest first, at most --limit (50), and
+        the clusters that claim it (`clusters`: id, handle, note).
     cauldron soup nodes [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
                         [--state <s>] [--limit N] [--max-chars N] [--include-superseded]
                         [--include-rejected] [--review pending|reviewed]
         Nodes as {id, type, state, handle, regions}, newest first (by the spine's commit
         order; one write's nodes by id prefix, then serial, highest first), at most --limit
-        (default 50); --region keeps a region's direct members.
+        (default 50); --region keeps a region's direct members. --type cluster lists the
+        clusters instead, each with the regions it claims (--region: those claiming it).
     cauldron soup search <query> [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
                          [--limit N] [--max-chars N] [--include-superseded]
                          [--include-rejected] [--review pending|reviewed]
-        Lexical search over handles and bodies: every word of the query a term, found
+        Lexical search over handles and bodies, and over cluster handles and boundaries
+        (--type cluster: clusters only): every word of the query a term, found
         case-insensitively as a substring; ranked by how many terms match, then handle hits over body hits, then newest.
         Prints {id, type, state, handle, regions, score, snippet}, at most --limit (20);
         the snippet is --max-chars long (default 160) around the first hit.
@@ -225,7 +235,34 @@ cauldron soup — a cauldron's soup, offline
         Those nodes as records in the published shape, with their outgoing edges. A node
         another node supersedes (an inbound `supersedes` edge) is answered all the same, with
         `superseded_by: [ids]`, which is read from the edges and is not a field: leave it out
-        when writing the record again.
+        when writing the record again. A cluster (CL-<n>) is answered with `claims` (each
+        claimed region, its handle and the claim's note), read from its edges, not a field.
+        An edge's note longer than 1,000 characters (written before notes were bounded) is
+        shown cut to 1,000, named in `truncated`.
+    cauldron soup claim <cluster> <region> [--cauldron <name>] [--env <env>] [--release]
+                        [--note <text>] [--agent <label>]
+        A cluster (CL-<n>: an area of the surface, a name and a boundary description, written
+        as a `cluster` record) claims a region (R-<n>), or with --release gives the claim up.
+        One write; idempotent: a claim already there prints `already-claimed`, a release of
+        one that is not prints `not-claimed`, and neither writes. --note is kept on the claim
+        (at most 1,000 characters, as every edge's note: a longer one is refused).
+        A claim is not a lease: it holds nothing and assigns no work. Refused for a cluster or
+        region the soup does not hold, an id that is not a region, and while a ripple holds
+        the region (`region_locked`, as for an import). Written directly, or, while the `mcp`
+        service holds the soup, sent to it as `soup_claim`.
+    cauldron soup changes [--cauldron <name>] [--env <env>] [--since <cursor>] [--wait <secs>]
+                          [--limit N] [--max-chars N]
+        What landed since a cursor, oldest first, as `soup_changes` answers it: `changes`
+        (each write: `op` create, link, unlink or update, with the ids it touched; cluster
+        and claim writes included, on the same cursor), `dumps`, and `cursor` to pass as
+        the next --since. Without --since, only the current cursor. --wait N (at most 60,
+        with --since) waits up to N seconds for something to land after the cursor and
+        prints as soon as it does, or when the wait ends with nothing (`waited.ended` is
+        `landed` or `timeout`); it looks at the store twice a second meanwhile and holds
+        no lock. --max-chars bounds the whole answer. A cursor of another cauldron is
+        refused (`cursor_unknown`), one ahead of the soup too (`cursor_stale`). The set of
+        `op` values can grow in a later release: a program reading this must ignore an op
+        it does not know.
     cauldron soup dump <file|-> [--cauldron <name>] [--env <env>] [--title <t>] [--source <s>]
                        [--wait-secs N]
         Keep the file's text (or stdin's, with -) as a dump in the cauldron's dumps store,
@@ -342,13 +379,15 @@ pub(crate) fn verb_soup(args: &[String]) -> Result<i32> {
         Some("dump-get") => dump_get(&args[1..]),
         Some("dump-remove") => dump_remove(&args[1..]),
         Some("approve") => approve(&args[1..]),
+        Some("claim") => claim(&args[1..]),
+        Some("changes") => changes(&args[1..]),
         None => {
             eprint!("{USAGE}");
             Ok(2)
         }
         Some(other) => {
             eprintln!(
-                "cauldron soup: no verb `{other}` (import | import-corpus | recover | regions | region | nodes | search | get | dump | dumps | dump-get | dump-remove | approve | help)"
+                "cauldron soup: no verb `{other}` (import | import-corpus | recover | regions | region | nodes | search | get | claim | changes | dump | dumps | dump-get | dump-remove | approve | help)"
             );
             Ok(2)
         }
@@ -383,6 +422,10 @@ struct Args {
     view: Option<String>,
     turn_offset: Option<usize>,
     wait_secs: Option<usize>,
+    release: bool,
+    note: Option<String>,
+    since: Option<String>,
+    wait: Option<usize>,
     pos: Vec<String>,
 }
 
@@ -434,6 +477,10 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--view" => a.view = Some(take(&mut it)?),
             "--turn-offset" => a.turn_offset = Some(count(flag, &take(&mut it)?)?),
             "--wait-secs" => a.wait_secs = Some(count(flag, &take(&mut it)?)?),
+            "--release" => a.release = true,
+            "--since" => a.since = Some(take(&mut it)?),
+            "--wait" => a.wait = Some(count(flag, &take(&mut it)?)?),
+            "--note" => a.note = Some(take(&mut it)?),
             _ => a.pos.push(s.clone()),
         }
     }
@@ -675,8 +722,16 @@ fn forward(t: &Target, records: &[Value], o: &ImportOptions, pid: u32) -> Result
         "cauldron soup import: {holder} holds cauldron `{}`'s soup; the import is sent to it and lands through it",
         t.cauldron.name
     );
-    let result = crate::mcp_door::call(&t.env, found.door, "soup_put", args)
-        .with_context(|| format!("sending the import to {holder}; nothing is known to have been written, check `cauldron soup nodes`"))?;
+    let result = match crate::mcp_door::call(&t.env, found.door, "soup_put", args) {
+        Ok(r) => r,
+        Err(err) if crate::mcp_door::is_lost(&err) => bail!(
+            "{holder} went away while it had the import ({err:#}): WHETHER IT LANDED IS NOT KNOWN (an import lands whole \
+             or not at all). Run the same import again once the service is back, or once it is stopped: if the first \
+             one landed, it is refused as batch-already-landed; `cauldron soup changes --since <cursor>` lists what \
+             landed after a cursor you had."
+        ),
+        Err(err) => return Err(err).with_context(|| format!("sending the import to {holder}; nothing is known to have been written, check `cauldron soup nodes`")),
+    };
     let via = json!({"service": svc, "pid": pid});
     if result["isError"] != json!(true) {
         let mut doc = result["structuredContent"].clone();
@@ -717,6 +772,111 @@ fn forward(t: &Target, records: &[Value], o: &ImportOptions, pid: u32) -> Result
         "not_granted" | "locked" => Ok(Forwarded::Released),
         _ => bail!("REFUSED ({holder} answered `{code}`): {message}"),
     }
+}
+
+// ------------------------------------------------------------------ changes
+
+/// **`cauldron soup changes [--since <cursor>] [--wait <secs>]`**: what
+/// landed since a cursor (`soup_door::changes`, the answer `soup_changes`
+/// gives), read through connections that cannot write. `--wait` waits up to
+/// that many seconds for something to land after `--since`; this process
+/// writes nothing, so it looks at the store twice a second while it waits.
+fn changes(args: &[String]) -> Result<i32> {
+    let a = parse("changes", args, &["--env", "--cauldron", "-c", "--since", "--wait", "--limit", "--max-chars"])?;
+    if let Some(p) = a.pos.first() {
+        bail!("`cauldron soup changes` takes no arguments (got `{p}`); give the cursor as --since");
+    }
+    let t = target("changes", &a, false)?;
+    let wait = a.wait.unwrap_or(0) as u64;
+    let doc = match (&a.since, wait) {
+        (None, w) if w > 0 => bail!("`cauldron soup changes --wait` needs --since <cursor> (a cursor to wait past)"),
+        (Some(since), w) if w > 0 => soup_door::changes::changes_waiting(
+            &t,
+            since,
+            a.limit,
+            std::time::Duration::from_secs(w),
+            &soup_door::changes::Sleep,
+            std::time::Duration::from_millis(500),
+            &mut || Ok(()),
+        )?,
+        (since, _) => soup_door::changes::changes(&t, since.as_deref(), a.limit)?,
+    };
+    let doc = match a.max_chars {
+        None => doc,
+        Some(m) => {
+            let mut d = soup_door::budget::budget(doc, soup_door::budget::clamp(Some(m)));
+            soup_door::changes::after_budget(&t, &mut d);
+            d
+        }
+    };
+    print(&doc)?;
+    Ok(0)
+}
+
+// -------------------------------------------------------------------- claim
+
+/// **`cauldron soup claim <cluster> <region> [--release] [--note <text>]`**:
+/// a cluster claims a region, or releases its claim
+/// (`soup_door::clusters::claim`). Written directly when nothing holds the
+/// soup; while the `mcp` service holds it, sent to the service as one
+/// `soup_claim`, as `import` sends a `soup_put`.
+fn claim(args: &[String]) -> Result<i32> {
+    let a = parse("claim", args, &["--env", "--cauldron", "-c", "--release", "--note", "--agent"])?;
+    let [cluster, region] = a.pos.as_slice() else {
+        bail!("`cauldron soup claim` takes a cluster and a region (`cauldron soup claim CL-1 R-3`); got {} argument(s)", a.pos.len());
+    };
+    let t = target("claim", &a, true)?;
+    let k = soup_door::clusters::Claim { cluster: cluster.clone(), region: region.clone(), release: a.release, note: a.note.clone() };
+    let w = soup_door::clusters::Writer {
+        thread: a.agent.clone().unwrap_or_else(|| "outside-agent".to_string()),
+        dispatch: "cauldron soup claim".into(),
+    };
+    let doc = match soup_door::clusters::claim_direct(&t, &k, &w) {
+        Err(e) if e.code == soup_door::Code::Locked => match soup_door::lock::held_by_service(&t.cauldron) {
+            Some(pid) => return claim_forward(&t, &k, pid),
+            None => return Err(e.into()),
+        },
+        other => other?,
+    };
+    print(&doc)?;
+    Ok(0)
+}
+
+/// The claim, sent to the `mcp` service (pid `pid`) that holds the soup.
+fn claim_forward(t: &Target, k: &soup_door::clusters::Claim, pid: u32) -> Result<i32> {
+    let svc = crate::mcp_door::SERVICE;
+    let holder = format!("the `{svc}` service (pid {pid})");
+    let found = match crate::mcp_door::find(&t.env) {
+        Ok(f) if f.pid == pid => f,
+        Ok(f) => bail!("REFUSED: {holder} holds cauldron `{}`'s soup, but the running `{svc}` service is pid {}. Nothing was written.", t.cauldron.name, f.pid),
+        Err(why) => bail!("REFUSED: {holder} holds cauldron `{}`'s soup, so this claim would be sent to it, but {}. Nothing was written.", t.cauldron.name, why.say()),
+    };
+    let mut args = json!({"cauldron": t.cauldron.name, "cluster": k.cluster, "region": k.region, "release": k.release, "_ctx": {"client": "cli"}});
+    if let Some(n) = &k.note {
+        args["note"] = json!(n);
+    }
+    eprintln!("cauldron soup claim: {holder} holds cauldron `{}`'s soup; the claim is sent to it and lands through it", t.cauldron.name);
+    let result = crate::mcp_door::call(&t.env, found.door, "soup_claim", args)
+        .with_context(|| format!("sending the claim to {holder}; nothing is known to have been written, check `cauldron soup get {}`", k.cluster))?;
+    if result["isError"] != json!(true) {
+        let mut doc = result["structuredContent"].clone();
+        if let Some(m) = doc.as_object_mut() {
+            m.remove("resolved_from");
+            m.insert("forwarded_to".into(), json!({"service": svc, "pid": pid}));
+        }
+        print(&doc)?;
+        return Ok(0);
+    }
+    let refused = &result["structuredContent"]["refused"];
+    let code = refused["code"].as_str().unwrap_or("");
+    let message = refused["message"].as_str().unwrap_or("");
+    if code == "unsupported" {
+        bail!(
+            "REFUSED: {holder} is from before clusters (it answers `soup_claim` as unsupported), so it cannot write a claim. \
+             Nothing was written. Upgrade it (`scripts/install --replace-running`), then claim again."
+        );
+    }
+    bail!("REFUSED ({holder} answered `{code}`): {message}")
 }
 
 // ------------------------------------------------------------------ recover

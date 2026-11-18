@@ -101,6 +101,7 @@ pub type WithFn = Box<dyn FnOnce(&spine::Cauldron, &Target) -> Result<Value, Ref
 
 enum Job {
     Put(Put, Who, mpsc::Sender<Result<Value, Refusal>>),
+    Claim(soup_door::clusters::Claim, Who, mpsc::Sender<Result<Value, Refusal>>),
     Link(Vec<Link>, Who, mpsc::Sender<Result<Value, Refusal>>),
     With(WithFn, mpsc::Sender<Result<Value, Refusal>>),
 }
@@ -120,6 +121,9 @@ pub struct Writer {
 /// Every open cauldron of this service's environment.
 pub struct Writers {
     audit: Arc<Audit>,
+    /// Bumped after every job a writer thread runs, for a waiting
+    /// `soup_changes`.
+    pulse: Arc<crate::changes::Pulse>,
     access: Arc<Access>,
     open: Mutex<HashMap<String, Arc<Writer>>>,
     /// Held while a cauldron is being opened (its recovery can take a
@@ -137,8 +141,8 @@ fn closed() -> Refusal {
 }
 
 impl Writers {
-    pub fn new(audit: Arc<Audit>, access: Arc<Access>) -> Writers {
-        Writers { audit, access, open: Mutex::new(HashMap::new()), opening: Mutex::new(()) }
+    pub fn new(audit: Arc<Audit>, access: Arc<Access>, pulse: Arc<crate::changes::Pulse>) -> Writers {
+        Writers { audit, access, pulse, open: Mutex::new(HashMap::new()), opening: Mutex::new(()) }
     }
 
     /// The open writer of `cauldron`, if any.
@@ -171,6 +175,14 @@ impl Writers {
         let w = self.get_or_open(t, &who)?;
         let (tx, rx) = mpsc::channel();
         w.send(Job::Put(put, who, tx))?;
+        rx.recv().unwrap_or_else(|_| Err(closed()))
+    }
+
+    /// Run `claim` on the target's writer, opening it first if needed.
+    pub fn claim(&self, t: &Target, who: Who, claim: soup_door::clusters::Claim) -> Result<Value, Refusal> {
+        let w = self.get_or_open(t, &who)?;
+        let (tx, rx) = mpsc::channel();
+        w.send(Job::Claim(claim, who, tx))?;
         rx.recv().unwrap_or_else(|_| Err(closed()))
     }
 
@@ -209,9 +221,10 @@ impl Writers {
         let target = t.clone();
         let closed = Arc::new(AtomicBool::new(false));
         let gate = Gate { access: self.access.clone(), closed: closed.clone() };
+        let pulse = self.pulse.clone();
         let thread = std::thread::Builder::new()
             .name(format!("writer-{}", t.cauldron.name))
-            .spawn(move || run(target, gate, ready_tx, jobs_rx))
+            .spawn(move || run(target, gate, pulse, ready_tx, jobs_rx))
             .map_err(|e| Refusal::new("store", format!("cannot start a writer thread: {e}")))?;
         let recovered = match ready_rx.recv() {
             Ok(Ok(r)) => r,
@@ -313,8 +326,8 @@ impl Gate {
     }
 }
 
-fn run(t: Target, gate: Gate, ready: mpsc::Sender<Result<Value, Refusal>>, jobs: mpsc::Receiver<Job>) {
-    let (cauldron, lock, report) = match open(&t) {
+fn run(t: Target, gate: Gate, pulse: Arc<crate::changes::Pulse>, ready: mpsc::Sender<Result<Value, Refusal>>, jobs: mpsc::Receiver<Job>) {
+    let (mut cauldron, lock, report) = match open(&t) {
         Ok(x) => x,
         Err(r) => {
             let _ = ready.send(Err(r));
@@ -331,7 +344,13 @@ fn run(t: Target, gate: Gate, ready: mpsc::Sender<Result<Value, Refusal>>, jobs:
             Job::Put(p, who, reply) => {
                 let _ = reply.send(match refused {
                     Some(r) => Err(r),
-                    None => put(&cauldron, &t, &p, &who),
+                    None => put(&mut cauldron, &t, &p, &who),
+                });
+            }
+            Job::Claim(k, who, reply) => {
+                let _ = reply.send(match refused {
+                    Some(r) => Err(r),
+                    None => claim(&cauldron, &t, &k, &who),
                 });
             }
             Job::Link(l, who, reply) => {
@@ -347,9 +366,15 @@ fn run(t: Target, gate: Gate, ready: mpsc::Sender<Result<Value, Refusal>>, jobs:
                 });
             }
         }
+        ran(&pulse);
     }
     drop(cauldron);
     drop(lock);
+}
+
+/// A job ran (it may have written): every waiting `soup_changes` looks again.
+fn ran(pulse: &crate::changes::Pulse) {
+    pulse.bump();
 }
 
 /// The three proofs, then the open, and what it recovered.
@@ -429,9 +454,11 @@ pub fn cursor_after(c: &spine::Cauldron, t: &Target) -> Value {
 
 // --------------------------------------------------------------- soup_put
 
-/// Does `type` declare a `meta` field in the pool's pinned grammar?
-fn has_meta(c: &spine::Cauldron, node_type: Option<&str>) -> bool {
-    let (Some(g), Some(t)) = (c.grammar(&pool()), node_type) else { return false };
+/// Does `type` declare a `meta` field in the grammar of the pool its records
+/// go to (`ws`, or the cluster pool for a `cluster`)?
+fn has_meta(_c: &spine::Cauldron, node_type: Option<&str>) -> bool {
+    let Some(t) = node_type else { return false };
+    let Some(g) = soup_door::clusters::grammar_of_type(t) else { return false };
     g.node_types.get(t).is_some_and(|d| d.fields.contains_key("meta"))
 }
 
@@ -460,8 +487,34 @@ fn cite_all(c: &spine::Cauldron, records: &[Value], cite: &Value, same: impl Fn(
         .collect()
 }
 
-fn put(c: &spine::Cauldron, t: &Target, p: &Put, who: &Who) -> Result<Value, Refusal> {
+fn put(handle: &mut spine::Cauldron, t: &Target, p: &Put, who: &Who) -> Result<Value, Refusal> {
     let pool = pool();
+    let wants_pool = soup_door::clusters::wants_pool(&p.records);
+    // A dry run of a cluster write on a store made before clusters is judged
+    // on a snapshot copy given the cluster pool (as `cauldron soup import
+    // --dry-run` judges it): a dry run writes nothing, not even the pool.
+    if p.dry_run && wants_pool && handle.grammar(&PoolName::new(soup_door::clusters::POOL)).is_none() {
+        return put_dry_on_copy(handle, t, p, who);
+    }
+    // The first cluster write of such a store gives it the cluster pool,
+    // under the writer lock this thread holds; but only a batch that will
+    // land a cluster: it is judged first on a snapshot copy given the pool,
+    // and a batch refused there adds nothing, not even the pool.
+    let mut refused_on_copy: Option<Value> = None;
+    if wants_pool && handle.grammar(&PoolName::new(soup_door::clusters::POOL)).is_none() {
+        let judged = put_dry_on_copy(handle, t, p, who)?;
+        let lands_a_cluster = judged["records"]
+            .as_array()
+            .is_some_and(|rs| rs.iter().any(|r| r["type"] == "cluster" && r["disposition"] == "accepted"));
+        if judged["outcome"] == "validated" || (p.partial && lands_a_cluster) {
+            soup_door::clusters::ensure_pool(handle, &t.cauldron).map_err(refusal)?;
+        } else if !p.partial {
+            refused_on_copy = Some(judged);
+        }
+    } else if wants_pool {
+        soup_door::clusters::ensure_pool(handle, &t.cauldron).map_err(refusal)?;
+    }
+    let c: &spine::Cauldron = handle;
     let mut records = p.records.clone();
     if let Some(cite) = &p.cite {
         records = cite_all(c, &records, cite, |x| x == cite);
@@ -509,7 +562,14 @@ fn put(c: &spine::Cauldron, t: &Target, p: &Put, who: &Who) -> Result<Value, Ref
         return judge(&records).map(|(doc, _)| doc);
     }
     if !p.partial {
-        let (mut doc, ok) = land(&records)?;
+        let (mut doc, ok) = match refused_on_copy {
+            Some(mut d) => {
+                d["dry_run"] = json!(false);
+                d["judged_on"] = json!(soup_door::import::JUDGED_BEFORE_THE_POOL);
+                (d, false)
+            }
+            None => land(&records)?,
+        };
         if !ok {
             let n = doc["refused"].as_u64().unwrap_or(0);
             return Err(Refusal::with_detail(
@@ -573,6 +633,48 @@ fn put(c: &spine::Cauldron, t: &Target, p: &Put, who: &Who) -> Result<Value, Ref
     }
     doc["partial"] = json!(true);
     doc["dropped"] = json!(dropped);
+    doc["cursor"] = cursor_after(c, t);
+    Ok(doc)
+}
+
+/// `soup_put` with `dry_run`, judged on a snapshot copy of the soup (see
+/// [`put`]): the same records, citations and digest as a dry run on the
+/// live handle.
+fn put_dry_on_copy(c: &spine::Cauldron, t: &Target, p: &Put, who: &Who) -> Result<Value, Refusal> {
+    let mut records = p.records.clone();
+    if let Some(cite) = &p.cite {
+        records = cite_all(c, &records, cite, |x| x == cite);
+    }
+    if let Some(s) = &who.session {
+        let cite = json!({"kind": "session", "id": s});
+        records = cite_all(c, &records, &cite, |x| x.get("kind") == Some(&json!("session")) && x.get("id") == Some(&json!(s)));
+    }
+    let opts = ImportOptions {
+        pool: None,
+        dry_run: true,
+        remint: p.remint,
+        allow_duplicate: p.allow_duplicate,
+        agent: who.thread.clone(),
+        dispatch: "mcp soup_put".into(),
+    };
+    match import::import(t, &records, &opts).map_err(refusal)? {
+        ImportOutcome::Judged { mut doc, .. } => {
+            doc["judged_on"] = json!("a read-only snapshot of the soup, taken now, given the cluster pool it does not have yet; nothing was written");
+            Ok(doc)
+        }
+        ImportOutcome::AlreadyLanded { mut doc, why } => {
+            let why = mcp_words(&why);
+            doc["why"] = json!(why);
+            Err(Refusal::with_detail("batch_already_landed", why, doc))
+        }
+    }
+}
+
+// ------------------------------------------------------------- soup_claim
+
+fn claim(c: &spine::Cauldron, t: &Target, k: &soup_door::clusters::Claim, who: &Who) -> Result<Value, Refusal> {
+    let w = soup_door::clusters::Writer { thread: who.thread.clone(), dispatch: "mcp soup_claim".into() };
+    let mut doc = soup_door::clusters::claim(c, t, k, &w).map_err(refusal)?;
     doc["cursor"] = cursor_after(c, t);
     Ok(doc)
 }

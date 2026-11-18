@@ -2,14 +2,15 @@
 # sync-plugin-schema [--check]
 #
 # The Claude Code plugin (claude-code/cauldron/) ships a COPY of the published
-# soup schema (schema/soup/workspace-v6/) in its own schema/ directory, so an
-# agent on a machine without this repository can read it. This script makes
-# that copy; it never edits a schema file (the .json files are generated from
-# the Rust grammar, see schema/soup/workspace-v6/README.md).
+# soup schemas in its own schema/ directory, so an agent on a machine without
+# this repository can read them: schema/soup/workspace-v6/ into schema/, and
+# schema/soup/cauldron-v1/ into schema/cauldron-v1/. This script makes those
+# copies; it never edits a schema file (the .json files are generated from
+# the Rust grammars, see each directory's README.md).
 #
-#   scripts/sync-plugin-schema           copy every file of the published dir
-#   scripts/sync-plugin-schema --check   change nothing; exit 1 if the copy
-#                                         differs from the published dir
+#   scripts/sync-plugin-schema           copy every file of the published dirs
+#   scripts/sync-plugin-schema --check   change nothing; exit 1 if a copy
+#                                         differs from its published dir
 #
 # A file in the copy that the published dir does not have is never deleted
 # here: both modes report it and exit 1, and a human removes it.
@@ -21,8 +22,10 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-src="$root/schema/soup/workspace-v6"
-dst="$root/claude-code/cauldron/schema"
+plugin="$root/claude-code/cauldron/schema"
+# Each pair: a published dir and the plugin's copy of it. The cauldron
+# grammar's copy is the one subdirectory of the workspace grammar's copy.
+pairs="workspace-v6: cauldron-v1:cauldron-v1"
 
 mode="copy"
 case "${1:-}" in
@@ -31,41 +34,51 @@ case "${1:-}" in
   *) echo "usage: scripts/sync-plugin-schema [--check]" >&2; exit 2 ;;
 esac
 
-if [ ! -d "$src" ]; then
-  echo "sync-plugin-schema: no published schema at $src" >&2
-  exit 2
-fi
-
 status=0
-if [ "$mode" = "copy" ]; then
-  mkdir -p "$dst"
-fi
-if [ ! -d "$dst" ]; then
-  echo "sync-plugin-schema: no plugin copy at $dst (run without --check to make it)" >&2
-  exit 1
-fi
-
-for f in "$src"/*; do
-  name="$(basename "$f")"
+copied=0
+for pair in $pairs; do
+  name_src="${pair%%:*}"
+  name_dst="${pair#*:}"
+  src="$root/schema/soup/$name_src"
+  dst="$plugin${name_dst:+/$name_dst}"
+  shown="claude-code/cauldron/schema${name_dst:+/$name_dst}"
+  if [ ! -d "$src" ]; then
+    echo "sync-plugin-schema: no published schema at $src" >&2
+    exit 2
+  fi
   if [ "$mode" = "copy" ]; then
-    cp "$f" "$dst/$name"
-  elif ! cmp -s "$f" "$dst/$name"; then
-    echo "sync-plugin-schema: claude-code/cauldron/schema/$name differs from schema/soup/workspace-v6/$name" >&2
-    status=1
+    mkdir -p "$dst"
   fi
-done
-
-for f in "$dst"/*; do
-  name="$(basename "$f")"
-  if [ ! -e "$src/$name" ]; then
-    echo "sync-plugin-schema: claude-code/cauldron/schema/$name is not in the published schema; remove it" >&2
-    status=1
+  if [ ! -d "$dst" ]; then
+    echo "sync-plugin-schema: no plugin copy at $dst (run without --check to make it)" >&2
+    exit 1
   fi
+  for f in "$src"/*; do
+    name="$(basename "$f")"
+    if [ "$mode" = "copy" ]; then
+      cp "$f" "$dst/$name"
+      copied=$((copied + 1))
+    elif ! cmp -s "$f" "$dst/$name"; then
+      echo "sync-plugin-schema: $shown/$name differs from schema/soup/$name_src/$name" >&2
+      status=1
+    fi
+  done
+  for f in "$dst"/*; do
+    name="$(basename "$f")"
+    # The workspace copy holds the cauldron copy as its one subdirectory.
+    if [ -z "$name_dst" ] && [ -d "$f" ] && [ "$name" = "cauldron-v1" ]; then
+      continue
+    fi
+    if [ ! -e "$src/$name" ]; then
+      echo "sync-plugin-schema: $shown/$name is not in the published schema; remove it" >&2
+      status=1
+    fi
+  done
 done
 
 if [ "$status" -ne 0 ]; then
   [ "$mode" = "check" ] && echo "sync-plugin-schema: the plugin's copy drifted; run scripts/sync-plugin-schema" >&2
   exit 1
 fi
-[ "$mode" = "copy" ] && echo "sync-plugin-schema: copied $(ls "$src" | wc -l | tr -d ' ') files to claude-code/cauldron/schema/"
+[ "$mode" = "copy" ] && echo "sync-plugin-schema: copied $copied files to claude-code/cauldron/schema/"
 exit 0

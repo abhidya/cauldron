@@ -16,6 +16,7 @@ mod c7f6_env_create_lock;
 mod c7f7_create_cleanup_lock;
 mod c7f7_relaunch_reads_migrating;
 mod c7f7_rollback_owed;
+mod clusters;
 mod ctl;
 mod soup;
 mod soup_corpus;

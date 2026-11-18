@@ -1,6 +1,6 @@
 ---
 name: soup-schema
-description: A short orientation to the Cauldron soup schema (workspace grammar v6), the node types, edges and record shape that the cauldron MCP tools (`soup_put`) and `cauldron soup import` accept. Use when you need to read, write or reason about records in a Cauldron soup, or before calling the curator.
+description: A short orientation to the Cauldron soup schema (workspace grammar v6, and cauldron grammar v1 for clusters), the node types, edges and record shape that the cauldron MCP tools (`soup_put`, `soup_claim`) and `cauldron soup import` accept. Use when you need to read, write or reason about records in a Cauldron soup, or before calling the curator.
 ---
 
 A Cauldron **soup** is a knowledge graph: typed nodes joined by a closed set of
@@ -25,6 +25,18 @@ and `viewer` (V).
 **Placement.** Every content node mints with an `in_region` edge (or, rarely,
 two `rejected_by` edges and `searched`). Regions are found with the
 `soup_regions` MCP tool, or `cauldron soup regions --env E --cauldron C`.
+
+**Clusters (`cauldron@1`).** The soup's second pool holds clusters: `cluster`
+(CL), an area of the surface with a `handle` and a `boundary` (40 to 1,000
+characters, as a region's), an open `meta` and no state. A cluster CLAIMS
+regions with `claims` edges (cluster to region, many-to-many, optional
+`note` of at most 1,000 characters, the bound on every edge's note). A region holds nodes; a cluster holds no node and groups regions; a
+claim is not a lease on work. Write a cluster as a record of type `cluster`
+in the same `soup_put` batch as workspace records (one write); add or release
+one claim with `soup_claim {cluster, region, release?}` (or `cauldron soup
+claim CL-1 R-3 [--release]`). `soup_region` lists the clusters claiming a
+region; `soup_nodes {type: "cluster"}` lists clusters. A ripple writes no
+cluster. Reference: `${CLAUDE_PLUGIN_ROOT}/schema/cauldron-v1/README.md`.
 
 **Knowledge capture.** A pattern is a `decision` or `constraint` with
 `meta.kind: "pattern"`; a case is an `idea` or `issue` with

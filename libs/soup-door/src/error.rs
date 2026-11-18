@@ -50,6 +50,10 @@ pub enum Code {
     TooLarge,
     /// A write names a region another writer holds (`region_lock`).
     RegionLocked,
+    /// A change cursor that is not this cauldron's (`changes`).
+    CursorUnknown,
+    /// A change cursor ahead of the cauldron's (`changes`).
+    CursorStale,
 }
 
 impl Code {
@@ -74,6 +78,8 @@ impl Code {
             Code::NotATerminal => "not_a_terminal",
             Code::TooLarge => "too_large",
             Code::RegionLocked => "region_locked",
+            Code::CursorUnknown => "cursor_unknown",
+            Code::CursorStale => "cursor_stale",
         }
     }
 }

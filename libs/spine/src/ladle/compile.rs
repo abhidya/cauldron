@@ -1075,8 +1075,9 @@ pub struct CompileCtx<'a> {
 }
 
 /// Compile the matched statement into the four interior deltas plus premise
-/// records — the spine row's durable payload. Parts are grouped per touched pool and ordered by ascending
-/// pool name (frozen — see [`crate::delta::CompiledPayload::parts`]).
+/// records — the spine row's durable payload. Parts are grouped per touched pool and ordered by the
+/// frozen landing order (`landing_order`: the far end of a cross-pool edge first, then ascending pool
+/// name — see [`crate::delta::CompiledPayload::parts`]).
 ///
 /// # The frozen node-identifier minting rule
 ///
@@ -1269,9 +1270,15 @@ pub fn compile(
         declared_by_kind: &declared_by_kind,
     };
 
-    // ---- parts, ascending by pool name (frozen landing order) ----
+    // ---- parts, in the frozen landing order (see `landing_order`) ----
     let mut parts = Vec::new();
-    for (ordinal, (pool, accum)) in emit.by_pool.into_iter().enumerate() {
+    let mut by_pool = emit.by_pool;
+    let order = landing_order(&by_pool);
+    let ordered: Vec<(PoolName, PartAccum)> = order
+        .into_iter()
+        .filter_map(|p| by_pool.remove(&p).map(|a| (p, a)))
+        .collect();
+    for (ordinal, (pool, accum)) in ordered.into_iter().enumerate() {
         let grammar = grammars
             .get(&pool)
             .ok_or_else(|| grammar_violation(&pool, "no pinned grammar for this pool"))?;
@@ -1617,6 +1624,39 @@ pub const FUEL_PER_DELTA: u64 = 1;
 struct PartAccum {
     deltas: Vec<Delta>,
     premises: Vec<Premise>,
+}
+
+/// **The frozen landing order** of a statement's parts: a part whose
+/// cross-pool edges point into another pool this statement touches lands
+/// AFTER that pool's part, so a reader never finds an edge whose far end has
+/// not landed yet (a cluster's claim of a region made in the same write);
+/// among parts with no such order between them, ascending pool name. A cycle
+/// (two touched pools each pointing into the other) is broken by ascending
+/// name. Deterministic, so the between-landings window is reproducible.
+fn landing_order(by_pool: &BTreeMap<PoolName, PartAccum>) -> Vec<PoolName> {
+    use std::collections::BTreeSet;
+    let mut after: BTreeMap<PoolName, BTreeSet<PoolName>> = BTreeMap::new();
+    for (pool, accum) in by_pool {
+        let deps = after.entry(pool.clone()).or_default();
+        for d in &accum.deltas {
+            if let Delta::AddEdge { dst, .. } | Delta::RemoveEdge { dst, .. } = d {
+                if &dst.pool != pool && by_pool.contains_key(&dst.pool) {
+                    deps.insert(dst.pool.clone());
+                }
+            }
+        }
+    }
+    let mut out: Vec<PoolName> = Vec::with_capacity(after.len());
+    while !after.is_empty() {
+        let next = after
+            .iter()
+            .find(|(_, deps)| deps.iter().all(|d| out.contains(d)))
+            .map(|(p, _)| p.clone())
+            .unwrap_or_else(|| after.keys().next().cloned().expect("not empty"));
+        after.remove(&next);
+        out.push(next);
+    }
+    out
 }
 
 struct Emit<'a> {

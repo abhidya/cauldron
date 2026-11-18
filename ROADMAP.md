@@ -34,20 +34,22 @@ recorded in [CHANGELOG.md](CHANGELOG.md).
   soup lands meanwhile, a write into a held region is refused at once by
   name with a retry-after, and a region whose boundary changed under the
   ripple makes it plan again once, told what changed.
-
-## Next
-
-- **0.1.15: cauldron on an Apple silicon Mac without a Rust toolchain.**
-  Prebuilt, ad-hoc-signed arm64 binaries with checksums and an installer
+- **0.1.15: cauldron on an Apple silicon Mac without a Rust toolchain**:
+  prebuilt, ad-hoc-signed arm64 binaries with checksums and an installer
   path that uses them (issue #22), a plugin MCP launcher that does not
   depend on Claude Code's `PATH`, and `cauldron soup import-corpus`, which
   brings records in the older corpus format into a cauldron's soup (issue
-  #4). In preparation.
-- **0.1.16: clusters claim regions** (issue #1). A cluster type and a
-  `claims` edge from a cluster to a region, kept beside the workspace
-  grammar, which stays as it is; `soup_claim` made real, a region listing
-  the clusters that claim it, `import-corpus` carrying clusters, and a
-  `soup_changes` that can wait for the next change.
+  #4).
+- **0.1.16: clusters claiming regions** (issue #1): a cluster, an area of
+  the surface with a name and a boundary, claims the regions of a soup it
+  covers, in a second published schema (`cauldron@1`) beside the unchanged
+  `workspace@6`; `soup_claim` and `cauldron soup claim`; a region lists the
+  clusters that claim it; `import-corpus` brings an older corpus's clusters
+  in with their claims; and `soup_changes` can wait for the next change
+  (`wait_secs`), the polling half of issue #7.
+
+## Next
+
 - **Ripples on by default in a fresh install**, once the conditions hold:
   enough real dumps processed and reviewed with a reject rate the owner
   accepts, tokens per dump measured with no cap ever passed silently, the
@@ -57,8 +59,10 @@ recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Open issues, not yet scheduled
 
-- **Changes as events** (issue #7): streaming what changed in a soup, and a
-  history of which write changed what.
+- **Changes as events** (issue #7): a streaming subscription to what
+  changed in a soup, and a history of which write changed what.
+  (`soup_changes` can already wait for the next change.)
+- **Ripples proposing clusters and claims**: a ripple writes neither today.
 - **Merging cauldrons** (issue #9).
 - **A summary page in the face** (issue #11).
 - **Comparisons with two other tools**, as input for design: octomind's

@@ -28,7 +28,9 @@ fault-injection = []
 # recovery writers (`recover::abort_row`, `recover::halt`) are `pub`, so
 # test suites can stage crash and lock states directly. Without it (every
 # production consumer): they are `pub(crate)`, and the only writes a
-# consumer can reach are `Cauldron::create`, `Cauldron::open` (it runs the
+# consumer can reach are `Cauldron::create`, `Cauldron::add_pool` (the cluster
+# pool, `cauldron@1`, and no other grammar: one whole
+# pool file moved into place, judged against the handle's pins), `Cauldron::open` (it runs the
 # recovery pass before it returns a handle), `submit`, `recover`,
 # `quiesce`, `resume` and `resume_all` (the by-hand lift). The test-support-only `Cauldron::open_unrecovered` writes nothing.
 # `tests/adversary_grammar_one_door.rs` proves the boundary by

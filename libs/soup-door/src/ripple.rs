@@ -18,6 +18,8 @@
 //! - no `provenance` key (who wrote it is the door's to say) and no
 //!   `meta.approved` or `meta.rejected` (a ripple never reviews; the spine
 //!   refuses both too);
+//! - no cluster and no claim: a ripple writes neither in this release
+//!   ([`NO_CLUSTERS`]);
 //! - at most [`MAX_RECORDS`] records.
 //!
 //! [`land`] then writes the batch as ONE statement of `CREATE`s (never the
@@ -42,6 +44,12 @@ pub const TYPES: [&str; 7] = ["idea", "issue", "question", "decision", "constrai
 
 /// The edge kinds a ripple's record may carry.
 pub const EDGES: [&str; 3] = ["in_region", "ref", "derived_from"];
+
+/// Why a ripple's batch may hold no cluster and no claim, said whenever it
+/// holds one. Clusters and their claims are written by a session
+/// (`soup_put`, `soup_claim`) or at a terminal (`cauldron soup import |
+/// claim`); a later release may let a ripple propose them.
+pub const NO_CLUSTERS: &str = "a ripple writes no cluster and no claim in this release: clusters and their claims are written by a session (soup_put, soup_claim) or at a terminal (cauldron soup import, cauldron soup claim)";
 
 /// The most records one batch may hold.
 pub const MAX_RECORDS: usize = 25;
@@ -96,6 +104,9 @@ pub fn check_batch(c: &env::Cauldron, records: &[Value]) -> Result<Vec<Value>> {
         if r.get("id").and_then(Value::as_str).is_none_or(|s| s.trim().is_empty()) {
             say(&label, "a record needs an `id`, a label of this batch".into());
         }
+        if let Err(e) = crate::notes::refuse_long_notes(std::slice::from_ref(r)) {
+            say(&label, e.message);
+        }
         for k in obj.keys() {
             if !KEYS.contains(&k.as_str()) {
                 say(&label, format!("`{k}` is not a key a ripple's record may carry (it may carry {})", KEYS.join(", ")));
@@ -103,6 +114,7 @@ pub fn check_batch(c: &env::Cauldron, records: &[Value]) -> Result<Vec<Value>> {
         }
         match r.get("type").and_then(Value::as_str) {
             Some(t) if TYPES.contains(&t) => {}
+            Some(spine::grammar_cauldron::CLUSTER) => say(&label, format!("`cluster`: {NO_CLUSTERS}")),
             Some(t) => say(&label, format!("a ripple may not write a `{t}`; it writes only {}", TYPES.join(", "))),
             None => say(&label, "a record needs a `type`".into()),
         }
@@ -130,6 +142,10 @@ pub fn check_batch(c: &env::Cauldron, records: &[Value]) -> Result<Vec<Value>> {
             }
             if e.get("note").is_some_and(|n| !n.is_string()) {
                 say(&label, "an edge's `note` is a string".into());
+            }
+            if kind == spine::grammar_cauldron::CLAIMS {
+                say(&label, format!("a `claims` edge: {NO_CLUSTERS}"));
+                continue;
             }
             if !EDGES.contains(&kind) {
                 say(&label, format!("a ripple's record may not carry a `{kind}` edge; it carries only {}", EDGES.join(", ")));

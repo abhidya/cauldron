@@ -1649,7 +1649,7 @@ fn rv4_the_real_older_mcp_service_rejects_nothing_and_says_why() {
 /// whenever the workspace version is not this constant, so every release
 /// bump makes someone check rv3 and rv4 against the new relation and move
 /// it.
-const OLDER_SERVICE_TESTS_CHECKED_AT: &str = "0.1.15";
+const OLDER_SERVICE_TESTS_CHECKED_AT: &str = "0.1.16";
 
 #[test]
 fn rv0_the_older_service_tests_were_checked_against_the_workspace_version() {
@@ -1834,6 +1834,236 @@ fn rv6_the_interactive_pass_decides_a_group_whole_or_not_at_all() {
     assert_eq!((q["counts"]["unreviewed"].clone(), q["counts"]["approved"].clone(), q["counts"]["rejected"].clone()), (json!(0), json!(1), json!(1)), "{q}");
     let _ = a;
     svc.stop();
+}
+
+// ------------------------------------------------------------- clusters
+
+const CLUSTER_BOUNDARY: &str = "Inside: everything that gets a release to the people who use it, end to end.";
+
+fn cluster(label: &str, claims: &[&str]) -> Value {
+    let edges: Vec<Value> = claims.iter().map(|r| json!({"kind": "claims", "to": r})).collect();
+    json!({"id": label, "type": "cluster", "handle": "Shipping", "boundary": CLUSTER_BOUNDARY, "edges": edges})
+}
+
+/// While the service holds the soup, an import holding a cluster and a
+/// `cauldron soup claim` are both sent to it and land through it.
+#[test]
+fn k1_a_cluster_import_and_a_claim_are_sent_to_the_service_that_holds_the_soup() {
+    let s = Scratch::new("k1", &["kb"]);
+    let ex = s.write("example.json", &json!(example()));
+    assert_eq!(s.import("kb", &ex, &[], &[]).rc, 0);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let r = svc.call(&s, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "Opens the writer")]}));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert!(!lock_free(&s, "kb"), "the service holds the soup");
+    let o = s.import("kb", &s.write("k.json", &json!([cluster("k1", &["R-1"])])), &["--remint"], &pids);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert_eq!(o.json()["id_map"]["k1"], "CL-1", "{}", o.out);
+    assert_eq!(o.json()["forwarded_to"]["pid"], json!(svc.pid()));
+    let o = s.run(&["soup", "claim", "CL-1", "R-2", "--env", "dev", "--cauldron", "kb"], &pids);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert_eq!((o.json()["outcome"].clone(), o.json()["forwarded_to"]["pid"].clone()), (json!("claimed"), json!(svc.pid())), "{}", o.out);
+    assert!(s.calls().iter().any(|l| l["tool"] == "soup_claim" && l["outcome"] == "claimed" && l["client"] == "cli"), "{:?}", s.calls());
+    svc.stop();
+}
+
+/// THE OLDER SERVICE. With `$CAULDRON_OLDER_MCP_BIN` naming a 0.1.14
+/// `cauldron-mcp`: on a store holding clusters it opens the soup, reads and
+/// writes it, and shows no cluster (its `soup_region` answers `clusters:
+/// []`, `soup_get CL-1` answers it missing); its `soup_changes` lists the
+/// earlier cluster writes as changes, by id. Skipped without the variable.
+#[test]
+fn k2_a_store_with_clusters_opens_reads_and_writes_under_the_older_service() {
+    let Some(older) = std::env::var_os("CAULDRON_OLDER_MCP_BIN") else {
+        eprintln!("k2: skipped: set CAULDRON_OLDER_MCP_BIN to a 0.1.14 `cauldron-mcp` to run it");
+        return;
+    };
+    let s = Scratch::new("k2", &["kb"]);
+    let ex = s.write("example.json", &json!(example()));
+    assert_eq!(s.import("kb", &ex, &[], &[]).rc, 0);
+    assert_eq!(s.import("kb", &s.write("k.json", &json!([cluster("k1", &["R-1"])])), &["--remint"], &[]).rc, 0);
+    s.grant("kb");
+    let svc = Service::start_bin(&s, Path::new(&older));
+    let st = svc.call(&s, "soup_status", json!({"cauldron": "kb"}));
+    assert_eq!(st["isError"], json!(false), "{st}");
+    assert!(st["structuredContent"]["counts"].get("cluster").is_none(), "{st}");
+    let r = svc.call(&s, "soup_region", json!({"cauldron": "kb", "id": "R-1"}));
+    assert_eq!(r["structuredContent"]["clusters"], json!([]), "{r}");
+    let g = svc.call(&s, "soup_get", json!({"cauldron": "kb", "ids": ["CL-1"]}));
+    assert_eq!(g["structuredContent"]["missing"], json!(["CL-1"]), "{g}");
+    let ch = svc.call(&s, "soup_changes", json!({"cauldron": "kb", "since": format!("v1.{}.0.0", st["structuredContent"]["cursor"].as_str().unwrap().split('.').nth(1).unwrap())}));
+    let text = ch["structuredContent"].to_string();
+    assert!(text.contains("CL-1"), "the older change feed lists the cluster write: {ch}");
+    let w = svc.call(&s, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "The older service still writes")]}));
+    assert_eq!(w["isError"], json!(false), "{w}");
+    let k = svc.call(&s, "soup_claim", json!({"cauldron": "kb", "cluster": "CL-1", "region": "R-2"}));
+    assert_eq!(k["structuredContent"]["refused"]["code"], "unsupported", "{k}");
+    svc.stop();
+    // This release reads the cluster and its claim afterwards.
+    let o = s.run(&["soup", "get", "CL-1", "--env", "dev", "--cauldron", "kb"], &[]);
+    assert_eq!(o.rc, 0, "{}{}", o.out, o.err);
+    assert_eq!(o.json()["records"][0]["claims"][0]["region"], "R-1", "{}", o.out);
+}
+
+// --------------------------------------------------------------------- B3
+
+/// A `soup_changes` wait sent straight to the door on a connection the
+/// caller keeps open, as session `session`.
+fn hold_wait(s: &Scratch, svc: &Service, since: &str, session: &str, secs: u64) -> TcpStream {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "soup_changes", "arguments": {
+        "cauldron": "kb", "since": since, "wait_secs": secs,
+        "_ctx": {"client": "test", "cwd": s.project().display().to_string(), "session_id": session}}}})
+    .to_string();
+    let mut c = TcpStream::connect(svc.door).unwrap();
+    write!(
+        c,
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        svc.door.port(),
+        s.secret(),
+        body.len()
+    )
+    .unwrap();
+    c
+}
+
+/// B3: every wait slot held, a session's `soup_changes` wait through the
+/// bridge is not handed back at once as `not-waited`: the bridge sleeps the
+/// service's `retry_after_secs`, asks again, and answers once it was given a
+/// slot and the wait ran.
+#[test]
+fn b3_the_bridge_backs_off_when_every_wait_slot_is_held() {
+    let s = Scratch::new("b3", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let cur = svc.call(&s, "soup_status", json!({"cauldron": "kb"}))["structuredContent"]["cursor"].as_str().unwrap().to_string();
+    let mut held: Vec<TcpStream> = (0..16).map(|i| hold_wait(&s, &svc, &cur, &format!("h{i}"), 3)).collect();
+    // Keep all sixteen held: one answered at once (racing the others in)
+    // is sent again.
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let mut answered = 0;
+        for (i, c) in held.iter_mut().enumerate() {
+            c.set_nonblocking(true).unwrap();
+            let early = c.peek(&mut [0u8; 1]).is_ok();
+            c.set_nonblocking(false).unwrap();
+            if early {
+                answered += 1;
+                *c = hold_wait(&s, &svc, &cur, &format!("h{i}"), 3);
+            }
+        }
+        if answered == 0 {
+            break;
+        }
+    }
+    let full = svc.call(&s, "soup_changes", json!({"cauldron": "kb", "since": cur, "wait_secs": 2}));
+    assert_eq!(full["structuredContent"]["waited"]["ended"], "not-waited", "the sixteen hold every slot: {full}");
+    let mut b = Bridge::start(&s, &s.project(), &[], &[("CLAUDE_CODE_SESSION_ID", "sess-b3")], &[svc.pid()]);
+    init(&mut b);
+    let t0 = Instant::now();
+    let r = b.call(1, "soup_changes", json!({"cauldron": "kb", "since": cur, "wait_secs": 8}));
+    let took = t0.elapsed();
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert_eq!(r["structuredContent"]["waited"]["ended"], "timeout", "the bridge waited for a slot, then waited: {r}");
+    assert!(took >= Duration::from_secs(5) && took < Duration::from_secs(20), "{took:?}");
+    drop(held);
+    b.finish();
+    svc.stop();
+}
+
+// --------------------------------------------------------------------- B4
+
+impl Service {
+    /// SIGKILL: the service dies at once, mid-call.
+    fn kill_hard(mut self) {
+        Command::new("/bin/kill").args(["-KILL", &self.child.id().to_string()]).status().unwrap();
+        let _ = self.child.wait();
+    }
+}
+
+/// B4: the service killed (SIGKILL) while a call is in flight reaches the
+/// session as the bridge's typed `service_down` refusal with the start
+/// command, never as a JSON-RPC error: mid-wait (a read: nothing was
+/// written) and mid-put (a write: whether it landed is not known, and the
+/// refusal says how to check, with `soup_changes` since the last cursor).
+#[test]
+fn b4_a_service_killed_mid_call_is_a_typed_refusal_not_a_protocol_error() {
+    let s = Scratch::new("b4", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    s.grant("kb");
+
+    // Mid-wait.
+    let svc = Service::start(&s);
+    let mut b = Bridge::start(&s, &s.project(), &[], &[("CLAUDE_CODE_SESSION_ID", "sess-b4")], &[svc.pid()]);
+    init(&mut b);
+    let cur = b.call(1, "soup_status", json!({}))["structuredContent"]["cursor"].as_str().unwrap().to_string();
+    let w = b.stdin.as_mut().unwrap();
+    writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "soup_changes", "arguments": {"since": cur, "wait_secs": 30}}})).unwrap();
+    w.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    let t0 = Instant::now();
+    svc.kill_hard();
+    let mut line = String::new();
+    b.stdout.read_line(&mut line).unwrap();
+    let v: Value = serde_json::from_str(&line).unwrap();
+    assert!(v.get("error").is_none(), "a protocol error, not a typed refusal: {v}");
+    assert_eq!(v["id"], 2, "{v}");
+    let (code, msg) = refused(&v["result"]);
+    assert_eq!(code, "service_down", "{msg}");
+    assert!(msg.contains("`cauldron --env dev start mcp`"), "{msg}");
+    assert!(msg.contains("while this call was in flight") && msg.contains("only reads, so nothing was written"), "{msg}");
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    // And the next call is the ordinary `service_down`.
+    let (code, _) = refused(&b.call(3, "soup_status", json!({})));
+    assert_eq!(code, "service_down");
+    b.finish();
+
+    // Mid-put: a batch big enough that the kill lands while the service
+    // has it (made bigger until it does).
+    let mut n = 2000;
+    loop {
+        let svc = Service::start(&s);
+        let mut b = Bridge::start(&s, &s.project(), &[], &[("CLAUDE_CODE_SESSION_ID", "sess-b4")], &[svc.pid()]);
+        init(&mut b);
+        let records: Vec<Value> = (0..n).map(|i| task(&format!("t{i}"), &format!("Killed mid-put task {n} {i}"))).collect();
+        let w = b.stdin.as_mut().unwrap();
+        writeln!(w, "{}", json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "soup_put", "arguments": {"remint": true, "records": records}}})).unwrap();
+        w.flush().unwrap();
+        // Kill it the moment the service has the write in hand: its row is
+        // on the spine and not yet cleared.
+        let spine = s.soup("kb").join("spine.db");
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(20) {
+            let open: i64 = spine::offline::read_only_connection(&spine)
+                .ok()
+                .and_then(|c| c.query_row("SELECT count(*) FROM transactions WHERE cleared = 0", [], |r| r.get(0)).ok())
+                .unwrap_or(0);
+            if open > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        svc.kill_hard();
+        let mut line = String::new();
+        b.stdout.read_line(&mut line).unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert!(v.get("error").is_none(), "a protocol error, not a typed refusal: {v}");
+        if v["result"]["isError"] == json!(false) {
+            assert!(n < 64_000, "the put always finished before the kill");
+            n *= 2;
+            b.finish();
+            continue;
+        }
+        let (code, msg) = refused(&v["result"]);
+        assert_eq!(code, "service_down", "{msg}");
+        assert!(msg.contains("`cauldron --env dev start mcp`") && msg.contains("while this call was in flight"), "{msg}");
+        assert!(msg.contains("WHETHER THIS WRITE LANDED IS NOT KNOWN"), "{msg}");
+        assert!(msg.contains("soup_changes") && msg.contains("since") && msg.contains("batch_already_landed"), "{msg}");
+        b.finish();
+        break;
+    }
 }
 
 // --------------------------------------------------------------------- F3

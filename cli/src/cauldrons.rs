@@ -382,22 +382,10 @@ pub(crate) fn live_tranches(c: &Cauldron) -> Result<Vec<(String, String)>> {
     if !db.is_file() {
         return Ok(Vec::new());
     }
-    // ZERO WRITES. A plain read-only open of a WAL database still CREATES
-    // `-wal` and `-shm` beside it (proved by the tests' before-and-after tree comparison). So:
-    // no `-wal` beside it means no writer has it open and everything is in the
-    // main file, which is read `immutable` (no side files, no locks); a `-wal`
-    // present means a writer's side files already exist, and `mode=ro` reads
-    // through them without creating any.
-    let wal = c.soup().join(format!("{}-wal", spine::spine_db::SPINE_FILE));
-    let mode = if wal.exists() { "mode=ro" } else { "immutable=1" };
-    let path = db.display().to_string().replace('%', "%25").replace('?', "%3f").replace('#', "%23");
-    let conn = rusqlite::Connection::open_with_flags(
-        format!("file:{path}?{mode}"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| {
+    // ZERO WRITES: the spine's own read-only open, which creates nothing
+    // beside the file and never reads a file a writer is changing under it
+    // (`spine::offline::read_only_connection`).
+    let conn = spine::offline::read_only_connection(&db).with_context(|| {
         format!("REFUSED: cannot open {} read-only, so cannot verify that no tranche is held", db.display())
     })?;
     let has_table: bool = conn

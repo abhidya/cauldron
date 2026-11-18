@@ -1,18 +1,22 @@
 //! **`cauldron soup import-corpus`**: the older corpus format (the terminal
-//! interface's seed corpus, schema version 5) landed as workspace-v6 records
-//! through the same door as `cauldron soup import`.
+//! interface's seed corpus, schema version 5) landed as workspace-v6 records,
+//! and its clusters as cauldron@1 `cluster` records, through the same door as
+//! `cauldron soup import`.
 //!
 //! Fixtures (`fixtures/corpus-v5/`): `seed.json`, a seed file with a cluster
-//! tree, a corpus of three regions and five nodes (one of a type workspace-v6
-//! does not have) and the seed's messages; and `records/`, the same regions
-//! and nodes one per file.
+//! tree (a cluster claiming two regions, holding a task, and a child claiming
+//! one region of the corpus and one that is not in it), a corpus of three
+//! regions and five nodes (one of a type workspace-v6 does not have) and the
+//! seed's messages; and `records/`, the same regions and nodes one per file.
 //!
 //! - **K1** a dry run validates and writes nothing, lists what is not carried
-//!   (the clusters, the incident, the messages, the unknown key, a boundary
+//!   (the cluster's task, the child's nesting, the claim of a region not in
+//!   the corpus, the incident, the messages, the unknown key, a boundary
 //!   naming old ids) and gives the id map by corpus id; the real import lands
 //!   with new ids, `narrows`, `in_region`, `ref` edges, `operator`,
-//!   `meta.imported_from`, `meta.cites` and a rewritten `[[link]]`.
-//! - **K2** the directory form converts to the same records.
+//!   `meta.imported_from`, `meta.cites`, a rewritten `[[link]]`, and the
+//!   clusters with their claims, seen from the cluster and from the region.
+//! - **K2** the directory form converts to the same regions and nodes.
 //! - **K3** all or nothing: a record the door refuses (a state outside its
 //!   type's vocabulary) refuses the batch, and nothing lands.
 //! - **K4** the batch-already-landed guard, and `--allow-duplicate`.
@@ -106,7 +110,7 @@ fn edge_to(n: &Value, kind: &str) -> Vec<String> {
 }
 
 #[test]
-fn k1_a_seed_lands_as_workspace_v6_records_and_says_what_it_does_not_carry() {
+fn k1_a_seed_lands_with_its_clusters_and_says_what_it_does_not_carry() {
     let s = Scratch::new("k1", &["kb"]);
     let before = files(&s.soup("kb"));
     let (rc, d, err) = s.corpus("kb", &fixture("seed.json"), &["--dry-run"]);
@@ -116,19 +120,23 @@ fn k1_a_seed_lands_as_workspace_v6_records_and_says_what_it_does_not_carry() {
     let corpus = &d["corpus"];
     assert_eq!(corpus["carried"]["regions"], 3);
     assert_eq!(corpus["carried"]["nodes"], 4);
+    assert_eq!(corpus["carried"]["clusters"], 2);
     let nc = corpus["not_carried"].as_array().unwrap();
     let has = |what: &str, reason: &str| nc.iter().any(|e| e["what"] == what && e["reason"].as_str().unwrap().starts_with(reason));
-    assert!(has("cluster", "cluster-not-in-workspace-v6"), "{nc:?}");
+    assert!(nc.iter().all(|e| !e["reason"].as_str().unwrap().starts_with("cluster-not-in-workspace-v6")), "{nc:?}");
+    assert!(has("cluster-part", "not-in-cauldron-v1"), "the cluster's task is listed: {nc:?}");
+    assert!(has("cluster-nesting", "no-cluster-nesting-in-cauldron-v1"), "{nc:?}");
+    let absent: Vec<&Value> = nc.iter().filter(|e| e["what"] == "claim").collect();
+    assert_eq!(absent.len(), 1, "{nc:?}");
+    assert_eq!((absent[0]["from"].clone(), absent[0]["to"].clone()), (json!("files"), json!("R-7")));
+    assert!(absent[0]["reason"].as_str().unwrap().starts_with("target-not-in-input"), "{nc:?}");
     assert!(has("node", "type-not-in-workspace-v6"), "the incident is listed: {nc:?}");
     assert!(has("seed-key", "seed-messages"), "{nc:?}");
     assert!(has("field", "unknown-key"), "{nc:?}");
     assert!(has("boundary-text", "old-ids-in-text"), "{nc:?}");
-    let cl = nc.iter().find(|e| e["what"] == "cluster").unwrap();
-    assert_eq!((cl["id"].clone(), cl["claims_regions"].clone(), cl["holds"].clone()), (json!("import"), json!(["R-1", "R-2"]), json!({"tasks": 1})));
-    assert_eq!(cl["children"][0]["id"], "files");
     assert!(err.contains("not carried"), "{err}");
     let map = corpus["id_map"].as_object().unwrap();
-    assert_eq!(map.len(), 7, "every carried record has a new id: {map:?}");
+    assert_eq!(map.len(), 9, "every carried record has a new id: {map:?}");
 
     let (rc, d, err) = s.corpus("kb", &fixture("seed.json"), &[]);
     assert_eq!(rc, 0, "{d}\n{err}");
@@ -151,6 +159,34 @@ fn k1_a_seed_lands_as_workspace_v6_records_and_says_what_it_does_not_carry() {
     assert_eq!(c["meta"]["imported_from"]["unmapped"], json!({"tags": ["later"]}));
     let r1 = s.get("kb", &id("R-1"));
     assert_eq!(r1["meta"]["imported_from"]["schema_version"], 5);
+
+    // The clusters landed in the same write, with their claims, seen both ways.
+    let import = s.get("kb", &id("cluster:import"));
+    assert_eq!((import["type"].clone(), import["handle"].clone()), (json!("cluster"), json!("Import")), "{import}");
+    assert_eq!(import["meta"]["imported_from"]["not_carried"], json!({"tasks": 1}), "{import}");
+    let claimed = |c: &Value| -> Vec<String> {
+        let mut v: Vec<String> = c["claims"].as_array().unwrap().iter().map(|x| x["region"].as_str().unwrap().to_string()).collect();
+        v.sort();
+        v
+    };
+    let mut want = vec![id("R-1"), id("R-2")];
+    want.sort();
+    assert_eq!(claimed(&import), want, "{import}");
+    let files_cl = s.get("kb", &id("cluster:files"));
+    assert_eq!(claimed(&files_cl), vec![id("R-2")], "the claim of R-7, not in the corpus, is not made: {files_cl}");
+    let claimants = |r: &str| -> Vec<String> {
+        let (rc, out, err) = s.run_in(&s.0, &["soup", "region", r, "--env", "dev", "--cauldron", "kb"]);
+        assert_eq!(rc, 0, "{err}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let mut l: Vec<String> = v["clusters"].as_array().unwrap_or_else(|| panic!("no clusters: {v}")).iter().map(|c| c["id"].as_str().unwrap().to_string()).collect();
+        l.sort();
+        l
+    };
+    assert_eq!(claimants(&id("R-1")), vec![id("cluster:import")]);
+    let mut both = vec![id("cluster:import"), id("cluster:files")];
+    both.sort();
+    assert_eq!(claimants(&id("R-2")), both);
+    assert!(claimants(&id("R-3")).is_empty());
 }
 
 #[test]
@@ -160,10 +196,17 @@ fn k2_a_directory_of_one_record_files_converts_to_the_same_records() {
     assert_eq!(rc, 0, "{err}");
     let (rc, dir, err) = s.corpus("b", &fixture("records"), &["--dry-run"]);
     assert_eq!(rc, 0, "{dir}\n{err}");
-    assert_eq!(file["corpus"]["carried"], dir["corpus"]["carried"]);
-    assert_eq!(file["corpus"]["id_map"], dir["corpus"]["id_map"]);
+    // The seed's clusters are the only difference: the directory holds none.
+    for k in ["regions", "nodes"] {
+        assert_eq!(file["corpus"]["carried"][k], dir["corpus"]["carried"][k], "{k}");
+    }
+    assert_eq!((file["corpus"]["carried"]["clusters"].clone(), dir["corpus"]["carried"]["clusters"].clone()), (json!(2), json!(0)));
+    let without_clusters = |m: &Value| -> Value {
+        Value::Object(m.as_object().unwrap().iter().filter(|(k, _)| !k.starts_with("cluster:")).map(|(k, v)| (k.clone(), v.clone())).collect())
+    };
+    assert_eq!(without_clusters(&file["corpus"]["id_map"]), dir["corpus"]["id_map"]);
     let strip = |v: &Value| -> Vec<(Value, Value)> {
-        let mut l: Vec<(Value, Value)> = v["records"].as_array().unwrap().iter().map(|r| (r["id"].clone(), r["disposition"].clone())).collect();
+        let mut l: Vec<(Value, Value)> = v["records"].as_array().unwrap().iter().filter(|r| !r["id"].as_str().unwrap_or("").starts_with("v5:cluster:")).map(|r| (r["id"].clone(), r["disposition"].clone())).collect();
         l.sort_by_key(|(id, _)| id.to_string());
         l
     };

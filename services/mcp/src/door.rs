@@ -41,12 +41,140 @@ use crate::refusal;
 /// The schema every soup speaks.
 pub const SCHEMA: &str = "workspace@6";
 
+/// The most `soup_changes` calls that wait at once.
+pub const MAX_WAITERS: usize = 16;
+
+/// The most of those one caller holds at once (a caller is the `_ctx`
+/// client and session; calls with no session share their client's share),
+/// so one session cannot hold every slot: with 16 slots, four sessions
+/// always have room.
+pub const MAX_WAITERS_PER_CALLER: usize = 4;
+
+/// **The waiting calls' slots**: each slot is one waiting `soup_changes`,
+/// with whose it is and when its wait ends at the latest. A slot is given
+/// back when its call returns, which is at once when its caller hangs up
+/// ([`Hangup`]).
+#[derive(Default)]
+struct Waiters {
+    held: std::sync::Mutex<Vec<(u64, String, std::time::Instant)>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+/// One waiting call's slot among [`MAX_WAITERS`], given back on drop.
+struct Waiter<'a> {
+    of: &'a Waiters,
+    id: u64,
+}
+
+/// Why a wait was not given a slot, and when to call again.
+struct NoSlot {
+    why: String,
+    retry_after_secs: u64,
+}
+
+impl Waiters {
+    fn take(&self, caller: &str, deadline: std::time::Instant) -> Result<Waiter<'_>, NoSlot> {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        // The soonest any of `slots` ends: at least a second away.
+        let soonest = |slots: &mut dyn Iterator<Item = std::time::Instant>| -> u64 {
+            slots.map(|d| d.saturating_duration_since(now).as_secs_f64().ceil() as u64).min().unwrap_or(1).max(1)
+        };
+        let mine = held.iter().filter(|(_, c, _)| c == caller).count();
+        if mine >= MAX_WAITERS_PER_CALLER {
+            let retry_after_secs = soonest(&mut held.iter().filter(|(_, c, _)| c == caller).map(|(_, _, d)| *d));
+            return Err(NoSlot {
+                why: format!(
+                    "this session already has {MAX_WAITERS_PER_CALLER} soup_changes calls waiting (the most one session may hold of the \
+                     {MAX_WAITERS}); this one answered at once. Call again after `retry_after_secs`, or wait on one call instead of several"
+                ),
+                retry_after_secs,
+            });
+        }
+        if held.len() >= MAX_WAITERS {
+            let retry_after_secs = soonest(&mut held.iter().map(|(_, _, d)| *d));
+            return Err(NoSlot {
+                why: format!(
+                    "{MAX_WAITERS} soup_changes calls are waiting already; this one answered at once. Call again after \
+                     `retry_after_secs`, and wait longer each time it says so again"
+                ),
+                retry_after_secs,
+            });
+        }
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        held.push((id, caller.to_string(), deadline));
+        Ok(Waiter { of: self, id })
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let mut held = self.of.held.lock().unwrap_or_else(|p| p.into_inner());
+        held.retain(|(id, _, _)| *id != self.id);
+    }
+}
+
+/// **The caller hung up**: set when the connection a call came in on
+/// closes before its answer is written (Claude Code cancelled the tool call,
+/// the bridge was killed, a hook timed out). A waiting `soup_changes` ends
+/// at its next wake, which the hang-up itself causes, and gives its slot
+/// back.
+#[derive(Clone, Default)]
+pub struct Hangup(Arc<std::sync::atomic::AtomicBool>);
+
+impl Hangup {
+    /// A call nobody can hang up on (one made in process).
+    pub fn never() -> Hangup {
+        Hangup::default()
+    }
+    pub fn hung_up(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Sets its [`Hangup`] and wakes every waiter when dropped before
+/// [`OnHangup::answered`]: what the carrier's call future holds, so a
+/// connection closed mid-call (the future dropped) reaches the blocking
+/// call.
+struct OnHangup {
+    hangup: Hangup,
+    pulse: Arc<crate::changes::Pulse>,
+    answered: bool,
+}
+
+impl OnHangup {
+    fn answered(mut self) {
+        self.answered = true;
+    }
+}
+
+impl Drop for OnHangup {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.hangup.set();
+            self.pulse.bump();
+        }
+    }
+}
+
 /// One environment's door.
 pub struct Door {
     pub env: env::Environment,
     secret: Secret,
     access: Arc<Access>,
     pub writers: Writers,
+    /// Bumped after every write this service lands: what a waiting
+    /// `soup_changes` sleeps on.
+    pub pulse: Arc<crate::changes::Pulse>,
+    /// Set when the service starts stopping: a waiting `soup_changes` ends.
+    stopping: std::sync::atomic::AtomicBool,
+    /// The `soup_changes` calls waiting now (at most [`MAX_WAITERS`], and
+    /// [`MAX_WAITERS_PER_CALLER`] for one caller; each holds one of the
+    /// door's connections).
+    waiters: Waiters,
     /// The dumps stores this door holds.
     pub dumps: Dumps,
     audit: Arc<Audit>,
@@ -59,9 +187,13 @@ impl Door {
     pub fn new(env: env::Environment, secret: Secret, label: String, dir: &std::path::Path) -> Arc<Door> {
         let audit = Arc::new(Audit::new(dir));
         let access = Arc::new(Access::new(&env));
+        let pulse = Arc::new(crate::changes::Pulse::default());
         Arc::new(Door {
-            writers: Writers::new(audit.clone(), access.clone()),
-            dumps: Dumps::new(audit.clone(), access.clone(), Arc::new(NotifyRipples { env: env.clone() })),
+            writers: Writers::new(audit.clone(), access.clone(), pulse.clone()),
+            dumps: Dumps::new(audit.clone(), access.clone(), Arc::new(NotifyRipples { env: env.clone() }), pulse.clone()),
+            pulse,
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            waiters: Waiters::default(),
             access,
             env,
             secret,
@@ -165,29 +297,30 @@ impl Door {
 
     /// Stop: close every open cauldron (each lock is free when this returns).
     pub fn shutdown(&self) {
+        // Every waiting `soup_changes` wakes and ends now.
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.pulse.bump();
         self.writers.close_all("the service is stopping");
         self.dumps.close_all("the service is stopping");
     }
 
     /// Answer one call (blocking: run it on a blocking thread).
     pub fn call(&self, tool: &'static Tool, arguments: Value) -> Result<Value, Refusal> {
+        self.call_from(tool, arguments, &Hangup::never())
+    }
+
+    /// [`Door::call`], for a caller that may hang up mid-call (`hangup`).
+    pub fn call_from(&self, tool: &'static Tool, arguments: Value, hangup: &Hangup) -> Result<Value, Refusal> {
         let (scope, also) = match tool.needs {
             Needs::Scope(s) => (s, None),
             Needs::Both(s, t) => (s, Some(t)),
             Needs::NotYet(why) => {
                 return Err(Refusal::new(codes::NOT_AVAILABLE_YET, format!("{why}. Nothing was read or written.")))
             }
-            Needs::Unsupported => {
-                return Err(Refusal::new(
-                    codes::UNSUPPORTED,
-                    "workspace-v6 has no clusters; use `in_region` (an edge from the node to its region, written with \
-                     soup_put or soup_link). Nothing was read or written.",
-                ))
-            }
         };
         let (ctx, args) = ctx::split(arguments)?;
         let mut target_name = None;
-        let mut out = self.call_scoped(tool, scope, also, &ctx, args, &mut target_name);
+        let mut out = self.call_scoped(tool, scope, also, &ctx, args, &mut target_name, hangup);
         if let Ok(doc) = &mut out {
             mark_unreviewed(doc);
         }
@@ -229,6 +362,7 @@ impl Door {
         ctx: &Ctx,
         args: Map<String, Value>,
         named: &mut Option<String>,
+        hangup: &Hangup,
     ) -> Result<Value, Refusal> {
         let mut a = Args { tool: tool.name, m: args };
         let explicit = a.str("cauldron")?;
@@ -255,9 +389,7 @@ impl Door {
                 };
                 let mc = a.count("max_chars")?;
                 a.done()?;
-                let mut doc = reads::region(&t, &id, &o).map_err(refusal)?;
-                doc["clusters"] = json!([]);
-                bounded(doc, mc, &t)
+                bounded(reads::region(&t, &id, &o).map_err(refusal)?, mc, &t)
             }
             "soup_nodes" => {
                 let o = ReadOpts {
@@ -325,8 +457,47 @@ impl Door {
                 let since = a.str("since")?;
                 let limit = a.count("limit")?;
                 let mc = a.count("max_chars")?;
+                let wait = a.count("wait_secs")?.unwrap_or(0) as u64;
                 a.done()?;
-                let mut doc = bounded(crate::changes::changes(&t, since.as_deref(), limit)?, mc, &t);
+                if wait > crate::changes::WAIT_MAX_SECS {
+                    return Err(usage(format!("`wait_secs` of soup_changes is 0 to {}", crate::changes::WAIT_MAX_SECS)));
+                }
+                // At most MAX_WAITERS calls wait at once (each holds a
+                // connection), MAX_WAITERS_PER_CALLER of them one caller's;
+                // one past that is answered at once, saying when to call
+                // again.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+                let slot = (wait > 0 && since.is_some()).then(|| self.waiters.take(&ctx.initiator_thread(), deadline));
+                let found = match (since.as_deref(), wait, slot) {
+                    (Some(since), w, Some(Err(no))) => {
+                        let mut doc = crate::changes::changes(&t, Some(since), limit)?;
+                        doc["waited"] = json!({"asked_secs": w, "ms": 0, "ended": "not-waited",
+                            "retry_after_secs": no.retry_after_secs, "why": no.why});
+                        doc
+                    }
+                    (Some(since), w, Some(Ok(_slot))) => {
+                        // The grant, re-read on every wake: a revoke (or a
+                        // lost `read`) ends the wait with its refusal; so
+                        // does a caller that hung up.
+                        let cauldron = t.cauldron.name.clone();
+                        let mut allowed = || -> Result<(), Refusal> {
+                            if hangup.hung_up() {
+                                return Err(Refusal::new("cancelled", "the caller hung up, so this wait ended. Nothing was read."));
+                            }
+                            if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                                return Err(Refusal::new("unavailable", "the mcp service is stopping, so this wait ended. Nothing was read. Call soup_changes again once it is back."));
+                            }
+                            self.refresh();
+                            let grants = self.access.grants().map_err(refusal)?;
+                            grants.authorize(&self.env, &cauldron, Scope::Read).map_err(refusal)?;
+                            Ok(())
+                        };
+                        crate::changes::waiting(&t, since, limit, w, &self.pulse, &mut allowed)?
+                    }
+                    (None, w, _) if w > 0 => return Err(usage("`wait_secs` of soup_changes needs `since` (a cursor to wait past)")),
+                    _ => crate::changes::changes(&t, since.as_deref(), limit)?,
+                };
+                let mut doc = bounded(found, mc, &t);
                 crate::changes::after_budget(&t, &mut doc);
                 doc
             }
@@ -356,7 +527,22 @@ impl Door {
             "soup_link" => {
                 let links = a.links()?;
                 a.done()?;
+                for l in &links {
+                    if let Some(n) = &l.note {
+                        soup_door::notes::check(n, &format!("the link `{}` -[{}]-> `{}`", l.from, l.kind, l.to)).map_err(refusal)?;
+                    }
+                }
                 self.writers.link(&t, who(ctx), links)?
+            }
+            "soup_claim" => {
+                let claim = soup_door::clusters::Claim {
+                    cluster: a.required_str("cluster")?,
+                    region: a.required_str("region")?,
+                    release: a.flag("release")?,
+                    note: a.str("note")?,
+                };
+                a.done()?;
+                self.writers.claim(&t, who(ctx), claim)?
             }
             "soup_dump" => {
                 let text = match a.take("text") {
@@ -590,6 +776,10 @@ impl Door {
             }
         }
         let regions = counts.get("region").and_then(Value::as_u64).unwrap_or(0);
+        // The clusters, from the soup's cluster pool (none before it has one):
+        // counted on their own, so `total` and `counts` keep meaning the
+        // workspace nodes, as before clusters.
+        let clusters = soup_door::clusters::count(&t.cauldron).map_err(refusal)?;
         let cursor = crate::cursor::now(&t.cauldron).map_err(|e| store(&e))?;
         let dumps = soup_door::dumps::counts(&t.cauldron).map_err(refusal)?;
         let writer = match self.writers.get(&t.cauldron.name) {
@@ -614,6 +804,8 @@ impl Door {
             "cauldron": t.cauldron.name,
             "scopes": grant.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             "schema": SCHEMA,
+            "cluster_schema": soup_door::clusters::SCHEMA,
+            "clusters": clusters,
             "service": {"name": "cauldron-mcp", "version": env!("CARGO_PKG_VERSION"), "label": self.label},
             "counts": counts,
             "regions": regions,
@@ -911,9 +1103,16 @@ impl McpTools for Tools {
                 return Err(Refusal::new(codes::UNKNOWN_METHOD, name.to_string()));
             };
             let door = self.0.clone();
-            tokio::task::spawn_blocking(move || door.call(tool, arguments))
+            // Dropped unanswered when the connection closes mid-call (the
+            // HTTP layer drops this future): the call is told it was hung
+            // up on, and a waiting call ends and frees its slot.
+            let hangup = Hangup::default();
+            let on_hangup = OnHangup { hangup: hangup.clone(), pulse: door.pulse.clone(), answered: false };
+            let out = tokio::task::spawn_blocking(move || door.call_from(tool, arguments, &hangup))
                 .await
-                .unwrap_or_else(|e| Err(Refusal::new("store", format!("the call failed inside the service: {e}"))))
+                .unwrap_or_else(|e| Err(Refusal::new("store", format!("the call failed inside the service: {e}"))));
+            on_hangup.answered();
+            out
         })
     }
 }

@@ -225,7 +225,9 @@ impl Pool {
     /// LIVE cauldron directory was judged against no cauldron and has no
     /// spine record, and the next `Cauldron::open` discovers it like any
     /// other pool. The set of pools changes through
-    /// `Cauldron::create` alone, so this is `pub` only under `test-support`
+    /// `Cauldron::create` and `Cauldron::add_pool` alone (the second adds only
+    /// the cluster pool, `cauldron@1`, judges it against the handle's pins
+    /// and moves a whole file into place), so this is `pub` only under `test-support`
     /// (the storage suite builds pools by hand) and crate-private otherwise.
     #[cfg(feature = "test-support")]
     pub fn create(path: &Path, grammar: &PoolGrammar) -> Result<Pool> {
@@ -290,6 +292,31 @@ impl Pool {
             name: grammar.pool.clone(),
             grammar: grammar.clone(),
         })
+    }
+
+    /// Build a COMPLETE pool file for `grammar` inside the directory
+    /// `staging` (the file name comes from the grammar, as for
+    /// [`Pool::create`]), and leave it whole on disk: its write-ahead log
+    /// checkpointed into the main file and switched off, the file synced.
+    /// What [`crate::Cauldron::add_pool`] moves into a live cauldron in one
+    /// rename, so no reader of the cauldron ever finds half a pool. The
+    /// next ordinary open switches the file back to WAL.
+    pub(crate) fn build_whole(staging: &Path, grammar: &PoolGrammar) -> Result<PathBuf> {
+        let pool = Self::create_interior(staging, grammar)?;
+        let file = Pool::path_in(staging, &grammar.pool);
+        pool.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        let mode: String = pool.conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            return Err(SpineError::hard(format!(
+                "the new pool file `{}` would not leave WAL mode (it is `{mode}`), so it cannot be moved into place whole",
+                file.display()
+            )));
+        }
+        drop(pool);
+        std::fs::File::open(&file)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| SpineError::hard(format!("syncing the new pool file `{}`: {e}", file.display())))?;
+        Ok(file)
     }
 
     /// Open an existing pool file, loading its pinned grammar.

@@ -29,7 +29,12 @@
 //! (`soup_door::catalogue`), so a session starts and sees every tool, and
 //! answers every `tools/call` with the typed refusal `service_down` naming
 //! the command that starts it. Nothing is read from a soup in the bridge:
-//! there is one way to a soup, through the service.
+//! there is one way to a soup, through the service. A service that goes
+//! away while a call is in flight (the connection lost after the request
+//! went out: killed, or crashed, mid-wait or mid-write) is answered the
+//! same way, `service_down` with the start command; a call that writes is
+//! also told that whether it landed is not known, and to look for it with
+//! `soup_changes` since the session's last cursor before writing it again.
 //!
 //! **The environment** is `--env`, else `$CAULDRON_ENV`, else `prod`. Unlike
 //! the other verbs, the bridge does NOT read `$ENV`: a session's shell often
@@ -263,13 +268,19 @@ impl Bridge {
             return;
         }
         match relay(e, &msg) {
-            Relayed::Answer(mut v) => {
+            Relayed::Answer(v) => {
+                let mut v = back_off(e, &msg, v);
                 skew(e, &msg, &mut v);
                 self.write(&v)
             }
             Relayed::Nothing => {}
             Relayed::Down(why) => {
                 if let Some(v) = answer_down(&e.name, &why, &msg) {
+                    self.write(&v);
+                }
+            }
+            Relayed::Lost(why) => {
+                if let Some(v) = answer_lost(&e.name, &why, &msg) {
                     self.write(&v);
                 }
             }
@@ -289,8 +300,74 @@ enum Relayed {
     Nothing,
     /// The service is not there: the bridge answers itself.
     Down(String),
+    /// The service went away while the call was in flight (its connection
+    /// was lost after the request went out): the bridge answers itself, and
+    /// says whether the call may have written.
+    Lost(String),
     /// The service is there and the relay failed.
     Failed(String),
+}
+
+/// The waited part of a `soup_changes` answer that was not given a slot
+/// (`waited.ended: "not-waited"`) and carries no change: `(retry_after_secs,
+/// asked_secs)`.
+fn not_waited(v: &Value) -> Option<(u64, u64)> {
+    let doc = v.pointer("/result/structuredContent")?;
+    // An answer that already carries changes is the answer: nothing to wait for.
+    let empty = |k: &str| doc.get(k).and_then(Value::as_array).is_none_or(|a| a.is_empty());
+    if !empty("changes") || !empty("dumps") {
+        return None;
+    }
+    let w = doc.get("waited")?;
+    (w.get("ended")?.as_str()? == "not-waited").then(|| (w.get("retry_after_secs").and_then(Value::as_u64).unwrap_or(1).max(1), w.get("asked_secs").and_then(Value::as_u64).unwrap_or(0)))
+}
+
+/// **A `soup_changes` wait the service had no slot for is waited here.**
+/// The service answers a wait past its slots at once, with
+/// `waited.ended: "not-waited"` and `retry_after_secs`. The bridge does not
+/// hand that to the session (which would call again at once, and again):
+/// it sleeps `retry_after_secs`, asks again, and doubles the sleep each time
+/// it is told the same, until the call's own `wait_secs` has passed; then it
+/// answers the last answer as it is. A wait it was given a slot for, and any
+/// other answer, is written as it came.
+fn back_off(e: &Environment, msg: &Value, first: Value) -> Value {
+    let Some((mut retry, asked)) = not_waited(&first) else { return first };
+    if msg.pointer("/params/name").and_then(Value::as_str) != Some("soup_changes") {
+        return first;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(asked);
+    let mut last = first;
+    let mut tries = 0u32;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return last;
+        }
+        std::thread::sleep(left.min(std::time::Duration::from_secs(retry)));
+        let left = deadline.saturating_duration_since(std::time::Instant::now()).as_secs();
+        if left == 0 {
+            return last;
+        }
+        // Ask again for what is left of the wait.
+        let mut again = msg.clone();
+        again["params"]["arguments"]["wait_secs"] = json!(left);
+        tries += 1;
+        match relay(e, &again) {
+            Relayed::Answer(v) => match not_waited(&v) {
+                Some((r, _)) => {
+                    retry = r.max(retry.saturating_mul(2)).min(asked.max(1));
+                    last = v;
+                }
+                None => return v,
+            },
+            // Anything else (the service went away meanwhile): the answer
+            // already in hand stands.
+            _ => return last,
+        }
+        if tries > 64 {
+            return last;
+        }
+    }
 }
 
 /// Is `s` a `${NAME}` placeholder nobody substituted?
@@ -310,6 +387,7 @@ fn relay(e: &Environment, msg: &Value) -> Relayed {
         tries += 1;
         let a = match crate::mcp_door::post(e, found.door, &body) {
             Ok(a) => a,
+            Err(err) if crate::mcp_door::is_lost(&err) => return Relayed::Lost(format!("{err:#}")),
             Err(err) if is_refused(&err) => return Relayed::Down(format!("its door refused the connection ({err:#})")),
             Err(err) => return Relayed::Failed(format!("relaying to the mcp service: {err:#}")),
         };
@@ -401,6 +479,41 @@ impl Down {
         }
     }
 
+    /// The service went away while the call `tool` was in flight. The same
+    /// code as the service being down (`service_down`, with the command that
+    /// starts it); a call that writes is told plainly that whether it landed
+    /// is not known, and how to find out.
+    fn lost(env: &str, why: &str, tool: Option<&str>) -> Down {
+        let mut d = Down::service(env, why);
+        let start = crate::mcp_door::start_command(env);
+        let writes = tool.and_then(catalogue::find).is_some_and(|t| {
+            matches!(t.needs, catalogue::Needs::Scope(soup_door::grants::Scope::Write) | catalogue::Needs::Scope(soup_door::grants::Scope::Dump))
+        });
+        let message = if writes {
+            let again = if tool == Some("soup_put") {
+                " A soup_put sent again unchanged is refused as `batch_already_landed` if the first one landed."
+            } else {
+                ""
+            };
+            format!(
+                "the `mcp` service of environment `{env}` stopped answering while this call was in flight ({why}): it was \
+                 stopped or it crashed. WHETHER THIS WRITE LANDED IS NOT KNOWN: a write lands whole or not at all, never in \
+                 part, and the service went away before it said which. The owner starts the service again from a terminal \
+                 with `{start}`. Then, before writing it again, call soup_changes with `since` set to the last cursor this \
+                 session had (from soup_status, soup_put, soup_link, soup_claim, soup_dump or an earlier soup_changes) and \
+                 look for this write there, or read back what it would have written (soup_get, soup_dumps).{again}"
+            )
+        } else {
+            format!(
+                "the `mcp` service of environment `{env}` stopped answering while this call was in flight ({why}): it was \
+                 stopped or it crashed. This call only reads, so nothing was written. The owner starts the service again \
+                 from a terminal with `{start}`; then call again."
+            )
+        };
+        d.refusal = Refusal::new(SERVICE_DOWN, message);
+        d
+    }
+
     /// The environment cannot be used.
     fn unusable(u: &Unusable) -> Down {
         Down {
@@ -449,6 +562,13 @@ fn answer_down(env: &str, why: &str, msg: &Value) -> Option<Value> {
     answer_locally(Down::service(env, why), msg)
 }
 
+/// The bridge's own answer to `msg` when the service went away while it was
+/// in flight (`None` for a notification).
+fn answer_lost(env: &str, why: &str, msg: &Value) -> Option<Value> {
+    let tool = (msg.get("method").and_then(Value::as_str) == Some("tools/call")).then(|| msg.pointer("/params/name").and_then(Value::as_str)).flatten();
+    answer_locally(Down::lost(env, why, tool), msg)
+}
+
 /// The bridge's own answer to `msg` when its environment cannot be used.
 fn answer_unusable(u: &Unusable, msg: &Value) -> Option<Value> {
     answer_locally(Down::unusable(u), msg)
@@ -484,6 +604,17 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bridge backs off only from a `not-waited` answer that carries no
+    /// change: one that already holds changes is the answer.
+    #[test]
+    fn only_an_empty_not_waited_answer_is_waited_again() {
+        let answer = |changes: Value, ended: &str| json!({"result": {"structuredContent": {"changes": changes, "dumps": [],
+            "waited": {"asked_secs": 20, "ended": ended, "retry_after_secs": 3}}}});
+        assert_eq!(not_waited(&answer(json!([]), "not-waited")), Some((3, 20)));
+        assert_eq!(not_waited(&answer(json!([{"seq": 4}]), "not-waited")), None);
+        assert_eq!(not_waited(&answer(json!([]), "timeout")), None);
+    }
 
     #[test]
     fn the_bridge_replaces_any_ctx_a_caller_sends() {
@@ -885,6 +1016,7 @@ fn dump_session(e: &Environment, ctx: &Ctx, msg: &Value) -> Value {
         }
         let a = match crate::mcp_door::post_stream(e, found.door, soup_door::catalogue::SESSION_PATH, &line, &mut f, len) {
             Ok(a) => a,
+            Err(err) if crate::mcp_door::is_lost(&err) => return answer_lost(&e.name, &format!("{err:#}"), &msg).unwrap_or(Value::Null),
             Err(err) if is_refused(&err) => return answer_down(&e.name, &format!("its door refused the connection ({err:#})"), &msg).unwrap_or(Value::Null),
             Err(err) => return shapewire::mcp::error_body(id, shapewire::mcp::rpc::SERVER, format!("sending the transcript to the mcp service: {err:#}"), None),
         };

@@ -129,6 +129,32 @@ pub fn mib(n: usize) -> String {
     format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
 }
 
+/// **The connection to the door was lost after the request went out**: it
+/// was closed, reset or cut before a whole answer came back (the service was
+/// killed, or crashed, mid-call). Whatever the call was, the service may
+/// have acted on it; the error chain of [`post`] and [`post_stream`] carries
+/// this when that is what happened, and [`is_lost`] finds it.
+#[derive(Debug)]
+pub struct Lost(pub String);
+
+impl std::fmt::Display for Lost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the connection to the mcp door was lost mid-call: {}", self.0)
+    }
+}
+
+impl std::error::Error for Lost {}
+
+/// Did [`post`] (or [`post_stream`]) lose its connection after sending?
+pub fn is_lost(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.downcast_ref::<Lost>().is_some())
+}
+
+/// `r`, an error after the request started going out, marked [`Lost`].
+fn lost<T>(r: Result<T>) -> Result<T> {
+    r.map_err(|e| anyhow::Error::new(Lost(format!("{e:#}"))))
+}
+
 /// The JSON-RPC body of one `tools/call`.
 pub fn call_body(tool: &str, arguments: serde_json::Value) -> String {
     serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}).to_string()
@@ -158,16 +184,20 @@ pub fn post(e: &Environment, door: SocketAddr, body: &str) -> Result<Answer> {
         port = door.port(),
         len = body.len()
     );
-    // The secret goes on the wire and nowhere else.
-    s.write_all(head.as_bytes())?;
-    s.write_all(b"Authorization: Bearer ")?;
-    s.write_all(secret.as_bytes())?;
-    s.write_all(b"\r\n\r\n")?;
-    s.write_all(body.as_bytes())?;
-    s.flush()?;
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).with_context(|| format!("reading the mcp door's answer from {door}"))?;
-    parse_http(&raw)
+    // The secret goes on the wire and nowhere else. From the first byte on,
+    // a failure is a connection lost mid-call (`Lost`): the service may have
+    // acted on the request.
+    lost((|| -> Result<Answer> {
+        s.write_all(head.as_bytes())?;
+        s.write_all(b"Authorization: Bearer ")?;
+        s.write_all(secret.as_bytes())?;
+        s.write_all(b"\r\n\r\n")?;
+        s.write_all(body.as_bytes())?;
+        s.flush()?;
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw).with_context(|| format!("reading the mcp door's answer from {door}"))?;
+        parse_http(&raw)
+    })())
 }
 
 /// `POST <path>` with the secret: `head` (one JSON-RPC message, no
@@ -185,10 +215,13 @@ pub fn post_stream(e: &Environment, door: SocketAddr, path: &str, head_line: &st
          Content-Length: {total}\r\nConnection: close\r\n",
         port = door.port(),
     );
-    s.write_all(head.as_bytes())?;
-    s.write_all(b"Authorization: Bearer ")?;
-    s.write_all(secret.as_bytes())?;
-    s.write_all(b"\r\n\r\n")?;
+    lost((|| -> Result<()> {
+        s.write_all(head.as_bytes())?;
+        s.write_all(b"Authorization: Bearer ")?;
+        s.write_all(secret.as_bytes())?;
+        s.write_all(b"\r\n\r\n")?;
+        Ok(())
+    })())?;
     let sent = (|| -> std::io::Result<u64> {
         s.write_all(head_line.as_bytes())?;
         s.write_all(b"\n")?;
@@ -199,13 +232,13 @@ pub fn post_stream(e: &Environment, door: SocketAddr, path: &str, head_line: &st
     let mut raw = Vec::new();
     let read = s.read_to_end(&mut raw);
     if raw.is_empty() {
-        let n = sent.with_context(|| format!("sending to the mcp door at {door}"))?;
-        read.with_context(|| format!("reading the mcp door's answer from {door}"))?;
+        let n = lost(sent.with_context(|| format!("sending to the mcp door at {door}")))?;
+        lost(read.with_context(|| format!("reading the mcp door's answer from {door}")))?;
         if n != len {
             bail!("the content ended after {n} of {len} bytes");
         }
     }
-    parse_http(&raw)
+    lost(parse_http(&raw))
 }
 
 fn parse_http(raw: &[u8]) -> Result<Answer> {
@@ -227,6 +260,9 @@ fn parse_http(raw: &[u8]) -> Result<Answer> {
     if header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
         body = dechunk(&body)?;
     } else if let Some(n) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        if body.len() < n {
+            bail!("the mcp door's answer ended after {} of its {n} bytes", body.len());
+        }
         body.truncate(n);
     }
     Ok(Answer { status, body: String::from_utf8_lossy(&body).into_owned() })

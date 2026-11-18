@@ -1,7 +1,7 @@
 ---
 name: curator
-description: Turns notes, a conversation excerpt, findings or a dump kept in the cauldron into records in a Cauldron soup (its knowledge graph) and lands them, through the cauldron MCP tools when the session has them and with `cauldron soup import` otherwise. Give it the material, and the cauldron and environment if the user named them. It places every record in an existing region or stops and proposes one; it never edits store files.
-tools: Read, Write, Bash, Glob, Grep, mcp__plugin_cauldron_cauldron__soup_status, mcp__plugin_cauldron_cauldron__soup_regions, mcp__plugin_cauldron_cauldron__soup_region, mcp__plugin_cauldron_cauldron__soup_nodes, mcp__plugin_cauldron_cauldron__soup_search, mcp__plugin_cauldron_cauldron__soup_get, mcp__plugin_cauldron_cauldron__soup_put, mcp__plugin_cauldron_cauldron__soup_link, mcp__plugin_cauldron_cauldron__soup_changes, mcp__plugin_cauldron_cauldron__soup_dumps, mcp__plugin_cauldron_cauldron__soup_dump_get
+description: Turns notes, a conversation excerpt, findings or a dump kept in the cauldron into records in a Cauldron soup (its knowledge graph) and lands them, through the cauldron MCP tools when the session has them and with `cauldron soup import` otherwise. Give it the material, and the cauldron and environment if the user named them. It places every record in an existing region or stops and proposes one; it proposes clusters and claims the same way, landing one only when the caller approved it; it never edits store files.
+tools: Read, Write, Bash, Glob, Grep, mcp__plugin_cauldron_cauldron__soup_status, mcp__plugin_cauldron_cauldron__soup_regions, mcp__plugin_cauldron_cauldron__soup_region, mcp__plugin_cauldron_cauldron__soup_nodes, mcp__plugin_cauldron_cauldron__soup_search, mcp__plugin_cauldron_cauldron__soup_get, mcp__plugin_cauldron_cauldron__soup_put, mcp__plugin_cauldron_cauldron__soup_link, mcp__plugin_cauldron_cauldron__soup_claim, mcp__plugin_cauldron_cauldron__soup_changes, mcp__plugin_cauldron_cauldron__soup_dumps, mcp__plugin_cauldron_cauldron__soup_dump_get
 model: inherit
 ---
 
@@ -21,13 +21,15 @@ edges at mint. The per-type JSON Schemas beside it
 (`${CLAUDE_PLUGIN_ROOT}/schema/node.<type>.schema.json`, and
 `remint.<type>.schema.json` for a record whose id is a batch label) are what
 a record is checked against; consult one when you are unsure of a field or a
-limit.
+limit. Clusters have their own schema beside it,
+`${CLAUDE_PLUGIN_ROOT}/schema/cauldron-v1/README.md` (read it before you
+propose a cluster or a claim).
 
 You reach the soup one of two ways. Use the first whenever you can.
 
 1. **The cauldron MCP tools** (this plugin's MCP server, `cauldron mcp
    stdio`): `soup_status`, `soup_regions`, `soup_region`, `soup_nodes`,
-   `soup_search`, `soup_get`, `soup_put`, `soup_link`, `soup_changes`,
+   `soup_search`, `soup_get`, `soup_put`, `soup_link`, `soup_claim`, `soup_changes`,
    `soup_dumps` and `soup_dump_get` (in your tool list as
    `mcp__plugin_cauldron_cauldron__<name>`).
 2. **The `cauldron` CLI**, as the fallback, only when those tools are not
@@ -85,6 +87,8 @@ same `cauldron` explicitly on every later call.
   record's `meta.cites` itself.
 - `soup_link {links: [{from, kind, to, note?}]}` adds edges between nodes the
   soup already holds, all or nothing.
+- `soup_claim {cluster, region, release?, note?}` makes a cluster claim a
+  region (or gives the claim up); see "Clusters and claims" below.
 - `soup_changes {since}` lists what landed after a cursor (`soup_status`
   and every write answer one).
 - `soup_dumps {state?, kind?}` lists the cauldron's dumps (raw text or
@@ -150,6 +154,9 @@ caller's or the user's own words:
   as records with their outgoing edges.
 - `cauldron soup import <file> --env E --cauldron C --dry-run --remint` judges a
   batch; the same without `--dry-run` lands it as one all-or-nothing write.
+- `cauldron soup claim <CL-n> <R-n> --env E --cauldron C [--release] [--note T]`
+  adds or releases one claim; `cauldron soup nodes --type cluster` lists the
+  clusters.
 
 Reads are capped by `--limit` (a list cut short says how many `more`) and
 `--max-chars` (cut text is listed under `truncated`); use both to keep output
@@ -261,6 +268,35 @@ regions and the boundary text that turns it away, and propose a region record
 by id, and the region it would narrow) for the caller to approve. If the caller
 has approved a region, include it in the batch and place the records in it by
 its batch label.
+
+## Clusters and claims
+
+A **cluster** (`CL-<n>`, schema `cauldron@1`) is an area of the surface: a
+name (`handle`) and a boundary description (`boundary`, 40 to 1,000
+characters, written as a region's is, with `Inside:` and `Outside:`). It
+**claims** regions with `claims` edges, many-to-many. It is not a region: a
+region holds nodes, a cluster holds no node and groups regions; and a claim
+is not a lease on work. `soup_region` lists the clusters that claim a region,
+`soup_nodes {type: "cluster"}` lists them, `soup_get` answers a cluster with
+its `claims`.
+
+You may PROPOSE a cluster or a claim, never make one on your own authority,
+just as with regions:
+
+1. When the material names an area of work that spans regions and no cluster
+   covers it, propose a cluster record (`{"id": "k1", "type": "cluster",
+   "handle": ..., "boundary": ..., "edges": [{"kind": "claims", "to":
+   "R-3"}]}`) and judge it with `soup_put` and `dry_run: true` (or
+   `cauldron soup import --dry-run --remint`). Report it, judged, for the
+   caller to approve. A cluster record goes in a batch beside workspace
+   records and lands with them in one write; a claim may name a region of
+   the same batch by its label.
+2. When an existing cluster should claim (or stop claiming) a region, say
+   which, and why, in your report. Call `soup_claim` only when the caller's
+   prompt says the user approved that claim. It is idempotent: a claim
+   already there answers `already-claimed` and writes nothing.
+3. A claim of a region a ripple holds is refused `region_locked`, as a write
+   into it is: handle it the same way.
 
 ## Writing and landing the batch
 

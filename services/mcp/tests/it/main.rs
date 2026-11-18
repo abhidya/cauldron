@@ -39,6 +39,7 @@ mod support;
 
 mod build_stamp;
 mod changes;
+mod clusters;
 mod door;
 mod dumps;
 mod issues;

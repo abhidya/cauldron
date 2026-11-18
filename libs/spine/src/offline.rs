@@ -21,18 +21,115 @@ use std::path::Path;
 /// the file.
 ///
 /// A plain read-only open of a WAL database still creates `-wal` and `-shm`
-/// beside it. So: with no `-wal` present, no writer has the file open and
-/// everything is in the main file, which is read `immutable=1` (no side
-/// files, no locks); with a `-wal` present, a writer's side files already
-/// exist and `mode=ro` reads through them without creating any. (The same
-/// rule the CLI's tranche check uses, `cli/src/cauldrons.rs`.)
+/// beside it, so which open is used depends on whether a writer is there:
+///
+/// - with a `-wal` present, a writer's side files already exist and
+///   `mode=ro` reads through them without creating any, taking part in
+///   SQLite's own locking (a checkpoint waits for this reader);
+/// - with no `-wal`, everything is in the main file. It is NOT read in place:
+///   an `immutable=1` connection takes no lock, so a writer that opens the
+///   file meanwhile, commits, and checkpoints its log back into the main
+///   file as its last connection closes rewrites pages under a read in
+///   flight. That read then sees a mix of old and new pages: SQLite answers
+///   `database disk image is malformed`, or, worse, a wrong answer that
+///   happens to parse. (Seen by readers hammering a store while a service
+///   wrote to it.) So the file is first copied to a private file in a
+///   directory of the temporary directory only its owner can enter
+///   ([`private_dir`]; a clone, on APFS: no data is copied), and the copy
+///   is kept only if no `-wal` appeared and the original's identity (inode,
+///   size, modification and change times) did not change across the copy;
+///   the copy is opened `immutable=1` and unlinked at once, so the reader
+///   holds a snapshot no writer can touch and leaves nothing behind. If the
+///   file changed during the copy, it is tried again (a writer is now there,
+///   so the next attempt usually reads through its log), a bounded number
+///   of times; after that it is read `mode=ro`, which is correct but may
+///   leave `-wal` and `-shm` beside the file.
 pub fn read_only_connection(path: &Path) -> Result<Connection> {
-    let wal = {
-        let mut p = path.as_os_str().to_owned();
-        p.push("-wal");
-        std::path::PathBuf::from(p)
+    let wal = side_file(path, "-wal");
+    for attempt in 0..SNAPSHOT_ATTEMPTS {
+        if wal.exists() {
+            return open_uri(path, "mode=ro");
+        }
+        if let Some(conn) = settled_copy(path, &wal)? {
+            return Ok(conn);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1 + attempt as u64));
+    }
+    open_uri(path, "mode=ro")
+}
+
+/// How many times [`read_only_connection`] copies a file that changed during
+/// the copy before it reads through SQLite's locking instead.
+const SNAPSHOT_ATTEMPTS: usize = 20;
+
+fn side_file(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
+    std::path::PathBuf::from(p)
+}
+
+/// What changes when a file is written: any write between two readings of
+/// it changes its modification and change times.
+fn identity(path: &Path) -> Result<(u64, u64, u64, i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path)
+        .map_err(|e| SpineError::hard(format!("cannot open `{}` read-only: {e}", path.display())))?;
+    Ok((m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()))
+}
+
+/// A private copy of `path` taken while nothing wrote to it, opened
+/// `immutable=1` and already unlinked; `None` when a write was seen during
+/// the copy, or when no private directory can be had for the copy (then the
+/// caller reads through SQLite's locking instead).
+fn settled_copy(path: &Path, wal: &Path) -> Result<Option<Connection>> {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let before = identity(path)?;
+    let owner = std::fs::metadata(path)
+        .map_err(|e| SpineError::hard(format!("cannot open `{}` read-only: {e}", path.display())))?
+        .uid();
+    let Some(dir) = private_dir(&std::env::temp_dir(), owner) else {
+        return Ok(None);
     };
-    let mode = if wal.exists() { "mode=ro" } else { "immutable=1" };
+    let copy = dir.join(format!(
+        "{}-{}-{}.db",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+    ));
+    if let Err(e) = std::fs::copy(path, &copy) {
+        let _ = std::fs::remove_file(&copy);
+        return Err(SpineError::hard(format!("cannot open `{}` read-only (copying it to read: {e})", path.display())));
+    }
+    let settled = !wal.exists() && identity(path)? == before;
+    if !settled {
+        let _ = std::fs::remove_file(&copy);
+        return Ok(None);
+    }
+    let conn = open_uri(&copy, "immutable=1");
+    let _ = std::fs::remove_file(&copy);
+    let conn = conn.map_err(|e| SpineError::hard(format!("cannot open `{}` read-only: {e}", path.display())))?;
+    Ok(Some(conn))
+}
+
+/// The directory the private copies go in: `spine-read-<uid>` in the
+/// temporary directory, made with mode 0700 and used only while it is a
+/// real directory (not a symlink) owned by the store's owner that nobody
+/// else can enter. One someone else made first is never used.
+fn private_dir(base: &Path, owner: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let dir = base.join(format!("spine-read-{owner}"));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    let m = std::fs::symlink_metadata(&dir).ok()?;
+    (m.file_type().is_dir() && m.uid() == owner && m.mode() & 0o077 == 0).then_some(dir)
+}
+
+fn open_uri(path: &Path, mode: &str) -> Result<Connection> {
     let text = path
         .display()
         .to_string()
@@ -188,4 +285,170 @@ pub fn snapshot_copy(src: &Path, dst: &Path) -> Result<()> {
             .map_err(|e| SpineError::hard(format!("cannot copy `{}`: {e}", f.display())))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// Readers hammering a WAL file while a writer lands write after write,
+    /// each on a connection of its own that it closes (so its log is
+    /// checkpointed into the main file and removed, as the spine's are).
+    /// Every write moves value between rows and keeps the total, so a read
+    /// that mixed pages of two states would see another total (reading the
+    /// main file in place, this saw both wrong totals and `database disk
+    /// image is malformed`). Zero refusals and every total right.
+    #[test]
+    fn reads_while_writes_land_are_never_refused_or_torn() {
+        let d = std::env::temp_dir().join(format!(
+            "spine-offline-hammer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("pool.db");
+        const ROWS: i64 = 3000;
+        {
+            let c = Connection::open(&p).unwrap();
+            c.pragma_update(None, "journal_mode", "WAL").unwrap();
+            c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, pad BLOB); CREATE INDEX tv ON t(v, pad);").unwrap();
+            let tx = c.unchecked_transaction().unwrap();
+            for i in 0..ROWS {
+                tx.execute("INSERT INTO t VALUES (?1, 100, randomblob(150))", [i]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        assert!(!super::side_file(&p, "-wal").exists(), "the writer's close removed its log");
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (p, stop) = (p.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    let c = Connection::open(&p).unwrap();
+                    c.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+                    let a = (n * 7919) as i64 % ROWS;
+                    c.execute_batch(&format!(
+                        "BEGIN IMMEDIATE; UPDATE t SET v = v - 5, pad = randomblob(150) WHERE id % 11 = {}; \
+                         UPDATE t SET v = v + 5, pad = randomblob(150) WHERE id IN (SELECT id + 1 FROM t WHERE id % 11 = {} AND id + 1 < {ROWS}); \
+                         UPDATE t SET v = v + 5 * (SELECT count(*) FROM t WHERE id % 11 = {} AND id + 1 >= {ROWS}) WHERE id = {a}; COMMIT;",
+                        n % 11, n % 11, n % 11
+                    ))
+                    .unwrap();
+                    drop(c);
+                    n += 1;
+                }
+                n
+            })
+        };
+        let t0 = std::time::Instant::now();
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let (mut reads, mut failures) = (0u64, Vec::new());
+                    while t0.elapsed() < std::time::Duration::from_secs(6) {
+                        let got = (|| -> Result<i64, String> {
+                            let c = super::read_only_connection(&p).map_err(|e| e.to_string())?;
+                            let mut st = c.prepare("SELECT v, length(pad) FROM t INDEXED BY tv").map_err(|e| e.to_string())?;
+                            let mut rows = st.query([]).map_err(|e| e.to_string())?;
+                            let (mut total, mut k) = (0i64, 0u64);
+                            while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+                                total += r.get::<_, i64>(0).map_err(|e| e.to_string())?;
+                                k += 1;
+                                if k % 25 == 0 {
+                                    std::thread::sleep(std::time::Duration::from_micros(100));
+                                }
+                            }
+                            Ok(total)
+                        })();
+                        reads += 1;
+                        match got {
+                            Ok(total) if total == ROWS * 100 => {}
+                            Ok(total) => failures.push(format!("torn read: total {total}")),
+                            Err(e) => failures.push(e),
+                        }
+                    }
+                    (reads, failures)
+                })
+            })
+            .collect();
+        let mut all = Vec::new();
+        let mut reads = 0;
+        for r in readers {
+            let (n, f) = r.join().unwrap();
+            reads += n;
+            all.extend(f);
+        }
+        stop.store(true, Ordering::SeqCst);
+        let writes = writer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        eprintln!("{reads} reads during {writes} writes");
+        assert!(writes > 50 && reads > 50, "{reads} reads, {writes} writes");
+        assert!(all.is_empty(), "{} of {reads} reads failed: {:?}", all.len(), &all[..all.len().min(5)]);
+    }
+
+    /// No side file and no copy is left behind by a read of a file at rest.
+    #[test]
+    fn a_read_of_a_file_at_rest_leaves_nothing() {
+        let d = std::env::temp_dir().join(format!("spine-offline-rest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("pool.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            c.pragma_update(None, "journal_mode", "WAL").unwrap();
+            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);").unwrap();
+        }
+        let list = || {
+            let mut v: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
+            v.sort();
+            v
+        };
+        let before = (list(), super::identity(&p).unwrap());
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(&p).unwrap().uid();
+        let mine = || {
+            super::private_dir(&std::env::temp_dir(), owner).map_or(0, |dir| {
+                std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{}-", std::process::id()))).count()
+            })
+        };
+        let tmp_before = mine();
+        let c = super::read_only_connection(&p).unwrap();
+        assert_eq!(c.query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert!(c.execute("INSERT INTO t VALUES (2)", []).is_err(), "the connection cannot write");
+        drop(c);
+        assert_eq!((list(), super::identity(&p).unwrap()), before, "the read wrote beside or to the file");
+        let tmp_after = mine();
+        assert!(tmp_after <= tmp_before, "a private copy was left behind");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The directory for the private copies is used only when it is a real
+    /// directory of the store's owner that nobody else can enter: one that is
+    /// a symlink, or open to others, is refused (and the read goes through
+    /// SQLite's locking instead).
+    #[test]
+    fn a_private_directory_someone_could_reach_is_not_used() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("spine-offline-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let me = std::fs::metadata(&base).unwrap().uid();
+        let made = super::private_dir(&base, me).expect("made fresh");
+        assert_eq!(std::fs::metadata(&made).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(super::private_dir(&base, me), Some(made.clone()), "reused");
+        std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(super::private_dir(&base, me), None, "open to others");
+        std::fs::remove_dir(&made).unwrap();
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &made).unwrap();
+        assert_eq!(super::private_dir(&base, me), None, "a symlink");
+        assert_eq!(super::private_dir(&base, me + 1), None, "another owner's name");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

@@ -134,6 +134,8 @@ pub struct Dumps {
     audit: Arc<Audit>,
     access: Arc<Access>,
     effects: Arc<dyn SideEffects>,
+    /// Bumped after every dump write, for a waiting `soup_changes`.
+    pulse: Arc<crate::changes::Pulse>,
     open: Mutex<HashMap<String, Arc<Held>>>,
     /// Held while a store is being opened, so opens run one at a time
     /// without holding `open` (see `writer::Writers`).
@@ -159,8 +161,8 @@ fn revoked(cauldron: &str, why: &str) -> Refusal {
 }
 
 impl Dumps {
-    pub fn new(audit: Arc<Audit>, access: Arc<Access>, effects: Arc<dyn SideEffects>) -> Dumps {
-        Dumps { audit, access, effects, open: Mutex::new(HashMap::new()), opening: Mutex::new(()) }
+    pub fn new(audit: Arc<Audit>, access: Arc<Access>, effects: Arc<dyn SideEffects>, pulse: Arc<crate::changes::Pulse>) -> Dumps {
+        Dumps { audit, access, effects, pulse, open: Mutex::new(HashMap::new()), opening: Mutex::new(()) }
     }
 
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Held>>> {
@@ -261,7 +263,10 @@ impl Dumps {
                 instrument: "cauldron-mcp".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             };
-            store.commit(blob, || self.still_allowed(t), |b| make(b, &store.blob_path(b)), &by, refusal)?
+            let out = store.commit(blob, || self.still_allowed(t), |b| make(b, &store.blob_path(b)), &by, refusal);
+            // A waiting `soup_changes` looks again, whatever came of it.
+            self.pulse.bump();
+            out?
         };
         let cursor = crate::cursor::now(&t.cauldron).unwrap_or_default();
         let mut receipt = dumps::receipt(&t.cauldron.name, &t.env.name, &dump, &landed);
@@ -294,7 +299,9 @@ impl Dumps {
         let h = self.get_or_open(t, who)?;
         let store = h.store.lock().unwrap_or_else(|p| p.into_inner());
         let Some(store) = store.as_ref() else { return Err(closed()) };
-        f(store)
+        let out = f(store);
+        self.pulse.bump();
+        out
     }
 
     /// Close `cauldron`'s dumps store: the dump being written (if any)

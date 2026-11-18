@@ -23,13 +23,15 @@
 # by its resolved path.
 #
 # The project directory is not trusted: a cloned repository can carry a file
-# named `cauldron`. So $CAULDRON_BIN is refused when it is inside the current
-# directory (where Claude Code starts an MCP server: the project) or inside
-# $CLAUDE_PROJECT_DIR; and the PATH step ignores empty and relative entries
-# (`.`, or a leading, trailing or doubled `:`, which mean the current
-# directory), entries inside the current directory or the project, and
-# entries in a directory others can write to. The current directory counts
-# as a project unless it is / or $HOME itself. Anything skipped is named on
+# named `cauldron`. So a candidate from ANY source ($CAULDRON_BIN, the file
+# the install marker names, $CAULDRON_HOME/bin/cauldron, PATH) is refused
+# when its resolved path is inside the current directory (where Claude Code
+# starts an MCP server: the project) or inside $CLAUDE_PROJECT_DIR; and the
+# PATH step also ignores empty and relative entries (`.`, or a leading,
+# trailing or doubled `:`, which mean the current directory), entries inside
+# the current directory or the project, and entries in a directory others
+# can write to. The current directory and $CLAUDE_PROJECT_DIR count as a
+# project unless they are / or $HOME itself. Anything skipped is named on
 # stderr.
 #
 # When no candidate qualifies, this answers the MCP handshake itself rather
@@ -49,12 +51,13 @@ ME=$(/usr/bin/id -u 2>/dev/null) || ME=""
 HERE=$(pwd -P 2>/dev/null) || HERE=""
 # The directories a candidate may not come from (see above), physical paths.
 PROJECTS=""
-if [ -n "$HERE" ] && [ "$HERE" != / ] && [ "$HERE" != "$(cd -P "${HOME:-/nonexistent}" 2>/dev/null && pwd -P)" ]; then
+HOMEP=$(cd -P "${HOME:-/nonexistent}" 2>/dev/null && pwd -P) || HOMEP=""
+if [ -n "$HERE" ] && [ "$HERE" != / ] && [ "$HERE" != "$HOMEP" ]; then
     PROJECTS=$HERE
 fi
 if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
     pd=$(cd -P "$CLAUDE_PROJECT_DIR" 2>/dev/null && pwd -P) || pd=""
-    if [ -n "$pd" ] && [ "$pd" != / ]; then PROJECTS="$PROJECTS${PROJECTS:+
+    if [ -n "$pd" ] && [ "$pd" != / ] && [ "$pd" != "$HOMEP" ]; then PROJECTS="$PROJECTS${PROJECTS:+
 }$pd"; fi
 fi
 
@@ -104,7 +107,7 @@ safe_dirs() {
 }
 
 # usable <path> <where>: 0 if <path> may be executed; sets BIN to its
-# resolved path.
+# resolved path. The same checks for every source, the project rule included.
 usable() {
     p=$1
     case "$p" in
@@ -121,19 +124,14 @@ usable() {
     if ! safe_owner_mode "$BIN"; then note "skipped $2: $WHY"; return 1; fi
     if [ ! -x "$BIN" ]; then note "skipped $2: $BIN is not executable"; return 1; fi
     if ! safe_dirs "$dir" || ! safe_dirs "$real"; then note "skipped $2: $WHY, so someone else could replace $p"; return 1; fi
+    if in_project "$BIN"; then note "skipped $2: $BIN is inside the project directory, which is not trusted to provide cauldron"; return 1; fi
     return 0
 }
 
 # 1. $CAULDRON_BIN
 if [ -n "${CAULDRON_BIN:-}" ]; then
     add_looked "CAULDRON_BIN=$CAULDRON_BIN"
-    if usable "$CAULDRON_BIN" CAULDRON_BIN; then
-        if in_project "$BIN"; then
-            note "skipped CAULDRON_BIN: $BIN is inside the project directory, which is not trusted to provide cauldron"
-        else
-            exec "$BIN" mcp stdio "$@"
-        fi
-    fi
+    if usable "$CAULDRON_BIN" CAULDRON_BIN; then exec "$BIN" mcp stdio "$@"; fi
 fi
 # 2. the install marker
 if [ -n "${HOME:-}" ]; then

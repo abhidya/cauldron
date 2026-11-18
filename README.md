@@ -153,6 +153,11 @@ your dumps into records:
   `cauldron soup import-corpus`, which brings records in the older corpus
   format into a cauldron's soup ([Records in the older corpus
   format](#records-in-the-older-corpus-format)).
+- 0.1.16: clusters claim regions: a cluster, an area of the surface with a
+  name and a boundary, claims the regions of a cauldron's soup it covers
+  (`soup_claim`, `cauldron soup claim`); `import-corpus` brings an older
+  corpus's clusters in with their claims; and `soup_changes` can wait for
+  the next change ([Clusters and claims](#clusters-and-claims)).
 
 cauldron has three parts:
 
@@ -224,16 +229,16 @@ From 0.1.15, each release on GitHub carries two files: the bundle
 `cauldron-<version>-aarch64-apple-darwin.tar.gz` (the `cauldron` command, the
 terminal UI, the `threads` daemon, the `mcp` service, their declarations and
 the installer) and `SHA256SUMS`, its checksum. Download both with `curl`,
-check the checksum, unpack, and install (the commands are for 0.1.15;
+check the checksum, unpack, and install (the commands are for 0.1.16;
 change the version for another release):
 
 ```sh
 mkdir cauldron-download && cd cauldron-download
-curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.15/cauldron-0.1.15-aarch64-apple-darwin.tar.gz
-curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.15/SHA256SUMS
+curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.16/cauldron-0.1.16-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.16/SHA256SUMS
 shasum -a 256 -c SHA256SUMS
-tar -xzf cauldron-0.1.15-aarch64-apple-darwin.tar.gz
-cauldron-0.1.15-aarch64-apple-darwin/install --prebuilt cauldron-0.1.15-aarch64-apple-darwin.tar.gz
+tar -xzf cauldron-0.1.16-aarch64-apple-darwin.tar.gz
+cauldron-0.1.16-aarch64-apple-darwin/install --prebuilt cauldron-0.1.16-aarch64-apple-darwin.tar.gz
 ```
 
 `shasum -a 256 -c SHA256SUMS` must print `OK` for the tarball. The installer
@@ -363,7 +368,8 @@ it too. Whichever source names it, the launcher runs only a regular file
 (not a symlink) owned by you or root that group and others cannot write,
 in directories owned by you or root that group and others cannot write
 either. It does not take one from the project directory Claude Code starts
-it in: `$CAULDRON_BIN` there is refused, and the `PATH` step skips empty
+it in: a file there is refused whichever source names it (`$CAULDRON_BIN`,
+the install marker, `$CAULDRON_HOME`), and the `PATH` step skips empty
 and relative entries (`.`, or a leading, trailing or doubled `:`), entries
 inside the project, and entries others can write to. When it finds none,
 the session still lists a `cauldron` server, with no tools, whose
@@ -447,7 +453,9 @@ yet. That soup is the store to write knowledge into; records in the older
 format are brought into it with `cauldron soup import-corpus` (below). The
 terminal interface keeps reading its seed file in this release, and an
 import does not change that file. When the tab will read a cauldron's soup
-instead is not settled in this release.
+instead is not settled in this release. The tab's clusters are the seed's
+too: a cauldron's soup has clusters of its own from 0.1.16 ([Clusters and
+claims](#clusters-and-claims)), which the tab does not show yet.
 
 ### Records in the older corpus format
 
@@ -466,18 +474,30 @@ Each region becomes a `region` record (its `narrows` become edges) and each
 node a record of its type (its `in_region` become edges, and its `cite`
 `<thread>#<msg>` becomes `operator`). Two keys the old format could not hold
 are read too: `refs` on a node (ids, or `{to, kind, note}`) become edges,
-and `cites` becomes `meta.cites`. Every record keeps its old id in
+and `cites` becomes `meta.cites`. Each cluster, and each of its children,
+becomes a `cluster` record of the `cauldron@1` schema ([Clusters and
+claims](#clusters-and-claims)): its name the handle, its description the
+boundary, and a `claims` edge to each region of the input it names, so the
+region lists it among the clusters that claim it. Every record keeps its old id in
 `meta.imported_from`, and every record gets a new id: the printed JSON's
-`corpus.id_map` maps old ids to new ones, and references and `[[links]]`
-between the imported records are rewritten. The batch then goes through
-`cauldron soup import --remint` unchanged: every record is judged by the
+`corpus.id_map` maps old ids to new ones (a cluster's as `cluster:<id>`),
+and references and `[[links]]` between the imported records are rewritten.
+The batch then goes through `cauldron soup import --remint` unchanged, the
+clusters in the same write as the regions they claim (a cauldron made
+before 0.1.16 gets its cluster pool with that write): every record is judged by the
 soup's door, nothing lands unless all of it does, the same batch twice is
 refused, a write to a project marker tracked by git is refused, and while
 the `mcp` service holds the cauldron the import is sent to it.
 
-What the published schema cannot hold is listed under `corpus.not_carried`,
-each item with its reason, and is not imported: clusters (the schema has no
-cluster type yet), with the regions each claims and what each holds; a node
+What the published schemas cannot hold is listed under `corpus.not_carried`,
+each item with its reason, and is not imported: what a cluster holds besides
+its name, description and regions (its tasks, questions and the rest, by key
+and count; a `cluster` record has a handle, a boundary and its claims only);
+a cluster's claim of a region that is not in the input; a child cluster's
+place under its parent (it lands as a cluster of its own, since `cauldron@1`
+has no edge between clusters); a cluster whose name or description is
+outside the bounds a region's handle and boundary have, or that has no id,
+name or description, which is not padded or cut but left out whole; a node
 whose type is not one of the schema's ten content types; a reference to an
 id that is not in the input; a symbolic link inside a directory input,
 which is not followed; and the seed's messages and dashboards. A
@@ -1365,6 +1385,102 @@ The ripples service still runs one dump at a time, so two ripples never
 contend for a region today; the locks keep a ripple and your sessions
 apart.
 
+### Clusters and claims
+
+A **cluster** is an area of the surface of a cauldron's soup: a name and a
+boundary description saying what it covers. It **claims** the regions it
+covers: any cluster may claim any region, and a region may be claimed by
+many clusters. Regions are the soup's own unit: a region holds nodes (each
+node sits in its regions) and regions nest. A cluster holds no node and does
+not nest; it groups regions, the way an area of your work spans several
+topics. A claim is a statement about the surface. It is not a lease on work:
+it holds nothing, assigns nothing to anyone, and never expires.
+
+Clusters live in the soup's second pool, `cauldron`, on their own published
+schema, `cauldron@1` ([`schema/soup/cauldron-v1/`](schema/soup/cauldron-v1/README.md)):
+one node type, `cluster` (`CL-<n>`: a `handle`, a `boundary` of 40 to 1,000
+characters as a region's, an open `meta`, no state), and one edge kind,
+`claims`, from a cluster to a region. The workspace schema, `workspace@6`,
+is unchanged.
+
+**Write a cluster** as a record of type `cluster`, beside workspace records
+if you like, with `cauldron soup import` or `soup_put`:
+
+```json
+[
+  {"id": "r1", "type": "region", "handle": "Packaging",
+   "boundary": "Inside: how a release is packaged and signed. Outside: how it is built (R-2)."},
+  {"id": "k1", "type": "cluster", "handle": "Shipping",
+   "boundary": "Inside: everything that gets a release to the people who use it. Outside: what it contains.",
+   "edges": [{"kind": "claims", "to": "r1"}, {"kind": "claims", "to": "R-2"}]}
+]
+```
+
+```sh
+cauldron soup import shipping.json --env prod --cauldron kb --remint --dry-run
+cauldron soup import shipping.json --env prod --cauldron kb --remint
+```
+
+The batch is one write, all or nothing: the region, the cluster and both
+claims land together, or nothing does. A `claims` edge names a region of
+the batch by its label, or a region the soup holds by its id (`R-2`, or
+`R-2@ws`). A claim of a node that is not a region is refused.
+
+**Claim, or release a claim**, one at a time:
+
+```sh
+cauldron soup claim CL-1 R-3 --env prod --cauldron kb [--note "only its install half"]
+cauldron soup claim CL-1 R-3 --env prod --cauldron kb --release
+```
+
+From a session, `soup_claim {cluster, region, release?, note?}` (it needs a
+grant with `write`, and is audited like every write). Both are idempotent:
+claiming what is claimed prints `already-claimed`, releasing what is not
+prints `not-claimed`, and neither writes. A note is at most 1,000
+characters, as every edge's note now is at the door (a longer one is
+refused with nothing written; one stored before this release reads back
+cut to 1,000, named in `truncated`). A claim touches the region it
+claims, so while a ripple holds that region it is refused `region_locked`
+at once, as any write into it is ([Region locks](#region-locks)).
+
+**Read them.** `cauldron soup region R-3` (and `soup_region`) lists the
+clusters that claim the region under `clusters`. `cauldron soup nodes --type
+cluster` lists the clusters, each with the regions it claims. `cauldron soup
+get CL-1` answers the cluster with its `claims`. `cauldron soup search`
+matches cluster handles and boundaries too. `soup_status` counts them.
+`cauldron soup changes` (and `soup_changes`) reports a new cluster as
+`create`, a claim as `link` and a release as `unlink`, on the same cursor as
+every other write. `unlink` is new in this release, and the set of `op`
+values can grow again: a program reading the change feed must ignore an op
+it does not know (or read that change's ids again), never fail on it.
+
+**Waiting for a change.** `soup_changes` takes `wait_secs` (0 to 60, with
+`since`): the call answers as soon as anything lands after the cursor, or
+when the wait ends with nothing (the same cursor back). A write through the
+`mcp` service wakes it at once, a write by another process within a second;
+the grant is checked again each time it wakes, and the wait holds no lock.
+A wait ends as soon as its caller hangs up. At most 16 calls wait at once,
+and at most 4 of them one session's; one more answers at once with
+`waited.ended: "not-waited"` and `retry_after_secs`, and the stdio bridge
+then waits that long and asks again, backing off, within the call's
+`wait_secs`. `cauldron soup changes --since <cursor> --wait <secs>` does the
+same from a shell (it reads the store itself, so it is never refused a
+slot).
+
+**Older cauldrons and older releases.** A cauldron made by 0.1.4 to 0.1.15
+has no cluster pool. It gets one on its first cluster write, as one additive
+act under the writer lock: nothing in the store is migrated or rewritten. A
+store with clusters still opens, reads and writes under 0.1.14 and 0.1.15,
+whose ordinary reads do not see clusters (its `soup_region` answers `clusters:
+[]`, its `soup_get CL-1` answers it missing, and its `soup_claim` answers
+`unsupported`); its `soup_changes` lists the cluster writes by id, and its
+command line reads and writes the cluster pool when asked for it by name
+(`--pool cauldron`; see [Known limitations](#known-limitations)). A claim
+writes no workspace node or edge; the spine records the write's bookkeeping
+(which parts of it have landed) in each pool it touched, `ws.db` among
+them. A ripple writes no cluster and no claim in this release: its batch is
+refused if it holds one.
+
 ### Local inference
 
 New in 0.1.11. It has run against two real models (Qwen3.6-35B-A3B at Q8_0
@@ -1514,6 +1630,30 @@ This is an early release. These are known:
   of what the dump means; it has not been measured on real dumps. A dump
   it matches to no region holds nothing during its call, and its records
   are held only for the write itself.
+- **A ripple writes no cluster and no claim.** Clusters and claims are
+  written by you or a session (`cauldron soup import | claim`, `soup_put`,
+  `soup_claim`); a ripple's batch holding one is refused, by name.
+- **The terminal interface does not show a soup's clusters.** Its clusters
+  are the seed corpus's (see "two stores" above).
+- **An older release does not see clusters.** A 0.1.14 or 0.1.15 command
+  line or `mcp` service reads and writes a store that has them, and leaves
+  them out of its ordinary reads; its `soup_changes` lists their writes by id (a claim
+  or a release as `update`). Asked for the pool by name, that command
+  line reads clusters raw (`--pool cauldron`) and lands a cluster record
+  with its claims (`soup import --pool cauldron`), judged by the pool's own
+  pinned grammar, so that write is checked as this release checks it. A
+  cluster record sent to a 0.1.14 or 0.1.15 `mcp` service (a `soup_put`, or
+  an import it lands) is refused as an unknown type: upgrade the service with the
+  command line.
+- **A claim stays on the region it names.** Superseding a region does not
+  move its claims: the claim stays on the retired region, the region that
+  replaces it lists no clusters until they claim it, and a cluster may still
+  claim the retired one. Release and claim again (`soup_claim`) to move a
+  claim. Moving claims on a supersede would make every supersede a write to
+  the cluster pool as well; this release leaves the two apart.
+- **A cluster cannot be changed or retired.** `cauldron@1` has no
+  `supersedes`, no state and no removal: a wrong handle or boundary stays.
+  Write a new cluster and move the claims to it.
 - **The prebuilt binaries are for Apple silicon only, and are not
   notarised.** They are ad-hoc signed (see [Install](#install)). On an Intel
   Mac, build from source. The prebuilt `threads` keeps the bundle's ad-hoc

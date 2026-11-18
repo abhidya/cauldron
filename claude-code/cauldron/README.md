@@ -33,9 +33,10 @@ records reach a session as `unreviewed` (see [Ripples](#ripples)).
 | `regions.example.json` | four example regions to import into a new, empty soup |
 | `skills/soup-schema/SKILL.md` | `/cauldron:soup-schema`: the schema in brief, with a pointer to the full README |
 | `schema/` | a copy of the published schema (`schema/soup/workspace-v6/` in the Cauldron repository): `README.md`, `grammar.json`, `edges.json`, one JSON Schema per node type, and its `--remint` variant (batch labels for ids) |
+| `schema/cauldron-v1/` | a copy of the clusters' schema (`schema/soup/cauldron-v1/`): `README.md`, `grammar.json`, `edges.json`, `node.cluster.schema.json` and its `--remint` variant |
 
-`schema/` is generated: `scripts/sync-plugin-schema` copies it from the
-published directory, and a test in the spine crate fails when the copy drifts.
+`schema/` (with `schema/cauldron-v1/`) is generated: `scripts/sync-plugin-schema` copies it from the
+published directories, and a test in the spine crate fails when the copy drifts.
 Do not edit it here.
 
 ## Install
@@ -191,9 +192,11 @@ skipped. It runs the file by its resolved path.
 
 The project directory is not trusted to provide `cauldron`, since a cloned
 repository can carry a file of that name. The project directory is the
-current directory the session starts the launcher in (unless that is `/`
-or your home directory itself), and `$CLAUDE_PROJECT_DIR` when it is set.
-`$CAULDRON_BIN` naming a file inside it is skipped. The `PATH` step reads
+current directory the session starts the launcher in, and
+`$CLAUDE_PROJECT_DIR` when it is set (unless either is `/` or your home
+directory itself). A candidate from any of the four sources whose resolved
+path is inside it is skipped: `$CAULDRON_BIN`, the file the install marker
+names, and `$CAULDRON_HOME/bin/cauldron` alike. The `PATH` step reads
 `PATH` entry by entry and skips an empty entry or a relative one such as
 `.` (both mean the current directory; an empty entry comes from a leading,
 trailing or doubled `:`), an entry inside the project directory, and an
@@ -284,14 +287,21 @@ judged and landed as one all-or-nothing write, with `dry_run`, `remint`,
 when Claude Code passes its id), `soup_link` (edges between nodes the soup
 holds), `soup_changes` (what landed since a cursor, the soup's changes
 and the dumps), `soup_review` (the review queue, read only: see
-[Reviewing a ripple's records](#reviewing-a-ripples-records)), and the dump tools below. `soup_claim` is listed and always
-refuses (`unsupported`: this schema has no clusters). A refusal is a tool
+[Reviewing a ripple's records](#reviewing-a-ripples-records)), `soup_claim` (a cluster claims a region, or
+releases it: see [Clusters and claims](#clusters-and-claims)), and the dump tools below. `soup_changes`
+takes `wait_secs` (0 to 60, with `since`): it answers as soon as something lands after the cursor, or
+when the wait ends with nothing. At most 16 calls wait at once (4 for one session); past that the
+service answers `waited.ended: "not-waited"` with `retry_after_secs`, and the bridge waits that long and
+asks again, backing off, within the call's `wait_secs`. A refusal is a tool
 result with a
 typed `code` (`not_granted`, `no_cauldron_for_project`, `records_refused`,
 `batch_already_landed`, …) and a message that says what to do.
 
 While the service is not running, the bridge still lists the tools, and every
-call is refused as `service_down` with the command that starts it.
+call is refused as `service_down` with the command that starts it. A service that stops or crashes
+while a call is in flight (a wait, a write) is answered the same way, `service_down` with the start
+command; for a write it also says that whether the write landed is not known (it lands whole or not at
+all), and to look for it with `soup_changes` since the session's last cursor before writing it again.
 
 **The CLI beside it.** While the service holds a cauldron, `cauldron soup
 import` is sent to the service and lands through it (its JSON says
@@ -309,6 +319,57 @@ offset and how many bytes were read), adds a line to
 tool, the outcome and counts; never record text, and never a dump's text or
 transcript). Once it reaches 8 MiB it is moved to `calls.jsonl.1`, replacing
 an older one.
+
+### Clusters and claims
+
+A **cluster** (`CL-<n>`) is an area of the surface: a name (`handle`) and a
+boundary description (`boundary`, 40 to 1,000 characters, written as a
+region's is). It lives in the soup's second pool, on its own schema
+(`cauldron@1`, `schema/cauldron-v1/README.md`), so the workspace schema is
+unchanged. A cluster **claims** regions: any cluster may claim any region,
+and a region may be claimed by many clusters.
+
+How it differs from a region: a region holds nodes (`in_region`) and nests
+(`narrows`); a cluster holds no node, does not nest, and groups regions. A
+claim is a statement about the surface, not a lease on work: it holds
+nothing and assigns nothing.
+
+- **Write a cluster** as a record of type `cluster` with `soup_put` (or
+  `cauldron soup import`), `dry_run` first. It may sit in one batch with
+  workspace records, and its `claims` edges may name a region of the same
+  batch by its label: the region, the cluster and the claim land together
+  or not at all.
+- **Claim a region**: `soup_claim {cluster: "CL-1", region: "R-3"}`;
+  `release: true` gives the claim up; `note` is kept on a claim (at most
+  1,000 characters, as every edge's note at the door). The command
+  line is `cauldron soup claim CL-1 R-3 [--release] [--note <text>]`.
+  Claiming what is claimed answers `already-claimed`, releasing what is not
+  `not-claimed`, and neither writes. A claim of a region a ripple holds is
+  refused `region_locked`, as a write into it is (see [When a region is
+  locked](#when-a-region-is-locked)).
+- **Read them**: `soup_region` lists the clusters that claim the region
+  (`clusters`); `soup_nodes {type: "cluster"}` lists clusters with the regions
+  they claim; `soup_get CL-1` answers the cluster with its `claims`;
+  `soup_search` matches cluster handles and boundaries (an answer holding a
+  cluster says `cluster_pool: "cauldron"`); `soup_status` counts them in
+  `clusters` (its `total` and `counts` are the workspace nodes);
+  `soup_changes` reports a cluster as `create`, a claim as `link` and a
+  release as `unlink`. `unlink` is a new `op`, and the set of ops can grow: a
+  consumer of `soup_changes` must ignore an op it does not know.
+- The curator proposes clusters and claims, judged with a dry run, and lands
+  one only when you approve it. A ripple writes no cluster and no claim in
+  this release.
+- `cauldron soup import-corpus`, run from a shell, lands an older corpus's
+  clusters as cluster records, each claiming the regions of the input it
+  names, in the same write as those regions.
+- A cauldron made before clusters gets its cluster pool on its first write
+  that lands a cluster (a refused batch, or a claim, adds none). Nothing else
+  changes, and an older `cauldron` or `mcp` service still reads and writes
+  the store; its ordinary reads do not show clusters (its `soup_claim`
+  answers `unsupported`, and its `soup_changes` lists a claim as `update`).
+- A claim stays on the region it names when that region is superseded;
+  release it and claim the new one to move it. A cluster cannot be changed
+  or retired in this release.
 
 ## Dumps
 
@@ -757,7 +818,14 @@ tools) lists it too, with its `superseded_by`. `get` always answers it, with
   and bodies; ranked by terms matched, then handle over body, then newest; `{id, type, state, handle,
   regions, score, snippet}` (default 20).
 - `cauldron soup get <id>... --env E --cauldron C`: nodes as records in the
-  published shape, with their outgoing edges.
+  published shape, with their outgoing edges (a cluster with its `claims`).
+- `cauldron soup claim <CL-n> <R-n> --env E --cauldron C [--release] [--note <text>]`:
+  a cluster claims a region, or gives the claim up (see [Clusters and
+  claims](#clusters-and-claims)). `cauldron soup nodes --type cluster` lists
+  the clusters.
+- `cauldron soup changes --env E --cauldron C [--since <cursor>] [--wait <secs>]`:
+  what landed since a cursor, as `soup_changes` answers it; `--wait` (at most
+  60) waits for something to land after the cursor.
 - `cauldron soup import <file-or-dir> --env E --cauldron C [--dry-run] [--remint] [--allow-duplicate]`:
   judges every record with the soup's own write door and lands the batch as
   one write, all or nothing. `--remint` treats ids as batch-local labels and

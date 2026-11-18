@@ -37,6 +37,15 @@
 //!   explicit form.
 //! - **One viewer per role** (a `LEFT_OUT` rule, kept here for this
 //!   adapter's own output as the v5 adapter keeps it for its own).
+//! - **Records routed by type.** A batch may hold records of more than one
+//!   pool's grammar: [`RecordsOptions::routes`] names, per type, the pool its
+//!   records go to (the soup routes `cluster` to its `cauldron` pool), and
+//!   every other type goes to [`RecordsOptions::pool`]. The batch is still
+//!   ONE statement, so a cluster, a region and the cluster's claim of that
+//!   region land together or not at all. A bare reference from a routed
+//!   record names a record of the batch first, then a node of its own pool,
+//!   then a node of the home pool (`opts.pool`), so a cluster's `claims` edge
+//!   may name a held region as `R-3`.
 //! - **Citations.** `meta` is open, so the grammar never looks inside it;
 //!   a `meta.cites` entry of an unknown kind, or without its kind's keys
 //!   ([`crate::grammar_v6::CITE_KINDS`]), refuses its record here
@@ -85,8 +94,12 @@ pub const REFUSE_BAD_CITE: &str = "bad-cite";
 /// How to run an import.
 #[derive(Debug, Clone)]
 pub struct RecordsOptions {
-    /// The destination pool (the soup's is `ws`).
+    /// The destination pool (the soup's is `ws`): the home pool, where a
+    /// record of every type not in [`RecordsOptions::routes`] goes.
     pub pool: PoolName,
+    /// Node type -> the pool its records go to instead of the home pool.
+    /// Empty: every record goes to the home pool.
+    pub routes: BTreeMap<String, PoolName>,
     /// Treat incoming ids as batch-local and assign fresh serials.
     pub remint: bool,
     /// Land when every record is accepted. `false` is the dry run.
@@ -179,10 +192,12 @@ pub fn import_records(
     opts: &RecordsOptions,
 ) -> Result<RecordsImport> {
     plan.check()?;
-    let pool = &opts.pool;
-    let grammar = cauldron.grammar(pool).cloned().ok_or_else(|| {
-        crate::error::SpineError::usage(format!("this cauldron has no pool `{pool}`"))
+    let home = &opts.pool;
+    let grammar = cauldron.grammar(home).cloned().ok_or_else(|| {
+        crate::error::SpineError::usage(format!("this cauldron has no pool `{home}`"))
     })?;
+    // The pool a record of `node_type` goes to.
+    let pool_of = |node_type: &str| -> PoolName { opts.routes.get(node_type).cloned().unwrap_or_else(|| home.clone()) };
 
     // ---- read every record; refusals of shape are made here ----
     let mut out: Vec<RecordDisposition> = Vec::with_capacity(records.len());
@@ -204,7 +219,17 @@ pub fn import_records(
         };
         match parse(raw) {
             Ok(p) => {
-                if let Some((j, why)) = edge_keys(&p, &grammar, pool) {
+                let pool = pool_of(&p.node_type);
+                let routed = cauldron.grammar(&pool).cloned();
+                if routed.is_none() {
+                    refuse(
+                        &mut d,
+                        REFUSE_UNKNOWN_POOL,
+                        format!("a `{}` record goes to pool `{pool}`, which this cauldron does not have", p.node_type),
+                        None,
+                    );
+                    parsed.push(None);
+                } else if let Some((j, why)) = edge_keys(&p, routed.as_ref().unwrap_or(&grammar), &pool) {
                     refuse(&mut d, REFUSE_SHAPE, why, Some(j));
                     parsed.push(None);
                 } else if let Some(why) = p.fields.get(META).and_then(crate::grammar_v6::cite_problem) {
@@ -232,11 +257,18 @@ pub fn import_records(
     if opts.remint {
         // A label equal to a held id would capture every bare reference
         // meant for the held node: refused, naming the node it would hide.
-        {
-            let handle = cauldron.open_pool(pool)?;
-            let snapshot = handle.snapshot()?;
-            for (i, p) in parsed.iter().enumerate() {
-                let Some(p) = p else { continue };
+        for (i, p) in parsed.iter().enumerate() {
+            let Some(p) = p else { continue };
+            let own = pool_of(&p.node_type);
+            // A routed record's bare references also reach the home pool,
+            // so its label may shadow a node of either.
+            let mut pools = vec![own.clone()];
+            if own != *home {
+                pools.push(home.clone());
+            }
+            for pool in &pools {
+                let handle = cauldron.open_pool(pool)?;
+                let snapshot = handle.snapshot()?;
                 let Some(held) = snapshot.node(&NodeId(p.label.clone()))? else { continue };
                 let what = held
                     .fields
@@ -255,19 +287,23 @@ pub fn import_records(
                     ),
                     None,
                 );
+                break;
             }
         }
-        let mut next: BTreeMap<String, u64> = cauldron
-            .serial_counters(pool)?
-            .into_iter()
-            .map(|(k, v)| (k, v + 1))
-            .collect();
+        let mut next_of: BTreeMap<PoolName, BTreeMap<String, u64>> = BTreeMap::new();
         for (i, p) in parsed.iter().enumerate() {
             let Some(p) = p else { continue };
             if out[i].disposition == REFUSED {
                 continue;
             }
-            let Some(prefix) = grammar.node_types.get(&p.node_type).and_then(|t| t.id_prefix.clone()) else {
+            let pool = pool_of(&p.node_type);
+            if !next_of.contains_key(&pool) {
+                let counters = cauldron.serial_counters(&pool)?.into_iter().map(|(k, v)| (k, v + 1)).collect();
+                next_of.insert(pool.clone(), counters);
+            }
+            let next = next_of.get_mut(&pool).expect("inserted above");
+            let prefix = cauldron.grammar(&pool).and_then(|g| g.node_types.get(&p.node_type)).and_then(|t| t.id_prefix.clone());
+            let Some(prefix) = prefix else {
                 refuse(
                     &mut out[i],
                     REFUSE_UNKNOWN_TYPE,
@@ -295,12 +331,13 @@ pub fn import_records(
     for (i, p) in parsed.iter().enumerate() {
         let mut row = Vec::new();
         if let Some(p) = p {
+            let pool = pool_of(&p.node_type);
             for (j, e) in p.edges.iter().enumerate() {
                 let (id, at) = match e.to.split_once('@') {
                     Some((id, p2)) => (id.to_string(), Some(PoolName::new(p2))),
                     None => (e.to.clone(), None),
                 };
-                let target_pool = at.clone().unwrap_or_else(|| pool.clone());
+                let mut target_pool = at.clone().unwrap_or_else(|| pool.clone());
                 // A bare id names the batch first; `<ID>@<pool>` always names
                 // a node the destination already holds (even this pool's).
                 if at.is_none() && labels.contains(&id) {
@@ -317,19 +354,30 @@ pub fn import_records(
                     row.push(None);
                     continue;
                 }
-                let held = {
-                    let handle = cauldron.open_pool(&target_pool)?;
+                let held_in = |pool: &PoolName| -> Result<Option<String>> {
+                    let handle = cauldron.open_pool(pool)?;
                     let snapshot = handle.snapshot()?;
-                    snapshot.node(&NodeId(id.clone()))?.map(|n| n.node_type)
+                    Ok(snapshot.node(&NodeId(id.clone()))?.map(|n| n.node_type))
                 };
+                let mut held = held_in(&target_pool)?;
+                // A routed record's bare reference falls back to the home pool.
+                let mut looked_in = vec![target_pool.clone()];
+                if held.is_none() && at.is_none() && pool != *home {
+                    held = held_in(home)?;
+                    looked_in.push(home.clone());
+                    if held.is_some() {
+                        target_pool = home.clone();
+                    }
+                }
                 match held {
                     Some(node_type) => row.push(Some(Target::Existing { pool: target_pool, id, node_type })),
                     None => {
+                        let pools = looked_in.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(" nor of pool ");
                         refuse(
                             &mut out[i],
                             REFUSE_UNKNOWN_TARGET,
                             format!(
-                                "edge {j} ({}) points at `{}`, which is neither a record of this batch nor a node of pool `{target_pool}`",
+                                "edge {j} ({}) points at `{}`, which is neither a record of this batch nor a node of pool {pools}",
                                 e.kind, e.to
                             ),
                             Some(j),
@@ -345,7 +393,7 @@ pub fn import_records(
     // ---- one viewer per role ----
     let mut roles: BTreeMap<String, String> = BTreeMap::new();
     {
-        let handle = cauldron.open_pool(pool)?;
+        let handle = cauldron.open_pool(home)?;
         let snapshot = handle.snapshot()?;
         for v in snapshot.nodes_of(VIEWER, None)? {
             if let Some(role) = v.fields.get(VIEWER_ROLE).and_then(|f| f.value.as_str()) {
@@ -417,6 +465,7 @@ pub fn import_records(
                 fields.insert(BODY.to_string(), Value::String(relink(body, &id_map)));
             }
         }
+        let pool = pool_of(&p.node_type);
         items.push(SourceItem::Node(SourceNode {
             source_id: p.label.clone(),
             pool: pool.clone(),

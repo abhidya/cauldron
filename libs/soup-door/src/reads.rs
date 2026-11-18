@@ -264,12 +264,12 @@ pub fn get(t: &Target, ids: &[String], o: &ReadOpts) -> Result<Value> {
             rec.insert(k.clone(), cut.value(&n.id.0, k, &f.value));
         }
         let mut edges = Vec::new();
-        for x in snap.edges_from(&n.id, None).map_err(store)? {
+        for (j, x) in snap.edges_from(&n.id, None).map_err(store)?.into_iter().enumerate() {
             let mut m = serde_json::Map::new();
             m.insert("kind".into(), json!(x.kind));
             m.insert("to".into(), json!(target_text(&pool, &x.dst)));
             if let Some(note) = &x.note {
-                m.insert("note".into(), json!(note));
+                m.insert("note".into(), json!(crate::notes::shown(&mut cut, &n.id.0, &format!("edges/{j}/note"), note)));
             }
             let fields: BTreeMap<String, Value> = x.fields.clone();
             for (k, v) in fields {
@@ -292,12 +292,28 @@ pub fn get(t: &Target, ids: &[String], o: &ReadOpts) -> Result<Value> {
         }
         records.push(Value::Object(rec));
     }
+    // An id the workspace pool does not hold may be a cluster's.
+    if pool.as_str() == DEFAULT_POOL && !missing.is_empty() {
+        let (clusters, still) = crate::clusters::get(c, &missing, &mut cut)?;
+        records.extend(clusters);
+        missing = still;
+    }
     let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "records": records});
+    say_cluster_pool(&mut doc, "records");
     if !missing.is_empty() {
         doc["missing"] = json!(missing);
     }
     cut.report(&mut doc);
     Ok(doc)
+}
+
+/// An answer whose `pool` is the workspace pool and whose `list` holds a
+/// cluster says where that came from: `cluster_pool: "cauldron"` (`pool`
+/// keeps naming the workspace pool, as before clusters).
+fn say_cluster_pool(doc: &mut Value, list: &str) {
+    if doc[list].as_array().is_some_and(|a| a.iter().any(|r| r["type"] == crate::clusters::POOL_TYPE)) {
+        doc["cluster_pool"] = json!(crate::clusters::POOL);
+    }
 }
 
 // ---------------------------------------------------- the catalog of nodes
@@ -487,6 +503,10 @@ pub fn nodes(t: &Target, o: &ReadOpts) -> Result<Value> {
     }
     let (e, c) = (&t.env, &t.cauldron);
     let pool = o.pool_name();
+    // `--type cluster` lists the clusters of the soup's cluster pool.
+    if pool.as_str() == DEFAULT_POOL && o.node_type.as_deref() == Some(spine::grammar_cauldron::CLUSTER) {
+        return crate::clusters::nodes(t, o.region.as_deref(), o.state.as_deref(), o.limit.unwrap_or(NODES_LIMIT), o.max_chars);
+    }
     let handle = read_pool(c, &pool)?;
     let snap = handle.snapshot().map_err(store)?;
     let types = types_of(&handle, o.node_type.as_deref())?;
@@ -577,7 +597,8 @@ fn snippet(text: &str, at: usize, max: usize) -> (String, bool) {
     (s, true)
 }
 
-/// Lexical search over handles and bodies: every word of the query a term,
+/// Lexical search over handles and bodies (and, in the soup's own pool, over
+/// cluster handles and boundaries): every word of the query a term,
 /// found case-insensitively as a substring; ranked by how many terms match,
 /// then handle hits over body hits, then newest. At most `limit` (default
 /// [`SEARCH_LIMIT`]); the snippet is `max_chars` long (default
@@ -594,7 +615,11 @@ pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
     let pool = o.pool_name();
     let handle = read_pool(c, &pool)?;
     let snap = handle.snapshot().map_err(store)?;
-    let types = types_of(&handle, o.node_type.as_deref())?;
+    // Clusters are searched beside the workspace's nodes (or alone, with
+    // `type: cluster`): their handles and boundaries.
+    let with_clusters = pool.as_str() == DEFAULT_POOL && o.node_type.as_deref().is_none_or(|t| t == spine::grammar_cauldron::CLUSTER);
+    let only_clusters = with_clusters && o.node_type.is_some();
+    let types = if only_clusters { vec![] } else { types_of(&handle, o.node_type.as_deref())? };
     let region = region_filter(&snap, o.region.as_deref())?;
     let phrase: Vec<char> = wanted.join(&' ');
     // (matched terms, score, catalog position, entry, first body hit)
@@ -628,28 +653,62 @@ pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
     hits.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)).then(x.2.cmp(&y.2)));
     let (hits, hidden) = unsuperseded(hits, o.include_superseded, |h| &h.3);
     let (hits, rejected_hidden) = unrejected(hits, o.include_rejected, |h| &h.3);
-    let total = hits.len();
-    let (shown, more) = bounded(hits, o.limit.unwrap_or(SEARCH_LIMIT));
+    // One ranked list of both: a workspace node or a cluster.
+    enum Found {
+        Node(Box<Entry>, Option<usize>),
+        Cluster(crate::clusters::Listed),
+    }
+    let mut ranked: Vec<(usize, usize, usize, usize, Found)> =
+        hits.into_iter().map(|(m, sc, pos, n, first)| (m, sc, 0, pos, Found::Node(Box::new(n), first))).collect();
+    if with_clusters {
+        for (m, sc, pos, k) in crate::clusters::search(c, &wanted, &phrase, region.as_deref())? {
+            ranked.push((m, sc, 1, pos, Found::Cluster(k)));
+        }
+        ranked.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)).then(x.2.cmp(&y.2)).then(x.3.cmp(&y.3)));
+    }
+    let total = ranked.len();
+    let (shown, more) = bounded(ranked, o.limit.unwrap_or(SEARCH_LIMIT));
     let max = o.max_chars.unwrap_or(SNIPPET_CHARS);
     let mut cut = Cut::new(o.max_chars);
+    let fold_find = |text: &str| -> usize {
+        let h = fold(text);
+        wanted.iter().filter_map(|t| find(&h, t)).min().unwrap_or(0)
+    };
     let list: Vec<Value> = shown
         .into_iter()
-        .map(|(_, score, _, n, first)| {
-            let (snip, partial) = snippet(&n.body, first.unwrap_or(0), max);
-            if partial {
-                cut.note(json!({"id": n.id, "field": "body", "chars": n.body.chars().count(), "as": "snippet"}));
+        .map(|(_, score, _, _, found)| match found {
+            Found::Node(n, first) => {
+                let (snip, partial) = snippet(&n.body, first.unwrap_or(0), max);
+                if partial {
+                    cut.note(json!({"id": n.id, "field": "body", "chars": n.body.chars().count(), "as": "snippet"}));
+                }
+                stated(
+                    json!({
+                        "id": n.id,
+                        "type": n.node_type,
+                        "handle": cut.value(&n.id, "handle", &json!(n.handle)),
+                        "regions": n.regions,
+                        "score": score,
+                        "snippet": snip,
+                    }),
+                    &n,
+                )
             }
-            stated(
+            Found::Cluster(k) => {
+                // A cluster's snippet is cut from its boundary.
+                let (snip, partial) = snippet(&k.boundary, fold_find(&k.boundary), max);
+                if partial {
+                    cut.note(json!({"id": k.id, "field": "boundary", "chars": k.boundary.chars().count(), "as": "snippet"}));
+                }
                 json!({
-                    "id": n.id,
-                    "type": n.node_type,
-                    "handle": cut.value(&n.id, "handle", &json!(n.handle)),
-                    "regions": n.regions,
+                    "id": k.id,
+                    "type": spine::grammar_cauldron::CLUSTER,
+                    "handle": cut.value(&k.id, "handle", &json!(k.handle)),
+                    "regions": k.regions,
                     "score": score,
                     "snippet": snip,
-                }),
-                &n,
-            )
+                })
+            }
         })
         .collect();
     let mut doc = json!({
@@ -657,6 +716,7 @@ pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
         "terms": wanted.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>(),
         "total": total, "superseded_hidden": hidden, "results": list,
     });
+    say_cluster_pool(&mut doc, "results");
     say_rejected(&mut doc, rejected_hidden);
     if more > 0 {
         doc["more"] = json!(more);
@@ -762,10 +822,13 @@ pub fn region(t: &Target, id: &str, o: &ReadOpts) -> Result<Value> {
         .iter()
         .map(|n| stated(json!({"id": n.id, "type": n.node_type, "handle": cut.value(&n.id, "handle", &json!(n.handle))}), n))
         .collect();
+    // The clusters that claim it (the cluster pool's reverse edges).
+    let clusters = if pool.as_str() == DEFAULT_POOL { crate::clusters::claimants(c, &id, &mut cut)? } else { vec![] };
     let mut doc = json!({
         "env": e.name, "cauldron": c.name, "pool": pool.as_str(),
         "region": record, "parents": parents, "children": children, "relates": relates,
         "members_total": total, "superseded_hidden": hidden, "members": members,
+        "clusters": clusters,
     });
     say_rejected(&mut doc, rejected_hidden);
     if more > 0 {

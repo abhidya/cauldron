@@ -89,10 +89,10 @@ fn d1_the_door_admits_only_the_secret_on_loopback_and_no_browser() {
     let r: Value = serde_json::from_str(&svc.post(&body.to_string(), &[]).body).unwrap();
     assert_eq!(refused(&r["result"]).0, "bad_ctx");
     assert_eq!(refused(&svc.call("soup_status", json!({"cauldron": "kb"}), &json!({"cwd": "/"}))).0, "bad_ctx");
-    // A dump is closed by default too; a cluster claim is never supported.
+    // A dump is closed by default too, and so is a cluster claim.
     assert_eq!(refused(&svc.call("soup_dump", json!({"text": "x"}), &ctx(&work))).0, "no_cauldron_for_project");
     assert_eq!(refused(&svc.call("soup_dump", json!({"cauldron": "kb", "text": "x"}), &ctx(&work))).0, "not_granted");
-    assert_eq!(refused(&svc.call("soup_claim", json!({"cluster": "x", "region": "R-1"}), &ctx(&work))).0, "unsupported");
+    assert_eq!(refused(&svc.call("soup_claim", json!({"cauldron": "kb", "cluster": "CL-1", "region": "R-1"}), &ctx(&work))).0, "not_granted");
     // An unknown tool is the protocol's -32602.
     let body = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "soup_grant", "arguments": {}}});
     let r: Value = serde_json::from_str(&svc.post(&body.to_string(), &[]).body).unwrap();
