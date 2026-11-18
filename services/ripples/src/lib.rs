@@ -12,6 +12,9 @@
 //! - [`engine`]: one run, step by step, with its caps and retries;
 //! - [`inference`]: the model-call trait and its `scripted` backend (tests);
 //! - [`threads`]: the `threads` backend;
+//! - [`local`]: the `local` backend (the `inference` service on this
+//!   machine), and the router that sends `local:<name>` model ids to it;
+//! - [`eval`]: backends side by side on fixture dumps, nothing written;
 //! - [`mcp`]: the client of the `mcp` service's ripple seam;
 //! - [`package`]: the dump package (`package/dump/v1`: one prompt file and the
 //!   batch's JSON schema);
@@ -20,9 +23,11 @@
 
 pub mod daemon;
 pub mod engine;
+pub mod eval;
 pub mod inference;
 pub mod journal;
 pub mod key;
+pub mod local;
 pub mod mcp;
 pub mod package;
 pub mod seam;

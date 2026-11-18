@@ -278,6 +278,18 @@ fn t2_unmet_parked_and_unreachable_and_every_give_up_cancels() {
     // Nothing listening (port 1, which nothing may bind).
     let t = Threads::new("127.0.0.1:1", None, None, Duration::from_secs(5));
     assert!(matches!(t.call(&req()), Err(Failure::Unavailable(_))));
+    // Another host: refused before anything is dialled.
+    let t = Threads::new("192.0.2.7:443", Some("s3cret-for-the-fake".into()), None, Duration::from_secs(5));
+    match t.call(&req()) {
+        Err(Failure::Unavailable(m)) => assert!(m.contains("not a loopback address") && m.contains("nothing was sent"), "{m}"),
+        other => panic!("{:?}", other.map(|r| r.output)),
+    }
+    // The mcp seam, likewise.
+    let s = crate::support::Scratch::new("t4mcp");
+    let mut mcp = cauldron_ripples::mcp::Mcp::new(&s.env());
+    mcp.seam = Some("192.0.2.7:443".into());
+    let r = mcp.ask("RREAD", &json!({"cauldron": "kb"})).unwrap_err();
+    assert!(r.code == "mcp_down" && r.message.contains("not a loopback address"), "{}", r.message);
 }
 
 /// A turn that ends without an answer ends the call at once, cancelled.

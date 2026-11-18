@@ -29,7 +29,10 @@
 //!    schema itself), or that the door refuses, gets ONE retry on Opus with
 //!    the refusal added to the prompt; a busy backend is tried again, within
 //!    the caps. Every call runs in an empty private directory made for the
-//!    run and removed after it;
+//!    run and removed after it. A local run (`--backend local`, model
+//!    `local:<name>`) makes both calls on its local model, so nothing leaves
+//!    the machine; its tokens cost no money, and the same caps still hold
+//!    (the per-dump call cap is what bounds a runaway loop);
 //! 5. the batch to the `mcp` service (`RPUT`), which lands it and marks the
 //!    dump `processed`.
 //!
@@ -114,6 +117,12 @@ pub struct Prepared {
     pub dump: Value,
     /// A text dump's text, read with the dump.
     pub text: Option<String>,
+}
+
+/// Is `model` a local model id (`local:<name>`, run by the `inference`
+/// service on this machine)?
+pub fn is_local(model: &str) -> bool {
+    model.starts_with(crate::local::PREFIX)
 }
 
 /// A model id is a plain word (`sonnet`, `opus`, `local:<name>`).
@@ -228,10 +237,10 @@ fn session_text(ctx: &Ctx, p: &Prepared, limit: usize) -> Result<(String, bool),
 /// **A run's private working directory**: an empty directory, owner-only,
 /// under the system's temporary directory, made for one run and removed
 /// with everything in it when this is dropped.
-struct Workdir(PathBuf);
+pub(crate) struct Workdir(pub(crate) PathBuf);
 
 impl Workdir {
-    fn make(root: &std::path::Path, run: &str) -> std::io::Result<Workdir> {
+    pub(crate) fn make(root: &std::path::Path, run: &str) -> std::io::Result<Workdir> {
         use std::os::unix::fs::DirBuilderExt;
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let p = root.join(format!("cauldron-ripple-{}-{}-{nanos}", &run[..run.len().min(8)], std::process::id()));
@@ -258,12 +267,15 @@ impl Drop for Workdir {
 /// starts and before each run, never while a run is in progress.
 pub fn settle(ctx: &Ctx) -> Vec<Value> {
     let mut out = Vec::new();
-    for sent in crate::journal::unsettled(&ctx.journal.lines()) {
-        let report = ctx.inference.cancel(&sent);
-        let mut extra = report.clone();
-        extra["settled"] = json!(true);
-        let _ = ctx.journal.write(sent["run"].as_str().unwrap_or(""), sent["cauldron"].as_str().unwrap_or(""), sent["dump"].as_str().unwrap_or(""), "cancel", extra);
-        out.push(json!({"run": sent["run"], "dump": sent["dump"], "cancel": report}));
+    // The runs' journal, then the evaluations' ledger.
+    for j in [Journal::at(ctx.journal.path()), ctx.journal.eval_ledger()] {
+        for sent in crate::journal::unsettled(&j.lines()) {
+            let report = ctx.inference.cancel(&sent);
+            let mut extra = report.clone();
+            extra["settled"] = json!(true);
+            let _ = j.write(sent["run"].as_str().unwrap_or(""), sent["cauldron"].as_str().unwrap_or(""), sent["dump"].as_str().unwrap_or(""), "cancel", extra);
+            out.push(json!({"run": sent["run"], "dump": sent["dump"], "cancel": report}));
+        }
     }
     out
 }
@@ -273,7 +285,8 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
     let (ask, run) = (&p.ask, p.run.as_str());
     let j = |event: &str, extra: Value| ctx.journal.write(run, &ask.cauldron, &ask.dump, event, extra);
     let first = ask.model.clone().unwrap_or_else(|| FIRST_MODEL.to_string());
-    let mut started = json!({"model": first, "package": format!("{}@{}", package::PACKAGE, package::VERSION), "backend": ctx.inference.name()});
+    let backend = ctx.inference.name_for(&first);
+    let mut started = json!({"model": first, "package": format!("{}@{}", package::PACKAGE, package::VERSION), "backend": backend});
     if let Some(n) = ask.force_budget {
         started["force_budget"] = json!(n);
     }
@@ -303,7 +316,7 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
         v["input_total"] = json!(usage.input_total());
         v["calls"] = json!(calls);
         v["models"] = json!(models);
-        v["backend"] = json!(ctx.inference.name());
+        v["backend"] = json!(backend);
         if let Some(c) = cancelled.lock().unwrap_or_else(|p| p.into_inner()).clone() {
             if c["confirmed"] != json!(true) {
                 let todo = v["what_to_do"].as_str().unwrap_or("").to_string();
@@ -527,7 +540,11 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
                 let mut v = outcome(ask, run, "failed");
                 v["code"] = json!("inference_unavailable");
                 v["message"] = json!(m);
-                v["what_to_do"] = json!(format!("start threads in this environment (`cauldron --env {} start threads`) and check that it is logged in, then run this again", ctx.env.name));
+                v["what_to_do"] = json!(if is_local(&model) {
+                    format!("start the inference service in this environment (`cauldron --env {} start inference`), then run this again; nothing was sent", ctx.env.name)
+                } else {
+                    format!("start threads in this environment (`cauldron --env {} start threads`) and check that it is logged in, then run this again", ctx.env.name)
+                });
                 return done(v, &usage, calls, &models);
             }
             Err(Failure::Unsupported(m)) => {
@@ -554,7 +571,8 @@ pub fn execute(ctx: &Ctx, p: &Prepared) -> Value {
             return done(v, &usage, calls, &models);
         }
         retried = true;
-        model = RETRY_MODEL.to_string();
+        // A local run stays local: its retry is the same model.
+        model = if is_local(&first) { first.clone() } else { RETRY_MODEL.to_string() };
         feedback = Some(refusal);
     }
 }

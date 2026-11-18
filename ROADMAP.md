@@ -106,7 +106,9 @@ Each weekly release covers one part of the system.
 
 - **Inference adapters**, on the inference layer of the threads daemon:
   **Codex** first, then others.
-- **Local models.** Running inference on models on your own machine.
+- **Local models.** Running inference on models on your own machine. 0.1.11
+  runs the dump ripple and the evaluation on a local model; the rest of
+  cauldron's model work does not use one yet.
 - **Encrypted cauldrons.** A fully private, offline mode: local inference only,
   and everything encrypted at rest.
 - **Cloud and remote cauldrons.** A cauldron that runs somewhere other than

@@ -3,7 +3,9 @@
 //! cauldron.
 //!
 //! The seam is the `mcp` row of the environment's seam table (it must be
-//! live), or `$CAULDRON_RIPPLES_MCP_SEAM` (`host:port`). Every line carries
+//! live), or `$CAULDRON_RIPPLES_MCP_SEAM` (`ip:port`); either must be a
+//! loopback address (`inference_registry::loopback_addr`), checked at the
+//! service's start and at every call before anything is dialled. Every line carries
 //! the ripples key, read for each call from `<data root>/mcp/ripples.secret`
 //! (the `mcp` service mints it at every start). One line out, one JSON line
 //! back. The dial goes through `env::egress::connect_tcp`.
@@ -47,6 +49,16 @@ impl Mcp {
         }
     }
 
+    /// [`Mcp::new`], refused at the service's start when
+    /// `$CAULDRON_RIPPLES_MCP_SEAM` names an address that is not loopback.
+    pub fn from_env(env: &env::Environment) -> anyhow::Result<Mcp> {
+        let m = Mcp::new(env);
+        if let Some(a) = &m.seam {
+            inference_registry::loopback_addr("CAULDRON_RIPPLES_MCP_SEAM", a).map_err(|e| anyhow::anyhow!(e))?;
+        }
+        Ok(m)
+    }
+
     fn key_path(&self) -> PathBuf {
         self.env.data_root.join("mcp").join("ripples.secret")
     }
@@ -61,6 +73,7 @@ impl Mcp {
                 let Some(row) = t.seams.get("mcp") else {
                     return Err(down(format!("the `mcp` service is not running in environment `{}`; start it with `cauldron --env {} start mcp`", self.env.name, self.env.name)));
                 };
+                inference_registry::loopback_addr("the mcp seam (seam table)", &row.addr).map_err(down)?;
                 let v = env::seams::probe(row);
                 if v.state != env::seams::SeamState::Live {
                     return Err(down(format!("the `mcp` service is not reachable ({}: {})", v.state.as_str(), v.detail)));
@@ -68,15 +81,15 @@ impl Mcp {
                 row.addr.clone()
             }
         };
-        addr.parse().map_err(|e| down(format!("the mcp seam address `{addr}`: {e}")))
+        inference_registry::loopback_addr("the mcp seam", &addr).map_err(down)
     }
 
     /// One verb; the answer's JSON when it is `ok`.
     pub fn ask(&self, verb: &str, args: &Value) -> Result<Value, Refused> {
         let down = |m: String| Refused { code: "mcp_down".into(), message: m, detail: Value::Null };
+        let sa = self.seam()?;
         let key = std::fs::read_to_string(self.key_path())
             .map_err(|e| down(format!("cannot read the ripples key {} (the `mcp` service mints it when it starts): {e}", self.key_path().display())))?;
-        let sa = self.seam()?;
         let s = env::egress::connect_tcp("mcp seam (ripples)", &sa, Duration::from_secs(5)).map_err(|e| down(format!("cannot reach the mcp seam at {sa}: {e}")))?;
         let _ = s.set_read_timeout(Some(self.timeout));
         let mut w = s.try_clone().map_err(|e| down(e.to_string()))?;

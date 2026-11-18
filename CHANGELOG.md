@@ -22,11 +22,93 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.10, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.11, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.10, only an
+  the disable and trigger a fresh usage reading. Through 0.1.11, only an
   explicit enable clears it.
+
+## [0.1.11] — 2026-11-17
+
+Local inference: a language model on this machine, for a dump ripple and
+for comparing it with Claude, with nothing leaving the machine. Off unless
+you start its service; nothing is downloaded, and llama.cpp is yours to
+install.
+
+### Added
+
+- **An `inference` service: a local model, on demand.** It runs llama.cpp's
+  `llama-server` (installed by you, found on `PATH` or named in its
+  settings; never bundled) with one registered `.gguf` model file at a
+  time, on 127.0.0.1 only. It loads the model when a request first names
+  it, unloads it after 15 idle minutes, and refuses a model whose estimated
+  memory (file size + KV cache for its context + 2 GiB) is over its budget,
+  64 GiB by default, with the arithmetic. Before each load it checks the
+  `llama-server` it runs and checks that the model file is the one
+  registered. It records crashes and backs off before reloading, never
+  offers the model tools, and stops its child before it exits. Off unless
+  you start it; the installer does not.
+- **`cauldron inference models add <name> <path>`, `list`, `verify`,
+  `remove`, `status`, `unload`.** Registering copies nothing and downloads
+  nothing. It records the model file's path, its identity (the real path
+  with symlinks resolved, device, inode, size, and modification and change
+  times) and its sha256. Before every load the identity is compared; when
+  any of it differs, the whole file is read again, and it is refused unless
+  its sha256 is the one registered. `verify` reads it again on demand, and
+  `verify_every_load = true` in the settings does so at every load (about
+  two minutes for a 60 GB file). A model file's header is read with every
+  declared size bounded, and a header outside those bounds is refused,
+  naming the field.
+- **`cauldron ripples run <DM-n> --backend local [--model <name>]`.** The
+  dump ripple on the local model: the same schema, caps, journal and
+  unreviewed marking, its retry on the same model, and nothing leaves the
+  machine. Every address it dials (the `inference` service, and the `mcp`
+  and threads addresses of any ripple) must be a loopback address, or
+  nothing is sent. The journal records the model, the sha256 of its file as
+  verified at load, tokens and tokens per second.
+- **`cauldron ripples eval --dumps <dir> --backends threads,local --out
+  <dir>`.** Backends side by side on fixture dumps (each `.txt` or `.md`
+  file is one dump), with nothing written to any soup (a new dry run on the
+  `mcp` service's ripple seam judges each answer): per dump and backend,
+  schema validity, record count, records quoting the dump, region coverage,
+  duplicate handles, tokens and timing, as files a person can read and
+  judge. With `threads` it needs `--max-calls <n>`, prints the estimated
+  spend, and sends nothing without `--yes`; each threads call is charged
+  before it is sent, in the evaluations' own ledger, never against a
+  cauldron's caps for runs.
+
+### Known limitations
+
+- **Run against two real models, not yet through a whole ripple.**
+  Qwen3.6-35B-A3B (Q8_0) and gpt-oss-120b (MXFP4) ran through the service
+  on llama-server build 12110: answers met the batch schema (36 of 36 each
+  on invented fixtures), memory stayed under the estimate, a cancel stopped
+  generation at once, the idle unload and a stop left no child, and the log
+  held no prompt text. A ripple run and the evaluation through the mcp
+  service have not run on a real model yet.
+- **gpt-oss-120b needs a smaller context under the default budget.** At
+  65,536 tokens its estimate is 65.53 GiB and it is refused; registered with
+  `--context 32768` it is 63.28 GiB and loads (about 60.5 GiB resident).
+- **gpt-oss writes a reasoning section whatever `--reasoning` says.** It is
+  not part of the answer, but it counts against the output limit.
+- **If the service and the guard process that holds its child are both
+  killed,** the `llama-server` child keeps running until the service next
+  starts, which stops it. Killing only the service stops the child within
+  seconds.
+- **llama-server answers `/health` without its key.** It says only
+  `{"status":"ok"}`; `/v1/models` and completions need the key (checked
+  against build 12110). The key file (owner-only) is readable by any process of the same
+  user, as the service's door key is.
+- **`llama-server` is found on `PATH` again at every load**, unless
+  `llama_server` names it. The check before a load proves its version and
+  its flags, not where it came from.
+- **The evaluation reads fixture dumps from text files**, not dumps of a
+  cauldron by id, and does not measure recall and precision against
+  another model's answers, or memory use.
+- **A local run never falls back to Claude.** Both of its calls use the
+  local model, so a dump the local model cannot answer to the schema fails.
+- **A 0.1.10 `cauldron status` does not list a running `inference`
+  service**; `cauldron envs` does.
 
 ## [0.1.10] — 2026-11-17
 
@@ -1006,7 +1088,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/broomstick-ai/cauldron/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/broomstick-ai/cauldron/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/broomstick-ai/cauldron/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/broomstick-ai/cauldron/compare/v0.1.7...v0.1.8

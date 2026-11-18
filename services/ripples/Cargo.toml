@@ -32,6 +32,9 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 # TcpStream `env::egress::connect_tcp` admitted (as `cauldron ctl node`
 # does); this crate dials nothing itself. The version the lockfile holds.
 tungstenite = "0.24"
+# The local backend: the inference service's registered model names and its
+# directory (the door key's place).
+inference-registry = { path = "../../libs/inference-registry" }
 
 [[test]]
 name = "it"

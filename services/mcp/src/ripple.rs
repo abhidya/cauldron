@@ -49,6 +49,12 @@
 //!   nothing. A run that
 //!   already landed is never landed again: the dump is marked and the
 //!   records it landed are answered.
+//! - `RCHECK {cauldron, run, step, package, version, model, records,
+//!   dump?}`: a dry run of `RPUT`, for the ripples evaluation: the same
+//!   limits, stamp and judgement (without landing, on the writer thread),
+//!   answered `would_land` with how many records would land, or refused
+//!   as `RPUT` would refuse them. Nothing is written and no dump is marked;
+//!   the dump is optional (a fixture outside the soup has none).
 //!
 //! Every answer is `{"ok": true, ...}` or `{"ok": false, "code", "message",
 //! "detail"?}`. Every call after the key is checked is a line in
@@ -69,7 +75,7 @@ use crate::secret::Secret;
 use crate::writer::Who;
 
 /// The verbs, in the order the seam lists them.
-pub const VERBS: [&str; 5] = ["RDUMP", "RTEXT", "RREAD", "RRUN", "RPUT"];
+pub const VERBS: [&str; 6] = ["RDUMP", "RTEXT", "RREAD", "RRUN", "RPUT", "RCHECK"];
 
 /// The client name every ripple call is audited under.
 pub const CLIENT: &str = "ripples";
@@ -181,6 +187,7 @@ fn run(door: &Door, verb: &str, a: &Map<String, Value>) -> Result<Value, Refusal
             Ok(json!({"run": run, "landed": !txs.is_empty(), "records": records, "txs": txs}))
         }
         "RPUT" => rput(door, &t, a),
+        "RCHECK" => rcheck(door, &t, a),
         other => Err(usage(format!("`{other}` is not a ripple verb"))),
     }
 }
@@ -379,6 +386,68 @@ fn rput(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusa
     v["id_map"] = doc["id_map"].clone();
     v["tx"] = doc["tx"].clone();
     v["dump_marked"] = json!(marked);
+    Ok(v)
+}
+
+/// **`RCHECK`**: `RPUT` judged and never landed (module docs).
+fn rcheck(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let run = plain_id(a, "run")?;
+    let step = plain_id(a, "step")?;
+    let ripple = json!({
+        "package": plain_id(a, "package")?,
+        "version": plain_id(a, "version")?,
+        "run": run,
+        "model": plain_id(a, "model")?,
+    });
+    let records: Vec<Value> = match a.get("records") {
+        Some(Value::Array(r)) => r.clone(),
+        _ => return Err(usage("`records` must be a list")),
+    };
+    let base = json!({"env": t.env.name, "cauldron": t.cauldron.name, "run": run, "dry_run": true});
+    if records.is_empty() {
+        let mut v = base;
+        v["outcome"] = json!("would_record_nothing");
+        return Ok(v);
+    }
+    let problems = soup_door::ripple::check_batch(&t.cauldron, &records).map_err(refusal)?;
+    if !problems.is_empty() {
+        return Err(Refusal::with_detail(
+            "batch_refused",
+            format!("{} problem(s) with the batch against what a ripple may write; nothing was written (a dry run)", problems.len()),
+            json!({"problems": problems}),
+        ));
+    }
+    let records = match a.get("dump") {
+        Some(_) => stamp(&records, &dump_id(a)?, &ripple),
+        None => records
+            .into_iter()
+            .map(|mut r| {
+                if let Some(o) = r.as_object_mut() {
+                    let meta = o.entry("meta").or_insert_with(|| json!({}));
+                    if let Some(m) = meta.as_object_mut() {
+                        m.insert("ripple".into(), ripple.clone());
+                    }
+                }
+                r
+            })
+            .collect(),
+    };
+    let n = records.len();
+    door.writers.with(
+        t,
+        who(),
+        Box::new(move |c, t| match soup_door::ripple::land(c, &t.cauldron, &records, initiator(&run, &step), false).map_err(refusal)? {
+            soup_door::ripple::Landed::Refused { witnesses } => Err(Refusal::with_detail(
+                "records_refused",
+                "the soup's grammar refused the batch when judged without landing; nothing was written (a dry run). `detail.witnesses` says why.",
+                json!({"witnesses": witnesses}),
+            )),
+            soup_door::ripple::Landed::Ok { .. } => Ok(Value::Null),
+        }),
+    )?;
+    let mut v = base;
+    v["outcome"] = json!("would_land");
+    v["would_land"] = json!(n);
     Ok(v)
 }
 

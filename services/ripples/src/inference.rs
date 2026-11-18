@@ -5,11 +5,13 @@
 //! - [`crate::threads::Threads`] (the default): the `threads` service, on
 //!   the owner's own Claude login;
 //! - [`Scripted`]: answers read from a file, for tests. It makes no model
-//!   call of any kind, and is refused outside an isolated process.
+//!   call of any kind, and is refused outside an isolated process;
+//! - [`crate::local::Local`]: the `inference` service on this machine, for a
+//!   model id `local:<name>` (`cauldron ripples run --backend local`).
 //!
-//! A local-inference backend fits under the same trait: a model id is a
-//! plain string (`sonnet`, `opus`, later `local:<name>`), and a backend
-//! answers the same [`Reply`] or [`Failure`].
+//! A model id is a plain string (`sonnet`, `opus`, `local:<name>`); the
+//! process's backend routes `local:` ids to the local one
+//! ([`crate::local::Routed`]) and every other id to the default.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -152,8 +154,15 @@ impl Failure {
 
 /// **A model-call backend.**
 pub trait Inference: Send + Sync {
-    /// The backend's name, recorded in the journal (`threads`, `scripted`).
+    /// The backend's name, recorded in the journal (`threads`, `scripted`,
+    /// `local`).
     fn name(&self) -> &'static str;
+    /// The name of the backend that runs `model` (a router answers per
+    /// model; any other backend, its own name).
+    fn name_for(&self, model: &str) -> &'static str {
+        let _ = model;
+        self.name()
+    }
     /// One call.
     fn call(&self, r: &Request) -> Result<Reply, Failure>;
     /// Stop a call that may still be running, from what the backend
@@ -167,8 +176,14 @@ pub trait Inference: Send + Sync {
 /// `scripted:<file>` (tests; refused outside an isolated process).
 pub const BACKEND_ENV: &str = "CAULDRON_RIPPLES_INFERENCE";
 
-/// The backend this process uses.
+/// The backend this process uses: the default one ([`default_from_env`])
+/// for every model, and the local one for `local:<name>`.
 pub fn from_env(e: &env::Environment) -> anyhow::Result<Box<dyn Inference>> {
+    Ok(Box::new(crate::local::Routed { default: default_from_env(e)?, local: Box::new(crate::local::Local::from_env(e)?) }))
+}
+
+/// The default backend: `threads`, or `scripted:<file>` in tests.
+pub fn default_from_env(e: &env::Environment) -> anyhow::Result<Box<dyn Inference>> {
     match std::env::var(BACKEND_ENV).ok().filter(|v| !v.trim().is_empty()) {
         None => Ok(Box::new(crate::threads::Threads::from_env(e)?)),
         Some(v) if v == "threads" => Ok(Box::new(crate::threads::Threads::from_env(e)?)),

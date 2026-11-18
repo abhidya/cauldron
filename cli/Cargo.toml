@@ -50,6 +50,9 @@ soup = { package = "soup-seed", path = "../libs/soup" }
 spine = { path = "../libs/spine" }
 # `cauldron soup` and `cauldron link` are argument parsing and printing over it.
 soup-door = { path = "../libs/soup-door" }
+# The registered local model files, the inference settings and the memory
+# estimate (`cauldron inference models`).
+inference-registry = { path = "../libs/inference-registry" }
 # `rename` / `remove` read a cauldron's own `spine.db` READ-ONLY for a
 # live tranche. The version and features spine already links.
 rusqlite = { version = "0.31", features = ["bundled"] }

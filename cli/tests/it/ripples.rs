@@ -47,6 +47,41 @@ fn rp1_ripples_without_its_service() {
     let (rc, _, err) = run(&s, &["ripples", "run", "DM-1", "--env", "dev", "--cauldron", "kb"]);
     assert_ne!(rc, 0);
     assert!(err.contains("not running") && err.contains("start ripples"), "{err}");
+    // `--backend` is threads or local, checked first.
+    let (rc, _, err) = run(&s, &["ripples", "run", "DM-1", "--env", "dev", "--cauldron", "kb", "--backend", "cloud"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("`--backend` is `threads` (the default) or `local`"), "{err}");
+    let (_, out, _) = run(&s, &["ripples", "help"]);
+    assert!(out.contains("--backend local runs it on this machine") && out.contains("nothing leaves the"), "{out}");
+    // `eval`: its flags, checked before the service is looked for.
+    let (rc, _, err) = run(&s, &["ripples", "eval", "--env", "dev", "--cauldron", "kb", "--dumps", "/nowhere", "--out", "/nowhere-out", "--backends", "threads,cloud"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("`--backends` is a comma-separated list"), "{err}");
+    let (rc, _, err) = run(&s, &["ripples", "eval", "--env", "dev", "--cauldron", "kb", "--out", "x", "--backends", "local"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("needs --dumps"), "{err}");
+    let fx = s.join("fx");
+    std::fs::create_dir_all(&fx).unwrap();
+    let fxs = fx.display().to_string();
+    let outs = s.join("out").display().to_string();
+    // Threads is paid: its bound is required, before anything else.
+    let (rc, _, err) = run(&s, &["ripples", "eval", "--env", "dev", "--cauldron", "kb", "--dumps", &fxs, "--out", &outs, "--backends", "threads,local"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("--max-calls") && err.contains("Nothing was sent"), "{err}");
+    let (rc, _, err) = run(&s, &["ripples", "eval", "--env", "dev", "--cauldron", "kb", "--dumps", &fxs, "--out", &outs, "--backends", "threads", "--max-calls", "0"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("`--max-calls` is 1 to 100"), "{err}");
+    let (rc, _, err) = run(&s, &["ripples", "eval", "--env", "dev", "--cauldron", "kb", "--dumps", &fxs, "--out", &outs, "--backends", "threads,local", "--max-calls", "4", "--yes"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("not running") && err.contains("start ripples"), "{err}");
+    // Local only needs neither.
+    let (rc, _, err) = run(&s, &["ripples", "eval", "--env", "dev", "--cauldron", "kb", "--dumps", &fxs, "--out", &outs, "--backends", "local"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("not running"), "{err}");
+    let (_, out, _) = run(&s, &["ripples", "help"]);
+    assert!(out.contains("cauldron ripples eval --dumps <dir> --backends threads,local --out <dir>") && out.contains("NOTHING written"), "{out}");
+    assert!(out.contains("[--max-calls <n> --yes]") && out.contains("is sent unless --yes"), "{out}");
+    assert!(out.contains("Ctrl-C stops this command following it, not the evaluation"), "{out}");
     // `--force-budget` is a positive number of tokens, checked first.
     let (rc, _, err) = run(&s, &["ripples", "run", "DM-1", "--env", "dev", "--cauldron", "kb", "--force-budget", "lots"]);
     assert_ne!(rc, 0);

@@ -36,7 +36,7 @@ pub fn run(se: ServiceEnv) -> Result<()> {
     let backoff = Duration::from_millis(std::env::var("CAULDRON_RIPPLES_BACKOFF_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5000));
     let ctx = Ctx {
         inference: crate::inference::from_env(&env)?,
-        mcp: Mcp::new(&env),
+        mcp: Mcp::from_env(&env)?,
         journal: Journal::new(&dir),
         caps: Caps::default(),
         scratch_root: std::env::temp_dir(),
@@ -54,6 +54,10 @@ pub fn run(se: ServiceEnv) -> Result<()> {
     let se2 = se.clone();
     let (_seam, addr) = shapewire::seam::start(&se, &attested, &reg, move |a| RipplesSeam { se: se2, addr: a, started_at, state })
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // This seam takes the run key and starts paid calls: loopback only.
+    if !addr.ip().is_loopback() {
+        anyhow::bail!("the ripples service listens on loopback only; CAULDRON_BIND `{}` gave {addr}", se.bind);
+    }
     tracing::info!(seam = %addr, env = %se.env, "cauldron-ripples listening");
     loop {
         std::thread::park();

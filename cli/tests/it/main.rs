@@ -40,6 +40,7 @@ mod permissions_cargo_built;
 mod pin_revives_parked;
 mod quiet_repin;
 mod ripples;
+mod inference;
 mod repin_deferral_why;
 mod restart_unhealthy_drains;
 mod self_stamp;

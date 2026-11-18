@@ -76,7 +76,7 @@ fn shipped_scan() -> std::collections::BTreeMap<String, Declaration> {
 /// added to `services/` or dropped from it must change this list in the same
 /// commit, so nobody registers a service — or loses one — without a test
 /// naming it.
-const SHIPPED: [&str; 9] = ["claude-account-expiry-alarm", "echo", "mcp", "ripples", "soup-backup", "tally", "threads", "tts", "ui-server"];
+const SHIPPED: [&str; 10] = ["claude-account-expiry-alarm", "echo", "inference", "mcp", "ripples", "soup-backup", "tally", "threads", "tts", "ui-server"];
 
 #[test]
 fn every_shipped_declaration_loads() {

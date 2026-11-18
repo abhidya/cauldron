@@ -91,6 +91,9 @@ mod mcp_door;
 mod mcp_bridge;
 // `cauldron ripples`: a dump into records, by hand, through the ripples service.
 mod ripples;
+// `cauldron inference`: local model files registered by hand, and the
+// `inference` service that runs them on demand.
+mod inference;
 // `ensure_soup_cauldron` only; this release has no engine.
 mod engine;
 mod daemon;
@@ -141,7 +144,8 @@ const VERBS: &[(&str, &str)] = &[
     ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get | dump-remove | approve (`soup help`)"),
     ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
     ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
-    ("ripples", "a dump into knowledge-graph records, by hand: run | status (`ripples help`); approve them with `soup approve`"),
+    ("ripples", "a dump into knowledge-graph records, by hand: run | status | eval (`ripples help`); approve them with `soup approve`"),
+    ("inference", "local models on this machine: models add | list | remove, status, unload (`inference help`)"),
 ];
 
 const USAGE: &str = "\
@@ -394,6 +398,7 @@ fn run() -> Result<i32> {
         Some("link") => link::verb_link(&argv[1..]),
         Some("mcp") => mcp::verb_mcp(&argv[1..]),
         Some("ripples") => ripples::verb_ripples(&argv[1..]),
+        Some("inference") => inference::verb_inference(&argv[1..]),
         Some("create") => cauldrons::verb_create(&argv[1..]),
         Some("list") | Some("ls") => cauldrons::verb_list(&argv[1..]),
         Some("rename") => cauldrons::verb_rename(&argv[1..]),

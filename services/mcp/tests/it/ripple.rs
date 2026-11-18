@@ -247,3 +247,38 @@ fn rp3_killed_between_the_landing_and_the_mark_the_run_still_lands_once() {
     let d = say(&svc, &s, "RDUMP", json!({"cauldron": "kb", "dump": "DM-1"}));
     assert_eq!(d["dump"]["state"], "processed");
 }
+
+/// rp4: `RCHECK` judges a batch as `RPUT` would and writes nothing: no
+/// record lands, no dump is marked, with or without a dump.
+#[test]
+fn rp4_a_check_judges_a_batch_and_writes_nothing() {
+    let s = Scratch::new("rp4", &["kb"]);
+    s.import("kb", &example());
+    s.grant("kb", &[Scope::Read, Scope::Write, Scope::Dump], &[]);
+    let svc = Service::start(&s);
+    let c = ctx(&s.project("p"));
+    ok(&svc.call("soup_dump", json!({"cauldron": "kb", "text": "a dump for a dry run"}), &c));
+    let before = s.node_count("kb");
+    let check = |run: &str, records: Value, dump: bool| {
+        let mut a = put(run, records);
+        if !dump {
+            a.as_object_mut().unwrap().remove("dump");
+        }
+        a["step"] = json!("check");
+        say(&svc, &s, "RCHECK", a)
+    };
+    let v = check("eval-1", json!([idea("n1", "one"), idea("n2", "two")]), false);
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!((v["outcome"].clone(), v["would_land"].clone(), v["dry_run"].clone()), (json!("would_land"), json!(2), json!(true)));
+    let v = check("eval-2", json!([idea("n1", "one")]), true);
+    assert_eq!(v["outcome"], "would_land", "{v}");
+    assert_eq!(code(&check("eval-3", json!([{"id": "n1", "type": "idea", "state": "idea", "handle": "x", "edges": [{"kind": "in_region", "to": "R-9"}]}]), false)), "batch_refused");
+    assert_eq!(code(&check("eval-4", json!([{"id": "n1", "type": "idea", "state": "nope", "handle": "x", "edges": [{"kind": "in_region", "to": "R-1"}]}]), false)), "records_refused");
+    assert_eq!(check("eval-5", json!([]), false)["outcome"], "would_record_nothing");
+    assert_eq!(s.node_count("kb"), before, "nothing landed");
+    assert!(ripple_rows(&s).is_empty(), "no ripple transaction");
+    let d = say(&svc, &s, "RDUMP", json!({"cauldron": "kb", "dump": "DM-1"}));
+    assert_eq!(d["dump"]["state"], "received", "{d}");
+    let r = say(&svc, &s, "RRUN", json!({"cauldron": "kb", "run": "eval-1"}));
+    assert_eq!(r["landed"], false);
+}

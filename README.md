@@ -559,6 +559,18 @@ keeps a dump from steering anything is that the call has no tool to use.
   The call's working directory is removed when the call ends.
 - *Written to the soup*: the records, through the `mcp` service, audited in
   its `calls.jsonl` (counts and ids, never text).
+- *With the local backend* (`cauldron ripples run ... --backend local`, see
+  [Local inference](#local-inference)): **nothing leaves this machine.** The
+  same prompt and schema go over loopback to the environment's `inference`
+  service and from it to its `llama-server` child on 127.0.0.1; threads,
+  Claude Code, a login and the network are not involved, so no provider
+  receives anything and threads keeps nothing. Every address the ripple
+  dials must be a loopback address, or nothing is sent. The `inference`
+  service writes no prompt or answer itself; its `llama-server.log` holds
+  llama-server's own output at its default log level, which has not yet
+  been checked against a real model. The ripple's journal gains a `local`
+  line per call: the model, the sha256 of the model file as checked at
+  load, the tokens and tokens per second, still never text.
 
 So do not run a ripple on a dump that holds a secret: remove the dump
 instead (`cauldron soup dump-remove`), before any run.
@@ -661,6 +673,119 @@ second run answers the first one's. A run cut short (the service stopped or
 killed) shows as `interrupted` in `cauldron ripples status`; run the same
 command again, and it lands once.
 
+### Local inference
+
+New in 0.1.11. It has run against two real models (Qwen3.6-35B-A3B at Q8_0
+and gpt-oss-120b at MXFP4, llama-server build 12110), but not yet through a
+whole ripple.
+
+The `inference` service runs a language model **on this machine**, with
+llama.cpp's `llama-server`, for work where a smaller model is good enough
+and nothing should leave the machine: summaries, curation, and turning a
+dump into records (the dump ripple's `--backend local`). It is **not** for
+writing code, settling a design question, or anything an agent acts on with tools:
+it never offers a model tools, and nothing in cauldron gives it any.
+
+**What it needs, and what it never does.** llama.cpp is not bundled:
+install it yourself (on macOS, `brew install llama.cpp`), and the service
+uses the `llama-server` on `PATH` (looked up again at every load), or the
+one named by `llama_server = "/absolute/path"` in
+`~/.cauldron/data/<env>/inference/config.toml`. Each time it loads a model
+it first checks that binary with `--version` and `--help` (a build number
+of at least 6000, and every flag it passes), and refuses a missing or older
+one with what to do. That check proves the version and the flags, not where
+the binary came from. Nothing is downloaded,
+ever: you place a `.gguf` model file on this machine yourself, and the
+model runs with `--offline`.
+
+```sh
+brew install llama.cpp                                              # yourself, once
+cauldron --env prod build inference                                 # the service: off unless you start it
+cauldron --env prod pin inference <the version label it printed>
+cauldron --env prod start inference
+cauldron inference models add qwen /Volumes/models/qwen.gguf --env prod   # record it: path, identity, sha256
+cauldron inference models list --env prod                           # each with its memory estimate
+cauldron inference status --env prod                                # loaded or not, memory, idle time, pid, crashes
+cauldron ripples run DM-3 --env prod --cauldron kb --backend local  # a dump ripple, on this machine
+```
+
+**Registering a model copies nothing.** `cauldron inference models add
+<name> <path> [--context <tokens>]` reads the file once for its sha256 (a
+line every 4 GiB says how far it has got) and records, in
+`data/<env>/inference/models.json` (owner-only), its path, its identity
+(the real path with symlinks resolved, device, inode, size, and
+modification and change times), its sha256 and a few facts from its
+header. The header is read with every size it declares bounded, and a
+header outside those bounds is refused, naming the field. Before every
+load the file's identity is compared with the one recorded; if any of it
+differs, the whole file is read again, and it is loaded only if its sha256
+is the one registered, otherwise refused with how to register it again.
+Reading a 60 GB file takes about two minutes, so that is not done at every
+load unless `verify_every_load = true` is in the settings; `cauldron
+inference models verify <name>` does it now. `models remove <name>` forgets
+a model and leaves the file where it is.
+
+**On demand, one model at a time.** The installer does not start the
+service. Started, it loads nothing until a request names a model; then it
+starts one `llama-server` child for it, on 127.0.0.1, on a port chosen at
+each load. Its completions answer only a key made for that load
+(`llama.key`, owner-only, removed when the child goes; any process of
+yours can read it, as it can the service's door key); llama-server's
+only `/health` answers without it, and says only that the child is up
+(`/v1/models` needs the key too, in build 12110). A model nobody used for
+15 minutes is unloaded and its memory is free again (`idle_minutes` in the
+settings); `cauldron inference unload` does it now. Asking for another
+model unloads the first. A child that crashes is recorded (`status` shows
+its exit and the end of its log), and the next load waits 1 s, then 2, 4,
+up to 60 s after repeated crashes. Stopping the service stops its child
+first. If the service is killed, the guard process that holds the child
+stops it within seconds; if the service and the guard are both killed, the
+child runs until the service next starts, which stops it.
+
+**The memory budget.** Before loading, the service estimates the memory a
+model needs: the file's size, plus the KV cache for its context (layers ×
+KV heads × (key + value width) × 2 bytes × context tokens, from the file's
+header), plus 2 GiB for llama-server's buffers. Over the budget, 64 GiB
+unless `memory_budget_gib` says otherwise, the model is refused, and the
+refusal shows that arithmetic. The context is 65,536 tokens unless the
+settings' `context` or the model's `--context` say otherwise; a smaller
+context needs less memory, and a dump whose prompt does not fit is refused
+by name. For example, gpt-oss-120b (a 59 GiB file) is refused at 65,536
+tokens (65.53 GiB) and fits registered with `--context 32768` (63.28 GiB).
+The estimate errs high: it counts every layer's cache in full, and
+Qwen3.6-35B-A3B measured about 36 GiB resident against 41.37 GiB
+estimated.
+
+**A ripple, locally.** `cauldron ripples run <DM-n> --backend local [--model
+<name>]` (the model defaults to the only one registered) sends the same
+prompt and schema to the local model, and its answer is held to the same
+schema, caps, journal and `unreviewed` marking as any ripple. Both of its
+calls use the local model: there is no Opus retry, so nothing leaves the
+machine. Local tokens cost no money, and the caps count them all the same:
+3 calls per dump is what stops a runaway loop. The journal adds, per call,
+the model, its file's sha256, the tokens and tokens per second. The
+`ripples`, `mcp` and `inference` services must be running (not `threads`).
+
+**Comparing backends.** `cauldron ripples eval --dumps <dir> --backends
+threads,local --out <dir> --env <env> --cauldron <name> [--local-model
+<name>] [--repeat <n>]` runs each fixture dump in `<dir>` (each `.txt` or
+`.md` file is one dump) on each backend, and **writes nothing to any soup**:
+every answer is judged by the `mcp` service's dry run and never landed. Into
+the new `--out` directory go, per dump, each run's records and measures
+side by side (`side-by-side.md`) and, for all of them, `summary.md`: schema
+validity on the first try and after one retry, record count, records that
+quote the dump, regions used, duplicate handles, tokens, time and tokens per
+second. Which records are better is for you to judge from those files.
+The threads runs are your Claude spend. With `threads` in `--backends`,
+`--max-calls <n>` (at most 100) is required; the command prints the most
+calls and the estimated input tokens first, and sends nothing unless you
+add `--yes`. Each threads call is charged before it is sent, in the
+evaluations' own ledger (`data/<env>/ripples/eval.jsonl`), with a daily
+input-token cap of its own, and never against the cauldron's caps for runs.
+A local-only evaluation needs neither flag. The evaluation runs in the
+`ripples` service: Ctrl-C stops the command following it, and stopping the
+service stops the evaluation. The `--out` directory is made owner-only.
+
 ## Known limitations
 
 This is an early release. These are known:
@@ -683,9 +808,16 @@ This is an early release. These are known:
   from the cauldron's directory and leaves a tombstone; it is refused while
   the `mcp` service holds the dumps store (revoke or stop it first). The
   plugin's README has the details.
-- **Claude Code is the only inference provider that runs.** Config shows the
-  other token sources, endpoints and templates greyed out, and refuses to act
-  on them.
+- **Claude Code is the only remote inference provider that runs.** Config
+  shows the other token sources, endpoints and templates greyed out, and
+  refuses to act on them. The one local provider is llama.cpp's
+  `llama-server`, through the `inference` service.
+- **Local inference has not run a whole ripple on a real model.** Real
+  models have answered through the `inference` service, but `--backend
+  local` and the evaluation have run only against a stand-in. A local run
+  never falls back to Claude, and the evaluation reads fixture
+  dumps from text files and does not measure recall or memory use. See
+  [Local inference](#local-inference).
 - **Parts of the UI read sample files, not the daemon.** These are the Status
   Mesh, Soup and Bus views and some Config views. The Threads tab, Status →
   Tokens and the threads face (`cauldron tui --chat`) are wired to the live
@@ -707,7 +839,8 @@ This is an early release. These are known:
 
 [ROADMAP.md](ROADMAP.md) lists what comes next, and [CHANGELOG.md](CHANGELOG.md)
 lists what each release contains. Not baked yet, and on the roadmap: Codex
-and other inference adapters, local models, encrypted cauldrons (fully
+and other inference adapters, local models for more than the dump ripple
+and the evaluation, encrypted cauldrons (fully
 private, never leaving your machine), remote cauldrons, and meshes of them.
 
 ## License

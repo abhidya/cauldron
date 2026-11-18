@@ -31,6 +31,11 @@ use std::sync::Mutex;
 use serde_json::{json, Map, Value};
 
 pub const FILE: &str = "runs.jsonl";
+/// **The evaluations' ledger**, beside the journal: an evaluation's threads
+/// calls are charged here, with the same `call` / `sent` / `cancel` /
+/// `called` lines, and never in [`FILE`], so they never count against a
+/// cauldron's caps for runs (its daily dump slots above all).
+pub const EVAL_FILE: &str = "eval.jsonl";
 
 pub struct Journal {
     path: PathBuf,
@@ -54,6 +59,11 @@ impl Journal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The evaluations' ledger beside this journal ([`EVAL_FILE`]).
+    pub fn eval_ledger(&self) -> Journal {
+        Journal::at(&self.path.with_file_name(EVAL_FILE))
     }
 
     /// Append one line, synced. A journal that cannot be written is an
@@ -111,6 +121,10 @@ pub fn runs(lines: &[Value], live: &dyn Fn(&str, u64) -> bool) -> Vec<Value> {
     let mut views: std::collections::HashMap<String, Map<String, Value>> = std::collections::HashMap::new();
     for l in lines {
         let Some(run) = l["run"].as_str() else { continue };
+        // An evaluation's calls are spend, not runs.
+        if l["eval"] == json!(true) {
+            continue;
+        }
         // A new attempt of a run already done starts a new view.
         let fresh = l["event"] == "started";
         if fresh || !views.contains_key(run) {
@@ -195,6 +209,11 @@ pub fn charges(lines: &[Value]) -> Vec<Charge> {
     let mut open: Vec<(usize, Value)> = Vec::new();
     let s = |v: &Value| v.as_str().unwrap_or("").to_string();
     for l in lines {
+        // An evaluation's call journaled here by an earlier build: spend of
+        // the evaluation, not of the cauldron's runs.
+        if l["eval"] == json!(true) {
+            continue;
+        }
         match l["event"].as_str() {
             Some("call") => {
                 open.push((out.len(), l["call_id"].clone()));

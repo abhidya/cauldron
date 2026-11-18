@@ -103,6 +103,11 @@ impl Scratch {
         soup_door::dumps::summary(&self.target().cauldron, id).unwrap()
     }
 
+    /// The evaluations' ledger.
+    pub fn eval_ledger(&self) -> Vec<Value> {
+        cauldron_ripples::journal::read(&self.ripples_dir().join(cauldron_ripples::journal::EVAL_FILE))
+    }
+
     pub fn journal(&self) -> Vec<Value> {
         std::fs::read_to_string(self.ripples_dir().join("runs.jsonl"))
             .unwrap_or_default()
@@ -252,12 +257,18 @@ impl Service {
     pub fn start(s: &Scratch, door: &Door, vars: &[(&str, String)]) -> Service {
         let log = s.0.join(format!("ripples-{}.log", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let out = std::fs::File::create(&log).unwrap();
+        let child = Service::command(s, door, vars).stdout(out.try_clone().unwrap()).stderr(out).spawn().unwrap();
+        Service::registered(s, child, log)
+    }
+
+    /// The service's command, its environment set, its output not yet.
+    pub fn command(s: &Scratch, door: &Door, vars: &[(&str, String)]) -> Command {
         let mut grants = vec![format!("{}@{}", door.seam, std::process::id())];
         if let Some((_, t)) = vars.iter().find(|(k, _)| *k == "CAULDRON_RIPPLES_THREADS_ADDR") {
             grants.push(format!("{t}@{}", std::process::id()));
         }
-        let child = Command::new(BIN)
-            .env("CAULDRON_SERVICE", "ripples")
+        let mut cmd = Command::new(BIN);
+        cmd.env("CAULDRON_SERVICE", "ripples")
             // A run's working directory goes under the system's temporary
             // directory; a test's goes under its own scratch, so one cut
             // short by a kill is not left behind.
@@ -282,11 +293,11 @@ impl Service {
             .env_remove("CAULDRON_RIPPLES_FAULT")
             .env_remove("THREADS_SECRET")
             .envs(vars.iter().map(|(k, v)| (*k, v.as_str())))
-            .stdin(Stdio::null())
-            .stdout(out.try_clone().unwrap())
-            .stderr(out)
-            .spawn()
-            .unwrap();
+            .stdin(Stdio::null());
+        cmd
+    }
+
+    fn registered(s: &Scratch, child: std::process::Child, log: PathBuf) -> Service {
         let pid = child.id() as u64;
         let deadline = Instant::now() + Duration::from_secs(60);
         let seam: SocketAddr = loop {

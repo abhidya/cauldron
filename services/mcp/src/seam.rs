@@ -9,7 +9,7 @@
 //!   for writing (`[{cauldron, opened_at, recovered_at_open}]`), for
 //!   `cauldron mcp status`. Names and times only, never soup content;
 //! - `DUMPS` answers the same for the dumps stores it holds;
-//! - `RDUMP`, `RTEXT`, `RREAD`, `RRUN`, `RPUT`: the ripple verbs, answered
+//! - `RDUMP`, `RTEXT`, `RREAD`, `RRUN`, `RPUT`, `RCHECK`: the ripple verbs, answered
 //!   only to a line carrying the ripples key (`crate::ripple`);
 //! - `APPROVE`: the owner's approval (or unapproval) of a ripple's records,
 //!   answered only to a line carrying the approval key, which only
@@ -60,6 +60,7 @@ impl Service for McpSeam {
         Verb::new("RREAD", McpSeam::v_rread),
         Verb::new("RRUN", McpSeam::v_rrun),
         Verb::new("RPUT", McpSeam::v_rput),
+        Verb::new("RCHECK", McpSeam::v_rcheck),
         Verb::new("APPROVE", McpSeam::v_approve),
     ];
 
@@ -116,6 +117,10 @@ impl McpSeam {
 
     fn v_rput(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
         self.ripple(c, "RPUT", rest)
+    }
+
+    fn v_rcheck(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        self.ripple(c, "RCHECK", rest)
     }
 
     fn v_approve(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {

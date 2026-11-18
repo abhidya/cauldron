@@ -46,6 +46,12 @@ members = [
     # The ripples service (`cauldron-ripples`): one named dump into records,
     # when its owner asks, through the threads service and the mcp door.
     "services/ripples",
+    # Local inference (`cauldron-inference`): one supervised `llama-server`
+    # child, loaded when first asked and unloaded when idle, loopback only.
+    "services/inference",
+    # The registered model files, the inference settings and the memory
+    # estimate, read by the inference service, ripples and the CLI.
+    "libs/inference-registry",
     # REL-3.S1: the MINIMAL soup crate on the release branch: the curated
     # `cauldron-build` dataset and its loader, until the real soup lands.
     "libs/soup",
@@ -64,7 +70,7 @@ members = [
 # discovered by filename, so a service directory is not mistaken for one.
 
 [workspace.package]
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 
 [workspace.dependencies]

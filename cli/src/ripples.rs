@@ -27,7 +27,7 @@ const SERVICE: &str = "ripples";
 const USAGE: &str = "\
 cauldron ripples — turn a dump into knowledge-graph records, by hand
 
-    cauldron ripples run <DM-n> --env <env> --cauldron <name> [--model <model>] [--force-budget <tokens>]
+    cauldron ripples run <DM-n> --env <env> --cauldron <name> [--backend threads|local] [--model <model>] [--force-budget <tokens>]
         Process one dump: its text (a session dump: only what the person typed and what
         the assistant wrote as text) goes to a model, through the `threads` service on
         this machine's Claude login, as a bare completion with no tools, no MCP server and
@@ -54,6 +54,12 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand
         services running in the environment (threads from this release) and the cauldron
         granted to the MCP door with read, write and dump. Exit 0 processed, 3 deferred,
         1 failed.
+        --backend local runs it on this machine instead, through the `inference` service
+        (`cauldron inference help`): --model names a registered model (default: the only
+        one registered), both calls use it (no Opus retry), and nothing leaves the
+        machine. The same schema, caps, journal and `unreviewed` marking apply; its tokens
+        cost no money, and the per-dump call cap still bounds a runaway loop. Needs the
+        `ripples`, `mcp` and `inference` services running (not `threads`).
     cauldron ripples status [--env <env>] [--cauldron <name>] [--run <run>]
         The service (running or not), the run in progress, the last ten runs (each `done`
         with its outcome and tokens, `running`, or `interrupted`: cut short, safe to run
@@ -62,6 +68,30 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand
         `unsettled_calls`), any model call that may still be running in threads (with how to
         stop it), and the caps. With the
         service stopped, all of it is read from its journal (data/<env>/ripples/runs.jsonl).
+    cauldron ripples eval --dumps <dir> --backends threads,local --out <dir> --env <env> --cauldron <name>
+                          [--local-model <name>] [--threads-model <model>] [--repeat <n>]
+                          [--max-calls <n> --yes]
+        Backends side by side, with NOTHING written to any soup: each fixture dump (each .txt
+        or .md file of --dumps, one dump each) gets the same prompt a run would build, with
+        the cauldron's regions, on each backend; an answer that misses the schema or that
+        the soup would refuse gets one retry on the same model; every schema-valid answer
+        is judged by the mcp service's dry run, never landed. --repeat runs each dump that
+        many times on the local backend (1 to 5; threads once). Writes into --out (new or
+        empty): per dump a directory with one JSON file per run and side-by-side.md, and
+        summary.md / summary.json with, per dump and run, schema validity (first try, after
+        the retry), record count, records quoting the dump, regions used of those offered,
+        duplicate handles, tokens, wall time and tokens per second. Judging the records is
+        left to a person. The dump text is never copied into --out.
+        Threads calls are the owner's Claude spend. With `threads` in --backends,
+        --max-calls <n> (1 to 100) is required: the most threads calls the evaluation makes.
+        The estimated spend (calls, input tokens, the model) is printed first, and nothing
+        is sent unless --yes is given. Each threads call is charged before it is sent, in
+        the evaluations' own ledger (data/<env>/ripples/eval.jsonl), held to the per-dump
+        input cap and to a daily input-token cap of the evaluations' own, and never counted
+        against the cauldron's caps for runs. A local-only evaluation costs no money and
+        needs neither; its calls are not journaled. The evaluation runs in the service:
+        Ctrl-C stops this command following it, not the evaluation, which ends when it is
+        done or when the service is stopped (`cauldron --env <env> stop ripples`).
     cauldron ripples help
 
   The `ripples` service is off unless started (`cauldron --env <env> build ripples`,
@@ -77,12 +107,13 @@ pub(crate) fn verb_ripples(args: &[String]) -> Result<i32> {
         }
         Some("run") => run(&args[1..]),
         Some("status") => status(&args[1..]),
+        Some("eval") => eval(&args[1..]),
         None => {
             eprint!("{USAGE}");
             Ok(2)
         }
         Some(other) => {
-            eprintln!("cauldron ripples: no verb `{other}` (run | status | help)");
+            eprintln!("cauldron ripples: no verb `{other}` (run | status | eval | help)");
             Ok(2)
         }
     }
@@ -93,8 +124,17 @@ struct Args {
     env: Option<String>,
     cauldron: Option<String>,
     model: Option<String>,
+    backend: Option<String>,
     run: Option<String>,
     force_budget: Option<String>,
+    dumps: Option<String>,
+    out: Option<String>,
+    backends: Option<String>,
+    local_model: Option<String>,
+    threads_model: Option<String>,
+    repeat: Option<String>,
+    max_calls: Option<String>,
+    yes: bool,
     pos: Vec<String>,
 }
 
@@ -109,6 +149,13 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
         if flag.starts_with('-') && !allow.contains(&flag) {
             bail!("unknown option `{s}` for `cauldron ripples {verb}` (`cauldron ripples help`)");
         }
+        if flag == "--yes" {
+            if inline.is_some() {
+                bail!("`--yes` takes no value");
+            }
+            a.yes = true;
+            continue;
+        }
         let mut value = || -> Result<String> {
             match &inline {
                 Some(v) => Ok(v.clone()),
@@ -119,8 +166,16 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--env" => a.env = Some(value()?),
             "--cauldron" => a.cauldron = Some(value()?),
             "--model" => a.model = Some(value()?),
+            "--backend" => a.backend = Some(value()?),
             "--run" => a.run = Some(value()?),
             "--force-budget" => a.force_budget = Some(value()?),
+            "--dumps" => a.dumps = Some(value()?),
+            "--out" => a.out = Some(value()?),
+            "--backends" => a.backends = Some(value()?),
+            "--local-model" => a.local_model = Some(value()?),
+            "--threads-model" => a.threads_model = Some(value()?),
+            "--repeat" => a.repeat = Some(value()?),
+            "--max-calls" => a.max_calls = Some(value()?),
             _ => a.pos.push(s.clone()),
         }
     }
@@ -133,11 +188,14 @@ fn find(e: &Environment) -> std::result::Result<SocketAddr, String> {
     let Some(row) = t.seams.get(SERVICE) else {
         return Err(format!("the `{SERVICE}` service is not running in environment `{}`", e.name));
     };
+    // Loopback, or nothing is dialled (the probe included): the key goes
+    // on every line.
+    let addr = inference_registry::loopback_addr(&format!("the `{SERVICE}` seam (seam table)"), &row.addr)?;
     let v = seams::probe(row);
     if v.state != SeamState::Live {
         return Err(format!("the `{SERVICE}` service is not reachable ({}: {})", v.state.as_str(), v.detail));
     }
-    row.addr.parse().map_err(|err| format!("its seam address `{}`: {err}", row.addr))
+    Ok(addr)
 }
 
 fn start_hint(e: &str) -> String {
@@ -192,13 +250,16 @@ fn finish(v: &Value) -> Result<i32> {
 }
 
 fn run(args: &[String]) -> Result<i32> {
-    let a = parse("run", args, &["--env", "--cauldron", "--model", "--force-budget"])?;
+    let a = parse("run", args, &["--env", "--cauldron", "--model", "--backend", "--force-budget"])?;
     let (Some(env_name), Some(cauldron)) = (a.env.as_deref(), a.cauldron.as_deref()) else {
         bail!("`cauldron ripples run` needs --env and --cauldron, given as flags (`cauldron ripples help`)");
     };
     let [dump] = a.pos.as_slice() else {
         bail!("`cauldron ripples run` takes one dump id (DM-<n>)");
     };
+    if let Some(b) = a.backend.as_deref().filter(|b| !matches!(*b, "threads" | "local")) {
+        bail!("`--backend` is `threads` (the default) or `local`, not `{b}`");
+    }
     let force_budget = match &a.force_budget {
         None => None,
         Some(n) => match n.parse::<u64>() {
@@ -214,6 +275,9 @@ fn run(args: &[String]) -> Result<i32> {
     let mut req = json!({"cauldron": cauldron, "dump": dump});
     if let Some(m) = &a.model {
         req["model"] = json!(m);
+    }
+    if let Some(b) = &a.backend {
+        req["backend"] = json!(b);
     }
     if let Some(n) = force_budget {
         req["force_budget"] = json!(n);
@@ -276,9 +340,11 @@ fn status(args: &[String]) -> Result<i32> {
             // was cut short.
             let path = e.data_root.join(SERVICE).join("runs.jsonl");
             let lines: Vec<Value> = std::fs::read_to_string(&path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            let eval_path = e.data_root.join(SERVICE).join("eval.jsonl");
+            let eval_lines: Vec<Value> = std::fs::read_to_string(&eval_path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
             let mut runs: Vec<Value> = Vec::new();
             for l in &lines {
-                if a.cauldron.as_deref().is_some_and(|c| l["cauldron"] != c) || a.run.as_deref().is_some_and(|r| l["run"] != r) {
+                if a.cauldron.as_deref().is_some_and(|c| l["cauldron"] != c) || a.run.as_deref().is_some_and(|r| l["run"] != r) || l["eval"] == json!(true) {
                     continue;
                 }
                 if l["event"] == "started" || !runs.iter().any(|r| r["run"] == l["run"]) {
@@ -303,7 +369,9 @@ fn status(args: &[String]) -> Result<i32> {
                 "service": {"running": false, "why": why},
                 "runs": runs,
                 "spend": spend(&lines, a.cauldron.as_deref()),
+                "evaluations_spend": spend(&eval_lines, a.cauldron.as_deref())["today"].clone(),
                 "journal": path.display().to_string(),
+                "evaluations_ledger": eval_path.display().to_string(),
             }))?;
             eprintln!("cauldron ripples: {why}. {}", start_hint(&e.name));
             Ok(0)
@@ -323,7 +391,9 @@ fn spend(lines: &[Value], cauldron: Option<&str>) -> Value {
     let charged = |l: &Value| l["charged"].as_u64().unwrap_or_else(|| l["input_total"].as_u64().unwrap_or(0));
     // (the call's first line, tokens, settled)
     let mut calls: Vec<(Value, u64, bool)> = Vec::new();
-    for l in lines.iter().filter(|l| cauldron.is_none_or(|c| l["cauldron"] == c)) {
+    // (An evaluation's line in the run journal, from an earlier build, is
+    // not a run's spend.)
+    for l in lines.iter().filter(|l| cauldron.is_none_or(|c| l["cauldron"] == c) && l["eval"] != json!(true)) {
         match l["event"].as_str() {
             Some("call") => calls.push((l.clone(), l["estimated_input_tokens"].as_u64().unwrap_or(0), false)),
             Some("called") => {
@@ -395,4 +465,132 @@ fn spend(lines: &[Value], cauldron: Option<&str>) -> Value {
     json!({"today": {"date": today, "per_cauldron": per_cauldron}, "per_dump": per_dump, "possibly_running": open,
            "caps": {"calls_per_dump": 3, "input_tokens_per_dump": 200000, "input_tokens_per_cauldron_per_day": 1500000, "dumps_per_cauldron_per_day": 30,
                     "counted": "a call is charged when it begins, as one call and its estimate, and settled when it ends; a call cut short by a kill or a stop stays charged at its estimate (`unsettled_calls`)"}})
+}
+
+/// An absolute path for `p` (relative to the working directory).
+fn absolute(p: &str) -> Result<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(p);
+    Ok(if p.is_absolute() { p } else { std::env::current_dir()?.join(p) })
+}
+
+fn eval(args: &[String]) -> Result<i32> {
+    let a = parse("eval", args, &["--env", "--cauldron", "--dumps", "--out", "--backends", "--local-model", "--threads-model", "--repeat", "--max-calls", "--yes"])?;
+    let (Some(env_name), Some(cauldron)) = (a.env.as_deref(), a.cauldron.as_deref()) else {
+        bail!("`cauldron ripples eval` needs --env and --cauldron (the cauldron's regions are offered, and its dry run judges the answers)");
+    };
+    let (Some(dumps), Some(out), Some(backends)) = (a.dumps.as_deref(), a.out.as_deref(), a.backends.as_deref()) else {
+        bail!("`cauldron ripples eval` needs --dumps <dir>, --backends threads,local and --out <dir> (`cauldron ripples help`)");
+    };
+    if !a.pos.is_empty() {
+        bail!("`cauldron ripples eval` takes no positional argument (got `{}`)", a.pos.join(" "));
+    }
+    let backends: Vec<String> = backends.split(',').map(|b| b.trim().to_string()).filter(|b| !b.is_empty()).collect();
+    if backends.is_empty() || backends.iter().any(|b| !matches!(b.as_str(), "threads" | "local")) {
+        bail!("`--backends` is a comma-separated list of `threads` and `local`");
+    }
+    let repeat = match &a.repeat {
+        None => None,
+        Some(n) => match n.parse::<u64>() {
+            Ok(n) if (1..=5).contains(&n) => Some(n),
+            _ => bail!("`--repeat` is 1 to 5, not `{n}`"),
+        },
+    };
+    let threads = backends.iter().any(|b| b == "threads");
+    let max_calls = match &a.max_calls {
+        None if threads => bail!("REFUSED: `--backends` names threads, which is your Claude spend: give `--max-calls <n>` (1 to 100), the most threads calls the evaluation may make. Nothing was sent."),
+        None => None,
+        Some(n) => match n.parse::<u64>() {
+            Ok(n) if (1..=100).contains(&n) => Some(n),
+            _ => bail!("`--max-calls` is 1 to 100, not `{n}`"),
+        },
+    };
+    let (dumps, out) = (absolute(dumps)?, absolute(out)?);
+    if !dumps.is_dir() {
+        bail!("REFUSED: {} is not a directory of fixture dumps", dumps.display());
+    }
+    if out.exists() && std::fs::read_dir(&out).map(|mut d| d.next().is_some()).unwrap_or(true) {
+        bail!("REFUSED: {} is not empty; give a new directory (an evaluation never overwrites one)", out.display());
+    }
+    let e = crate::mcp::environment(Some(env_name))?;
+    let addr = match find(&e) {
+        Ok(a) => a,
+        Err(why) => bail!("REFUSED: {why}. Nothing was run. {}", start_hint(&e.name)),
+    };
+    let mut req = json!({"cauldron": cauldron, "dumps": dumps, "out": out, "backends": backends});
+    for (k, v) in [("local_model", &a.local_model), ("threads_model", &a.threads_model)] {
+        if let Some(v) = v {
+            req[k] = json!(v);
+        }
+    }
+    if let Some(n) = repeat {
+        req["repeat"] = json!(n);
+    }
+    if let Some(n) = max_calls {
+        req["max_calls"] = json!(n);
+    }
+    if threads {
+        // What it may spend, before anything is sent.
+        let mut p = req.clone();
+        p["plan"] = json!(true);
+        let plan = ask(&e, addr, "EVAL", &p)?;
+        if plan["ok"] != json!(true) {
+            print(&plan)?;
+            eprintln!("cauldron ripples: refused ({}): {}", plan["code"].as_str().unwrap_or("?"), plan["message"].as_str().unwrap_or(""));
+            return Ok(1);
+        }
+        let t = &plan["plan"]["threads"];
+        eprintln!(
+            "cauldron ripples: threads calls: at most {} on `{}` (--max-calls {}), about {} input tokens in all, and up to {} output tokens a call. This is your Claude spend, charged in the evaluations' ledger, not against the cauldron's caps for runs.",
+            t["calls_at_most"], t["model"].as_str().unwrap_or("?"), t["max_calls"], t["estimated_input_tokens_at_most"], t["output_tokens_per_call_at_most"]
+        );
+        if let Some(sk) = t["skipped_over_the_per_dump_cap"].as_array().filter(|x| !x.is_empty()) {
+            eprintln!("cauldron ripples: {} fixture(s) over the per-dump input cap are skipped on threads.", sk.len());
+        }
+        if !a.yes {
+            print(&plan)?;
+            eprintln!("cauldron ripples: nothing was sent. Run the same command with --yes to start it.");
+            return Ok(2);
+        }
+        req["confirmed"] = json!(true);
+    }
+    let first = ask(&e, addr, "EVAL", &req)?;
+    if first["ok"] != json!(true) {
+        print(&first)?;
+        eprintln!("cauldron ripples: refused ({}): {}", first["code"].as_str().unwrap_or("?"), first["message"].as_str().unwrap_or(""));
+        return Ok(1);
+    }
+    let id = first["run"].as_str().unwrap_or_default().to_string();
+    eprintln!("cauldron ripples: evaluation {id} started; writing into {}. Ctrl-C stops following it, not the evaluation (stop the ripples service to stop it).", out.display());
+    let mut said = 0;
+    loop {
+        std::thread::sleep(Duration::from_millis(1000));
+        let lines: Vec<String> = std::fs::read_to_string(out.join("progress.jsonl")).unwrap_or_default().lines().map(str::to_string).collect();
+        for l in lines.iter().skip(said) {
+            eprintln!("cauldron ripples: {l}");
+        }
+        said = said.max(lines.len());
+        let st = match find(&e) {
+            Ok(addr) => ask(&e, addr, "STATUS", &json!({"run": id}))?,
+            Err(why) => bail!("the ripples service went away during the evaluation ({why}); what it finished is in {}", out.display()),
+        };
+        match st["state"].as_str() {
+            Some("running") => continue,
+            Some("done") => {
+                let r = &st["result"];
+                print(r)?;
+                return if r["outcome"] == json!("done") {
+                    eprintln!("cauldron ripples: evaluation {id} done; read {}", out.join("summary.md").display());
+                    Ok(0)
+                } else {
+                    eprintln!("cauldron ripples: evaluation {id} failed: {}", r["message"].as_str().unwrap_or(""));
+                    Ok(1)
+                };
+            }
+            _ => {
+                print(&st)?;
+                eprintln!("cauldron ripples: the evaluation is {}; what it finished is in {}", st["state"].as_str().unwrap_or("?"), out.display());
+                return Ok(1);
+            }
+        }
+    }
 }

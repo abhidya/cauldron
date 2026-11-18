@@ -6,6 +6,8 @@
 //! - `service`: the binary, its run key, `RUN` and `STATUS`, and runs killed
 //!   during the model call and after the put, then run again.
 //! - `threads`: the threads backend against a fake chassis.
+//! - `local`: the local backend against a fake inference seam.
+//! - `eval`: the evaluation with scripted backends, nothing written.
 
 // Every child a test spawns is isolated.
 test_isolation::install!();
@@ -15,3 +17,5 @@ mod support;
 mod engine;
 mod service;
 mod threads;
+mod local;
+mod eval;

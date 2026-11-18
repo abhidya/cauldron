@@ -70,7 +70,10 @@
 //! the address the environment's threads is launched on, found as the face
 //! finds it (a registering threads' seam row, else `[services.threads]
 //! addr` in the environment's `env.toml`, else the declaration's `[launch]
-//! addr`). The dial goes through `env::egress::connect_tcp`.
+//! addr`). Whichever it is, it must be a loopback address
+//! (`inference_registry::loopback_addr`), checked when the service starts
+//! and again at every connection; the dial goes through
+//! `env::egress::connect_tcp`.
 
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -130,6 +133,12 @@ pub struct Threads {
 
 /// Where the environment's threads listens (see the module docs).
 pub fn resolve_addr(e: &env::Environment) -> Result<String> {
+    let a = resolve_any(e)?;
+    inference_registry::loopback_addr("the threads address", &a).map_err(|m| anyhow::anyhow!(m))?;
+    Ok(a)
+}
+
+fn resolve_any(e: &env::Environment) -> Result<String> {
     if let Some(a) = std::env::var("CAULDRON_RIPPLES_THREADS_ADDR").ok().filter(|v| !v.trim().is_empty()) {
         return Ok(a.trim().to_string());
     }
@@ -286,7 +295,7 @@ struct Conn {
 impl Conn {
     fn open(addr: &str, secret: Option<&str>, wait: Duration) -> Result<Conn, Failure> {
         let unavailable = |m: String| Failure::Unavailable(m);
-        let sa: SocketAddr = addr.parse().map_err(|e| unavailable(format!("the threads address `{addr}`: {e}")))?;
+        let sa: SocketAddr = inference_registry::loopback_addr("the threads address", addr).map_err(unavailable)?;
         let stream = env::egress::connect_tcp("threads chassis (ripples)", &sa, Duration::from_secs(5))
             .map_err(|e| unavailable(format!("cannot reach threads at {addr}: {e}")))?;
         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));

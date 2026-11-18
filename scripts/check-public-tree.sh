@@ -80,7 +80,8 @@ scripts/prove-alarm-hosted
 # lists libs/soup-door as a member that the `cauldron` CLI links, and
 # services/mcp as a member (the CLI's tests link it), and services/ripples as
 # a member whose binary reads its dump package (prompt and schema) at build
-# time, so an archive without any of them would not build. The plugin's MCP server is its .mcp.json, a dot
+# time, and services/inference and libs/inference-registry as members (the
+# CLI and ripples link the registry), so an archive without any of them would not build. The plugin's MCP server is its .mcp.json, a dot
 # file an export rule could drop without breaking the build. The plugin is
 # installed from the repository by its root marketplace (`/plugin
 # marketplace add <owner>/<repo>` reads .claude-plugin/marketplace.json at the
@@ -104,6 +105,11 @@ services/ripples/Cargo.toml
 services/ripples/src/lib.rs
 services/ripples/package/dump/v1/prompt.md
 services/ripples/package/dump/v1/batch.schema.json
+services/inference.toml
+services/inference/Cargo.toml
+services/inference/src/lib.rs
+libs/inference-registry/Cargo.toml
+libs/inference-registry/src/lib.rs
 '
 # A path every archive of this repo must contain: the positive sentinel that
 # proves the archive listing and the match below can find a path at all.

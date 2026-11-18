@@ -1,0 +1,42 @@
+[package]
+name = "cauldron-inference"
+version.workspace = true
+edition.workspace = true
+description = "Local inference: a supervised service that runs one `llama-server` child at a time on loopback, loads a registered model file when first asked, unloads it when idle, refuses a model over its memory budget, and answers one structured-output completion at a time. No tools, ever."
+
+# One integration-test binary (tests/it/); a new test is a module there.
+autotests = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cauldron-inference"
+path = "src/main.rs"
+
+[dependencies]
+env = { path = "../../libs/env" }
+# The registered model files, the settings and the memory estimate.
+inference-registry = { path = "../../libs/inference-registry" }
+# The seam a service registers through, and the warnings counter.
+shapewire = { path = "../../libs/shapewire", features = ["server", "seam"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+# TERM, INT and HUP, caught so the child is stopped before the process
+# exits. The version the lockfile already holds (libs/term-shell's).
+signal-hook = "0.3.18"
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+[dev-dependencies]
+# Every child a test spawns is isolated (CAULDRON_ISOLATED=1).
+test-isolation = { path = "../../testkit/test-isolation" }
+
+[lints.rust]
+unsafe_code = "forbid"
