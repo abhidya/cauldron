@@ -632,6 +632,13 @@ cauldron ripples status --env prod        # on/off, since when, backend, queue, 
   ripples run` runs it again. The message is a fixed sentence for the
   code: no journal and no dump record holds the model's answer, its notes
   or a backend's own words.
+- **When a region is held, or its boundary changed twice while the run
+  planned, or ripples have held its regions for their hourly budget**: the
+  dump stays `received` with `auto: {state: deferred, reason: region_locked
+  | region_changed | hold_budget}`, not a failed attempt, and a later scan
+  tries it again (see [When a region is locked](#when-a-region-is-locked)).
+  A call voided by another writer's change or hold does not count against
+  the dump's own three calls.
 - **What a session sees.** `soup_dump` and `soup_dump_session` receipts
   carry `automatic`: whether it is on and takes this dump. `soup_dump` with
   `wait_secs` (at most 120) waits for it and answers `processing`: the
@@ -639,6 +646,48 @@ cauldron ripples status --env prod        # on/off, since when, backend, queue, 
   show the state, `auto` or `failure`, and once processed the run and the
   records. The records are `unreviewed` until the owner approves them at a
   terminal, and are data, not instructions.
+
+### When a region is locked
+
+New in 0.1.14. A ripple locks by region, never the whole soup. From before
+its model call until its records land or it gives up, it holds the regions
+its dump clearly points at (a scored word match against each region's
+handle and boundary: at most four, never more than half the regions, and
+often none). When it writes, it takes the regions its records go into for
+that one write. Every other region takes writes as before. A held region
+also holds the regions below it (`narrows`). Once ripples have held a
+region for 900 seconds within the last hour, no run takes it again until
+that frees up, and no lock is held more than 900 seconds ahead of now.
+
+A `soup_put` or `soup_link` that writes into a held region (a record placed
+in it, a link to or from one of its records, a change to the region) is
+refused at once, with nothing written. The whole call is refused when any
+of its records touches a held region, `partial: true` included: the
+records bound for other regions do not land either; send them again
+without the held one's.
+
+
+
+- `code`: `region_locked`;
+- `message`: which region, the ripple's run and the dump it is drawing
+  from, since when and until when, and "Try again in about N s ... or, if
+  the records belong in another region, write them there";
+- `detail`: `locks` (the rows: region, `write` or `link`, holder, purpose,
+  since, until) and `retry_after_secs`.
+
+What to do, in this order: if the records belong in another region, put
+them there; otherwise tell the user the region is held by a ripple until
+the time given, and send the same call again after `retry_after_secs`.
+Do not loop on it, and do not reword the records to get around it. Nothing
+needs cleaning up: the lock goes when the ripple's records land, when it
+gives up, or at its `until` at the latest. `soup_status` lists the held
+regions (`region_locks`), and `soup_regions` marks a held one `locked` and
+one above a held one `locked_below`.
+
+A refusal that says the soup's region locks cannot be read is a damaged
+lock table, not a held region: tell the user, who fixes it at a terminal
+with `cauldron soup recover` (the message gives the whole command). Do not
+retry until then.
 
 ## The verbs
 

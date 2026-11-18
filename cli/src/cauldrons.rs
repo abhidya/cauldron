@@ -568,6 +568,11 @@ pub(crate) fn verb_rename(args: &[String]) -> Result<i32> {
     refuse_held_tranche(&c)?;
     refuse_live_soup(&e, "rename")?;
     let _writers = take_writer_locks(&e, &c, "rename")?;
+    // A region a ripple holds (its write in progress) holds the whole store
+    // too: refused, naming the holder and until when.
+    if c.soup().is_dir() {
+        soup_door::region_lock::refuse_held(&c, "rename").map_err(door_err)?;
+    }
     // A cauldron made before ids is given its id now (a rename is a writer),
     // so its grant follows it by that id.
     let id = soup_door::grants::adopt(&e, &c).map_err(door_err)?;
@@ -685,6 +690,11 @@ pub(crate) fn verb_remove(args: &[String]) -> Result<i32> {
     refuse_held_tranche(&c)?;
     refuse_live_soup(&e, "remove")?;
     let _writers = take_writer_locks(&e, &c, "remove")?;
+    // A region a ripple holds (its write in progress) holds the whole store
+    // too: refused, naming the holder and until when.
+    if c.soup().is_dir() {
+        soup_door::region_lock::refuse_held(&c, "remove").map_err(door_err)?;
+    }
     let granted = soup_door::grants::Grants::load(&e).map_err(door_err)?.get(&name).is_some();
     println!("{}", e.banner());
     if !a.yes {

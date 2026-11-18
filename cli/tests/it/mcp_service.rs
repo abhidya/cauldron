@@ -1629,12 +1629,36 @@ fn rv4_the_real_older_mcp_service_rejects_nothing_and_says_why() {
         let o = s.on_tty(&args, &pids, &[], None);
         println!("rv4 {}:\n{}", args.join(" "), o.out);
         assert_ne!(o.rc, 0, "{args:?}: {}", o.out);
-        assert!(o.out.contains("REFUSED:") && o.out.contains("nothing was decided") && o.out.contains("must be upgraded"), "{args:?}: {}", o.out);
+        assert!(o.out.contains("REFUSED:") && (o.out.contains("nothing was decided") || o.out.contains("nothing was written")) && o.out.contains("must be upgraded"), "{args:?}: {}", o.out);
     }
     let q = s.queue(&[]);
     assert_eq!((q["counts"]["unreviewed"].clone(), q["counts"]["approved"].clone(), q["counts"]["rejected"].clone()), (json!(2), json!(0), json!(0)), "{q}");
     assert!(!s.calls().iter().any(|l| l["tool"] == "soup_approve"), "{:?}", s.calls());
     svc.stop();
+}
+
+/// **The version the older-service tests were last checked against.**
+/// Which refusal an older `mcp` service draws depends on how its version
+/// compares with this build's: one of the SAME version that does not know
+/// `DECIDE` is sent it and answers `ERR unknown request` ("nothing was
+/// decided"); one of an OLDER version is refused by the version-skew check
+/// before anything is sent ("nothing was written"). rv4 runs against a real
+/// older binary only when `CAULDRON_OLD_MCP` names one, so when the
+/// workspace version moved past that binary's, rv4 changed branch and broke
+/// while the suite (run without the variable) stayed green. This test fails
+/// whenever the workspace version is not this constant, so every release
+/// bump makes someone check rv3 and rv4 against the new relation and move
+/// it.
+const OLDER_SERVICE_TESTS_CHECKED_AT: &str = "0.1.14";
+
+#[test]
+fn rv0_the_older_service_tests_were_checked_against_the_workspace_version() {
+    assert_eq!(
+        env!("CARGO_PKG_VERSION"),
+        OLDER_SERVICE_TESTS_CHECKED_AT,
+        "the workspace version moved: check rv3 and rv4 (which refusal an older `mcp` service draws now: the version-skew check, or `DECIDE` unknown), \
+         run rv4 with CAULDRON_OLD_MCP naming the previous release's binary, then set OLDER_SERVICE_TESTS_CHECKED_AT to the new version"
+    );
 }
 
 /// **No record write sets or clears a review flag**: `soup import` direct

@@ -19,6 +19,11 @@
 //!   provenance the batch cannot change, the stage's write limits, a run
 //!   that lands once (and, under `--features fault-injection`, a kill
 //!   between the landing and the dump's mark).
+//! - `regions`: region locks: a region a ripple holds refuses every other
+//!   writer at once, by name, and every other region takes writes; two
+//!   holders of disjoint regions both land; the revision check; expiry and
+//!   renewal; a held child region and its parent; (under `--features
+//!   fault-injection`) a kill between the landing and the release.
 //! - `issues`: the consumer's filed issues, each reproduction as the door
 //!   answers it (the CLI's twins are the `i<n>_` tests of `cli/tests/it/soup.rs`).
 //! - `writes`: the writer: concurrency, `partial`, refusals named by id,
@@ -39,6 +44,7 @@ mod dumps;
 mod issues;
 mod limits;
 mod reads;
+mod regions;
 mod review;
 mod ripple;
 mod writes;

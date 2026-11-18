@@ -129,6 +129,12 @@ pub enum SpineError {
     /// the build that lands it. Kind
     /// `not_yet`; the chassis code is `unsupported`.
     NotYet { what: String, step: &'static str },
+
+    /// A commit named a region another holder holds (`crate::regions`):
+    /// refused whole before its row was appended, so nothing was written.
+    /// `fields` carries the holders' facts (who, since when, until when).
+    /// Kind `region_locked`.
+    RegionLocked { message: String, fields: Map<String, Value> },
 }
 
 impl std::fmt::Display for SpineError {
@@ -166,7 +172,8 @@ impl SpineError {
             SpineError::Hard { message }
             | SpineError::Usage { message }
             | SpineError::NotFound { message }
-            | SpineError::Busy { message } => message.clone(),
+            | SpineError::Busy { message }
+            | SpineError::RegionLocked { message, .. } => message.clone(),
             SpineError::TrancheBusy { why, .. } => {
                 format!("the tranche cannot take this act now (`{why}`); call again")
             }
@@ -236,6 +243,11 @@ impl SpineError {
                 m.insert("what".into(), json!(what));
                 m.insert("step".into(), json!(step));
             }
+            SpineError::RegionLocked { fields, .. } => {
+                for (k, v) in fields {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
             _ => {}
         }
         Value::Object(m)
@@ -257,6 +269,7 @@ impl SpineError {
             SpineError::TrancheKey { .. } => "tranche_key",
             SpineError::SpineSchemaNewer { .. } => "spine_schema_newer",
             SpineError::NotYet { .. } => "not_yet",
+            SpineError::RegionLocked { .. } => "region_locked",
         }
     }
 

@@ -626,6 +626,10 @@ impl Door {
                 "by_state": dumps["by_state"],
                 "held": self.dumps.holds(&t.cauldron.name),
             },
+            // The regions a writer holds now (a ripple between reading them
+            // and landing its records): a write into one is refused
+            // `region_locked` until it is let go.
+            "region_locks": env::region_locks::view_of(&t.cauldron),
         }))
     }
 }

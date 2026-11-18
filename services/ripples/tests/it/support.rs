@@ -386,6 +386,8 @@ pub fn engine(s: &Scratch, door: &Door, script: &Path, caps: cauldron_ripples::e
         caps,
         scratch_root: s.scratch_root(),
         backoff: Duration::from_millis(5),
+        lock_ttl_secs: 120,
+        hold_budget_secs: 900,
     }
 }
 

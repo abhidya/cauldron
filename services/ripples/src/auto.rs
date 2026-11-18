@@ -57,6 +57,14 @@
 //!   another client of the local inference service does, or it was not
 //!   ready yet): `meta.auto` `{state: deferred, reason: busy, ...}`, charged
 //!   nothing, not a failed attempt, and tried again at the next scan.
+//!   Or a region the run writes into was held by another writer
+//!   (`region_locked`), or changed while the run planned, again after it
+//!   planned once more (`region_changed`): `meta.auto` `{state: deferred,
+//!   reason: region_locked | region_changed, ...}`, not a failed attempt,
+//!   tried again at the next scan. Or the regions its text points at were
+//!   already held by ripples for their hourly budget (`hold_budget`):
+//!   deferred the same way, tried again once the budget frees up (its
+//!   `retry_after_secs`), with no lock taken and no call made.
 //! - **retrying**: the attempt failed (the model could not be reached, the
 //!   call failed, the service was killed or stopped during it): the dump
 //!   stays `received` with `meta.auto` `{state: retrying, failed_attempts,
@@ -269,6 +277,15 @@ fn classify(v: &Value, failed_before: u32, parks_before: u32) -> (&'static str, 
         // The backend was busy (a run by hand, or another client, held it):
         // not a failure, charged nothing; the next scan tries again.
         "deferred" if v["reason"] == "busy" => ("deferred", Some(later(scan_period()))),
+        // A region another writer held, or one that changed twice while the
+        // run planned: not a failure; the next scan tries again.
+        "deferred" if v["reason"] == "region_locked" || v["reason"] == "region_changed" => ("deferred", Some(later(scan_period()))),
+        // The regions its text points at were held for their hourly
+        // budget: not a failure; tried again once the budget frees up.
+        "deferred" if v["reason"] == "hold_budget" => {
+            let wait = v["retry_after_secs"].as_u64().map(Duration::from_secs).unwrap_or_else(scan_period).max(scan_period());
+            ("deferred", Some(later(wait)))
+        }
         "deferred" => ("deferred", Some(next_midnight())),
         _ => match code {
             "dump_removed" | "not_found" => ("skip", None),
@@ -386,8 +403,8 @@ fn run_one(state: &State, s: &Settings, dump: &str, states: &std::collections::B
             state.ctx.mcp.ask("RFAIL", &json!({"cauldron": s.cauldron, "dump": dump, "run": note_run, "failure": f})).map(|_| ())
         }
         "deferred" => {
-            let a = if result["reason"] == "busy" {
-                json!({"state": "deferred", "reason": "busy", "message": clip(result["message"].as_str().unwrap_or(""), 600), "retry_after": retry_after})
+            let a = if result["reason"] == "busy" || result["reason"] == "region_locked" || result["reason"] == "region_changed" || result["reason"] == "hold_budget" {
+                json!({"state": "deferred", "reason": result["reason"], "message": clip(result["message"].as_str().unwrap_or(""), 600), "retry_after": retry_after})
             } else if result["held_by"] == "threads" {
                 json!({"state": "deferred", "reason": "threads_parked", "park": result["park"], "message": clip(result["message"].as_str().unwrap_or(""), 600), "retry_after": retry_after})
             } else {

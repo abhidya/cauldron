@@ -46,6 +46,7 @@ pub mod pool;
 pub mod project;
 pub mod read;
 pub mod recover;
+pub mod regions;
 pub mod schema_def;
 pub mod schema_publish;
 pub mod spine_db;
@@ -112,9 +113,23 @@ pub struct Cauldron {
     /// position, whether its overlay was rebuilt. Empty for a created
     /// cauldron and for the test-only unrecovered open.
     tranches_at_open: TranchePassReport,
+    /// The guard asked about every commit's regions
+    /// ([`regions::RegionGuard`]), when the writer installed one.
+    region_guard: Option<std::sync::Arc<dyn regions::RegionGuard>>,
 }
 
 impl Cauldron {
+    /// Install `guard`: from now on every commit through this handle names
+    /// its regions to it first ([`regions`]), and a refusal writes nothing.
+    pub fn set_region_guard(&mut self, guard: std::sync::Arc<dyn regions::RegionGuard>) {
+        self.region_guard = Some(guard);
+    }
+
+    /// The installed region guard, if any.
+    pub fn region_guard(&self) -> Option<&std::sync::Arc<dyn regions::RegionGuard>> {
+        self.region_guard.as_ref()
+    }
+
     /// Create a cauldron directory: `spine.db` (with lock tables) plus one
     /// pool file per grammar, each grammar pinned into its pool.
     /// Refuses an existing directory with database files, a duplicate pool
@@ -184,6 +199,7 @@ impl Cauldron {
             grammars: pinned,
             recovered_at_open: RecoveryReport::default(),
             tranches_at_open: TranchePassReport::default(),
+            region_guard: None,
         })
     }
 
@@ -357,6 +373,7 @@ impl Cauldron {
             grammars,
             recovered_at_open: RecoveryReport::default(),
             tranches_at_open: TranchePassReport::default(),
+            region_guard: None,
         })
     }
 

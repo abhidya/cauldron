@@ -68,6 +68,38 @@ pub fn prompt(dump_id: &str, kind: &str, regions: &[Value], text: &str) -> Strin
         .replace("{{dump}}", text)
 }
 
+/// **What changed in the regions while the model answered**, as the
+/// section a re-plan's prompt ends with: for each region of `changed` (the
+/// `region_changed` refusal's list), what it was in `before` and what it is
+/// in `after` (both as the prompt shows them, already scrubbed). The
+/// re-plan's prompt therefore always differs from the one that was
+/// answered.
+pub fn what_changed(before: &[Value], after: &[Value], changed: &Value) -> String {
+    let find = |rs: &[Value], id: &str| rs.iter().find(|r| r["id"].as_str() == Some(id)).cloned();
+    let shown = |r: &Value| format!("\"{}\" (boundary: \"{}\")", clip(r["handle"].as_str().unwrap_or(""), 235), clip(r["boundary"].as_str().unwrap_or(""), BOUNDARY_CHARS));
+    let mut lines = Vec::new();
+    for c in changed.as_array().into_iter().flatten() {
+        let Some(id) = c["region"].as_str() else { continue };
+        let line = match (find(before, id), find(after, id)) {
+            (Some(b), Some(a)) if b["handle"] == a["handle"] && b["boundary"] == a["boundary"] => {
+                format!("- {id}: its place among the regions changed (it was re-parented, or a region now narrows it); its handle and boundary are the same")
+            }
+            (Some(b), Some(a)) => format!("- {id}: was {}; is now {}", shown(&b), shown(&a)),
+            (Some(b), None) => format!("- {id}: was {}; it is no longer a region a record may be placed in (retired or superseded)", shown(&b)),
+            (None, Some(a)) => format!("- {id}: new since you read the regions: {}", shown(&a)),
+            (None, None) => format!("- {id}: no longer a region a record may be placed in"),
+        };
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        lines.push("- (the list above is the regions as they are now)".to_string());
+    }
+    format!(
+        "## The regions changed while you answered\n\nYour previous answer was not written: while you were answering, another writer changed these regions. The regions listed above are as they are now; place every record against them.\n\n{}",
+        lines.join("\n")
+    )
+}
+
 /// **Validate an answer against the batch schema**, strictly: every
 /// violation, at most ten, as one message.
 pub fn validate(answer: &Value) -> Result<(), String> {

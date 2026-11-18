@@ -186,6 +186,12 @@ pub fn regions(t: &Target, o: &ReadOpts) -> Result<Value> {
     let snap = handle.snapshot().map_err(store)?;
     let mut out = Vec::new();
     let mut cut = Cut::new(o.max_chars);
+    // The region locks held now (`region_lock`): a region a writer holds is
+    // marked `locked`; an ancestor of one (held `link`: writes beside it
+    // land, a change of its header or parents is refused) is marked
+    // `locked_below`.
+    let now = env::region_locks::now_ms();
+    let locks = env::region_locks::load(c);
     for r in snap.nodes_of("region", None).map_err(store)? {
         let field = |k: &str| r.fields.get(k).map(|f| f.value.clone());
         let text = |cut: &mut Cut, k: &str| r.fields.get(k).map(|f| cut.value(&r.id.0, k, &f.value));
@@ -212,8 +218,20 @@ pub fn regions(t: &Target, o: &ReadOpts) -> Result<Value> {
             "relates": of("relates"),
             "members": members,
         }));
+        if let Ok(t) = &locks {
+            if let Some(h) = env::region_locks::holder_of(t, now, pool.as_str(), &r.id.0) {
+                let last = out.len() - 1;
+                out[last]["locked"] = json!({"holder": h.holder, "purpose": h.purpose, "since": h.since, "until": h.until});
+            } else if let Some(h) = t.live(now).into_iter().find(|x| x.pool == pool.as_str() && x.region == r.id.0 && x.mode == env::region_locks::LINK) {
+                let last = out.len() - 1;
+                out[last]["locked_below"] = json!({"holder": h.holder, "purpose": h.purpose, "since": h.since, "until": h.until});
+            }
+        }
     }
     let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "regions": out});
+    if let Err(err) = &locks {
+        doc["region_locks_error"] = json!(format!("{err:#}"));
+    }
     cut.report(&mut doc);
     Ok(doc)
 }

@@ -13,3 +13,5 @@ mod landing;
 mod locks;
 
 mod crash;
+
+mod regions;

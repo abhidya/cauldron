@@ -105,6 +105,14 @@ it. Keep replies small with `limit` and narrow filters. A refusal comes back
 as an error result with a typed `code` and a message: read it, it is never
 an empty answer.
 
+A write refused `region_locked` landed nothing: a ripple holds that region
+(or one above it) while it plans or writes records there, and the message
+says until when.
+Put the records in another region if they belong there; otherwise tell the
+caller the region is held until that time and send the same call again
+after `detail.retry_after_secs`, once. Never reword or re-place records
+only to get around the lock.
+
 ### The CLI fallback
 
 The CLI never defaults to production, so always pass `--env <env>` and

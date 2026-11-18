@@ -143,6 +143,10 @@ your dumps into records:
 - 0.1.13: the review queue: see what a ripple wrote, grouped by dump, and
   approve or reject it in bulk at a terminal ([Reviewing a ripple's
   records](#reviewing-a-ripples-records)).
+- 0.1.14: region locks: a ripple holds the few regions its dump clearly
+  points at while it thinks, and the regions its records go into while it
+  writes them, so you and your sessions write everywhere else meanwhile
+  ([Region locks](#region-locks)).
 
 cauldron has three parts:
 
@@ -327,6 +331,23 @@ shows it. Open it with:
 cauldron env create cauldron-build
 cauldron --env cauldron-build
 ```
+
+
+**The terminal interface's Cauldron tab and a cauldron's soup are two
+stores.** The tab (its clusters, regions and nodes) reads a seed corpus,
+`~/.cauldron/data/<env>/tui/soup/seed/clusters.json`, a file of regions and
+nodes in an older workspace format (corpus schema version 5). Only
+`cauldron-build` carries one, written when it is created, so the tab of
+every other environment shows only what was made in it there. The soup that
+`cauldron soup`, the MCP tools and the ripples read and write lives in each
+cauldron's directory, `~/.cauldron/data/<env>/cauldrons/<name>/soup`, in the
+published `workspace@6` grammar; the terminal interface does not read it
+yet. That soup is the store to write knowledge into. This release has no
+importer for the older workspace format: records from it have to be
+rewritten in the published record shape first, then landed with `cauldron
+soup import` (`--remint` turns their ids into labels and prints the ids
+they were given). When the tab will read a cauldron's soup, and what then
+becomes of the seed file, is not settled in this release.
 
 ## From install to a working session
 
@@ -1081,6 +1102,130 @@ time in proportion to the text (2 seconds plus 20 per MiB). If it runs out,
 nothing is sent (or, for the answer, written): the run fails
 `scrub_timeout`, and automatic processing parks the dump.
 
+### Region locks
+
+New in 0.1.14. A ripple reads the cauldron's regions, thinks for a while
+(its model call), then writes records into some of them. It locks by
+region, never the whole soup: **while it thinks it holds only the regions
+its dump clearly points at, often none, and while it writes it holds the
+regions its records go into, for that one write**. You, your Claude Code
+sessions and the curator keep writing everywhere else in the same soup.
+
+**What a ripple holds, and when.**
+- **Before its model call**, a run declares the regions its dump's text
+  clearly points at. No model is asked: each region is scored against the
+  dump's words (its handle and the inside of its boundary, the text before
+  `Outside:`; stop words and plural, `-ing` and `-ed` endings left out).
+  A shared word counts by how rare it is among the regions: 1 for a word
+  only that region uses, little for one every region uses. A region is
+  declared at a score of 2 or more (two words that region alone uses, or
+  the like) and at least half the best region's score; at most four, and
+  never more than half the regions. On the plugin's starter regions file
+  (four regions) an ordinary note declares one region or none; text made
+  of every region's words declares two. It holds `write` on each declared
+  region and `link` on each region above it, from then until its records
+  land (let go in the same act) or the run ends any other way (a park, a
+  cap, a failure, `off`: let go before the outcome is written; when the
+  `mcp` service cannot be reached then, the ripples service lets it go
+  when it next starts or runs, and it expires meanwhile).
+- **When it writes**, in the one act on the `mcp` service's writer that
+  writes the records, it takes every region its records go into (and
+  `link` on the regions above them), declared or not: when another holder
+  holds one of them, the put is refused `region_locked` and nothing
+  lands. No record lands in a region the run did not hold at that moment.
+- **Once ripples have held a region for 900 seconds within the last
+  hour** (`CAULDRON_RIPPLES_REGION_HOLD_S`, counted from the ripples
+  journal), a run that declares it is `deferred` (`hold_budget`) before it
+  takes any lock or makes any call, and tried again once the budget frees
+  up, so no dump's text can keep a busy region held hour after hour. (The
+  run that crosses the budget finishes: a region can be held for up to
+  one run's length past it.)
+
+A hold is a row in the soup, `region-locks.json`, with the holder (the run
+and its dump), what it is for, since when and until when. A row lasts 120
+seconds and the run renews it while its model call is open (and while a
+run by hand waits a few seconds for a busy backend); a row past its time
+holds nothing, whatever happened to its holder, and no row is held more
+than 900 seconds ahead of now, whatever it says (one that says more, from
+a hand edit or a clock set back, is held 900 seconds from when it was
+first read so, and written back that way).
+
+**What a session sees when it writes into a held region.** `soup_put`,
+`soup_link`, `cauldron soup import`, and the owner's approve and reject are
+refused at once, with code `region_locked` and nothing written. A batch
+(a `soup_put` with `partial: true` too, and one approve or reject over
+many records) is refused whole when any of its records touches a held
+region. The message reads like this:
+
+```
+region `R-2` is locked by a ripple (run <run>, drawing records from dump DM-7)
+for placing the records drawn from dump DM-7, since 2026-11-18T09:12:04Z until
+2026-11-18T09:14:04Z. Nothing was written. Try again in about 95 s (the lock is
+let go as soon as that write lands or gives up, and at 2026-11-18T09:14:04Z at
+the latest), or, if the records belong in another region, write them there.
+```
+
+and `detail` holds the rows and `retry_after_secs`. **What to do:** wait
+about `retry_after_secs` and send the same call again, or write the
+records into another region if they belong there; never re-place records
+only to get around a lock. There is nothing to clean up: the lock goes by
+itself. Writes into any region that is not held land as before.
+
+A held region also holds the regions below it (`narrows`): a write into a
+child of a held region is refused, naming the held one. A region above a
+held one still takes new records, but not a change of its own header or a
+move under another parent.
+
+**Where to see it.** `cauldron ripples status` and `cauldron mcp status`
+(and `soup_status` in a session) list the held regions per cauldron;
+`cauldron soup regions` (and `soup_regions`) marks a held region
+`locked`, and a region above a held one `locked_below`, each with its
+holder, purpose, since and until.
+
+**When a region changes under a ripple anyway.** Every region has a head
+revision, read from the store each time: it moves when the region's
+handle or boundary is rewritten, the region is retired or superseded, or
+it is re-parented or given a child region. A member added, moved,
+superseded or closed never moves it: the model is shown each region's
+id, handle and boundary, never a member. A ripple's put carries the head
+revisions it read, and is refused `region_changed`, nothing written, when
+one of the regions its records go into, or one it holds, moved since.
+The run then reads the regions again. When nothing the model was shown
+changed, it sends the same records again with no new call; otherwise it
+calls the model once more, its prompt saying which regions changed and
+how. A second change leaves the dump `received`, tried again at the next
+scan. A call whose answer was refused so (or refused `region_locked` at
+the put) counts against the cauldron's daily caps but not against the
+dump's own three calls, so other writers alone can never use them up. A
+region the model was shown but placed nothing in is not checked: holding
+every region to its revision would make any edit anywhere stop every
+ripple, which is the whole soup again.
+
+**A damaged lock table.** A `region-locks.json` that cannot be read
+(truncated, not JSON, the wrong shape, another release's format, empty)
+refuses every write, `rename` and `remove`, naming the fix: stop the
+`mcp` service if it runs, then `cauldron soup recover --env <env>
+--cauldron <name>`. Holding the soup's writer lock, `recover` moves the
+file aside to `region-locks.json.damaged-<UTC time>` (the soup then holds
+no lock) only when no ripple run of the cauldron is live in the ripples
+journal; with one live it refuses, naming it, and changes nothing. When
+it sets the file aside its output says so (`region_locks`).
+
+**Crashes.** A ripples service killed while a run holds regions lets them
+go when it starts again, from its journal; a hold of a run whose records
+landed holds nothing; every hold expires. While a region is held, `cauldron
+rename` and `cauldron remove` are refused, naming the holder and until when.
+
+**Upgrade the `mcp` service with the command line.** A 0.1.13 `mcp`
+service knows nothing of region locks: a 0.1.14 ripples service will not
+write through one (its runs fail `mcp_too_old`, nothing sent or written,
+naming the upgrade), and a 0.1.13 command line or `mcp` service writing
+the store ignores the rows (see [Known limitations](#known-limitations)).
+
+The ripples service still runs one dump at a time, so two ripples never
+contend for a region today; the locks keep a ripple and your sessions
+apart.
+
 ### Local inference
 
 New in 0.1.11. It has run against two real models (Qwen3.6-35B-A3B at Q8_0
@@ -1219,6 +1364,17 @@ This is an early release. These are known:
   a real threads.
 - **After a downgrade to 0.1.9, ripple records are not marked.** 0.1.9 reads
   a 0.1.10 store, but shows records a ripple wrote without `unreviewed`.
+- **An older release ignores region locks.** A 0.1.13 command line or
+  `mcp` service reads and writes a store with region locks as before, and
+  its writes are not held back by them; a ripple's head-revision check
+  still catches a boundary such a write changed, but not a record it added
+  to a held region. Upgrade the `mcp` service with the command line: a
+  0.1.14 ripples service refuses to write through a 0.1.13 one.
+- **Which regions a ripple holds while it thinks is a scored word match**
+  between the dump and the regions' handles and boundaries, not a reading
+  of what the dump means; it has not been measured on real dumps. A dump
+  it matches to no region holds nothing during its call, and its records
+  are held only for the write itself.
 - **No prebuilt binaries.** `./scripts/install` builds everything from the
   checkout, which needs the Rust toolchain and takes a while.
 - **A dump is removed from a shell only.** `cauldron soup dump-remove

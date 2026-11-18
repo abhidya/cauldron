@@ -62,6 +62,8 @@ pub mod identity;
 pub mod lock;
 pub mod paths;
 pub mod private;
+// The region locks a writer holds while it prepares a write (a ripple).
+pub mod region_locks;
 // Automatic processing of dumps: the per-cauldron setting and its journal.
 pub mod ripples_auto;
 pub mod seams;

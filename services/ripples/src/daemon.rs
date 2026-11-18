@@ -77,6 +77,8 @@ pub fn run(se: ServiceEnv) -> Result<()> {
         caps: Caps::default(),
         scratch_root: std::env::temp_dir(),
         backoff,
+        lock_ttl_secs: crate::regions::ttl_secs(),
+        hold_budget_secs: crate::regions::hold_budget_secs(),
         env,
     };
     // A call a kill left running is cancelled before anything else runs.

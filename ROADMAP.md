@@ -26,14 +26,17 @@ recorded in [CHANGELOG.md](CHANGELOG.md).
 - **0.1.12: automatic ripples behind a setting**, off by default and turned
   on per cauldron by its owner at a terminal, with a secret scrubber.
 - **0.1.13: the review queue**: the records a ripple wrote, grouped by dump,
-  approved or rejected in bulk by the owner at a terminal (being prepared;
-  see the CHANGELOG).
+  approved or rejected in bulk by the owner at a terminal.
+- **0.1.14: region locks**: a ripple locks by region, never the whole
+  soup: from before its model call until its records land it holds the few
+  regions its dump clearly points at (often none), and it takes the regions
+  its records go into for the write itself, so a write elsewhere in the
+  soup lands meanwhile, a write into a held region is refused at once by
+  name with a retry-after, and a region whose boundary changed under the
+  ripple makes it plan again once, told what changed.
 
 ## Next
 
-- **Region locks.** A ripple's write takes a lock on the regions it
-  touches, checked against what it read, so a write elsewhere in the soup
-  never waits for it and a change in the same region makes it plan again.
 - **Ripples on by default in a fresh install**, once the conditions hold:
   enough real dumps processed and reviewed with a reject rate the owner
   accepts, tokens per dump measured with no cap ever passed silently, the

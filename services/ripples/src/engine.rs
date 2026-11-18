@@ -101,6 +101,13 @@ pub struct Ctx {
     pub scratch_root: PathBuf,
     /// The wait before trying a busy backend again.
     pub backoff: Duration,
+    /// A region lock's time to live, renewed while a model call is open
+    /// (`crate::regions::ttl_secs`).
+    pub lock_ttl_secs: u64,
+    /// How long ripples may hold one region of a cauldron within any hour
+    /// (`crate::regions::hold_budget_secs`); a run that would hold a region
+    /// past it is deferred (`hold_budget`) before it takes any lock.
+    pub hold_budget_secs: u64,
 }
 
 /// What the owner asked.
@@ -217,6 +224,10 @@ pub fn fixed_message(code: &str) -> String {
         "dump_removed" => "the dump was removed (or its removal is unfinished); it is never processed".into(),
         "unauthorized" => "the mcp service did not take the run key".into(),
         "batch_refused" | "records_refused" => "the soup refused the answer's records".into(),
+        "region_locked" => "another writer holds a region this run writes into; nothing was written, a call this cost is not counted against the dump's own cap, and the dump waits and is tried again once it is let go".into(),
+        "region_changed" => "the boundary of a region the run planned against changed while it was planning, again after it planned once more; nothing was written, the calls this cost are not counted against the dump's own cap, and the dump waits to be tried again".into(),
+        "hold_budget" => "the regions this dump's text points at have been held by ripples for their whole hourly budget; nothing was sent, no lock was taken, and the dump waits to be tried again once the budget frees up".into(),
+        "mcp_too_old" => "the running mcp service is older than this ripples service and does not know the verbs it uses; nothing was written".into(),
         other => format!("the mcp service refused the request ({other})"),
     }
 }
@@ -261,6 +272,7 @@ fn advice(ctx: &Ctx, r: &Refused) -> String {
         "not_found" => "check the dump's id with `cauldron soup dumps`".to_string(),
         "dump_removed" => "nothing to do: a removed dump is never processed".to_string(),
         "unauthorized" => "the mcp service restarted while this run read its key: run the same command again".to_string(),
+        "mcp_too_old" => format!("upgrade the mcp service to this release (`scripts/install --replace-running` from your checkout, or `cauldron --env {e} build mcp --env-copy` and then `cauldron --env {e} pin mcp <the label that build printed>`), then run this again"),
         _ => "read the message; nothing was written".to_string(),
     }
 }
@@ -363,10 +375,20 @@ impl Drop for Workdir {
 /// **Settle calls a run left running**: every `sent` call of the journal
 /// whose end was never recorded (the service was killed during the call),
 /// and every cancel that was not confirmed, is cancelled through the
-/// backend now; each answer is a `cancel` line. Called when the service
+/// backend now; each answer is a `cancel` line. Every region lock a run
+/// took and never let go is let go first (an `unlocked` line). Called when the service
 /// starts and before each run, never while a run is in progress.
 pub fn settle(ctx: &Ctx) -> Vec<Value> {
     let mut out = Vec::new();
+    // The region locks a run took and never let go (the service was killed
+    // while it held them): let go now. One the `mcp` service cannot be
+    // asked about is tried again next time, and expires meanwhile.
+    for (run, cauldron, dump) in crate::journal::held_locks(&ctx.journal.lines()) {
+        if let Ok(u) = ctx.mcp.ask("RUNLOCK", &json!({"cauldron": cauldron, "run": run})) {
+            let _ = ctx.journal.write(&run, &cauldron, &dump, "unlocked", json!({"released": u["released"], "settled": true}));
+            out.push(json!({"run": run, "dump": dump, "unlocked": u["released"]}));
+        }
+    }
     // The runs' journal, then the evaluations' ledger.
     for j in [Journal::at(ctx.journal.path()), ctx.journal.eval_ledger()] {
         for sent in crate::journal::unsettled(&j.lines()) {
@@ -494,7 +516,25 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
             kept.lock().unwrap_or_else(|p| p.into_inner()).push(json!({"what": what, "value": v}));
         }
     };
+    // The run's region lock (`crate::regions`): held from before the first
+    // model call until the records land (the `mcp` service lets it go in
+    // the act that lands them) or the run ends any other way, when it is let
+    // go here, before the outcome is written.
+    let lock_held = std::cell::Cell::new(false);
     let done = |mut v: Value, usage: &Usage, calls: u32, models: &[String]| -> Value {
+        if lock_held.get() {
+            match ctx.mcp.ask("RUNLOCK", &json!({"cauldron": ask.cauldron, "run": run})) {
+                Ok(u) => {
+                    let _ = j("unlocked", json!({"released": u["released"]}));
+                    lock_held.set(false);
+                }
+                // Left for the next start or run to let go (`settle`); it
+                // expires meanwhile.
+                Err(r) => {
+                    let _ = j("unlock_failed", json!({"code": r.code}));
+                }
+            }
+        }
         v["usage"] = json!(usage);
         v["input_total"] = json!(usage.input_total());
         v["calls"] = json!(calls);
@@ -572,6 +612,17 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
         Ok(v) => v,
         Err(r) => return done(fail(&r), &usage, calls, &models),
     };
+    // An `mcp` service from before region locks answers without revisions:
+    // it would take no lock and check no revision at the put, so nothing is
+    // written through it (the service is upgraded with the command line).
+    if !read.get("revs").is_some_and(Value::is_object) {
+        let r = Refused {
+            code: "mcp_too_old".into(),
+            message: "the running mcp service answered the regions without their revisions: it is from before region locks, and would neither hold a region nor check one at the put; nothing was sent or written".into(),
+            detail: Value::Null,
+        };
+        return done(fail(&r), &usage, calls, &models);
+    }
     let empty = vec![];
     let regions = read["regions"].as_array().unwrap_or(&empty);
     if regions.is_empty() {
@@ -595,25 +646,67 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
         v["what_to_do"] = json!("curate it by hand (`/cauldron:curate-dump`), or give this run more with `--force-budget <tokens>`; the dump stays `received`");
         return done(v, &usage, calls, &models);
     }
+    // The regions this run expects to write into, held from now until its
+    // records land or it gives up (`crate::regions`). The prompt is built
+    // from the regions as they were read at the moment the lock was taken,
+    // and the put carries their revisions.
+    // A run already at a cap holds nothing: deferred before any lock (the
+    // check that charges is the one under the journal's lock, below).
+    if let Some(v) = over_caps(ctx, p, &ctx.journal.lines(), calls_cap, tokens_cap, &budget_note, estimate(text.chars().count())) {
+        return done(v, &usage, calls, &models);
+    }
+    let declared = crate::regions::declare(&text, regions);
+    // A region ripples already held for its hourly budget is not held
+    // again: the run is deferred before it takes any lock, so no text can
+    // keep a region busy hour after hour.
+    if let Some(v) = over_hold_budget(ctx, p, &declared) {
+        let _ = j("hold_budget", json!({"regions": v["regions"]}));
+        return done(v, &usage, calls, &models);
+    }
+    let (regions, mut revs) = if declared.is_empty() {
+        (regions.clone(), read.get("revs").filter(|v| v.is_object()).cloned())
+    } else {
+        match take_lock(ctx, p, &declared) {
+            Ok(v) => {
+                lock_held.set(true);
+                let _ = j("locked", json!({"regions": v["lock"]["regions"], "above": v["lock"]["above"], "until": v["lock"]["until"]}));
+                (v["regions"].as_array().cloned().unwrap_or_default(), Some(v["revs"].clone()))
+            }
+            Err(r) if r.code == "region_locked" => {
+                let _ = j("lock_refused", json!({"regions": declared}));
+                return done(region_deferred(ask, run, "region_locked", &r), &usage, calls, &models);
+            }
+            Err(r) => return done(fail(&r), &usage, calls, &models),
+        }
+    };
+    fault_point("after-lock");
     // The secret scrubber (`crate::scrub`) on what is sent: always through
     // threads, and to a local model unless the owner said otherwise. The
     // stored dump is never changed: this is the run's copy. Held to a time
     // budget in proportion to the text; out of time, nothing is sent (it
     // fails closed, whatever the backend).
     let scrub_sent = !is_local(&first) || !opts.no_scrub_local;
-    let mut regions = regions.clone();
-    let text = if scrub_sent {
-        let bytes = text.len() + regions.iter().map(crate::scrub::value_bytes).sum::<usize>();
+    let scrub_regions = |regions: &[Value]| -> Result<Vec<Value>, crate::scrub::Exhausted> {
+        let mut regions = regions.to_vec();
+        if !scrub_sent {
+            return Ok(regions);
+        }
+        let bytes = regions.iter().map(crate::scrub::value_bytes).sum::<usize>();
         let deadline = std::time::Instant::now() + opts.scrub_budget.unwrap_or_else(|| crate::scrub::budget_for(bytes));
-        let scrubbed = crate::scrub::scrub_within(&text, deadline).and_then(|(t, mut counts)| {
-            for r in regions.iter_mut() {
-                for k in ["handle", "boundary"] {
-                    crate::scrub::add(&mut counts, &crate::scrub::scrub_value_within(&mut r[k], deadline)?);
-                }
+        let mut counts = Default::default();
+        for r in regions.iter_mut() {
+            for k in ["handle", "boundary"] {
+                crate::scrub::add(&mut counts, &crate::scrub::scrub_value_within(&mut r[k], deadline)?);
             }
-            Ok((t, counts))
-        });
-        match scrubbed {
+        }
+        if !counts.is_empty() {
+            let _ = j("redacted", json!({"in": "sent", "of": "regions", "counts": counts}));
+        }
+        Ok(regions)
+    };
+    let text = if scrub_sent {
+        let deadline = std::time::Instant::now() + opts.scrub_budget.unwrap_or_else(|| crate::scrub::budget_for(text.len()));
+        match crate::scrub::scrub_within(&text, deadline) {
             Ok((t, counts)) => {
                 if !counts.is_empty() {
                     let _ = j("redacted", json!({"in": "sent", "counts": counts}));
@@ -625,10 +718,17 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
     } else {
         text
     };
-    let regions = &regions;
-    let prompt = package::prompt(&ask.dump, kind, regions, &text);
+    let regions = match scrub_regions(&regions) {
+        Ok(r) => r,
+        Err(x) => return done(scrub_timeout(ask, run, &x, "sent"), &usage, calls, &models),
+    };
+    let mut prompt = package::prompt(&ask.dump, kind, &regions, &text);
+    // The regions as the prompt shows them, and, after a re-plan, what
+    // changed in them while the model answered (said in the next prompt).
+    let mut shown = regions.clone();
+    let mut changes: Option<String> = None;
     let est = estimate(prompt.chars().count());
-    let _ = j("read", json!({"prompt_chars": prompt.chars().count(), "estimated_input_tokens": est, "text_cut": cut, "regions": regions.len().min(package::MAX_REGIONS), "spent_before": {"calls": calls_before, "charged_input_tokens": tokens_before}}));
+    let _ = j("read", json!({"prompt_chars": prompt.chars().count(), "estimated_input_tokens": est, "text_cut": cut, "regions": regions.len().min(package::MAX_REGIONS), "declared": declared, "spent_before": {"calls": calls_before, "charged_input_tokens": tokens_before}}));
 
     // Step 4: the calls.
     let schema = package::schema();
@@ -637,10 +737,17 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
     let mut feedback: Option<String> = None;
     let mut refused_by: &str;
     let mut busy = 0u32;
-    loop {
-        let this_prompt = match &feedback {
+    // A put refused because a region changed after the run read it is
+    // planned again ONCE, from a fresh read; a second time, the dump waits.
+    let mut replanned = false;
+    'calls: loop {
+        let base = match &changes {
             None => prompt.clone(),
-            Some(f) => format!("{prompt}\n\n## Your previous answer was refused\n\n{f}\n\nAnswer again, meeting the schema and the rules above."),
+            Some(c) => format!("{prompt}\n\n{c}"),
+        };
+        let this_prompt = match &feedback {
+            None => base,
+            Some(f) => format!("{base}\n\n## Your previous answer was refused\n\n{f}\n\nAnswer again, meeting the schema and the rules above."),
         };
         let this_est = estimate(this_prompt.chars().count());
         let workdir = match Workdir::make(&ctx.scratch_root, run) {
@@ -661,31 +768,7 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
             if let Some(why) = opts.gate.and_then(|g| g()) {
                 return Err(gated(ask, run, why));
             }
-            let (spent_calls, spent_tokens) = crate::journal::spent(lines, run);
-            if spent_calls >= calls_cap || spent_tokens + this_est > tokens_cap {
-                let mut v = outcome(ask, run, "deferred");
-                v["reason"] = json!("budget");
-                v["message"] = json!(format!(
-                    "the next call would pass {budget_note}: {spent_calls} calls and {spent_tokens} input tokens spent on this dump, about {this_est} more needed; nothing more was sent"
-                ));
-                v["what_to_do"] = json!("the dump stays `received`; curate it by hand (`/cauldron:curate-dump`), or run it again with `--force-budget <tokens>` to let one run spend that many more");
-                return Err(v);
-            }
-            let date = crate::journal::today();
-            let today = crate::journal::day_of(lines, &ask.cauldron, &p.identities, &date);
-            let new_dump = !today.dumps.contains(&ask.dump);
-            if today.tokens + this_est > ctx.caps.day_tokens || (new_dump && today.dumps.len() >= ctx.caps.day_dumps) {
-                let mut v = outcome(ask, run, "deferred");
-                v["reason"] = json!("daily_cap");
-                v["message"] = json!(format!(
-                    "the next call would pass cauldron `{}`'s daily cap ({} input tokens or {} dumps per UTC day; {} tokens and {} dumps spent on {date}); nothing more was sent",
-                    ask.cauldron,
-                    ctx.caps.day_tokens,
-                    ctx.caps.day_dumps,
-                    today.tokens,
-                    today.dumps.len()
-                ));
-                v["what_to_do"] = json!("the dump stays `received`; run it again after midnight UTC, or curate it by hand (`/cauldron:curate-dump`)");
+            if let Some(v) = over_caps(ctx, p, lines, calls_cap, tokens_cap, &budget_note, this_est) {
                 return Err(v);
             }
             Ok(json!({"n": calls + 1, "call_id": call_id, "model": model, "estimated_input_tokens": this_est, "cauldron_id": p.identity}))
@@ -712,7 +795,7 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
             max_output_tokens: MAX_OUTPUT_TOKENS,
             sink: Some(sink.clone()),
         };
-        let answer = ctx.inference.call(&req);
+        let answer = with_renewal(&ctx.mcp, &ask.cauldron, run, lock_held.get().then_some(ctx.lock_ttl_secs), &j, || ctx.inference.call(&req));
         let left = workdir.entries();
         drop(workdir);
         let _ = j("scrubbed", json!({"entries_left_by_the_call": left}));
@@ -758,22 +841,73 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
                 }
                 Ok(records) => match scrub_answer(&j, records, opts.scrub_budget) {
                     Err(x) => return done(scrub_timeout(ask, run, &x, "answer"), &usage, calls, &models),
-                    Ok(records) => match ctx.mcp.ask("RPUT", &put_args(p, "put", &model, records)) {
-                    Ok(v) => {
-                        fault_point("after-put");
-                        let mut o = outcome(ask, run, "processed");
-                        o["records"] = v["records"].clone();
-                        if let Some(n) = reply.output.get("notes") {
-                            o["notes"] = n.clone();
+                    // The put, sent again (with no new call) when nothing
+                    // the model was shown changed.
+                    Ok(records) => loop {
+                        match ctx.mcp.ask("RPUT", &with_revs(put_args(p, "put", &model, records.clone()), &revs)) {
+                            Ok(v) => {
+                                if lock_held.get() {
+                                    lock_held.set(false);
+                                    let _ = j("unlocked", json!({"released": v["locks_released"], "by": "put"}));
+                                }
+                                fault_point("after-put");
+                                let mut o = outcome(ask, run, "processed");
+                                o["records"] = v["records"].clone();
+                                if let Some(n) = reply.output.get("notes") {
+                                    o["notes"] = n.clone();
+                                }
+                                return done(o, &usage, calls, &models);
+                            }
+                            Err(r) if r.code == "region_changed" && !replanned => {
+                                replanned = true;
+                                // Read the regions again (under the lock again,
+                                // when the run holds one).
+                                let fresh = if declared.is_empty() { ctx.mcp.ask("RREAD", &json!({"cauldron": ask.cauldron})) } else { take_lock(ctx, p, &declared) };
+                                let v = match fresh {
+                                    Ok(v) => v,
+                                    Err(r) if r.code == "region_locked" => {
+                                        let _ = j("voided", json!({"call_id": call_id, "n": calls, "why": "region_locked"}));
+                                        return done(region_deferred(ask, run, "region_locked", &r), &usage, calls, &models);
+                                    }
+                                    Err(r) => return done(fail(&r), &usage, calls, &models),
+                                };
+                                if !declared.is_empty() {
+                                    lock_held.set(true);
+                                    let _ = j("locked", json!({"regions": v["lock"]["regions"], "above": v["lock"]["above"], "until": v["lock"]["until"], "again": true}));
+                                }
+                                revs = v.get("revs").filter(|x| x.is_object()).cloned();
+                                let again = match scrub_regions(&v["regions"].as_array().cloned().unwrap_or_default()) {
+                                    Ok(r) => r,
+                                    Err(x) => return done(scrub_timeout(ask, run, &x, "sent"), &usage, calls, &models),
+                                };
+                                let fresh_prompt = package::prompt(&ask.dump, kind, &again, &text);
+                                if fresh_prompt == prompt {
+                                    // Nothing the model was shown changed: the
+                                    // same records, with the fresh revisions,
+                                    // and no call.
+                                    let _ = j("replan", json!({"changed": r.detail["changed"], "prompt_changed": false, "call": false}));
+                                    continue;
+                                }
+                                let _ = j("replan", json!({"changed": r.detail["changed"], "prompt_changed": true, "call": true}));
+                                let _ = j("voided", json!({"call_id": call_id, "n": calls, "why": "region_changed"}));
+                                changes = Some(package::what_changed(&shown, &again, &r.detail["changed"]));
+                                shown = again;
+                                prompt = fresh_prompt;
+                                feedback = None;
+                                continue 'calls;
+                            }
+                            Err(r) if r.code == "region_changed" || r.code == "region_locked" => {
+                                let _ = j("refused", json!({"code": r.code}));
+                                let _ = j("voided", json!({"call_id": call_id, "n": calls, "why": r.code}));
+                                return done(region_deferred(ask, run, &r.code, &r), &usage, calls, &models);
+                            }
+                            Err(r) if matches!(r.code.as_str(), "batch_refused" | "records_refused") => {
+                                let _ = j("refused", json!({"code": r.code}));
+                                refused_by = "soup";
+                                break format!("{}: {}", r.message, clip(&r.detail.to_string(), 4000));
+                            }
+                            Err(r) => return done(fail(&r), &usage, calls, &models),
                         }
-                        return done(o, &usage, calls, &models);
-                    }
-                    Err(r) if matches!(r.code.as_str(), "batch_refused" | "records_refused") => {
-                        let _ = j("refused", json!({"code": r.code}));
-                        refused_by = "soup";
-                        format!("{}: {}", r.message, clip(&r.detail.to_string(), 4000))
-                    }
-                    Err(r) => return done(fail(&r), &usage, calls, &models),
                     },
                 },
             },
@@ -793,7 +927,9 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
                     });
                     return done(v, &usage, calls, &models);
                 }
-                std::thread::sleep(ctx.backoff);
+                // The wait keeps the run's lock renewed: it is held through
+                // it (at most `BUSY_TRIES - 1` waits of `backoff`).
+                with_renewal(&ctx.mcp, &ask.cauldron, run, lock_held.get().then_some(ctx.lock_ttl_secs), &j, || std::thread::sleep(ctx.backoff));
                 continue;
             }
             Err(Failure::Parked { message: m, cause, .. }) => {
@@ -862,7 +998,8 @@ pub fn execute_with(ctx: &Ctx, p: &Prepared, opts: &Opts<'_>) -> Value {
 }
 
 /// Test-only: under isolation, `CAULDRON_RIPPLES_FAULT=<point>` kills the
-/// process at that point (`after-put`: the batch landed and the dump was
+/// process at that point (`after-lock`: the run holds its region lock and
+/// no call was made; `after-put`: the batch landed and the dump was
 /// marked, and the journal has no `done` yet).
 fn fault_point(point: &str) {
     if env::egress::process_isolation().is_some() && std::env::var("CAULDRON_RIPPLES_FAULT").as_deref() == Ok(point) {
@@ -885,6 +1022,150 @@ fn scrub_answer(j: &dyn Fn(&str, Value) -> std::io::Result<()>, records: Vec<Val
 /// At most `n` characters of `s`.
 fn clip(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
+}
+
+/// **The caps, counted from the journal's `lines`** (module docs, step 4):
+/// the run's `deferred` outcome when a call of about `this_est` input tokens
+/// would pass one, else `None`.
+fn over_caps(ctx: &Ctx, p: &Prepared, lines: &[Value], calls_cap: u32, tokens_cap: u64, budget_note: &str, this_est: u64) -> Option<Value> {
+    let (ask, run) = (&p.ask, p.run.as_str());
+    let (spent_calls, spent_tokens) = crate::journal::spent(lines, run);
+    if spent_calls >= calls_cap || spent_tokens + this_est > tokens_cap {
+        let mut v = outcome(ask, run, "deferred");
+        v["reason"] = json!("budget");
+        v["message"] = json!(format!(
+            "the next call would pass {budget_note}: {spent_calls} calls and {spent_tokens} input tokens spent on this dump, about {this_est} more needed; nothing more was sent"
+        ));
+        v["what_to_do"] = json!("the dump stays `received`; curate it by hand (`/cauldron:curate-dump`), or run it again with `--force-budget <tokens>` to let one run spend that many more");
+        return Some(v);
+    }
+    let date = crate::journal::today();
+    let today = crate::journal::day_of(lines, &ask.cauldron, &p.identities, &date);
+    let new_dump = !today.dumps.contains(&ask.dump);
+    if today.tokens + this_est > ctx.caps.day_tokens || (new_dump && today.dumps.len() >= ctx.caps.day_dumps) {
+        let mut v = outcome(ask, run, "deferred");
+        v["reason"] = json!("daily_cap");
+        v["message"] = json!(format!(
+            "the next call would pass cauldron `{}`'s daily cap ({} input tokens or {} dumps per UTC day; {} tokens and {} dumps spent on {date}); nothing more was sent",
+            ask.cauldron,
+            ctx.caps.day_tokens,
+            ctx.caps.day_dumps,
+            today.tokens,
+            today.dumps.len()
+        ));
+        v["what_to_do"] = json!("the dump stays `received`; run it again after midnight UTC, or curate it by hand (`/cauldron:curate-dump`)");
+        return Some(v);
+    }
+    None
+}
+
+/// **Hold `regions` for the run** (`RLOCK`): the lock, and the regions and
+/// their revisions read at that moment.
+fn take_lock(ctx: &Ctx, p: &Prepared, regions: &[String]) -> Result<Value, Refused> {
+    ctx.mcp.ask(
+        "RLOCK",
+        &json!({"cauldron": p.ask.cauldron, "run": p.run, "dump": p.ask.dump, "regions": regions, "ttl_secs": ctx.lock_ttl_secs}),
+    )
+}
+
+/// Run `f` (a model call), renewing the run's lock every third of its time
+/// to live (`held`: the time to live, when the run holds a lock) while it
+/// runs. A renewal that finds the
+/// lock gone is journaled (`lock_lost`); the put's revision check decides.
+fn with_renewal<T>(mcp: &Mcp, cauldron: &str, run: &str, held: Option<u64>, j: &(dyn Fn(&str, Value) -> std::io::Result<()> + Sync), f: impl FnOnce() -> T) -> T {
+    let Some(ttl) = held else {
+        return f();
+    };
+    let period = Duration::from_millis((ttl * 1000 / 3).max(200));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let mut next = std::time::Instant::now() + period;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if std::time::Instant::now() >= next {
+                    next = std::time::Instant::now() + period;
+                    match mcp.ask("RRENEW", &json!({"cauldron": cauldron, "run": run, "ttl_secs": ttl})) {
+                        Ok(v) if v["renewed"] == json!(0) => {
+                            let _ = j("lock_lost", json!({}));
+                        }
+                        Ok(_) => {}
+                        Err(r) => {
+                            let _ = j("renew_failed", json!({"code": r.code}));
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let out = f();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        out
+    })
+}
+
+/// One hour, in milliseconds: the window of the hold budget.
+const HOUR_MS: i64 = 3_600_000;
+
+/// **The hourly hold budget per region** (`Ctx::hold_budget_secs`): the
+/// run's `deferred` outcome (reason `hold_budget`) when ripples already
+/// held one of `declared` for the whole budget within the last hour, as this
+/// service's journal counts it (`crate::journal::region_hold_ms`), else
+/// `None`. Checked before any lock is taken and before any call.
+fn over_hold_budget(ctx: &Ctx, p: &Prepared, declared: &[String]) -> Option<Value> {
+    if declared.is_empty() {
+        return None;
+    }
+    let lines = ctx.journal.lines();
+    let now = chrono::Utc::now().timestamp_millis();
+    let budget = ctx.hold_budget_secs as i64 * 1000;
+    let used = crate::journal::region_hold_ms(&lines, &p.ask.cauldron, now, HOUR_MS);
+    let spent: Vec<String> = declared.iter().filter(|r| used.get(*r).copied().unwrap_or(0) >= budget).cloned().collect();
+    if spent.is_empty() {
+        return None;
+    }
+    // When every one of them is under its budget again, if nothing more is
+    // held meanwhile: a minute at a time, at most the hour.
+    let retry_ms = (1..=60)
+        .map(|m| m * 60_000)
+        .find(|d| {
+            let u = crate::journal::region_hold_ms(&lines, &p.ask.cauldron, now + d, HOUR_MS);
+            spent.iter().all(|r| u.get(r).copied().unwrap_or(0) < budget)
+        })
+        .unwrap_or(HOUR_MS);
+    let mut v = outcome(&p.ask, &p.run, "deferred");
+    v["reason"] = json!("hold_budget");
+    v["message"] = json!(fixed_message("hold_budget"));
+    v["regions"] = json!(spent);
+    v["hold_budget_secs_per_hour"] = json!(ctx.hold_budget_secs);
+    v["retry_after_secs"] = json!(retry_ms / 1000);
+    v["what_to_do"] = json!("the dump stays `received`; automatic processing tries it again once the budget frees up, or run it again later, or curate it by hand (`/cauldron:curate-dump`)");
+    Some(v)
+}
+
+/// The run's outcome when a region held it back: `deferred`, with the
+/// holder's retry-after when it gave one.
+fn region_deferred(ask: &Ask, run: &str, reason: &str, r: &Refused) -> Value {
+    let mut v = outcome(ask, run, "deferred");
+    v["reason"] = json!(reason);
+    v["message"] = json!(fixed_message(reason));
+    v["detail"] = json!(r.message);
+    if let Some(n) = r.detail.get("retry_after_secs") {
+        v["retry_after_secs"] = n.clone();
+    }
+    v["what_to_do"] = json!(if reason == "region_locked" {
+        "the dump stays `received`; it is tried again once that region is let go (automatic processing does so by itself), or run this again later"
+    } else {
+        "the dump stays `received`; automatic processing tries it again at its next scan, or run this again"
+    });
+    v
+}
+
+/// `args` with the revisions the run read, when it has them.
+fn with_revs(mut args: Value, revs: &Option<Value>) -> Value {
+    if let Some(r) = revs {
+        args["revs"] = r.clone();
+    }
+    args
 }
 
 /// `RPUT`'s arguments.

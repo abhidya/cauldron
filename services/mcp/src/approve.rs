@@ -367,6 +367,7 @@ pub fn decide(c: &spine::Cauldron, t: &Target, ask: &Ask, reason: Option<&str>, 
             doc["witnesses"] = json!(witnesses);
             Err(Refusal::with_detail("records_refused", format!("the soup refused the {word}; nothing was written"), doc))
         }
+        Err(e @ spine::error::SpineError::RegionLocked { .. }) => Err(crate::refusal(soup_door::region_lock::spine_error(e))),
         Err(e) => Err(store(format!("writing the {word}: {e}"))),
     }
 }

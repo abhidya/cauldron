@@ -269,6 +269,14 @@ pub fn execute(cauldron: &Cauldron, envelope: Envelope) -> Result<Outcome> {
         // `flag_not_writable`, beside `sealed_body`): a ripple that writes a flag its kind and scope do
         // not grant is refused whole, on both callers, before any row exists.
         crate::flags::check_flag_grants(&envelope.provenance.initiator, &payload, &matched)?;
+        // THE REGION GUARD (`crate::regions`): a commit names its regions to
+        // the guard the writer installed, before any row exists; a refusal
+        // writes nothing. A dry run is never asked.
+        if envelope.mode == Mode::Commit {
+            if let Some(guard) = cauldron.region_guard() {
+                crate::regions::check_guard(cauldron, guard.as_ref(), &envelope.provenance.initiator, &payload)?;
+            }
+        }
 
         if envelope.mode == Mode::Validate {
             // The dry run the migration's validate-then-commit shape needs:

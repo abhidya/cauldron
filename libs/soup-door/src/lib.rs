@@ -26,6 +26,7 @@ pub mod lock;
 pub mod marker;
 pub mod reads;
 pub mod recover;
+pub mod region_lock;
 pub mod review;
 pub mod ripple;
 pub mod target;

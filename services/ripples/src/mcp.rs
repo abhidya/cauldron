@@ -99,6 +99,14 @@ impl Mcp {
         if line.trim().is_empty() {
             return Err(down(format!("the mcp service closed the connection without answering `{verb}` (did it stop?)")));
         }
+        // An older `mcp` service answers a verb it does not know so.
+        if line.trim_start().starts_with("ERR unknown request") {
+            return Err(Refused {
+                code: "mcp_too_old".into(),
+                message: format!("the running `mcp` service does not know `{verb}`: it is older than this ripples service; nothing was read or written"),
+                detail: Value::Null,
+            });
+        }
         let v: Value = serde_json::from_str(line.trim()).map_err(|e| down(format!("the mcp seam answered something that is not JSON: {e}")))?;
         if v["ok"] == Value::Bool(true) {
             Ok(v)

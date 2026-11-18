@@ -384,8 +384,12 @@ fn open(t: &Target) -> Result<(spine::Cauldron, File, Value), Refusal> {
     }
     let _ = fh.set_len(0).and_then(|_| writeln!(fh, "mcp {}", std::process::id())).and_then(|_| fh.flush());
     let soup = c.soup();
-    let cauldron = spine::Cauldron::open(&soup, spine::config::SpineConfig::default())
+    let mut cauldron = spine::Cauldron::open(&soup, spine::config::SpineConfig::default())
         .map_err(|e| Refusal::new("store", format!("opening cauldron `{}`'s soup: {e}", c.name)))?;
+    // Every commit through this handle names its regions to the soup's
+    // region locks first: a region a ripple holds refuses everyone else
+    // (`soup_door::region_lock`).
+    cauldron.set_region_guard(soup_door::region_lock::Guard::new(c));
     let rec = cauldron.recovered_at_open();
     let hexes = |v: &[spine::envelope::TxHash]| v.iter().map(|h| h.to_hex()).collect::<Vec<_>>();
     let landed_tx: Vec<String> = hexes(&rec.rolled_forward).into_iter().chain(hexes(&rec.cleared_only)).collect();
@@ -658,6 +662,7 @@ fn link(c: &spine::Cauldron, t: &Target, links: &[Link], who: &Who) -> Result<Va
             doc["witnesses"] = json!(witnesses);
             Err(Refusal::with_detail("links_refused", "every link passed alone and the whole set was refused; nothing was written", doc))
         }
+        Err(e @ spine::error::SpineError::RegionLocked { .. }) => Err(crate::refusal(soup_door::region_lock::spine_error(e))),
         Err(e) => Err(Refusal::new("store", format!("writing the links: {e}"))),
     }
 }

@@ -145,8 +145,11 @@ pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<Import
             }
         }
         // 4. The spine's own open, checked: it must have done nothing.
-        let cauldron = spine::Cauldron::open(&soup, spine::config::SpineConfig::default())
+        let mut cauldron = spine::Cauldron::open(&soup, spine::config::SpineConfig::default())
             .map_err(|err| store(format!("opening cauldron `{}`'s soup: {err}", c.name)))?;
+        // A region a ripple holds is refused here as at the door
+        // (`region_lock`).
+        cauldron.set_region_guard(crate::region_lock::Guard::new(c));
         let rec = cauldron.recovered_at_open();
         if !rec.rolled_forward.is_empty() || !rec.cleared_only.is_empty() || !rec.aborted.is_empty() || !cauldron.tranches_at_open().tranches.is_empty() {
             refuse!(
@@ -181,7 +184,7 @@ pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &Imp
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
     ));
     let opts = RecordsOptions { pool: o.pool_name(), remint: o.remint, commit: !o.dry_run };
-    let run = import_records(cauldron, &plan, records, &opts).map_err(store)?;
+    let run = import_records(cauldron, &plan, records, &opts).map_err(crate::region_lock::spine_error)?;
 
     let accepted = run.records.iter().filter(|r| r.disposition == "accepted").count();
     let refused = run.records.len() - accepted;

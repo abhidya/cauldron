@@ -349,6 +349,9 @@ impl State {
             "caps": caps_json(&self.ctx.caps),
             "journal": self.ctx.journal.path().display().to_string(),
             "automatic": self.automatic(cauldron),
+            // The regions held now, in every cauldron (a run between reading
+            // its regions and landing its records holds them).
+            "region_locks": env::region_locks::env_view(&self.ctx.env, cauldron),
         })
     }
 }

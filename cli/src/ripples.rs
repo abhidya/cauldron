@@ -66,6 +66,17 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand or automa
         services running in the environment (threads from this release) and the cauldron
         granted to the MCP door with read, write and dump. Exit 0 processed, 3 deferred,
         1 failed.
+        Region locks: from before its call the run holds the regions its dump's text
+        clearly points at (a scored word match against each region's handle and boundary,
+        at most 4 and never more than half the regions; often none), and at the put it
+        takes every region its records go into, in the same act that writes them. Another
+        writer into a held region is refused `region_locked` at once; a run that meets a
+        region another holds is `deferred` and tried again. Ripples hold one region at most
+        900 s in any hour (CAULDRON_RIPPLES_REGION_HOLD_S); past that, a run that would hold
+        it is `deferred` (`hold_budget`) before any call. A region whose boundary changed
+        while the run planned makes it plan once more, told what changed; a member written
+        into a region meanwhile never does. A call voided so is not counted against the
+        dump's own cap.
         --backend local runs it on this machine instead, through the `inference` service
         (`cauldron inference help`): --model names a registered model (default: the only
         one registered), both calls use it (no Opus retry), and nothing leaves the
@@ -503,6 +514,9 @@ fn status(args: &[String]) -> Result<i32> {
                 "evaluations_ledger": eval_path.display().to_string(),
                 "automatic": automatic_offline(&e, a.cauldron.as_deref()),
                 "review": review_view(&e, a.cauldron.as_deref()),
+                // Held regions are rows in each soup: shown with the service
+                // stopped too (a lock whose holder stopped expires).
+                "region_locks": env::region_locks::env_view(&e, a.cauldron.as_deref()),
             }))?;
             say_review(&json!({"review": review_view(&e, a.cauldron.as_deref())}));
             eprintln!("cauldron ripples: {why}. {}", start_hint(&e.name));

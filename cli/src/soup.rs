@@ -161,6 +161,11 @@ cauldron soup — a cauldron's soup, offline
         A batch over the 16 MiB the service reads in one request is refused before it is
         sent (never split): import it in smaller files, or revoke the grant (or stop the
         service) and import directly.
+        A batch with a record or edge in a region a ripple holds (`soup regions` marks it
+        `locked`; a header change or re-parenting of a region above one, `locked_below`, too)
+        is refused whole as `region_locked`, at once, naming the holder and until when, with
+        nothing written. Try again after that time, or, if the records belong in another
+        region, write them there.
     cauldron soup recover [--cauldron <name>] [--env <env>]
         Settle a soup that an interrupted import left not at rest: an import that never
         reached its commit decision is rolled back (none of it lands), one that did is
@@ -173,10 +178,18 @@ cauldron soup — a cauldron's soup, offline
         (none of it landed: importing it again is safe) or `none` (nothing to recover).
         Also says what still stands in the way if anything does. Refused while the `mcp`
         service holds the soup: it recovers the soup itself when it opens it, and
-        `cauldron mcp status` shows what that recovered.
+        `cauldron mcp status` shows what that recovered. It also mends a region-lock table
+        (`<soup>/region-locks.json`) that cannot be read, which otherwise refuses every
+        write, rename and remove: holding the soup's writer lock, and only when no ripple
+        run of the cauldron is live in the ripples journal (a run with no `done` line whose
+        process is running and whose last line is under an hour old), it moves the file
+        aside to `region-locks.json.damaged-<UTC time>` and the soup holds no lock; with a
+        run live it refuses, naming it, and changes nothing. When it sets one aside, its
+        output carries `region_locks` (`set_aside`, with `moved_to`).
     cauldron soup regions [--cauldron <name>] [--env <env>] [--max-chars N]
         Every region: id, handle, boundary, flags, the regions it narrows or relates to,
-        and how many nodes sit in it.
+        and how many nodes sit in it. A region a ripple holds is marked `locked` (holder,
+        purpose, since, until); a region above a held one, `locked_below`.
     cauldron soup region <id> [--cauldron <name>] [--env <env>] [--depth N] [--limit N] [--max-chars N]
                          [--include-superseded] [--include-rejected]
         One region: its record, the regions it narrows (parents) and that narrow it

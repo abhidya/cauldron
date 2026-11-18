@@ -34,6 +34,7 @@ pub mod key;
 pub mod local;
 pub mod mcp;
 pub mod package;
+pub mod regions;
 pub mod scrub;
 pub mod seam;
 pub mod threads;

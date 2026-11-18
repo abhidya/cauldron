@@ -637,3 +637,157 @@ fn rp5_the_review_bound_is_real() {
         assert!(err.contains("is under 2000"), "{low}: {err}");
     }
 }
+
+/// **A held region is shown everywhere, and holds the command line's own
+/// import too.** A ripple's lock on R-1 (a row in the soup): `soup regions`
+/// marks R-1 `locked`, `mcp status` and `ripples status` (service stopped)
+/// list it; `soup import` into R-1 is refused `region_locked` by name and
+/// writes nothing, into R-2 it lands. With `CAULDRON_OLD_CLI` naming a
+/// build of the release before region locks, that build reads and writes
+/// the same store as before: the rows are a file it never opens, and a
+/// revision is never stored.
+#[test]
+fn rp6_a_held_region_is_shown_and_refuses_the_command_lines_import() {
+    let s = scratch("rp6");
+    assert_eq!(run(&s, &["env", "create", "dev", "--no-engine"]).0, 0);
+    assert_eq!(run(&s, &["create", "kb", "--env", "dev"]).0, 0);
+    let regions = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../claude-code/cauldron/regions.example.json");
+    assert_eq!(run(&s, &["soup", "import", regions.to_str().unwrap(), "--env", "dev", "--cauldron", "kb", "--remint"]).0, 0);
+    let e = env::Environment {
+        root: s.join("root"),
+        root_source: env::paths::Source::CauldronHome,
+        name: "dev".into(),
+        name_source: env::paths::Source::CauldronEnv,
+        data_root: s.join("root/data/dev"),
+    };
+    let c = e.find_cauldron("kb").unwrap().unwrap();
+    let mut t = env::region_locks::Table::default();
+    let h = env::region_locks::Holder { kind: "ripple".into(), run: "run-held".into(), dump: Some("DM-1".into()) };
+    t.acquire(&h, "placing the records drawn from dump DM-1", "ws", &["R-1".to_string()], &[], env::region_locks::now_ms(), 600_000).unwrap();
+    env::region_locks::save(&c, &t).unwrap();
+
+    let (rc, out, err) = run(&s, &["soup", "regions", "--env", "dev", "--cauldron", "kb"]);
+    assert_eq!(rc, 0, "{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let by = |id: &str| v["regions"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap().clone();
+    assert_eq!(by("R-1")["locked"]["holder"]["run"], "run-held", "{out}");
+    assert!(by("R-1")["locked"]["until"].is_string());
+    assert!(by("R-3").get("locked").is_none());
+    let (_, out, _) = run(&s, &["mcp", "status", "--env", "dev"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let kb = v["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap().clone();
+    assert_eq!(kb["region_locks"][0]["regions"], json!(["R-1"]), "{out}");
+    assert_eq!(kb["region_locks"][0]["holder"]["dump"], "DM-1");
+    let (_, out, _) = run(&s, &["ripples", "status", "--env", "dev"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["region_locks"][0]["cauldron"], "kb", "{out}");
+    assert_eq!(v["region_locks"][0]["locks"][0]["regions"], json!(["R-1"]));
+
+    let record = |region: &str, handle: &str| {
+        let p = s.join(format!("{handle}.json").replace(' ', "-"));
+        std::fs::write(&p, json!([{"id": "x", "type": "idea", "state": "idea", "handle": handle, "edges": [{"kind": "in_region", "to": region}]}]).to_string()).unwrap();
+        p
+    };
+    let held = record("R-1", "an idea for the held region");
+    let (rc, out, err) = run(&s, &["soup", "import", held.to_str().unwrap(), "--env", "dev", "--cauldron", "kb", "--remint"]);
+    assert_ne!(rc, 0, "{out}");
+    assert!(err.contains("region `R-1` is locked by a ripple (run run-held, drawing records from dump DM-1)") && err.contains("Nothing was written"), "{err}");
+    // R-2 narrows R-1: held too (a held region covers the regions below
+    // it). R-3 does not.
+    let below = record("R-2", "an idea for the region below");
+    let (rc, _, err) = run(&s, &["soup", "import", below.to_str().unwrap(), "--env", "dev", "--cauldron", "kb", "--remint"]);
+    assert!(rc != 0 && err.contains("region `R-1` is locked"), "{err}");
+    let free = record("R-3", "an idea for the free region");
+    let (rc, _, err) = run(&s, &["soup", "import", free.to_str().unwrap(), "--env", "dev", "--cauldron", "kb", "--remint"]);
+    assert_eq!(rc, 0, "{err}");
+
+    if let Some(old) = std::env::var_os("CAULDRON_OLD_CLI") {
+        let old_run = |args: &[&str]| {
+            let o = Command::new(&old)
+                .args(args)
+                .env("CAULDRON_HOME", s.join("root"))
+                .env("HOME", s.join("home"))
+                .env_remove("CAULDRON_ENV")
+                .env_remove("ENV")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+        };
+        for args in [&["soup", "regions", "--env", "dev", "--cauldron", "kb"][..], &["soup", "nodes", "--env", "dev", "--cauldron", "kb"][..], &["soup", "get", "R-1", "--env", "dev", "--cauldron", "kb"][..], &["mcp", "status", "--env", "dev"][..]] {
+            let (rc, out, err) = old_run(args);
+            assert_eq!(rc, 0, "the older build on {args:?}: {out}\n{err}");
+        }
+        let older = record("R-4", "an idea written by the older build");
+        let (rc, _, err) = old_run(&["soup", "import", older.to_str().unwrap(), "--env", "dev", "--cauldron", "kb", "--remint"]);
+        assert_eq!(rc, 0, "the older build writes the store as before: {err}");
+        // And this build reads it after, the lock still shown.
+        let (rc, out, _) = run(&s, &["soup", "regions", "--env", "dev", "--cauldron", "kb"]);
+        assert_eq!(rc, 0);
+        assert!(out.contains("run-held"), "{out}");
+    } else {
+        eprintln!("rp6: CAULDRON_OLD_CLI names no binary; the older build was not run");
+    }
+}
+
+/// **A damaged region-lock table: refused with the fix, then recovered.**
+/// Truncated, garbage, of the wrong shape, zero bytes: an import, a rename
+/// and a remove are each refused, naming `cauldron soup recover`; while a
+/// ripple run of the cauldron is live in the ripples journal, recover
+/// refuses to set it aside and changes nothing; once it is not, recover
+/// sets the file aside under a dated name and says so, and the import and
+/// the rename go through.
+#[test]
+fn rp7_a_damaged_lock_table_is_refused_with_its_fix_and_recover_sets_it_aside() {
+    let s = scratch("rp7");
+    assert_eq!(run(&s, &["env", "create", "dev", "--no-engine"]).0, 0);
+    let regions = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../claude-code/cauldron/regions.example.json");
+    let record = s.join("idea.json");
+    std::fs::write(&record, json!([{"id": "x", "type": "idea", "state": "idea", "handle": "an idea once the table is set aside", "edges": [{"kind": "in_region", "to": "R-1"}]}]).to_string()).unwrap();
+    let damaged: [(&str, &str); 4] = [("truncated", r#"{"format": 1, "rows": [{"pool": "#), ("garbage", "not a table"), ("wrong shape", r#"{"format": 1, "rows": {"R-1": true}}"#), ("zero bytes", "")];
+    for (n, (what, text)) in damaged.iter().enumerate() {
+        let name = format!("kb{n}");
+        assert_eq!(run(&s, &["create", &name, "--env", "dev"]).0, 0);
+        assert_eq!(run(&s, &["soup", "import", regions.to_str().unwrap(), "--env", "dev", "--cauldron", &name, "--remint"]).0, 0);
+        let soup = s.join(format!("root/data/dev/cauldrons/{name}/soup"));
+        let table = soup.join("region-locks.json");
+        std::fs::write(&table, text).unwrap();
+        let fix = format!("cauldron soup recover --env dev --cauldron {name}");
+        let (rc, out, err) = run(&s, &["soup", "import", record.to_str().unwrap(), "--env", "dev", "--cauldron", &name, "--remint"]);
+        assert_ne!(rc, 0, "{what}: {out}");
+        assert!(err.contains("region locks cannot be read") && err.contains(&fix), "{what}: {err}");
+        for args in [&["rename", name.as_str(), "renamed", "--env", "dev"][..], &["remove", name.as_str(), "--env", "dev", "--yes"][..]] {
+            let (rc, _, err) = run(&s, args);
+            assert!(rc != 0 && err.contains(&fix), "{what} {args:?}: {err}");
+        }
+        // A live run in the ripples journal (this process stands in for it).
+        let journal = s.join("root/data/dev/ripples/runs.jsonl");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let line = |event: &str| json!({"at": at, "run": format!("run-{n}"), "cauldron": name, "dump": "DM-1", "pid": std::process::id(), "event": event}).to_string() + "\n";
+        std::fs::write(&journal, line("started") + &line("call")).unwrap();
+        let (rc, out, err) = run(&s, &["soup", "recover", "--env", "dev", "--cauldron", &name]);
+        assert_ne!(rc, 0, "{what}: {out}");
+        assert!(err.contains("a ripple run of it may be live") && err.contains("cauldron --env dev stop ripples"), "{what}: {err}");
+        assert_eq!(std::fs::read_to_string(&table).unwrap(), *text, "{what}: nothing changed");
+        // The run ended.
+        std::fs::write(&journal, line("started") + &line("call") + &line("done")).unwrap();
+        let (rc, out, err) = run(&s, &["soup", "recover", "--env", "dev", "--cauldron", &name]);
+        assert_eq!(rc, 0, "{what}: {out}\n{err}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["region_locks"]["outcome"], "set_aside", "{what}: {out}");
+        assert!(err.contains("was set aside as") && err.contains("the soup now holds no region lock"), "{what}: {err}");
+        let moved = std::path::PathBuf::from(v["region_locks"]["moved_to"].as_str().unwrap());
+        assert_eq!(moved.parent().unwrap(), soup, "{what}");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), *text, "{what}: kept whole");
+        assert!(!table.exists());
+        let (rc, _, err) = run(&s, &["soup", "import", record.to_str().unwrap(), "--env", "dev", "--cauldron", &name, "--remint"]);
+        assert_eq!(rc, 0, "{what}: {err}");
+        // A second recover finds the table readable and leaves it.
+        let (rc, out, _) = run(&s, &["soup", "recover", "--env", "dev", "--cauldron", &name]);
+        assert_eq!(rc, 0);
+        assert!(serde_json::from_str::<Value>(&out).unwrap().get("region_locks").is_none(), "{out}");
+        let (rc, _, err) = run(&s, &["rename", &name, &format!("done{n}"), "--env", "dev"]);
+        assert_eq!(rc, 0, "{what}: {err}");
+    }
+}

@@ -71,6 +71,9 @@ impl Service for McpSeam {
         Verb::new("RDUMPS", McpSeam::v_rdumps),
         Verb::new("RNOTE", McpSeam::v_rnote),
         Verb::new("RFAIL", McpSeam::v_rfail),
+        Verb::new("RLOCK", McpSeam::v_rlock),
+        Verb::new("RRENEW", McpSeam::v_rrenew),
+        Verb::new("RUNLOCK", McpSeam::v_runlock),
     ];
 
     fn service_env(&self) -> &ServiceEnv {
@@ -142,6 +145,18 @@ impl McpSeam {
 
     fn v_rfail(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
         self.ripple(c, "RFAIL", rest)
+    }
+
+    fn v_rlock(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        self.ripple(c, "RLOCK", rest)
+    }
+
+    fn v_rrenew(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        self.ripple(c, "RRENEW", rest)
+    }
+
+    fn v_runlock(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        self.ripple(c, "RUNLOCK", rest)
     }
 
     fn v_approve(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {

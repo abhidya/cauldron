@@ -10,6 +10,11 @@
 //! It runs that open only when it can prove no other process holds the
 //! store: no live soup daemon in the environment, and the soup's writer
 //! lock taken exclusive. A soup already at rest is not opened at all.
+//!
+//! With that writer lock held, it also sets aside a region-lock table that
+//! cannot be read, once no ripple run of the cauldron is live
+//! (`crate::region_lock::set_aside_damaged`), and says so
+//! (`doc["region_locks"]`, present only when it did).
 
 use std::path::Path;
 
@@ -39,22 +44,40 @@ pub fn recover(t: &Target) -> Result<RecoverReport> {
     let soup = c.soup();
     refuse_live_soup(e)?;
     let _lock = take_writer_lock(c, "recover")?;
+    let locks = crate::region_lock::set_aside_damaged(c, &_lock)?;
+    let locks_said = locks.as_ref().map(|v| {
+        format!(
+            "The region-lock table could not be read ({}), and no ripple run of this cauldron was live, so it was set aside as {}; the soup now holds no region lock. ",
+            v["why"].as_str().unwrap_or(""),
+            v["moved_to"].as_str().unwrap_or("")
+        )
+    });
     let before = spine::offline::rest_check(&soup).map_err(|err| store(format!("REFUSED: cannot read {}'s spine: {err}", c.name)))?;
     let mut doc = json!({
         "env": e.name,
         "cauldron": c.name,
         "before": before,
     });
+    // Only when it set a damaged table aside: a readable one leaves the
+    // output as it always was.
+    if let Some(v) = &locks {
+        doc["region_locks"] = v.clone();
+    }
     let nodes_cmd = format!("cauldron soup nodes --env {} --cauldron {}", e.name, c.name);
     if before.is_empty() {
         doc["outcome"] = json!("at-rest");
         doc["interrupted_import"] = json!("none");
-        doc["note"] = json!("the soup was already at rest; the spine was not opened and no data was written");
+        doc["note"] = json!(if locks.is_some() {
+            "the soup was already at rest; the spine was not opened and no record was written; the damaged region-lock table was set aside"
+        } else {
+            "the soup was already at rest; the spine was not opened and no data was written"
+        });
         doc["instruction"] = json!(format!(
-            "Nothing to recover: no interrupted import is waiting to be settled. This cannot tell you whether an \
+            "{}Nothing to recover: no interrupted import is waiting to be settled. This cannot tell you whether an \
              import you stopped earlier landed (one stopped after it finished landed in full, one stopped before \
              it began writing landed nothing, and an earlier recover printed its own outcome), so check with \
-             `{nodes_cmd}` (newest first) before importing that batch again."
+             `{nodes_cmd}` (newest first) before importing that batch again.",
+            locks_said.clone().unwrap_or_default()
         ));
         return Ok(RecoverReport { doc, settled: true });
     }
@@ -112,6 +135,9 @@ pub fn recover(t: &Target) -> Result<RecoverReport> {
             "The soup is still NOT at rest ({}); do not import anything until a recover reports `recovered`.",
             doc["after"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join("; ")).unwrap_or_default()
         ));
+    }
+    if let Some(said) = locks_said {
+        steps.insert(0, said.trim_end().to_string());
     }
     doc["instruction"] = json!(steps.join(" "));
     Ok(RecoverReport { doc, settled })

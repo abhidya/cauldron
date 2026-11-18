@@ -295,6 +295,7 @@ pub fn land(c: &spine::Cauldron, at: &env::Cauldron, records: &[Value], initiato
         Ok(spine::Outcome::Validated { .. }) if !commit => Ok(Landed::Ok { ids: Default::default(), tx: None }),
         Ok(other) => Err(store(format!("the batch came back {other:?}"))),
         Err(spine::error::SpineError::Refused { witnesses }) => Ok(Landed::Refused { witnesses: serde_json::to_value(witnesses).unwrap_or(Value::Null) }),
+        Err(e @ spine::error::SpineError::RegionLocked { .. }) => Err(crate::region_lock::spine_error(e)),
         Err(e) => Err(store(format!("writing the batch: {e}"))),
     }
 }

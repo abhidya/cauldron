@@ -666,3 +666,37 @@ fn a16_a_busy_refusal_leaves_the_dump_to_the_next_scan() {
     assert_eq!(g.get("kb").unwrap().cauldron_id.as_deref(), Some(id.as_str()));
     assert_eq!(ra::load(&s.data(), "kb").unwrap().unwrap().bound_to.unwrap().id.as_deref(), Some(id.as_str()));
 }
+
+/// **A flood of 500 dumps still respects the caps, and holds no region it
+/// does not need.** 500 dumps, each declaring a region, land while
+/// automatic processing is on: exactly the daily cap's 30 are processed
+/// with one call each, every other one is deferred `daily_cap` with nothing
+/// sent and without ever taking a region lock, and no lock is held at the
+/// end.
+#[test]
+fn a17_a_flood_of_500_dumps_respects_the_caps_and_holds_nothing_after() {
+    let s = Scratch::new("a17");
+    let door = Door::start(&s);
+    on(&s, 0, false);
+    let entries: Vec<Value> = (0..40).map(|_| json!({"output": ideas(1), "usage": usage(1000, 100)})).collect();
+    let script = s.script("a17", json!(entries));
+    let svc = start(&s, &door, &script, &[("CAULDRON_RIPPLES_SCAN_MS", "50".into())]);
+    let ids: Vec<String> = (0..500).map(|i| door.dump(&format!("the published schema needs a drift test, note {i}"))).collect();
+    wait_for("every dump has an outcome", 600, || {
+        let lines = auto_lines(&s);
+        ids.iter().all(|id| lines.iter().any(|l| l["dump"] == id.as_str() && l["event"] == "outcome"))
+    });
+    let processed = ids.iter().filter(|id| s.dump_state(id)["state"] == "processed").count();
+    assert_eq!(processed, 30, "the daily cap of 30 dumps");
+    assert_eq!(calls(&script).len(), 30, "one call each, none for a deferred dump");
+    let deferred: Vec<&String> = ids.iter().filter(|id| s.dump_state(id)["auto"]["reason"] == "budget" || s.dump_state(id)["auto"]["detail"] == "daily_cap").collect();
+    assert_eq!(deferred.len(), 470, "every other dump deferred at the daily cap");
+    let locked_runs: std::collections::BTreeSet<String> = s.journal().iter().filter(|l| l["event"] == "locked").map(|l| l["run"].as_str().unwrap().to_string()).collect();
+    assert_eq!(locked_runs.len(), 30, "only the runs that called took a lock");
+    let now = env::region_locks::now_ms();
+    assert!(env::region_locks::load(&s.target().cauldron).unwrap().live(now).is_empty(), "nothing held after");
+    let k = Service::key(&s);
+    let st = svc.say(&format!("STATUS {k} {}", json!({"cauldron": "kb"})));
+    assert_eq!(st["today"]["per_cauldron"]["kb"]["dumps"], 30, "{}", st["today"]);
+    assert_eq!(st["region_locks"], json!([]), "{}", st["region_locks"]);
+}

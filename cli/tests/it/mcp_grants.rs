@@ -419,6 +419,26 @@ fn g6_rename_and_remove_are_refused_while_something_holds_the_cauldron() {
         drop(fh);
     }
 
+    // A region a ripple holds (its write in progress): both are refused,
+    // naming the region, the holder and until when; once let go, the store
+    // is the whole cauldron's again.
+    {
+        let c = env_dev(&s).find_cauldron("kb").unwrap().unwrap();
+        let mut t = env::region_locks::Table::default();
+        let h = env::region_locks::Holder { kind: "ripple".into(), run: "run-held".into(), dump: Some("DM-1".into()) };
+        t.acquire(&h, "placing the records drawn from dump DM-1", "ws", &["R-1".to_string()], &[], env::region_locks::now_ms(), 600_000).unwrap();
+        env::region_locks::save(&c, &t).unwrap();
+        for (args, verb) in [(&["rename", "kb", "kb2", "--env", "dev"][..], "rename"), (&["remove", "kb", "--env", "dev", "--yes"][..], "remove")] {
+            let o = run(&s, args);
+            assert_ne!(o.rc, 0, "{args:?} went through while a region was held: {}", o.out);
+            assert!(o.err.contains(&format!("`{verb}` acts on the whole of cauldron `kb`, and a write is in progress in part of it")), "{}", o.err);
+            assert!(o.err.contains("region `R-1` is locked by a ripple (run run-held, drawing records from dump DM-1)"), "{}", o.err);
+            unchanged(&s);
+        }
+        t.release("run-held");
+        env::region_locks::save(&c, &t).unwrap();
+    }
+
     // A live tranche in its soup.
     let db = cauldron_dir(&s, "kb").join("soup/spine.db");
     {

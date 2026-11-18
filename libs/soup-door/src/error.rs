@@ -48,6 +48,8 @@ pub enum Code {
     NotATerminal,
     /// A dump is larger than one dump may be.
     TooLarge,
+    /// A write names a region another writer holds (`region_lock`).
+    RegionLocked,
 }
 
 impl Code {
@@ -71,6 +73,7 @@ impl Code {
             Code::GrantStore => "grant_store",
             Code::NotATerminal => "not_a_terminal",
             Code::TooLarge => "too_large",
+            Code::RegionLocked => "region_locked",
         }
     }
 }
@@ -87,11 +90,20 @@ impl fmt::Display for Code {
 pub struct Error {
     pub code: Code,
     pub message: String,
+    /// The refusal's facts for a caller that reads JSON (who holds a
+    /// region, until when), when it has any.
+    pub detail: Option<serde_json::Value>,
 }
 
 impl Error {
     pub fn new(code: Code, message: impl Into<String>) -> Error {
-        Error { code, message: message.into() }
+        Error { code, message: message.into(), detail: None }
+    }
+
+    /// The same error with `detail`.
+    pub fn with_detail(mut self, detail: serde_json::Value) -> Error {
+        self.detail = Some(detail);
+        self
     }
 
     /// `context: <cause and its sources>`, as `anyhow`'s `with_context`

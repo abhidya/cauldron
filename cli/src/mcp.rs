@@ -355,6 +355,9 @@ fn status(args: &[String]) -> Result<i32> {
             "writer_lock_says": soup_door::lock::lock_says(&c),
             "dumps_lock_says": soup_door::dumps::lock_says(&c),
             "dumps": dumps_status(&c, dumps_held.as_deref()),
+            // The regions a writer holds now: a write into one is refused
+            // `region_locked` until it is let go or expires.
+            "region_locks": env::region_locks::view_of(&c),
         });
         if let Some(w) = crate::review::waiting(&e, &c) {
             row["unreviewed"] = w["unreviewed"].clone();

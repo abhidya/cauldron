@@ -36,19 +36,46 @@
 //!   text. A session dump's text is read through `RTEXT` only.
 //! - `RTEXT {cauldron, dump, offset?, turn_offset?, max_chars?}`: one page of
 //!   a session dump's text view (user and assistant text only).
-//! - `RREAD {cauldron, query?, limit?}`: the regions, and the existing
-//!   nodes a search for `query` finds (at most `limit`, default 20).
+//! - `RREAD {cauldron, query?, limit?}`: the regions, each with its head
+//!   revision (`rev`, `spine::regions::region_head_rev`: its boundary and
+//!   identity, never its members), `revs` (every region's), and the
+//!   existing nodes a search for `query` finds (at most `limit`, default
+//!   20).
 //! - `RRUN {cauldron, run}`: whether run `run` already landed, and what.
 //! - `RPUT {cauldron, dump, run, step, package, version, model, records}`:
 //!   the batch held to the stage's limits (`soup_door::ripple`), stamped,
 //!   judged without landing, then landed as ONE write (one spine
 //!   transaction, all or nothing) on the cauldron's writer thread, which is
 //!   the only writer, so nothing else writes the soup between the two;
-//!   then the dump is marked `processed` in its own write. An empty batch
+//!   then the dump is marked `processed` in its own write, and the run's
+//!   region locks are let go. In that one act on the writer thread, before
+//!   anything is written, the regions the records go into (and their
+//!   ancestors, `link`) are taken for the run: one another holder holds
+//!   refuses the put `region_locked`, nothing written, whether or not the
+//!   run declared it. So no record lands in a region the run did not hold
+//!   at the moment it landed. With `revs` (the head revisions the run read,
+//!   from `RLOCK` or `RREAD`), every region a record is placed in, and every
+//!   region the run holds `write`, must still be at the head revision the
+//!   run read, or the put is refused `region_changed` (which regions, read
+//!   and now), nothing written: the run re-plans. A member added to, moved
+//!   in or out of, or superseded in a region never moves its head revision:
+//!   the model is never shown a member. An empty batch
 //!   (the model found nothing worth recording) marks the dump and lands
 //!   nothing. A run that
 //!   already landed is never landed again: the dump is marked and the
 //!   records it landed are answered.
+//! - `RLOCK {cauldron, run, dump?, regions, ttl_secs?}`: hold `regions`
+//!   for `run` (a row each in the soup's region-lock table, `write`, and
+//!   `link` on each of their ancestors) for `ttl_secs` (default 120, at
+//!   most 900), replacing what the run held before; answered with the
+//!   lock and, read on the writer thread at the same moment, what `RREAD`
+//!   answers (the regions and their revisions), which is what the run's
+//!   prompt is built from. Refused `region_locked` (who holds what, since
+//!   when, until when) when another holder holds one of them, changing
+//!   nothing. Expired rows and rows of runs that landed are swept first.
+//! - `RRENEW {cauldron, run, ttl_secs?}`: move the run's rows still held to
+//!   `ttl_secs` from now; an expired row is never revived (`renewed: 0`).
+//! - `RUNLOCK {cauldron, run}`: let go of every row of the run.
 //! - `RCHECK {cauldron, run, step, package, version, model, records,
 //!   dump?}`: a dry run of `RPUT`, for the ripples evaluation: the same
 //!   limits, stamp and judgement (without landing, on the writer thread),
@@ -86,7 +113,7 @@ use crate::secret::Secret;
 use crate::writer::Who;
 
 /// The verbs, in the order the seam lists them.
-pub const VERBS: [&str; 9] = ["RDUMP", "RTEXT", "RREAD", "RRUN", "RPUT", "RCHECK", "RDUMPS", "RNOTE", "RFAIL"];
+pub const VERBS: [&str; 12] = ["RDUMP", "RTEXT", "RREAD", "RRUN", "RPUT", "RCHECK", "RDUMPS", "RNOTE", "RFAIL", "RLOCK", "RRENEW", "RUNLOCK"];
 
 /// The client name every ripple call is audited under.
 pub const CLIENT: &str = "ripples";
@@ -201,6 +228,9 @@ fn run(door: &Door, verb: &str, a: &Map<String, Value>) -> Result<Value, Refusal
         "RCHECK" => rcheck(door, &t, a),
         "RDUMPS" => rdumps(&t, a),
         "RNOTE" | "RFAIL" => rnote(door, &t, verb, a),
+        "RLOCK" => rlock(door, &t, a),
+        "RRENEW" => rrenew(door, &t, a),
+        "RUNLOCK" => runlock(door, &t, a),
         other => Err(usage(format!("`{other}` is not a ripple verb"))),
     }
 }
@@ -238,12 +268,25 @@ fn rtext(t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
     soup_door::dumps::get_text(&t.cauldron, &id, n(a, "offset")?.unwrap_or(0), n(a, "turn_offset")?.unwrap_or(0), max).map_err(refusal)
 }
 
-fn rread(t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+/// The regions a ripple may place records in (every region not retired),
+/// each `{id, handle, boundary, rev}`, and every head revision.
+fn catalogue(t: &Target) -> Result<(Vec<Value>, Value), Refusal> {
     let regions = reads::regions(t, &ReadOpts::default()).map_err(refusal)?;
+    let revs = soup_door::region_lock::head_revisions(&t.cauldron).map_err(refusal)?;
     let regions: Vec<Value> = regions["regions"]
         .as_array()
-        .map(|rs| rs.iter().filter(|r| r["flags"].get("retired").is_none_or(|x| x != &json!(true))).map(|r| json!({"id": r["id"], "handle": r["handle"], "boundary": r["boundary"]})).collect())
+        .map(|rs| {
+            rs.iter()
+                .filter(|r| r["flags"].get("retired").is_none_or(|x| x != &json!(true)))
+                .map(|r| json!({"id": r["id"], "handle": r["handle"], "boundary": r["boundary"], "rev": revs.get(r["id"].as_str().unwrap_or("")).cloned()}))
+                .collect()
+        })
         .unwrap_or_default();
+    Ok((regions, json!(revs)))
+}
+
+fn rread(t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let (regions, revs) = catalogue(t)?;
     let mut related = vec![];
     if let Some(q) = a.get("query").and_then(Value::as_str).filter(|q| !reads::search_terms(q).is_empty()) {
         let o = ReadOpts { limit: Some(n(a, "limit")?.unwrap_or(20).min(50) as usize), ..ReadOpts::default() };
@@ -253,7 +296,7 @@ fn rread(t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
             .map(|rs| rs.iter().map(|r| json!({"id": r["id"], "type": r["type"], "state": r["state"], "handle": r["handle"], "snippet": r["snippet"]})).collect())
             .unwrap_or_default();
     }
-    Ok(json!({"env": t.env.name, "cauldron": t.cauldron.name, "regions": regions, "related": related}))
+    Ok(json!({"env": t.env.name, "cauldron": t.cauldron.name, "regions": regions, "revs": revs, "related": related}))
 }
 
 /// What run `run` landed: its transactions and the ids they created.
@@ -320,6 +363,7 @@ fn rput(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusa
     // A run lands once: one that already landed is answered, never landed again.
     let (txs, ids) = landed(t, &run)?;
     if !txs.is_empty() {
+        let _ = let_go(door, t, &run);
         let marked = mark(door, t, &dump, &run, &step, &ids)?;
         let mut v = base;
         v["outcome"] = json!("already_landed");
@@ -339,6 +383,7 @@ fn rput(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusa
     // nothing lands.
     if records.is_empty() {
         let marked = mark(door, t, &dump, &run, &step, &[])?;
+        let _ = let_go(door, t, &run);
         let mut v = base;
         v["outcome"] = json!("nothing_to_record");
         v["records"] = json!([]);
@@ -354,6 +399,22 @@ fn rput(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusa
         ));
     }
     let records = stamp(&records, &dump, &ripple);
+    let read_revs: Option<Map<String, Value>> = match a.get("revs") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(m)) => Some(m.clone()),
+        Some(_) => return Err(usage("`revs` is an object of region id to revision")),
+    };
+    let placed: Vec<String> = {
+        let mut v: Vec<String> = records
+            .iter()
+            .flat_map(|r| r["edges"].as_array().cloned().unwrap_or_default())
+            .filter(|e| e["kind"] == "in_region")
+            .filter_map(|e| e["to"].as_str().map(str::to_string))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
     let (run2, step2) = (run.clone(), step.clone());
     let landed_doc = door.writers.with(
         t,
@@ -362,6 +423,51 @@ fn rput(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusa
             // Again on the writer thread: two puts of one run never both land.
             if !soup_door::ripple::run_landed(&t.cauldron, &run2).map_err(refusal)?.is_empty() {
                 return Err(Refusal::new("run_landed", "this run landed while this put waited; nothing more was written"));
+            }
+            // Lock, then verify, then write, in this one act (this is the
+            // one writer, so nothing else writes between the three): the
+            // regions the records go into are taken for the run first, and
+            // one another holder holds refuses the put, declared or not.
+            let now_ms = env::region_locks::now_ms();
+            let table = soup_door::region_lock::load(&t.cauldron).map_err(refusal)?;
+            let above = soup_door::region_lock::ancestors(&t.cauldron, &placed).map_err(refusal)?;
+            let mut wanted: Vec<env::region_locks::Want> = placed.iter().map(|r| (reads::DEFAULT_POOL.to_string(), r.clone(), env::region_locks::WRITE.to_string())).collect();
+            wanted.extend(above.iter().map(|r| (reads::DEFAULT_POOL.to_string(), r.clone(), env::region_locks::LINK.to_string())));
+            let others = soup_door::region_lock::conflicts(&t.cauldron, &table, now_ms, Some(&run2), &wanted).map_err(refusal)?;
+            if !others.is_empty() {
+                let mut detail = env::region_locks::refusal_detail(&others, now_ms);
+                detail["at"] = json!("put");
+                return Err(Refusal::with_detail("region_locked", env::region_locks::refusal_text(&others, now_ms), detail));
+            }
+            // The regions the run's plan depended on, at the head revision
+            // the run read: every region a record goes into and every
+            // region the run holds `write`. Their boundary and identity
+            // only: the model is never shown a member, so a member's
+            // change is not staleness.
+            if let Some(read) = &read_revs {
+                let now = soup_door::region_lock::head_revisions(&t.cauldron).map_err(refusal)?;
+                let mut guarded: Vec<String> = placed.clone();
+                for r in table.live(now_ms) {
+                    if r.holder.run == run2 && r.mode == env::region_locks::WRITE && !guarded.contains(&r.region) {
+                        guarded.push(r.region.clone());
+                    }
+                }
+                guarded.sort();
+                let changed: Vec<Value> = guarded
+                    .iter()
+                    .filter(|r| read.get(*r).and_then(Value::as_str) != now.get(*r).map(String::as_str))
+                    .map(|r| json!({"region": r, "read": read.get(r), "now": now.get(r)}))
+                    .collect();
+                if !changed.is_empty() {
+                    return Err(Refusal::with_detail(
+                        "region_changed",
+                        format!(
+                            "{} of the region(s) this run planned against changed after it read them (a boundary or handle rewritten, the region retired, superseded, re-parented or given a child region); nothing was written. Read the regions again and plan again. A member's change never counts here.",
+                            changed.len()
+                        ),
+                        json!({"changed": changed}),
+                    ));
+                }
             }
             // Judged without landing first, then landed: one write.
             for commit in [false, true] {
@@ -377,7 +483,12 @@ fn rput(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusa
                         ))
                     }
                     soup_door::ripple::Landed::Ok { ids, tx } if commit => {
-                        return Ok(json!({"id_map": ids, "tx": tx}));
+                        // Landed: the run's region locks go in the same act
+                        // (a crash before this leaves rows the store already
+                        // knows are done: they are swept).
+                        fault_at("ripple-landed-held");
+                        let released = release(&t.cauldron, &run2);
+                        return Ok(json!({"id_map": ids, "tx": tx, "released": released}));
                     }
                     soup_door::ripple::Landed::Ok { .. } => {}
                 }
@@ -395,11 +506,139 @@ fn rput(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusa
     let marked = mark(door, t, &dump, &run, &step, &ids)?;
     let mut v = base;
     v["outcome"] = json!("landed");
+    v["locks_released"] = doc["released"].clone();
     v["records"] = json!(ids);
     v["id_map"] = doc["id_map"].clone();
     v["tx"] = doc["tx"].clone();
     v["dump_marked"] = json!(marked);
     Ok(v)
+}
+
+/// The longest a region lock is held before it must be renewed, and the
+/// default.
+const TTL_MAX: u64 = 900;
+const TTL_DEFAULT: u64 = 120;
+
+fn ttl_ms(a: &Map<String, Value>) -> Result<i64, Refusal> {
+    let secs = n(a, "ttl_secs")?.unwrap_or(TTL_DEFAULT);
+    if secs == 0 || secs > TTL_MAX {
+        return Err(usage(format!("`ttl_secs` is 1 to {TTL_MAX}")));
+    }
+    Ok(secs as i64 * 1000)
+}
+
+/// Let go of `run`'s rows (on the writer thread); how many there were.
+/// A table that cannot be written is logged: its rows expire.
+fn release(c: &env::Cauldron, run: &str) -> usize {
+    let Ok(mut table) = env::region_locks::load(c) else { return 0 };
+    let n = table.release(run);
+    if n > 0 {
+        if let Err(e) = env::region_locks::save(c, &table) {
+            tracing::warn!(cauldron = %c.name, error = %format!("{e:#}"), "the region locks of a run could not be let go; they expire");
+        }
+    }
+    n
+}
+
+/// [`release`] as its own job on the writer thread.
+fn let_go(door: &Door, t: &Target, run: &str) -> Result<Value, Refusal> {
+    let run = run.to_string();
+    door.writers.with(t, who(), Box::new(move |_c, t| Ok(json!(release(&t.cauldron, &run)))))
+}
+
+/// The table with expired rows and rows of landed runs swept (on the
+/// writer thread).
+fn swept(c: &env::Cauldron, now: i64) -> Result<(env::region_locks::Table, bool), Refusal> {
+    let mut table = soup_door::region_lock::load(c).map_err(refusal)?;
+    let landed = |run: &str| soup_door::ripple::run_landed(c, run).map(|t| !t.is_empty()).unwrap_or(false);
+    let n = table.sweep(now, &landed);
+    // A row read as cut back (too far ahead) is written back cut.
+    let dirty = n > 0 || !table.clamped.is_empty();
+    Ok((table, dirty))
+}
+
+/// **`RLOCK`** (module docs).
+fn rlock(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let run = plain_id(a, "run")?;
+    let dump = match a.get("dump") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(dump_id(a)?),
+    };
+    let ttl = ttl_ms(a)?;
+    let regions: Vec<String> = match a.get("regions") {
+        Some(Value::Array(v)) if !v.is_empty() && v.len() <= 50 && v.iter().all(|x| x.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64)) => {
+            let mut v: Vec<String> = v.iter().filter_map(Value::as_str).map(str::to_string).collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+        _ => return Err(usage("`regions` is a list of 1 to 50 region ids")),
+    };
+    door.writers.with(
+        t,
+        who(),
+        Box::new(move |_c, t| {
+            let now = env::region_locks::now_ms();
+            let (regions_doc, revs) = catalogue(t)?;
+            let known: Vec<&str> = regions_doc.iter().filter_map(|r| r["id"].as_str()).collect();
+            if let Some(r) = regions.iter().find(|r| !known.contains(&r.as_str())) {
+                return Err(usage(format!("`{r}` is not a region of cauldron `{}` (or it is retired)", t.cauldron.name)));
+            }
+            let above = soup_door::region_lock::ancestors(&t.cauldron, &regions).map_err(refusal)?;
+            let (mut table, dirty) = swept(&t.cauldron, now)?;
+            let holder = env::region_locks::Holder { kind: "ripple".into(), run: run.clone(), dump: dump.clone() };
+            let purpose = match &dump {
+                Some(d) => format!("placing the records drawn from dump {d}"),
+                None => "placing a ripple's records".to_string(),
+            };
+            match table.acquire(&holder, &purpose, reads::DEFAULT_POOL, &regions, &above, now, ttl) {
+                Ok(()) => {}
+                Err(rows) => {
+                    if dirty {
+                        let _ = env::region_locks::save(&t.cauldron, &table);
+                    }
+                    let mut rows = rows;
+                    let landed = |run: &str| soup_door::ripple::run_landed(&t.cauldron, run).map(|t| !t.is_empty()).unwrap_or(false);
+                    rows.retain(|r| !landed(&r.holder.run));
+                    return Err(Refusal::with_detail("region_locked", env::region_locks::refusal_text(&rows, now), env::region_locks::refusal_detail(&rows, now)));
+                }
+            }
+            env::region_locks::save(&t.cauldron, &table).map_err(|e| Refusal::new("store", format!("writing the region locks: {e:#}; nothing is held")))?;
+            let mine: Vec<&env::region_locks::Row> = table.rows.iter().filter(|r| r.holder.run == run).collect();
+            Ok(json!({
+                "env": t.env.name, "cauldron": t.cauldron.name, "run": run, "outcome": "locked",
+                "lock": {"regions": regions, "above": above, "since": mine.first().map(|r| r.since.clone()), "until": mine.first().map(|r| r.until.clone()), "ttl_secs": ttl / 1000},
+                "regions": regions_doc, "revs": revs,
+            }))
+        }),
+    )
+}
+
+/// **`RRENEW`** (module docs).
+fn rrenew(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let run = plain_id(a, "run")?;
+    let ttl = ttl_ms(a)?;
+    door.writers.with(
+        t,
+        who(),
+        Box::new(move |_c, t| {
+            let now = env::region_locks::now_ms();
+            let mut table = soup_door::region_lock::load(&t.cauldron).map_err(refusal)?;
+            let n = table.renew(&run, now, ttl);
+            if n > 0 || !table.clamped.is_empty() {
+                env::region_locks::save(&t.cauldron, &table).map_err(|e| Refusal::new("store", format!("writing the region locks: {e:#}")))?;
+            }
+            let until = table.rows.iter().filter(|r| r.holder.run == run && r.live(now)).map(|r| r.until.clone()).max();
+            Ok(json!({"env": t.env.name, "cauldron": t.cauldron.name, "run": run, "outcome": "renewed", "renewed": n, "until": until}))
+        }),
+    )
+}
+
+/// **`RUNLOCK`** (module docs).
+fn runlock(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refusal> {
+    let run = plain_id(a, "run")?;
+    let n = let_go(door, t, &run)?;
+    Ok(json!({"env": t.env.name, "cauldron": t.cauldron.name, "run": run, "outcome": "released", "released": n}))
 }
 
 /// **`RDUMPS`**: the `received` dumps above `after`, oldest first.
@@ -516,8 +755,15 @@ fn rcheck(door: &Door, t: &Target, a: &Map<String, Value>) -> Result<Value, Refu
 /// `CAULDRON_MCP_FAULT=ripple-landed`, the process dies right after a
 /// ripple's records landed and before its dump is marked processed.
 fn fault_point() {
+    fault_at("ripple-landed");
+}
+
+/// Test-only: with `--features fault-injection`, `CAULDRON_MCP_FAULT=<point>`
+/// kills the process at `point` (`ripple-landed-held`: the records landed
+/// and the run's region locks are still in the table).
+fn fault_at(_point: &str) {
     #[cfg(feature = "fault-injection")]
-    if std::env::var("CAULDRON_MCP_FAULT").as_deref() == Ok("ripple-landed") {
+    if std::env::var("CAULDRON_MCP_FAULT").as_deref() == Ok(_point) {
         std::process::abort();
     }
 }

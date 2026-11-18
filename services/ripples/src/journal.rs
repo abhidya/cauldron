@@ -200,6 +200,13 @@ pub struct Charge {
     /// `false` while no `called` line ended it: a call in progress, or one
     /// a kill or a stop cut short, which stays charged at its estimate.
     pub settled: bool,
+    /// A `voided` line names it: its answer was never judged on its merits,
+    /// because another writer changed or held a region the answer went into
+    /// (`region_changed`, `region_locked` at the put). It still counts
+    /// against the cauldron's daily caps, and never against the dump's own
+    /// ([`spent`]), so other writers' activity alone can never use up a
+    /// dump's lifetime cap.
+    pub voided: bool,
 }
 
 /// **Every model call, charged from the moment it began.** A `call` line
@@ -210,6 +217,8 @@ pub struct Charge {
 /// `call` before it counts on its own.
 pub fn charges(lines: &[Value]) -> Vec<Charge> {
     let mut out: Vec<Charge> = Vec::new();
+    // The `call_id` of each charge, by index.
+    let mut ids: Vec<Value> = Vec::new();
     let mut open: Vec<(usize, Value)> = Vec::new();
     let mut dropped: Vec<usize> = Vec::new();
     let s = |v: &Value| v.as_str().unwrap_or("").to_string();
@@ -230,7 +239,9 @@ pub fn charges(lines: &[Value]) -> Vec<Charge> {
                     at: s(&l["at"]),
                     tokens: l["estimated_input_tokens"].as_u64().unwrap_or(0),
                     settled: false,
+                    voided: false,
                 });
+                ids.push(l["call_id"].clone());
             }
             Some("called") => {
                 let run = s(&l["run"]);
@@ -247,7 +258,16 @@ pub fn charges(lines: &[Value]) -> Vec<Charge> {
                         out[i].settled = true;
                     }
                     None if held => {}
-                    None => out.push(Charge { run, cauldron: s(&l["cauldron"]), identity: None, dump: s(&l["dump"]), at: s(&l["at"]), tokens: charged(l), settled: true }),
+                    None => {
+                        out.push(Charge { run, cauldron: s(&l["cauldron"]), identity: None, dump: s(&l["dump"]), at: s(&l["at"]), tokens: charged(l), settled: true, voided: false });
+                        ids.push(l["call_id"].clone());
+                    }
+                }
+            }
+            Some("voided") if !l["call_id"].is_null() => {
+                let run = s(&l["run"]);
+                if let Some(i) = (0..out.len()).rev().find(|i| out[*i].run == run && ids[*i] == l["call_id"]) {
+                    out[i].voided = true;
                 }
             }
             _ => {}
@@ -261,10 +281,55 @@ pub fn charges(lines: &[Value]) -> Vec<Charge> {
     out
 }
 
+/// **How long each region of `cauldron` was held by this journal's runs
+/// within the `window_ms` before `now_ms`**: `{region: ms}`. A hold begins
+/// at a run's `locked` line (its `regions`, the ones held `write`) and ends
+/// at its next `locked`, `unlocked` or `done` line; one with no end yet runs
+/// to `now_ms`. What a ripple's hourly hold budget per region is counted
+/// from.
+pub fn region_hold_ms(lines: &[Value], cauldron: &str, now_ms: i64, window_ms: i64) -> std::collections::BTreeMap<String, i64> {
+    let ms = |l: &Value| chrono::DateTime::parse_from_rfc3339(l["at"].as_str().unwrap_or("")).map(|t| t.timestamp_millis()).ok();
+    let from = now_ms - window_ms;
+    let mut out: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut open: std::collections::HashMap<String, (i64, Vec<String>)> = std::collections::HashMap::new();
+    let mut close = |out: &mut std::collections::BTreeMap<String, i64>, (start, regions): (i64, Vec<String>), end: i64| {
+        let span = (end.min(now_ms) - start.max(from)).max(0);
+        for r in regions {
+            *out.entry(r).or_insert(0) += span;
+        }
+    };
+    for l in lines {
+        if l["cauldron"].as_str() != Some(cauldron) {
+            continue;
+        }
+        let (Some(run), Some(at)) = (l["run"].as_str(), ms(l)) else { continue };
+        match l["event"].as_str() {
+            Some("locked") | Some("unlocked") | Some("done") => {
+                if let Some(h) = open.remove(run) {
+                    close(&mut out, h, at);
+                }
+                if l["event"] == "locked" {
+                    let regions: Vec<String> = l["regions"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+                    if !regions.is_empty() {
+                        open.insert(run.to_string(), (at, regions));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for (_, h) in open.drain() {
+        close(&mut out, h, now_ms);
+    }
+    out
+}
+
 /// **What a dump's run has spent, across every attempt**: `(calls, charged
-/// input tokens)` of every call it began ([`charges`]).
+/// input tokens)` of every call it began ([`charges`]), less the calls
+/// voided by another writer's region change or hold ([`Charge::voided`]):
+/// the dump's own caps count only answers judged on their merits.
 pub fn spent(lines: &[Value], run: &str) -> (u32, u64) {
-    charges(lines).iter().filter(|c| c.run == run).fold((0, 0), |(n, t), c| (n + 1, t + c.tokens))
+    charges(lines).iter().filter(|c| c.run == run && !c.voided).fold((0, 0), |(n, t), c| (n + 1, t + c.tokens))
 }
 
 /// One day's spend of one cauldron.
@@ -368,4 +433,24 @@ pub fn unsettled(lines: &[Value]) -> Vec<Value> {
         }
     }
     open.into_iter().map(|(_, x)| x).collect()
+}
+
+/// **The region locks runs took and did not let go**: every run whose last
+/// `locked` line (with regions) has no `unlocked` line after it, as `(run,
+/// cauldron, dump)`, oldest first. A service killed while a run held its
+/// lock leaves one; [`crate::engine::settle`] lets it go.
+pub fn held_locks(lines: &[Value]) -> Vec<(String, String, String)> {
+    let mut held: Vec<(String, String, String)> = Vec::new();
+    for l in lines {
+        let run = l["run"].as_str().unwrap_or("").to_string();
+        match l["event"].as_str() {
+            Some("locked") if l["regions"].as_array().is_some_and(|r| !r.is_empty()) => {
+                held.retain(|(r, _, _)| *r != run);
+                held.push((run, l["cauldron"].as_str().unwrap_or("").to_string(), l["dump"].as_str().unwrap_or("").to_string()));
+            }
+            Some("unlocked") => held.retain(|(r, _, _)| *r != run),
+            _ => {}
+        }
+    }
+    held
 }

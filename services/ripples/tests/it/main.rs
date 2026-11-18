@@ -14,6 +14,11 @@
 //!   (a fake chassis): a call that fails fast, a failure's stderr written
 //!   nowhere, the turn's token totals, a park at admission held as a
 //!   deferral.
+//! - `regions`: region locks from the run's side: held from before the
+//!   call, a curator's write elsewhere lands meanwhile and one into a held
+//!   region is refused by name, a changed region re-planned once, two runs
+//!   on disjoint regions at once, nothing held after a park, a cap, a
+//!   failure or a kill once the service starts again.
 //! - `scrub`: the secret scrubber's corpus: no known format missed, the
 //!   false-positive rate on prose and code, the stored dump unchanged.
 
@@ -30,3 +35,4 @@ mod eval;
 mod auto;
 mod auto_threads;
 mod scrub;
+mod regions;

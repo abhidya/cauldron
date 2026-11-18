@@ -42,7 +42,10 @@ use shapewire::envelope::Refusal;
 
 /// A soup-door error as a refusal: its stable code and its message.
 pub fn refusal(e: soup_door::Error) -> Refusal {
-    Refusal::new(e.code.as_str(), e.message)
+    match e.detail {
+        Some(d) => Refusal::with_detail(e.code.as_str(), e.message, d),
+        None => Refusal::new(e.code.as_str(), e.message),
+    }
 }
 
 /// The service's directory: `<data root>/mcp`, where the grants, the door
