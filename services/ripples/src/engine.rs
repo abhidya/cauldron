@@ -145,17 +145,7 @@ pub fn cauldron_identity(e: &env::Environment, cauldron: &str) -> String {
 /// the day it was given one still count.
 pub fn cauldron_identities(e: &env::Environment, cauldron: &str) -> Vec<String> {
     match e.find_cauldron(cauldron) {
-        Ok(Some(c)) => {
-            let b = env::ripples_auto::Binding::of(e, &c);
-            if b.id.is_none() && b.created_at.is_none() && b.dir_ino.is_none() {
-                return vec![format!("name:{cauldron}")];
-            }
-            let mut out = vec![format!("id:{}", b.key())];
-            if b.id.is_some() && b.created_at.is_some() {
-                out.push(format!("id:{}", b.legacy_key()));
-            }
-            out
-        }
+        Ok(Some(c)) => env::ripples_auto::spend_identities(e, &c),
         _ => vec![format!("name:{cauldron}")],
     }
 }

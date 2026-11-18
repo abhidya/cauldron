@@ -12,9 +12,13 @@
 //! - `RDUMP`, `RTEXT`, `RREAD`, `RRUN`, `RPUT`, `RCHECK`, `RDUMPS`, `RNOTE`,
 //!   `RFAIL`: the ripple verbs, answered
 //!   only to a line carrying the ripples key (`crate::ripple`);
-//! - `APPROVE`: the owner's approval (or unapproval) of a ripple's records,
-//!   answered only to a line carrying the approval key, which only
-//!   `cauldron soup approve` at a terminal reads (`crate::approve`).
+//! - `DECIDE`: the owner's decision on a ripple's records (approve,
+//!   unapprove, reject, unreject, or approve some and reject others at
+//!   once), answered only to a line carrying the approval key, which only
+//!   the owner's commands at a terminal read (`crate::approve`);
+//! - `APPROVE`: the earlier command line's approval by id (`{cauldron, ids,
+//!   unapprove?}` and nothing else), kept for a command line older than
+//!   `DECIDE`, with the same key.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,6 +67,7 @@ impl Service for McpSeam {
         Verb::new("RPUT", McpSeam::v_rput),
         Verb::new("RCHECK", McpSeam::v_rcheck),
         Verb::new("APPROVE", McpSeam::v_approve),
+        Verb::new("DECIDE", McpSeam::v_decide),
         Verb::new("RDUMPS", McpSeam::v_rdumps),
         Verb::new("RNOTE", McpSeam::v_rnote),
         Verb::new("RFAIL", McpSeam::v_rfail),
@@ -140,7 +145,12 @@ impl McpSeam {
     }
 
     fn v_approve(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
-        c.line(&crate::approve::answer(&self.state, &self.approve, rest))?;
+        c.line(&crate::approve::answer_approve(&self.state, &self.approve, rest))?;
+        Ok(())
+    }
+
+    fn v_decide(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        c.line(&crate::approve::answer_decide(&self.state, &self.approve, rest))?;
         Ok(())
     }
 }

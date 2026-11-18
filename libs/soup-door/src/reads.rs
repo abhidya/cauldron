@@ -25,6 +25,16 @@
 //! record carries no such key, so a store with no ripple record reads
 //! exactly as before. `nodes` and `search` take [`ReadOpts::review`]:
 //! `pending` keeps only unreviewed records, `reviewed` only the rest.
+//!
+//! # Rejected records
+//!
+//! A record a ripple wrote that the owner REJECTED (`meta.rejected` set, by
+//! `cauldron ripples reject` at a terminal) is no longer unreviewed, and
+//! `nodes`, `search` and a region's members leave it out unless
+//! [`ReadOpts::include_rejected`], saying how many they left out
+//! (`rejected_hidden`, present only when there are any). `get` always
+//! answers it, marked `rejected: true`, so its cite to the dump and the
+//! decision stay readable. Nothing is deleted.
 
 use std::collections::BTreeMap;
 
@@ -71,6 +81,9 @@ pub struct ReadOpts {
     /// `nodes`, `search`: `pending` (only unreviewed records) or
     /// `reviewed` (only the others); checked with [`checked_review`].
     pub review: Option<String>,
+    /// `nodes`, `search`, `region`: list rejected records too (they are
+    /// left out, and counted, by default).
+    pub include_rejected: bool,
 }
 
 impl ReadOpts {
@@ -133,6 +146,16 @@ pub fn approved(fields: &BTreeMap<String, spine::pool::FieldValue>) -> bool {
     fields
         .get("meta")
         .and_then(|m| m.value.get("approved"))
+        .is_some_and(|a| !a.is_null() && *a != Value::Bool(false))
+}
+
+/// Does a node's `meta` carry a rejection (`meta.rejected` present and
+/// neither `false` nor `null`)? Only the owner's `cauldron ripples reject`,
+/// at a terminal, writes one.
+pub fn rejected(fields: &BTreeMap<String, spine::pool::FieldValue>) -> bool {
+    fields
+        .get("meta")
+        .and_then(|m| m.value.get("rejected"))
         .is_some_and(|a| !a.is_null() && *a != Value::Bool(false))
 }
 
@@ -244,7 +267,9 @@ pub fn get(t: &Target, ids: &[String], o: &ReadOpts) -> Result<Value> {
             rec.insert("superseded_by".into(), json!(by));
         }
         let created = snap.created_tx(&n.id).map_err(store)?;
-        if created.is_some_and(|h| ripples.contains(&h.to_hex())) && !approved(&n.fields) {
+        if rejected(&n.fields) {
+            rec.insert("rejected".into(), json!(true));
+        } else if created.is_some_and(|h| ripples.contains(&h.to_hex())) && !approved(&n.fields) {
             rec.insert("unreviewed".into(), json!(true));
         }
         records.push(Value::Object(rec));
@@ -273,8 +298,10 @@ struct Entry {
     /// The nodes whose `supersedes` edge points at it, by id; empty for a
     /// node nothing supersedes.
     superseded_by: Vec<String>,
-    /// A ripple wrote it and nobody approved it yet.
+    /// A ripple wrote it and nobody approved or rejected it yet.
     unreviewed: bool,
+    /// The owner rejected it (`meta.rejected`).
+    rejected: bool,
 }
 
 /// Every node of the pool, newest first: by the commit that created it
@@ -296,7 +323,8 @@ fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>,
                 .collect();
             let created = snap.created_tx(&n.id).map_err(store)?;
             let superseded_by = superseded_by(snap, pool, &n.id)?;
-            let unreviewed = created.as_ref().is_some_and(|h| ripples.contains(&h.to_hex())) && !approved(&n.fields);
+            let rejected = rejected(&n.fields);
+            let unreviewed = !rejected && created.as_ref().is_some_and(|h| ripples.contains(&h.to_hex())) && !approved(&n.fields);
             out.push(Entry {
                 id: n.id.0.clone(),
                 node_type: n.node_type.clone(),
@@ -307,6 +335,7 @@ fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>,
                 order: created.and_then(|h| order.get(&h.to_hex()).copied()),
                 superseded_by,
                 unreviewed,
+                rejected,
             });
         }
     }
@@ -331,6 +360,9 @@ fn stated(mut item: Value, n: &Entry) -> Value {
         }
         if n.unreviewed {
             m.insert("unreviewed".into(), json!(true));
+        }
+        if n.rejected {
+            m.insert("rejected".into(), json!(true));
         }
     }
     item
@@ -368,6 +400,25 @@ fn unsuperseded<T>(list: Vec<T>, keep: bool, entry: impl Fn(&T) -> &Entry) -> (V
     let kept: Vec<T> = list.into_iter().filter(|x| entry(x).superseded_by.is_empty()).collect();
     let hidden = before - kept.len();
     (kept, hidden)
+}
+
+/// `list` without its rejected records, unless `keep`; and how many were
+/// left out.
+fn unrejected<T>(list: Vec<T>, keep: bool, entry: impl Fn(&T) -> &Entry) -> (Vec<T>, usize) {
+    if keep {
+        return (list, 0);
+    }
+    let before = list.len();
+    let kept: Vec<T> = list.into_iter().filter(|x| !entry(x).rejected).collect();
+    let hidden = before - kept.len();
+    (kept, hidden)
+}
+
+/// Say how many rejected records a listing left out, when it left any.
+fn say_rejected(doc: &mut Value, hidden: usize) {
+    if hidden > 0 {
+        doc["rejected_hidden"] = json!(hidden);
+    }
 }
 
 /// The prefix of `<PREFIX>-<n>`, the whole id for anything else.
@@ -429,6 +480,7 @@ pub fn nodes(t: &Target, o: &ReadOpts) -> Result<Value> {
         .filter(|n| reviewed_as(o.review.as_deref(), n))
         .collect();
     let (all, hidden) = unsuperseded(all, o.include_superseded, |n| n);
+    let (all, rejected_hidden) = unrejected(all, o.include_rejected, |n| n);
     let total = all.len();
     let (shown, more) = bounded(all, o.limit.unwrap_or(NODES_LIMIT));
     let mut cut = Cut::new(o.max_chars);
@@ -447,6 +499,7 @@ pub fn nodes(t: &Target, o: &ReadOpts) -> Result<Value> {
         })
         .collect();
     let mut doc = json!({"env": e.name, "cauldron": c.name, "pool": pool.as_str(), "total": total, "superseded_hidden": hidden, "nodes": list});
+    say_rejected(&mut doc, rejected_hidden);
     if more > 0 {
         doc["more"] = json!(more);
     }
@@ -556,6 +609,7 @@ pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
     // Most terms matched, then the score, then newest (catalog order).
     hits.sort_by(|x, y| y.0.cmp(&x.0).then(y.1.cmp(&x.1)).then(x.2.cmp(&y.2)));
     let (hits, hidden) = unsuperseded(hits, o.include_superseded, |h| &h.3);
+    let (hits, rejected_hidden) = unrejected(hits, o.include_rejected, |h| &h.3);
     let total = hits.len();
     let (shown, more) = bounded(hits, o.limit.unwrap_or(SEARCH_LIMIT));
     let max = o.max_chars.unwrap_or(SNIPPET_CHARS);
@@ -585,6 +639,7 @@ pub fn search(t: &Target, query: &str, o: &ReadOpts) -> Result<Value> {
         "terms": wanted.iter().map(|t| t.iter().collect::<String>()).collect::<Vec<_>>(),
         "total": total, "superseded_hidden": hidden, "results": list,
     });
+    say_rejected(&mut doc, rejected_hidden);
     if more > 0 {
         doc["more"] = json!(more);
     }
@@ -682,6 +737,7 @@ pub fn region(t: &Target, id: &str, o: &ReadOpts) -> Result<Value> {
     let types = types_of(&handle, None)?;
     let members: Vec<Entry> = catalog(c, &pool, &snap, &types)?.into_iter().filter(|n| n.regions.contains(&id)).collect();
     let (members, hidden) = unsuperseded(members, o.include_superseded, |n| n);
+    let (members, rejected_hidden) = unrejected(members, o.include_rejected, |n| n);
     let total = members.len();
     let (shown, more) = bounded(members, o.limit.unwrap_or(MEMBERS_LIMIT));
     let members: Vec<Value> = shown
@@ -693,6 +749,7 @@ pub fn region(t: &Target, id: &str, o: &ReadOpts) -> Result<Value> {
         "region": record, "parents": parents, "children": children, "relates": relates,
         "members_total": total, "superseded_hidden": hidden, "members": members,
     });
+    say_rejected(&mut doc, rejected_hidden);
     if more > 0 {
         doc["more"] = json!(more);
     }

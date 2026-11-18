@@ -2,7 +2,8 @@
 //! loopback), registered with the warnings attestation as every cauldron
 //! service does. Its verbs, each answering one JSON line:
 //!
-//! - `STATUS <key> {}`: the state (`idle`, `loading`, `ready`), the loaded
+//! - `STATUS <key> {}`: the state (`idle`, `loading`, `ready`, or `unloading`
+//!   while an unload waits for its child to exit), the loaded
 //!   model (name, sha256, context, memory estimate, child pid, port, when it
 //!   was loaded, how long it has been idle and when it unloads), the
 //!   runtime (path, version, build), the settings, the registered names,

@@ -178,19 +178,19 @@ cauldron soup — a cauldron's soup, offline
         Every region: id, handle, boundary, flags, the regions it narrows or relates to,
         and how many nodes sit in it.
     cauldron soup region <id> [--cauldron <name>] [--env <env>] [--depth N] [--limit N] [--max-chars N]
-                         [--include-superseded]
+                         [--include-superseded] [--include-rejected]
         One region: its record, the regions it narrows (parents) and that narrow it
         (children) to --depth levels (default 1), the regions it relates to either way, and
         its direct members (id, type, state, handle), newest first, at most --limit (50).
     cauldron soup nodes [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
                         [--state <s>] [--limit N] [--max-chars N] [--include-superseded]
-                        [--review pending|reviewed]
+                        [--include-rejected] [--review pending|reviewed]
         Nodes as {id, type, state, handle, regions}, newest first (by the spine's commit
         order; one write's nodes by id prefix, then serial, highest first), at most --limit
         (default 50); --region keeps a region's direct members.
     cauldron soup search <query> [--cauldron <name>] [--env <env>] [--region <id>] [--type <t>]
                          [--limit N] [--max-chars N] [--include-superseded]
-                         [--review pending|reviewed]
+                         [--include-rejected] [--review pending|reviewed]
         Lexical search over handles and bodies: every word of the query a term, found
         case-insensitively as a substring; ranked by how many terms match, then handle hits over body hits, then newest.
         Prints {id, type, state, handle, regions, score, snippet}, at most --limit (20);
@@ -223,6 +223,9 @@ cauldron soup — a cauldron's soup, offline
         `next_offset` while there is more.
         --raw prints the whole content, verbatim, and nothing else (--offset and --max-chars
         do not apply): a text dump's text, or a session dump's transcript exactly as stored.
+        To a terminal (not a file or a pipe), its control and invisible characters (escape
+        sequences, bidirectional overrides, zero-width characters) are shown escaped, as
+        \\u{1B}, and its lines are kept.
         --view text (a session dump only) answers only what the person typed and what the
         assistant wrote as text, as turns with `at` (the byte its line starts at), `role` and
         `text`. Everything else is left out and counted in `elided` by kind: tool calls and
@@ -260,9 +263,11 @@ cauldron soup — a cauldron's soup, offline
         again. All in one write, through the running `mcp` service, audited in its
         calls.jsonl. Approving is the owner's act: this runs only with its input and output
         on an interactive terminal, and no option skips that; no MCP tool approves, and a
-        ripple never can. An id that is not a ripple's record, or is already in the asked
-        state, is listed in `skipped` with why. A review flow for sessions comes in a later
-        release.
+        ripple never can. An id that is not a ripple's record, is rejected, or is already in
+        the asked state, is listed in `skipped` with why. `cauldron ripples review` lists
+        the records waiting, and `cauldron ripples approve | reject` decides them by dump,
+        by run or by id. Like those, it needs the running `mcp` service to be this
+        release's or later, and refuses (writing nothing) an older one.
     cauldron soup help
 
   Every verb prints JSON on stdout and exits non-zero on a refusal. Reads open the store
@@ -274,8 +279,12 @@ cauldron soup — a cauldron's soup, offline
   lists them too, each with its `superseded_by`. `total` and `members_total` count what
   is listed, before --limit.
   A record a ripple wrote (`cauldron ripples run`) is unreviewed until its owner approves
-  it (`cauldron soup approve`): every read shows it, marked `unreviewed: true`.
+  or rejects it (`cauldron ripples review | approve | reject`, or `cauldron soup approve`):
+  every read shows it, marked `unreviewed: true`.
   --review pending lists only those; --review reviewed only the rest.
+  A record its owner rejected (`cauldron ripples reject`) is kept, and `get` answers it
+  marked `rejected: true`; `nodes`, `search` and `region`'s members leave it out and say
+  how many they left out in `rejected_hidden`; --include-rejected lists them too.
   `--pool <p>` names another pool than `ws`.
 
   --env and --cauldron may be left out inside a project linked with `cauldron link`: the
@@ -335,6 +344,7 @@ struct Args {
     remint: bool,
     allow_duplicate: bool,
     include_superseded: bool,
+    include_rejected: bool,
     review: Option<String>,
     title: Option<String>,
     source: Option<String>,
@@ -385,6 +395,7 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--remint" => a.remint = true,
             "--allow-duplicate" => a.allow_duplicate = true,
             "--include-superseded" => a.include_superseded = true,
+            "--include-rejected" => a.include_rejected = true,
             "--review" => a.review = Some(soup_door::reads::checked_review(&take(&mut it)?)?),
             "--title" => a.title = Some(take(&mut it)?),
             "--source" => a.source = Some(take(&mut it)?),
@@ -446,7 +457,9 @@ fn print(v: &Value) -> Result<()> {
     if let (Some(from), Some(obj)) = (RESOLVED_FROM.get(), v.as_object_mut()) {
         obj.insert("resolved_from".to_string(), json!(from));
     }
-    println!("{}", serde_json::to_string_pretty(&v)?);
+    // A record's or a dump's text can hold characters a terminal acts on:
+    // they are written as JSON escapes, which mean the same string.
+    println!("{}", soup_door::review::json_for_terminal(&v));
     Ok(())
 }
 
@@ -460,6 +473,7 @@ fn read_opts(a: &Args) -> ReadOpts {
         node_type: a.node_type.clone(),
         state: a.state.clone(),
         include_superseded: a.include_superseded,
+        include_rejected: a.include_rejected,
         review: a.review.clone(),
     }
 }
@@ -476,6 +490,9 @@ fn import(args: &[String]) -> Result<i32> {
         bail!("`cauldron soup import` takes ONE file or directory (got {}); `cauldron soup help`", a.pos.len());
     };
     let records = soup_door::import::read_records(Path::new(input))?;
+    // Checked here, before the batch can be forwarded to a running service
+    // (which may be an older one that does not check it).
+    soup_door::review::refuse_review_flags(&records)?;
     let t = target("import", &a, !a.dry_run)?;
     let opts = ImportOptions {
         pool: a.pool.clone(),
@@ -675,7 +692,7 @@ fn nodes(args: &[String]) -> Result<i32> {
     let a = parse(
         "nodes",
         args,
-        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--state", "--limit", "--max-chars", "--include-superseded", "--review"],
+        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--state", "--limit", "--max-chars", "--include-superseded", "--include-rejected", "--review"],
     )?;
     if let Some(p) = a.pos.first() {
         bail!("`cauldron soup nodes` takes no ids (got `{p}`); `soup get` reads nodes by id");
@@ -689,7 +706,7 @@ fn search(args: &[String]) -> Result<i32> {
     let a = parse(
         "search",
         args,
-        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--limit", "--max-chars", "--include-superseded", "--review"],
+        &["--env", "--cauldron", "-c", "--pool", "--region", "--type", "--limit", "--max-chars", "--include-superseded", "--include-rejected", "--review"],
     )?;
     let query = a.pos.join(" ");
     if soup_door::reads::search_terms(&query).is_empty() {
@@ -701,7 +718,7 @@ fn search(args: &[String]) -> Result<i32> {
 }
 
 fn region(args: &[String]) -> Result<i32> {
-    let a = parse("region", args, &["--env", "--cauldron", "-c", "--pool", "--depth", "--limit", "--max-chars", "--include-superseded"])?;
+    let a = parse("region", args, &["--env", "--cauldron", "-c", "--pool", "--depth", "--limit", "--max-chars", "--include-superseded", "--include-rejected"])?;
     let [id] = a.pos.as_slice() else {
         bail!("`cauldron soup region` takes ONE region id (got {}); `cauldron soup regions` lists them", a.pos.len());
     };
@@ -868,8 +885,9 @@ fn dump_forward(t: &Target, text: &str, a: &Args, pid: u32) -> Result<Option<i32
 
 /// **`cauldron soup approve <id>... --env <e> --cauldron <c> [--unapprove]`**:
 /// the owner's approval of a ripple's records, sent to the running `mcp`
-/// service's `APPROVE` seam verb with the approval key it minted
-/// (`approve.secret`). Refused unless stdin and stdout are an interactive
+/// service's `DECIDE` seam verb with the approval key it minted
+/// (`approve.secret`), as `ripples approve` sends it
+/// (`crate::review::send`). Refused unless stdin and stdout are an interactive
 /// terminal, checked before the key is read, as `cauldron mcp grant` is.
 fn approve(args: &[String]) -> Result<i32> {
     use std::io::IsTerminal;
@@ -901,20 +919,8 @@ fn approve(args: &[String]) -> Result<i32> {
              {command}"
         );
     }
-    let found = match crate::mcp_door::find(&e) {
-        Ok(f) => f,
-        Err(why) => bail!(
-            "REFUSED: the `mcp` service writes the approval, and {}. Nothing was written. Start it: `{}`.",
-            why.say(),
-            crate::mcp_door::start_command(&e.name)
-        ),
-    };
-    let key_path = soup_door::grants::store_dir(&e).join("approve.secret");
-    let key = std::fs::read_to_string(&key_path)
-        .with_context(|| format!("reading the approval key {} (the `mcp` service mints it when it starts)", key_path.display()))?;
-    let body = serde_json::json!({"cauldron": cauldron, "ids": a.pos, "unapprove": a.unapprove});
-    let answer = crate::mcp_door::seam_ask(&found.seam, &format!("APPROVE {} {body}", key.trim()))?;
-    let v: serde_json::Value = serde_json::from_str(&answer).with_context(|| format!("the mcp service answered `{answer}`"))?;
+    let body = serde_json::json!({"action": word, "ids": a.pos, "from": "cauldron soup approve"});
+    let v = crate::review::send(&e, cauldron, body)?;
     print(&v)?;
     Ok(if v["ok"] == serde_json::json!(true) { 0 } else { 1 })
 }
@@ -1008,11 +1014,19 @@ fn dump_get(args: &[String]) -> Result<i32> {
         print(&soup_door::dumps::get(&t.cauldron, id, a.offset.unwrap_or(0) as u64, max)?)?;
         return Ok(0);
     }
-    // The whole content, verbatim.
-    use std::io::{Read, Write};
+    // The whole content, verbatim, to a file or a pipe. To a terminal, the
+    // characters a terminal would act on (escape sequences, bidirectional
+    // overrides, invisible characters) are shown escaped instead, lines kept.
+    use std::io::{IsTerminal, Read, Write};
     let mut content = soup_door::dumps::open_content(&t.cauldron, id)?;
     let mut out = std::io::stdout().lock();
-    std::io::copy(&mut (&mut content).take(u64::MAX), &mut out)?;
+    if std::io::stdout().is_terminal() {
+        let mut bytes = Vec::new();
+        (&mut content).take(u64::MAX).read_to_end(&mut bytes)?;
+        out.write_all(soup_door::review::shown(&String::from_utf8_lossy(&bytes), true).as_bytes())?;
+    } else {
+        std::io::copy(&mut (&mut content).take(u64::MAX), &mut out)?;
+    }
     out.flush()?;
     Ok(0)
 }

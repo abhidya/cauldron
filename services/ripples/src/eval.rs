@@ -264,6 +264,9 @@ fn one_run(ctx: &Ctx, spec: &Spec, f: &Fixture, backend: &str, model: &str, k: u
     }
     let call_id = format!("{}-{}-{backend}-{k}", spec.id, f.label);
     let ledger = ctx.journal.eval_ledger();
+    // The evaluations' daily cap counts the cauldron by its identity, as a
+    // run's does: a rename does not reset it.
+    let identities = crate::engine::cauldron_identities(&ctx.env, &spec.cauldron);
     let dump_id = format!("fixture:{}", f.label);
     let sink: crate::inference::Sink = {
         let (path, call_id, cauldron, dump, eval_id) = (ledger.path().to_path_buf(), call_id.clone(), spec.cauldron.clone(), dump_id.clone(), spec.id.clone());
@@ -311,11 +314,11 @@ fn one_run(ctx: &Ctx, spec: &Spec, f: &Fixture, backend: &str, model: &str, k: u
                 if made >= max {
                     return Err(format!("the evaluation's bound of {max} threads calls (`--max-calls`) is reached; nothing more was sent"));
                 }
-                let day = crate::journal::day(lines, &spec.cauldron, None, &crate::journal::today());
+                let day = crate::journal::day_of(lines, &spec.cauldron, &identities, &crate::journal::today());
                 if day.tokens + this_est > ctx.caps.day_tokens {
                     return Err(format!("the next call would pass the evaluations' own daily cap of {} input tokens for cauldron `{}` ({} spent today); nothing more was sent", ctx.caps.day_tokens, spec.cauldron, day.tokens));
                 }
-                Ok(json!({"eval_id": spec.id, "call_id": n, "model": model, "estimated_input_tokens": this_est}))
+                Ok(json!({"eval_id": spec.id, "call_id": n, "model": model, "estimated_input_tokens": this_est, "cauldron_id": identities[0]}))
             });
             match begun {
                 Ok(Ok(())) => {}

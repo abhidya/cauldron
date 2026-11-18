@@ -104,17 +104,22 @@ fn rp1_ripples_without_its_service() {
     let (rc, _, err) = run(&s, &["soup", "approve", "C-1", "--env", "dev"]);
     assert_ne!(rc, 0);
     assert!(err.contains("only as flags"), "{err}");
-    let (rc, _, err) = run(&s, &["ripples", "approve", "C-1", "--env", "dev", "--cauldron", "kb"]);
-    assert_eq!(rc, 2);
-    assert!(err.contains("no verb `approve`"), "{err}");
-    // The top-level help names `soup approve` and no `ripples approve`.
+    // `ripples approve | reject` are the owner's acts at a terminal too.
+    let (rc, out, err) = run(&s, &["ripples", "approve", "C-1", "--env", "dev", "--cauldron", "kb"]);
+    assert_ne!(rc, 0);
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("REFUSED: approving a ripple's records is the owner's act at a terminal") && err.contains("cauldron ripples approve C-1 --env dev --cauldron kb"), "{err}");
+    let (rc, _, err) = run(&s, &["ripples", "reject", "--dump", "DM-1", "--env", "dev", "--cauldron", "kb"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("REFUSED: rejecting a ripple's records") && err.contains("cauldron ripples reject --dump DM-1 --env dev --cauldron kb"), "{err}");
+    // The top-level help names `soup approve` and `ripples review | approve | reject`.
     let (_, _, listing) = run(&s, &["help"]);
     let line = |verb: &str| listing.lines().find(|l| l.trim_start().starts_with(&format!("{verb} "))).unwrap_or_else(|| panic!("{listing}")).to_string();
     assert!(line("soup").contains("| approve"), "{listing}");
-    assert!(!line("ripples").contains("| approve") && line("ripples").contains("run | status"), "{listing}");
+    assert!(line("ripples").contains("run | status") && line("ripples").contains("review | approve | reject"), "{listing}");
     let (rc, usage, _) = run(&s, &["--help"]);
     assert_eq!(rc, 0);
-    assert!(usage.contains("dump-remove|approve") && !usage.contains("ripples approve"), "{usage}");
+    assert!(usage.contains("dump-remove|approve"), "{usage}");
     // `status` reads the journal.
     let dir = s.join("root/data/dev/ripples");
     std::fs::create_dir_all(&dir).unwrap();
@@ -371,4 +376,264 @@ fn rp3_on_follows_no_remove_rename_or_copy() {
     assert_eq!(r["automatic"]["takes_this_dump"], false, "{r}");
     assert!(r["automatic"]["void"].as_str().unwrap().contains("environment `dev`"), "{r}");
     let _ = std::fs::remove_dir_all(&s);
+}
+
+/// Records a ripple wrote, straight through the spine (what the MCP door's
+/// ripple seam lands), each citing `dump` and carrying `meta.ripple`; one
+/// write per call, so one run. Answers the ids, in `labels` order.
+pub(crate) fn ripple_write(soup: &std::path::Path, run: &str, dump: &str, model: &str, records: &[(&str, &str, &str)]) -> Vec<String> {
+    use spine::envelope::{Envelope, Initiator, Instrument, Mode, Provenance, RippleKind, ENVELOPE_FORMAT_VERSION};
+    let c = spine::Cauldron::open(soup, spine::config::SpineConfig::default()).unwrap();
+    let mut lines = vec!["MATCH (r: ws/region { id: $r })".to_string()];
+    let mut bindings: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    bindings.insert("r".into(), json!("R-1"));
+    bindings.insert("m".into(), json!({"cites": [{"kind": "dump", "id": dump}], "ripple": {"package": "dump", "version": "v1", "run": run, "model": model}}));
+    let mut ret = vec![];
+    for (i, (ty, handle, body)) in records.iter().enumerate() {
+        let state = match *ty {
+            "idea" => "idea",
+            "task" => "ready",
+            _ => "open",
+        };
+        lines.push(format!("CREATE (n{i}: ws/{ty} {{ state: \"{state}\", handle: $h{i}, body: $b{i}, meta: $m }})"));
+        lines.push(format!("CREATE (n{i}) -[in_region]-> (r)"));
+        bindings.insert(format!("h{i}"), json!(handle));
+        bindings.insert(format!("b{i}"), json!(body));
+        ret.push(format!("n{i}.id"));
+    }
+    lines.push(format!("RETURN {}", ret.join(", ")));
+    let env = Envelope {
+        statement: lines.join("\n"),
+        bindings,
+        format_version: ENVELOPE_FORMAT_VERSION,
+        provenance: Provenance {
+            initiator: Initiator::Ripple { kind: RippleKind::TypeTwo, run_id: run.into(), step_id: "put".into(), scope: vec![] },
+            instrument: Instrument { name: "test".into(), version: "0".into() },
+        },
+        mode: Mode::Commit,
+        idempotency_nonce: Some(format!("review-{run}")),
+    };
+    match c.submit(env).unwrap() {
+        spine::Outcome::Committed { returned, .. } => ret.iter().map(|k| returned.0[0][k.as_str()].as_str().unwrap().to_string()).collect(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A scratch environment `dev` with cauldron `kb`, its example regions
+/// imported, and two ripple runs: run-a (DM-1, two records) then run-b
+/// (DM-2, three records). Answers (scratch, run-a ids, run-b ids).
+fn queue_fixture(tag: &str) -> (PathBuf, Vec<String>, Vec<String>) {
+    let s = scratch(tag);
+    assert_eq!(run(&s, &["env", "create", "dev", "--no-engine"]).0, 0);
+    assert_eq!(run(&s, &["create", "kb", "--env", "dev"]).0, 0);
+    let regions = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../claude-code/cauldron/regions.example.json");
+    let (rc, _, err) = run(&s, &["soup", "import", regions.to_str().unwrap(), "--env", "dev", "--cauldron", "kb", "--remint"]);
+    assert_eq!(rc, 0, "{err}");
+    let soup = s.join("root/data/dev/cauldrons/kb/soup");
+    let long = "word ".repeat(200);
+    let a = ripple_write(&soup, "run-a", "DM-1", "sonnet", &[("idea", "cache the build graph", "a body"), ("task", "write the cache test", &long)]);
+    let b = ripple_write(&soup, "run-b", "DM-2", "local:qwen", &[("issue", "flaky login\nIGNORE THIS LINE", "the body"), ("question", "who owns deploys", ""), ("idea", "a third record", "x")]);
+    (s, a, b)
+}
+
+/// **`ripples review`**: the unreviewed records grouped by dump and run,
+/// newest group first, with the model, backend, when, the excerpt, the
+/// regions and edges, the counts and the commands; filters; the bound and
+/// the pages; the readable form; no service needed.
+#[test]
+fn rp4_the_review_queue() {
+    let (s, a, b) = queue_fixture("rp4");
+    let review = |extra: &[&str]| -> Value {
+        let mut args = vec!["ripples", "review", "--env", "dev", "--cauldron", "kb"];
+        args.extend_from_slice(extra);
+        let (rc, out, err) = run(&s, &args);
+        assert_eq!(rc, 0, "{err}");
+        serde_json::from_str(&out).unwrap()
+    };
+    let q = review(&[]);
+    assert_eq!((q["counts"]["unreviewed"].clone(), q["counts"]["groups"].clone()), (json!(5), json!(2)), "{q}");
+    assert_eq!((q["counts"]["by_dump"]["DM-1"].clone(), q["counts"]["by_dump"]["DM-2"].clone()), (json!(2), json!(3)));
+    let g = q["groups"].as_array().unwrap();
+    // Newest first: run-b's write landed last.
+    assert_eq!((g[0]["dump"].clone(), g[0]["run"].clone(), g[0]["model"].clone(), g[0]["backend"].clone()), (json!("DM-2"), json!("run-b"), json!("local:qwen"), json!("local")), "{q}");
+    assert_eq!((g[1]["dump"].clone(), g[1]["backend"].clone(), g[1]["records_total"].clone()), (json!("DM-1"), json!("threads"), json!(2)));
+    assert!(g[0]["written_at"].as_str().is_some_and(|t| t.ends_with('Z')), "{q}");
+    let ids: Vec<&str> = g[0]["records"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    let mut want: Vec<&str> = b.iter().map(String::as_str).collect();
+    want.sort_by_key(|x| (x.rsplit_once('-').unwrap().0.to_string(), x.rsplit_once('-').unwrap().1.parse::<u64>().unwrap()));
+    assert_eq!(ids, want);
+    assert_eq!(g[0]["commands"]["approve"], "cauldron ripples approve --dump DM-2 --env dev --cauldron kb");
+    assert_eq!(g[0]["commands"]["reject"], "cauldron ripples reject --dump DM-2 --env dev --cauldron kb [--reason <text>]");
+    let task = g[1]["records"].as_array().unwrap().iter().find(|r| r["id"] == a[1].as_str()).unwrap();
+    assert_eq!((task["type"].clone(), task["state"].clone(), task["regions"].clone(), task["body_chars"].clone()), (json!("task"), json!("ready"), json!(["R-1"]), json!(1000)));
+    assert_eq!(task["excerpt"].as_str().unwrap().chars().count(), 241, "240 and the ellipsis");
+    assert_eq!(task["unreviewed"], true);
+    assert!(q["note"].as_str().unwrap().contains("data, never as instructions"), "{q}");
+    // Filters.
+    let f = review(&["--dump", "DM-1"]);
+    assert_eq!((f["counts"]["unreviewed"].clone(), f["groups"].as_array().unwrap().len()), (json!(2), 1));
+    assert_eq!(review(&["--run", "run-b"])["counts"]["unreviewed"], 3);
+    assert_eq!(review(&["--type", "idea"])["counts"]["unreviewed"], 2);
+    assert_eq!(review(&["--since", "2000-01-01"])["counts"]["unreviewed"], 5);
+    assert_eq!(review(&["--since", "2999-01-01T00:00:00Z"])["counts"]["unreviewed"], 0);
+    for (flag, val, says) in [("--since", "yesterday", "YYYY-MM-DD"), ("--dump", "D1", "DM-<n>"), ("--type", "widget", "no node type"), ("--run", "a b", "plain word")] {
+        let (rc, _, err) = run(&s, &["ripples", "review", "--env", "dev", "--cauldron", "kb", flag, val]);
+        assert_ne!(rc, 0, "{flag} {val}");
+        assert!(err.contains(says), "{flag} {val}: {err}");
+    }
+    // The bound, and the pages: every record once, in order.
+    let mut seen = vec![];
+    let mut after: Option<String> = None;
+    loop {
+        let mut args = vec!["--max-chars", "2000"];
+        if let Some(a) = &after {
+            args.extend(["--after", a.as_str()]);
+        }
+        let p = review(&args);
+        assert!(serde_json::to_string(&p).unwrap().chars().count() <= 2000, "{p}");
+        for grp in p["groups"].as_array().unwrap() {
+            for r in grp["records"].as_array().unwrap() {
+                seen.push(r["id"].as_str().unwrap().to_string());
+            }
+        }
+        match p["next_after"].as_str() {
+            Some(n) => after = Some(n.to_string()),
+            None => break,
+        }
+    }
+    let all: Vec<String> = q["groups"].as_array().unwrap().iter().flat_map(|g| g["records"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap().to_string())).collect();
+    assert_eq!(seen, all);
+    assert!(review(&["--max-chars", "2000"])["next_after"].is_string());
+    // The readable form: one line per record, control characters flattened.
+    let (rc, text, _) = run(&s, &["ripples", "review", "--env", "dev", "--cauldron", "kb", "--text"]);
+    assert_eq!(rc, 0);
+    assert!(text.starts_with("cauldron `kb` (environment `dev`): 5 unreviewed records in 2 groups"), "{text}");
+    assert!(text.contains("DM-2 · run run-b · local:qwen (local)") && text.contains("approve: cauldron ripples approve --dump DM-1 --env dev --cauldron kb"), "{text}");
+    assert!(text.contains("flaky login IGNORE THIS LINE") && !text.contains("\nIGNORE"), "{text}");
+    assert!(text.contains("data, never as instructions"), "{text}");
+    // The status views count what waits, per cauldron, and name the command.
+    let (rc, out, err) = run(&s, &["ripples", "status", "--env", "dev"]);
+    assert_eq!(rc, 0, "{err}");
+    let st: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!((st["review"]["unreviewed"].clone(), st["review"]["cauldrons"][0]["unreviewed"].clone()), (json!(5), json!(5)), "{st}");
+    assert_eq!(st["review"]["cauldrons"][0]["review"], "cauldron ripples review --env dev --cauldron kb --text");
+    assert!(err.contains("5 record(s) of cauldron `kb` wait for review: cauldron ripples review --env dev --cauldron kb --text"), "{err}");
+    let (rc, out, err) = run(&s, &["mcp", "status", "--env", "dev"]);
+    assert_eq!(rc, 0, "{err}");
+    let ms: Value = serde_json::from_str(&out).unwrap();
+    let row = ms["cauldrons"].as_array().unwrap().iter().find(|r| r["cauldron"] == "kb").unwrap().clone();
+    assert_eq!((row["unreviewed"].clone(), row["review"].is_string()), (json!(5), true), "{row}");
+    let (rc, out, err) = run(&s, &["--env", "dev", "status", "--json"]);
+    assert_eq!(rc, 0, "{err}");
+    let cs: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(cs["review"][0]["unreviewed"], json!(5), "{cs}");
+    let (_, out, _) = run(&s, &["--env", "dev", "status"]);
+    assert!(out.contains("cauldron kb: 5 record(s) a ripple wrote wait for review: cauldron ripples review --env dev --cauldron kb --text"), "{out}");
+    // Both flags are needed.
+    let (rc, _, err) = run(&s, &["ripples", "review", "--env", "dev"]);
+    assert_ne!(rc, 0);
+    assert!(err.contains("--env <env> --cauldron <name>"), "{err}");
+    let _ = std::fs::remove_dir_all(&s);
+}
+
+/// One record a ripple wrote, in R-1, with a `ref` edge to each of `refs`.
+fn ripple_write_refs(soup: &std::path::Path, run: &str, dump: &str, handle: &str, body: &str, refs: &[String]) -> String {
+    use spine::envelope::{Envelope, Initiator, Instrument, Mode, Provenance, RippleKind, ENVELOPE_FORMAT_VERSION};
+    let c = spine::Cauldron::open(soup, spine::config::SpineConfig::default()).unwrap();
+    let mut lines = vec!["MATCH (r: ws/region { id: $r })".to_string()];
+    let mut bindings: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    bindings.insert("r".into(), json!("R-1"));
+    for (k, id) in refs.iter().enumerate() {
+        lines.push(format!("MATCH (x{k}: ws/idea {{ id: $x{k} }})"));
+        bindings.insert(format!("x{k}"), json!(id));
+    }
+    bindings.insert("m".into(), json!({"cites": [{"kind": "dump", "id": dump}], "ripple": {"package": "dump", "version": "v1", "run": run, "model": "sonnet"}}));
+    lines.push("CREATE (n: ws/idea { state: \"idea\", handle: $h, body: $b, meta: $m })".into());
+    lines.push("CREATE (n) -[in_region]-> (r)".into());
+    for k in 0..refs.len() {
+        lines.push(format!("CREATE (n) -[ref]-> (x{k})"));
+    }
+    lines.push("RETURN n.id".into());
+    bindings.insert("h".into(), json!(handle));
+    bindings.insert("b".into(), json!(body));
+    let env = Envelope {
+        statement: lines.join("\n"),
+        bindings,
+        format_version: ENVELOPE_FORMAT_VERSION,
+        provenance: Provenance {
+            initiator: Initiator::Ripple { kind: RippleKind::TypeTwo, run_id: run.into(), step_id: "put".into(), scope: vec![] },
+            instrument: Instrument { name: "test".into(), version: "0".into() },
+        },
+        mode: Mode::Commit,
+        idempotency_nonce: Some(format!("review-{run}")),
+    };
+    match c.submit(env).unwrap() {
+        spine::Outcome::Committed { returned, .. } => returned.0[0]["n.id"].as_str().unwrap().to_string(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// **`ripples review --max-chars` is a bound**, for JSON and for `--text`,
+/// at every limit, including below the size of one record: whole records
+/// while they fit; one record longer than the bound is cut (its longest
+/// fields, then its edges) and `truncated` says what was cut, with paths
+/// from the answer's top; a smaller limit gives a smaller answer; under the
+/// floor the bound is refused, as `soup dump-get` refuses its own.
+#[test]
+fn rp5_the_review_bound_is_real() {
+    let s = scratch("rp5");
+    assert_eq!(run(&s, &["env", "create", "dev", "--no-engine"]).0, 0);
+    assert_eq!(run(&s, &["create", "kb", "--env", "dev"]).0, 0);
+    let regions = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../claude-code/cauldron/regions.example.json");
+    assert_eq!(run(&s, &["soup", "import", regions.to_str().unwrap(), "--env", "dev", "--cauldron", "kb", "--remint"]).0, 0);
+    let soup = s.join("root/data/dev/cauldrons/kb/soup");
+    let many: Vec<(String, String, String)> = (0..80).map(|i| ("idea".to_string(), format!("bulk record {i} {}", "y".repeat(80)), "z".repeat(300))).collect();
+    let many: Vec<(&str, &str, &str)> = many.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str())).collect();
+    let targets = ripple_write(&soup, "run-a", "DM-1", "sonnet", &many);
+    let big = ripple_write_refs(&soup, "run-b", "DM-2", &format!("many edges {}", "h".repeat(200)), &"b".repeat(5000), &targets);
+    let ask = |extra: &[&str]| -> (i32, String, String) {
+        let mut args = vec!["ripples", "review", "--env", "dev", "--cauldron", "kb"];
+        args.extend_from_slice(extra);
+        run(&s, &args)
+    };
+    let whole: Value = serde_json::from_str(&ask(&["--max-chars", "50000"]).1).unwrap();
+    let rec = whole["groups"][0]["records"][0].clone();
+    assert_eq!(rec["id"], json!(big), "the newest record first");
+    let one = serde_json::to_string(&rec).unwrap().chars().count();
+    assert!(one > 2600, "the record is longer than the smaller bounds: {one}");
+    let mut sizes = vec![];
+    for limit in [2000usize, 2600, 4000, 8000, 12000] {
+        let l = limit.to_string();
+        let (rc, out, err) = ask(&["--max-chars", &l]);
+        assert_eq!(rc, 0, "{limit}: {err}");
+        let n = out.trim_end().chars().count();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let compact = serde_json::to_string(&v).unwrap().chars().count();
+        assert!(compact <= limit, "{limit}: {compact}");
+        assert!(v["shown"].as_u64().unwrap() >= 1, "{limit}: at least one record: {v}");
+        if limit < one {
+            let t = &v["truncated"];
+            let named = t["fields"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).chain(t["dropped_from"].as_object().into_iter().flat_map(|d| d.keys().map(String::as_str))).collect::<Vec<_>>();
+            assert!(!named.is_empty() && named.iter().all(|p| p.starts_with("/groups/0/records/0/")), "{limit}: {t}");
+            assert!(t["dropped_from"]["/groups/0/records/0/edges"].as_u64().is_some_and(|n| n > 0), "{limit}: its edges first: {t}");
+            assert_eq!(v["groups"][0]["records"][0]["id"], json!(big), "{limit}: the cut record keeps its id");
+            assert_eq!(v["next_after"], json!(big), "{limit}: the next page starts after it");
+        }
+        let (rc, text, err) = ask(&["--max-chars", &l, "--text"]);
+        assert_eq!(rc, 0, "{limit}: {err}");
+        assert!(text.chars().count() <= limit, "{limit}: the text is bounded too: {}", text.chars().count());
+        assert!(text.contains(&big), "{limit}: {text}");
+        sizes.push((compact, n));
+    }
+    for w in sizes.windows(2) {
+        assert!(w[0].0 < w[1].0, "a smaller limit, a smaller answer: {sizes:?}");
+    }
+    for low in ["1999", "256", "1"] {
+        let (rc, _, err) = ask(&["--max-chars", low]);
+        assert_ne!(rc, 0, "{low}");
+        assert!(err.contains(&format!("max_chars {low} is under 2000")), "{low}: {err}");
+        let (rc, _, err) = ask(&["--max-chars", low, "--text"]);
+        assert_ne!(rc, 0, "{low}");
+        assert!(err.contains("is under 2000"), "{low}: {err}");
+    }
 }

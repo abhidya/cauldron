@@ -213,8 +213,13 @@ impl Drop for Service {
 impl Service {
     /// Started as `cauldron start mcp` starts it.
     fn start(s: &Scratch) -> Service {
+        Service::start_bin(s, &service_bin())
+    }
+
+    /// `bin` (a `cauldron-mcp`) started as `cauldron start mcp` starts it.
+    fn start_bin(s: &Scratch, bin: &Path) -> Service {
         let log = std::fs::File::create(s.0.join(format!("service-{}.log", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))).unwrap();
-        let bin = service_bin();
+        let bin = bin.to_path_buf();
         let child = Command::new(&bin)
             .env("CAULDRON_SERVICE", "mcp")
             .env("CAULDRON_ENV", "dev")
@@ -1172,5 +1177,637 @@ fn d6_a_batch_is_answered_by_the_bridge_and_a_placeholder_session_id_is_this_ses
     assert_eq!((r["structuredContent"]["session_id"].clone(), r["structuredContent"]["sha256"].clone()), (json!("sess-c"), json!(sha256_hex(&tc))));
     let (rc, _, err) = b.finish();
     assert_eq!(rc, 0, "{err}");
+    svc.stop();
+}
+
+// ------------------------------------------------------------- the review
+
+impl Scratch {
+    /// The verb on a pseudo-terminal (`script -q /dev/null cauldron <args>`,
+    /// the in-test way to give a command a terminal), with `input` typed in
+    /// line by line, each once the terminal shows `prompt_marker` again (or
+    /// at once when there is none). Everything it prints arrives on stdout.
+    fn on_tty(&self, args: &[&str], pids: &[u32], input: &[&str], prompt_marker: Option<&str>) -> Out {
+        use std::io::Read;
+        let mut full = vec!["-q", "/dev/null", CAULDRON];
+        full.extend_from_slice(args);
+        let cmd = self.command(&[], pids);
+        let mut child = Command::new("/usr/bin/script");
+        child.args(&full).current_dir(self.0.join("work"));
+        for (k, v) in cmd.get_envs() {
+            match v {
+                Some(v) => child.env(k, v),
+                None => child.env_remove(k),
+            };
+        }
+        let mut child = child.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader = {
+            let (out, mut stdout) = (out.clone(), child.stdout.take().unwrap());
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = stdout.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    out.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+            })
+        };
+        let mut stdin = child.stdin.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for (i, line) in input.iter().enumerate() {
+            if let Some(m) = prompt_marker {
+                loop {
+                    let seen = String::from_utf8_lossy(&out.lock().unwrap()).matches(m).count();
+                    if seen > i || child.try_wait().unwrap().is_some() || Instant::now() > deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            let _ = stdin.write_all(format!("{line}\n").as_bytes());
+        }
+        let status = child.wait().unwrap();
+        drop(stdin);
+        reader.join().unwrap();
+        let text = String::from_utf8_lossy(&out.lock().unwrap()).replace("\r\n", "\n");
+        Out { rc: status.code().unwrap_or(-1), out: text, err: String::new() }
+    }
+
+    /// `ripples review` (JSON).
+    fn queue(&self, extra: &[&str]) -> Value {
+        let mut a = vec!["ripples", "review", "--env", "dev", "--cauldron", "kb"];
+        a.extend_from_slice(extra);
+        let o = self.run(&a, &[]);
+        assert_eq!(o.rc, 0, "{}", o.err);
+        o.json()
+    }
+}
+
+/// The JSON object a terminal run printed (from its first `{` line to the
+/// matching closing line).
+fn printed_json(text: &str) -> Value {
+    let start = text.find("{\n").unwrap_or_else(|| panic!("no JSON in: {text}"));
+    let end = text[start..].find("\n}").map(|e| start + e + 2).unwrap_or_else(|| panic!("no JSON end in: {text}"));
+    serde_json::from_str(&text[start..end]).unwrap_or_else(|e| panic!("{e}: {text}"))
+}
+
+/// **`ripples approve | reject`, at a terminal, through the real service.**
+/// Without a terminal each is refused with the exact command and writes
+/// nothing; at one, a dump is rejected with a reason, a run approved, a
+/// rejected record refused approval until it is unrejected, all through the
+/// running `mcp` service; the queue and the reads follow; with the service
+/// stopped the command says how to start it.
+#[test]
+fn rv1_ripples_approve_and_reject_at_a_terminal() {
+    let s = Scratch::new("rv1", &["kb"]);
+    let records = s.write("example.json", &json!(example()));
+    assert_eq!(s.import("kb", &records, &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y")]);
+    let b = crate::ripples::ripple_write(&s.soup("kb"), "run-b", "DM-2", "sonnet", &[("task", "three", "z"), ("idea", "four", "w")]);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    assert_eq!(s.queue(&[])["counts"]["unreviewed"], 4);
+    // No terminal: refused before anything is sent, with the command.
+    let o = s.run(&["ripples", "reject", "--dump", "DM-1", "--env", "dev", "--cauldron", "kb", "--reason", "not mine"], &pids);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("REFUSED: rejecting a ripple's records is the owner's act at a terminal") && o.err.contains("no option skips this"), "{}", o.err);
+    assert!(o.err.contains("cauldron ripples reject --dump DM-1 --env dev --cauldron kb --reason 'not mine'"), "{}", o.err);
+    let o = s.run(&["ripples", "approve", "--run", "run-b", "--env", "dev", "--cauldron", "kb"], &pids);
+    assert!(o.err.contains("cannot approve records by itself") && o.err.contains("cauldron ripples approve --run run-b --env dev --cauldron kb"), "{}", o.err);
+    assert_eq!(s.queue(&[])["counts"]["unreviewed"], 4, "nothing was written");
+    // Usage, before the terminal.
+    for (args, says) in [
+        (vec!["ripples", "approve", "--dump", "DM-1", "--run", "run-a", "--env", "dev", "--cauldron", "kb"], "one way"),
+        (vec!["ripples", "approve", "--env", "dev", "--cauldron", "kb"], "one way"),
+        (vec!["ripples", "approve", "--dump", "DM-1", "--env", "dev", "--cauldron", "kb", "--reason", "x"], "unknown option"),
+        (vec!["ripples", "reject", "--dump", "DM-1", "--env", "dev"], "only as flags"),
+        (vec!["ripples", "reject", "--dump", "DM-1", "--env", "dev", "--cauldron", "kb", "--unreject", "--reason", "x"], "--unreject"),
+    ] {
+        let o = s.run(&args, &pids);
+        assert_ne!(o.rc, 0, "{args:?}");
+        assert!(o.err.contains(says), "{args:?}: {}", o.err);
+    }
+    // At a terminal.
+    let o = s.on_tty(&["ripples", "reject", "--dump", "DM-1", "--env", "dev", "--cauldron", "kb", "--reason", "not mine"], &pids, &[], None);
+    assert_eq!(o.rc, 0, "{}", o.out);
+    let v = printed_json(&o.out);
+    assert_eq!((v["outcome"].clone(), v["rejected"].as_array().unwrap().len()), (json!("rejected"), 2), "{v}");
+    assert!(o.out.contains("reject: 2 record(s) written, 0 skipped"), "{}", o.out);
+    let o = s.on_tty(&["ripples", "approve", "--run", "run-b", "--env", "dev", "--cauldron", "kb"], &pids, &[], None);
+    assert_eq!(printed_json(&o.out)["approved"].as_array().unwrap().len(), 2, "{}", o.out);
+    let q = s.queue(&[]);
+    assert_eq!((q["counts"]["unreviewed"].clone(), q["counts"]["approved"].clone(), q["counts"]["rejected"].clone()), (json!(0), json!(2), json!(2)), "{q}");
+    // Rejected: kept, out of the reads unless asked, not approvable.
+    let o = s.run(&["soup", "nodes", "--env", "dev", "--cauldron", "kb", "--limit", "100"], &pids);
+    let n = o.json();
+    assert_eq!(n["rejected_hidden"], json!(2), "{n}");
+    let o = s.run(&["soup", "nodes", "--env", "dev", "--cauldron", "kb", "--limit", "100", "--include-rejected"], &pids);
+    assert!(o.json()["nodes"].as_array().unwrap().iter().any(|x| x["id"] == a[0].as_str() && x["rejected"] == json!(true)));
+    let o = s.run(&["soup", "get", &a[0], "--env", "dev", "--cauldron", "kb"], &pids);
+    let rec = &o.json()["records"][0];
+    assert_eq!((rec["rejected"].clone(), rec["meta"]["rejected"]["reason"].clone()), (json!(true), json!("not mine")), "{rec}");
+    let o = s.on_tty(&["ripples", "approve", &a[0], "--env", "dev", "--cauldron", "kb"], &pids, &[], None);
+    let v = printed_json(&o.out);
+    assert_eq!(v["outcome"], json!("nothing-to-approve"), "{v}");
+    let o = s.on_tty(&["soup", "approve", &a[0], "--env", "dev", "--cauldron", "kb"], &pids, &[], None);
+    assert_eq!(printed_json(&o.out)["outcome"], json!("nothing-to-approve"), "`soup approve` too: {}", o.out);
+    // Unrejected: back in the queue; then approvable.
+    let o = s.on_tty(&["ripples", "reject", "--dump", "DM-1", "--env", "dev", "--cauldron", "kb", "--unreject"], &pids, &[], None);
+    assert_eq!(printed_json(&o.out)["unrejected"].as_array().unwrap().len(), 2, "{}", o.out);
+    assert_eq!(s.queue(&["--dump", "DM-1"])["counts"]["unreviewed"], 2);
+    let o = s.on_tty(&["ripples", "approve", &a[0], &a[1], "--env", "dev", "--cauldron", "kb"], &pids, &[], None);
+    assert_eq!(printed_json(&o.out)["approved"].as_array().unwrap().len(), 2, "{}", o.out);
+    let o = s.on_tty(&["ripples", "approve", "--dump", "DM-2", "--env", "dev", "--cauldron", "kb", "--unapprove"], &pids, &[], None);
+    let mut un: Vec<String> = printed_json(&o.out)["unapproved"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+    un.sort();
+    let mut bs = b.clone();
+    bs.sort();
+    assert_eq!(un, bs, "{}", o.out);
+    assert_eq!(s.queue(&[])["counts"]["unreviewed"], 2);
+    let audit = s.calls();
+    for t in ["soup_reject", "soup_approve", "soup_unreject", "soup_unapprove"] {
+        assert!(audit.iter().any(|l| l["tool"] == t && l["client"] == "cli"), "{t}");
+    }
+    // The service stopped: the command says how to start it.
+    svc.stop();
+    let o = s.on_tty(&["ripples", "approve", "--dump", "DM-2", "--env", "dev", "--cauldron", "kb"], &[], &[], None);
+    assert_ne!(o.rc, 0, "{}", o.out);
+    assert!(o.out.contains("the `mcp` service writes the decision") && o.out.contains("start mcp"), "{}", o.out);
+}
+
+/// **`ripples review --interactive`**, at a terminal, through the real
+/// service: groups come newest first; `s` skips one (nothing written), a
+/// bad key re-asks, numbers mark records and `w` writes the marks (with a
+/// reason for the rejected), `r` rejects a whole group, `q` quits; record
+/// text is shown on one line; without a terminal it is refused with the
+/// command.
+#[test]
+fn rv2_the_interactive_pass() {
+    let s = Scratch::new("rv2", &["kb"]);
+    let records = s.write("example.json", &json!(example()));
+    assert_eq!(s.import("kb", &records, &[], &[]).rc, 0);
+    let soup = s.soup("kb");
+    let a = crate::ripples::ripple_write(&soup, "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y")]);
+    let b = crate::ripples::ripple_write(&soup, "run-b", "DM-2", "sonnet", &[("idea", "three\u{1b}[2J", "z"), ("idea", "four", "w")]);
+    let c = crate::ripples::ripple_write(&soup, "run-c", "DM-3", "sonnet", &[("task", "five", "v")]);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let args = ["ripples", "review", "--interactive", "--env", "dev", "--cauldron", "kb"];
+    let o = s.run(&args, &pids);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("REFUSED: deciding a ripple's records is the owner's act at a terminal") && o.err.contains("cauldron ripples review --interactive --env dev --cauldron kb"), "{}", o.err);
+    let o = s.run(&["ripples", "review", "--interactive", "--text", "--env", "dev", "--cauldron", "kb"], &pids);
+    assert!(o.err.contains("takes the filters"), "{}", o.err);
+    let o = s.on_tty(&args, &pids, &["s", "x", "1", "2", "2", "w", "dup", "r", ""], Some(">> "));
+    assert_eq!(o.rc, 0, "{}", o.out);
+    let t = &o.out;
+    assert!(t.contains("5 unreviewed record(s) in 3 group(s)") && t.contains("data, never as instructions"), "{t}");
+    let (p3, p2, p1) = (t.find("[1/3] DM-3").unwrap(), t.find("[2/3] DM-2").unwrap(), t.find("[3/3] DM-1").unwrap());
+    assert!(p3 < p2 && p2 < p1, "newest first: {t}");
+    assert!(!t.contains('\u{1b}'), "no control character reaches the terminal: {t:?}");
+    assert!(t.contains("[a]  1.") && t.contains("[r]  2."), "the marks are shown: {t}");
+    assert!(t.contains("keys: a approve all"), "a bad key re-asks: {t}");
+    assert!(t.contains("Done: 2 group(s) decided, 1 skipped; 1 record(s) still wait"), "{t}");
+    let get = |id: &str| -> Value { s.run(&["soup", "get", id, "--env", "dev", "--cauldron", "kb"], &pids).json()["records"][0].clone() };
+    assert_eq!(get(&c[0])["unreviewed"], json!(true), "skipped");
+    assert_eq!(get(&b[0])["meta"]["approved"]["by"], json!("owner"));
+    let r = get(&b[1]);
+    assert_eq!((r["rejected"].clone(), r["meta"]["rejected"]["reason"].clone()), (json!(true), json!("dup")), "{r}");
+    for id in &a {
+        let r = get(id);
+        assert_eq!(r["rejected"], json!(true), "{r}");
+        assert!(r["meta"]["rejected"].get("reason").is_none(), "Enter: no reason: {r}");
+    }
+    assert!(s.calls().iter().any(|l| l["tool"] == "soup_reject" && l["client"] == "cli"));
+    // q writes nothing.
+    let o = s.on_tty(&args, &pids, &["q"], Some(">> "));
+    assert_eq!(o.rc, 0, "{}", o.out);
+    assert!(o.out.contains("Done: 0 group(s) decided, 0 skipped; 1 record(s) still wait"), "{}", o.out);
+    assert_eq!(get(&c[0])["unreviewed"], json!(true));
+    // a approves the group.
+    let o = s.on_tty(&args, &pids, &["a"], Some(">> "));
+    assert!(o.out.contains("approved 1"), "{}", o.out);
+    assert_eq!(s.queue(&[])["counts"]["unreviewed"], 0);
+}
+
+// ------------------------------------------- a service older than DECIDE
+
+/// **A fake `mcp` service of the release before `DECIDE`**: it registers its
+/// seam row and answers the handshake as every service does, and knows only
+/// that release's verbs (`MCP`, `OPEN`, `DUMPS`, `PING`, `APPROVE` and the
+/// ripple verbs); any other word gets the seam's `ERR unknown request`. Its
+/// `APPROVE` answers as that release's did, which read only `ids` and
+/// `unapprove` and approved: every line it is sent is kept, so a test can
+/// show what a newer command line sent it. Its door answers `initialize`
+/// with `version`, as the real door does.
+struct OldMcp {
+    se: env::seams::ServiceEnv,
+    addr: SocketAddr,
+    door: SocketAddr,
+    heard: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl env::warnings::ServesWarnings for OldMcp {
+    const SHAPE: &'static str = env::warnings::SHAPE;
+    fn warnings(&self, _asked: &str) -> anyhow::Result<env::warnings::Export> {
+        anyhow::bail!("this fake serves no warnings")
+    }
+}
+
+impl OldMcp {
+    fn says(&self, c: &mut env::warnings::Conn<'_>, line: &str) -> anyhow::Result<()> {
+        c.line(line)?;
+        Ok(())
+    }
+    fn v_mcp(&self, c: &mut env::warnings::Conn<'_>, _r: &str) -> anyhow::Result<()> {
+        self.says(c, &format!("http://{}/mcp", self.door))
+    }
+    fn v_empty(&self, c: &mut env::warnings::Conn<'_>, _r: &str) -> anyhow::Result<()> {
+        self.says(c, "[]")
+    }
+    fn v_ping(&self, c: &mut env::warnings::Conn<'_>, _r: &str) -> anyhow::Result<()> {
+        self.says(c, "PONG")
+    }
+    fn v_ripple(&self, c: &mut env::warnings::Conn<'_>, _r: &str) -> anyhow::Result<()> {
+        self.says(c, r#"{"ok":false,"code":"unauthorized","message":"no"}"#)
+    }
+    /// That release's `APPROVE`: `{cauldron, ids, unapprove?}`, nothing else read.
+    fn v_approve(&self, c: &mut env::warnings::Conn<'_>, rest: &str) -> anyhow::Result<()> {
+        self.heard.lock().unwrap().push(format!("APPROVE {rest}"));
+        let body: Value = rest.split_once(' ').and_then(|(_, b)| serde_json::from_str(b).ok()).unwrap_or(Value::Null);
+        let un = body["unapprove"].as_bool().unwrap_or(false);
+        let answer = match body["ids"].as_array() {
+            Some(ids) if !ids.is_empty() => {
+                let key = if un { "unapproved" } else { "approved" };
+                json!({"ok": true, key: ids, "skipped": [], "outcome": key})
+            }
+            _ => json!({"ok": false, "code": "usage", "message": "`ids` must be a list of 1 to 500 record ids. Nothing was written."}),
+        };
+        self.says(c, &answer.to_string())
+    }
+}
+
+impl env::warnings::Service for OldMcp {
+    const VERBS: &'static [env::warnings::Verb<OldMcp>] = &[
+        env::warnings::Verb::new("MCP", OldMcp::v_mcp),
+        env::warnings::Verb::new("OPEN", OldMcp::v_empty),
+        env::warnings::Verb::new("DUMPS", OldMcp::v_empty),
+        env::warnings::Verb::new("PING", OldMcp::v_ping),
+        env::warnings::Verb::new("RDUMP", OldMcp::v_ripple),
+        env::warnings::Verb::new("RTEXT", OldMcp::v_ripple),
+        env::warnings::Verb::new("RREAD", OldMcp::v_ripple),
+        env::warnings::Verb::new("RRUN", OldMcp::v_ripple),
+        env::warnings::Verb::new("RPUT", OldMcp::v_ripple),
+        env::warnings::Verb::new("RCHECK", OldMcp::v_ripple),
+        env::warnings::Verb::new("APPROVE", OldMcp::v_approve),
+        env::warnings::Verb::new("RDUMPS", OldMcp::v_ripple),
+        env::warnings::Verb::new("RNOTE", OldMcp::v_ripple),
+        env::warnings::Verb::new("RFAIL", OldMcp::v_ripple),
+    ];
+    fn service_env(&self) -> &env::seams::ServiceEnv {
+        &self.se
+    }
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+/// Start [`OldMcp`] in this process, answering `version` from its door;
+/// it registers itself in the scratch environment's seam table. Answers
+/// what it heard (shared) once it is up.
+fn old_mcp(s: &Scratch, version: &str) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+    use std::net::TcpListener;
+    // The files the real service mints at its start.
+    for f in ["door.secret", "approve.secret"] {
+        std::fs::write(s.mcp_dir().join(f), format!("fake-{f}-value\n")).unwrap();
+    }
+    let door = TcpListener::bind("127.0.0.1:0").unwrap();
+    let door_addr = door.local_addr().unwrap();
+    let v = version.to_string();
+    std::thread::spawn(move || {
+        for c in door.incoming().flatten() {
+            let mut r = BufReader::new(c.try_clone().unwrap());
+            let mut len = 0usize;
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+                if let Some(n) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = n.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            let _ = r.read_exact(&mut body);
+            let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let answer = json!({"jsonrpc": "2.0", "id": req["id"], "result": {"serverInfo": {"name": "cauldron-mcp", "version": v}}}).to_string();
+            let mut c = c;
+            let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}", answer.len());
+        }
+    });
+    let seam = TcpListener::bind("127.0.0.1:0").unwrap();
+    let se = env::seams::ServiceEnv {
+        service: "mcp".into(),
+        env: "dev".into(),
+        data_root: s.data(),
+        data_dir: s.mcp_dir(),
+        seams: s.data().join("seams.json"),
+        boot_token: format!("old-boot-{}", std::process::id()),
+        version: version.into(),
+        commit: String::new(),
+        dirty: false,
+        bind: "127.0.0.1:0".into(),
+    };
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let svc = std::sync::Arc::new(OldMcp { se, addr: seam.local_addr().unwrap(), door: door_addr, heard: heard.clone() });
+    let attested = env::attest_warnings!(OldMcp);
+    svc.se.register(&svc.addr, "old-cauldron-mcp", "seam", &attested).unwrap();
+    std::thread::spawn(move || {
+        for c in seam.incoming().flatten() {
+            let svc = svc.clone();
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut w = c;
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let line = line.trim().to_string();
+                    let (verb, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+                    let mut conn = env::warnings::Conn { out: &mut w, frames: 0 };
+                    match env::warnings::dispatch(&*svc, verb, rest.trim(), &mut conn) {
+                        Ok(env::warnings::Answered::Yes) => {}
+                        Ok(env::warnings::Answered::NotMine) => {
+                            svc.heard.lock().unwrap().push(line.clone());
+                            let _ = conn.line(&format!("ERR unknown request `{verb}`"));
+                        }
+                        Err(_) => return,
+                    }
+                    let _ = w.flush();
+                }
+            });
+        }
+    });
+    heard
+}
+
+/// **A newer command line never decides through an older `mcp` service.**
+/// Against a fake service of the release before `DECIDE` (the same version
+/// number, as between two builds of one version): `ripples reject`,
+/// `--unreject`, `ripples approve`, `soup approve` and the interactive pass
+/// are each refused, naming the upgrade, and the old service is sent no
+/// `APPROVE` (the verb it would read as an approval). Against one that
+/// says it is an older version: refused before anything but the version
+/// question is asked.
+#[test]
+fn rv3_an_older_mcp_service_is_never_sent_a_decision_it_would_misread() {
+    let s = Scratch::new("rv3", &["kb"]);
+    let records = s.write("example.json", &json!(example()));
+    assert_eq!(s.import("kb", &records, &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y")]);
+    s.grant("kb");
+    let heard = old_mcp(&s, env!("CARGO_PKG_VERSION"));
+    let me = [std::process::id()];
+    let before = s.queue(&[]);
+    for args in [
+        vec!["ripples", "reject", a[0].as_str(), "--env", "dev", "--cauldron", "kb", "--reason", "spam"],
+        vec!["ripples", "reject", a[1].as_str(), "--env", "dev", "--cauldron", "kb", "--unreject"],
+        vec!["ripples", "reject", "--dump", "DM-1", "--env", "dev", "--cauldron", "kb"],
+        vec!["ripples", "approve", "--run", "run-a", "--env", "dev", "--cauldron", "kb"],
+        vec!["soup", "approve", a[0].as_str(), "--env", "dev", "--cauldron", "kb"],
+    ] {
+        let o = s.on_tty(&args, &me, &[], None);
+        assert_ne!(o.rc, 0, "{args:?}: {}", o.out);
+        assert!(o.out.contains("REFUSED: the running `mcp` service does not know `DECIDE`") && o.out.contains("It wrote nothing, and nothing was decided"), "{args:?}: {}", o.out);
+        assert!(o.out.contains("the `mcp` service must be upgraded with the command line") && o.out.contains("--replace-running") && o.out.contains("build mcp --env-copy"), "{args:?}: {}", o.out);
+    }
+    let o = s.on_tty(&["ripples", "review", "--interactive", "--env", "dev", "--cauldron", "kb"], &me, &["r", "spam"], Some(">> "));
+    assert!(o.out.contains("does not know `DECIDE`"), "{}", o.out);
+    let lines = heard.lock().unwrap().clone();
+    assert!(!lines.is_empty() && lines.iter().all(|l| l.starts_with("DECIDE ")), "only the verb it does not know was sent: {lines:?}");
+    assert_eq!(s.queue(&[])["counts"], before["counts"], "nothing was written");
+    assert!(s.calls().is_empty(), "nothing was audited as a decision");
+
+    // An older version: nothing is sent but the version question.
+    let s2 = Scratch::new("rv3b", &["kb"]);
+    assert_eq!(s2.import("kb", &s2.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let b = crate::ripples::ripple_write(&s2.soup("kb"), "run-b", "DM-1", "sonnet", &[("idea", "one", "x")]);
+    s2.grant("kb");
+    let heard2 = old_mcp(&s2, "0.1.0");
+    let o = s2.on_tty(&["ripples", "reject", b[0].as_str(), "--env", "dev", "--cauldron", "kb"], &me, &[], None);
+    assert_ne!(o.rc, 0, "{}", o.out);
+    assert!(o.out.contains("REFUSED: the running `mcp` service is cauldron 0.1.0, older than this cauldron") && o.out.contains("Nothing was sent and nothing was written") && o.out.contains("Version skew:"), "{}", o.out);
+    assert!(heard2.lock().unwrap().is_empty(), "nothing was sent: {:?}", heard2.lock().unwrap());
+    assert_eq!(s2.queue(&[])["counts"]["unreviewed"], 1);
+}
+
+/// **The same, against the real binary of the release before `DECIDE`**,
+/// when one is named in `CAULDRON_OLD_MCP` (it is not built here): reject
+/// changes nothing and says why.
+#[test]
+fn rv4_the_real_older_mcp_service_rejects_nothing_and_says_why() {
+    let Some(old) = std::env::var_os("CAULDRON_OLD_MCP") else {
+        eprintln!("rv4: CAULDRON_OLD_MCP names no binary; the fake of rv3 stands in");
+        return;
+    };
+    let s = Scratch::new("rv4", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y")]);
+    s.grant("kb");
+    let svc = Service::start_bin(&s, Path::new(&old));
+    let pids = [svc.pid()];
+    for args in [
+        vec!["ripples", "reject", a[0].as_str(), "--env", "dev", "--cauldron", "kb", "--reason", "spam"],
+        vec!["ripples", "reject", a[1].as_str(), "--env", "dev", "--cauldron", "kb", "--unreject"],
+        vec!["soup", "approve", a[0].as_str(), "--env", "dev", "--cauldron", "kb"],
+    ] {
+        let o = s.on_tty(&args, &pids, &[], None);
+        println!("rv4 {}:\n{}", args.join(" "), o.out);
+        assert_ne!(o.rc, 0, "{args:?}: {}", o.out);
+        assert!(o.out.contains("REFUSED:") && o.out.contains("nothing was decided") && o.out.contains("must be upgraded"), "{args:?}: {}", o.out);
+    }
+    let q = s.queue(&[]);
+    assert_eq!((q["counts"]["unreviewed"].clone(), q["counts"]["approved"].clone(), q["counts"]["rejected"].clone()), (json!(2), json!(0), json!(0)), "{q}");
+    assert!(!s.calls().iter().any(|l| l["tool"] == "soup_approve"), "{:?}", s.calls());
+    svc.stop();
+}
+
+/// **No record write sets or clears a review flag**: `soup import` direct
+/// (and `--dry-run`), `soup import` while the service holds the soup (it
+/// would be forwarded), `soup_put`, `soup_link` and the ripple's own batch
+/// (`services/mcp` `ripple` tests) each refuse a record carrying
+/// `meta.approved` or `meta.rejected` in any casing or nesting, and write
+/// nothing; only the owner's decision does.
+#[test]
+fn w3_no_record_write_sets_a_review_flag() {
+    let s = Scratch::new("w3", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let rec = |meta_key: &str, meta: Value| -> Value {
+        let mut r = task("t", "a record that reviews itself");
+        r[meta_key] = meta;
+        r
+    };
+    let variants = [
+        ("meta", json!({"rejected": {"at": "2026-01-01T00:00:00Z", "by": "owner"}})),
+        ("meta", json!({"approved": {"at": "2026-01-01T00:00:00Z", "by": "owner"}})),
+        ("meta", json!({"rejected": null})),
+        ("meta", json!({"Approved": true})),
+        ("meta", json!({"REJECTED": true})),
+        ("meta", json!({"meta": {"rejected": true}})),
+        ("Meta", json!({"rejected": true})),
+        ("meta.rejected", json!({"by": "owner"})),
+        ("rejected", json!({"by": "owner"})),
+    ];
+    let before = s.node_count("kb");
+    for (k, m) in &variants {
+        let file = s.write("flag.json", &json!([rec(k, m.clone())]));
+        for extra in [&["--remint"][..], &["--remint", "--dry-run"][..]] {
+            let o = s.import("kb", &file, extra, &[]);
+            assert_ne!(o.rc, 0, "{k} {m} {extra:?}: {}", o.out);
+            assert!(o.err.contains("the review flags (`meta.approved`, `meta.rejected`) are the owner's"), "{k} {m}: {}", o.err);
+        }
+    }
+    assert_eq!(s.node_count("kb"), before, "nothing landed directly");
+    // The service holds the soup: the batch would be forwarded; it is not.
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let r = svc.call(&s, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "Opens the writer")]}));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let before = s.node_count("kb");
+    let puts = s.calls().iter().filter(|l| l["tool"] == "soup_put").count();
+    for (k, m) in &variants {
+        let o = s.import("kb", &s.write("flag.json", &json!([rec(k, m.clone())])), &["--remint"], &pids);
+        assert_ne!(o.rc, 0, "{k} {m}: {}", o.out);
+        assert!(o.err.contains("are the owner's"), "{k} {m}: {}", o.err);
+        // And straight to the service, as a session or an older command line would send it.
+        let r = svc.call(&s, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [rec(k, m.clone())]}));
+        assert_eq!(r["isError"], json!(true), "{k} {m}: {r}");
+        let refused = &r["structuredContent"]["refused"];
+        assert_eq!(refused["code"], json!("usage"), "{k} {m}: {r}");
+        assert!(refused["message"].as_str().unwrap().contains("are the owner's"), "{k} {m}: {r}");
+    }
+    assert_eq!(s.node_count("kb"), before, "nothing landed through the service");
+    assert_eq!(s.calls().iter().filter(|l| l["tool"] == "soup_put").count(), puts + variants.len(), "each refusal audited, none forwarded");
+    // A link carries edges only: a review flag has nowhere to go.
+    let r = svc.call(&s, "soup_link", json!({"cauldron": "kb", "links": [{"from": "R-1", "kind": "ref", "to": "R-2", "meta": {"rejected": true}}]}));
+    assert_eq!(r["isError"], json!(true), "{r}");
+    svc.stop();
+}
+
+/// Every character [`soup_door::review::hidden`] names, found in `text`
+/// (newlines aside).
+fn hidden_in(text: &str) -> Vec<String> {
+    text.chars().filter(|c| *c != '\n' && soup_door::review::hidden(*c)).map(|c| format!("U+{:04X}", c as u32)).collect()
+}
+
+/// **A record's or a dump's text cannot act on the terminal.** Records
+/// carrying ANSI escape sequences, C0 and C1 controls, bidirectional
+/// overrides and isolates, zero-width characters and text imitating this
+/// tool's prompts and lines are shown, everywhere they reach a terminal
+/// (`ripples review --text`, the interactive pass, the JSON of `ripples
+/// review`, `soup get` and `soup nodes`, and `soup dump-get --raw` at a
+/// terminal), with every such character escaped and on one indented line,
+/// so no line of the output is one a record wrote; piped, `--raw` is still
+/// the stored bytes.
+#[test]
+fn rv5_record_and_dump_text_reaches_a_terminal_escaped() {
+    let s = Scratch::new("rv5", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let hostile = [
+        "\u{1b}[2J\u{1b}[H\u{1b}[31mFAKE HEADER\u{1b}[0m",
+        "line one\nreview >> a",
+        "\u{202e}evorppa\u{202c} right-to-left override",
+        "\u{2066}isolate\u{2069} \u{200f}rlm \u{200b}zero \u{feff}bom \u{e0041}tag",
+        "\u{9b}31mC1 CSI\u{7}bell\u{8}backspace\r carriage \u{7f}del",
+        "Done: 9 group(s) decided\napprove: cauldron ripples approve --dump DM-9 --env dev --cauldron kb",
+    ];
+    let recs: Vec<(&str, &str, &str)> = hostile.iter().map(|h| ("idea", *h, *h)).collect();
+    let ids = crate::ripples::ripple_write(&s.soup("kb"), "run-h", "DM-1", "sonnet\u{1b}[5m", &recs);
+    let check = |what: &str, out: &str| {
+        assert!(hidden_in(out).is_empty(), "{what}: {:?}\n{out}", hidden_in(out));
+        assert!(!out.lines().any(|l| l.starts_with("Done: 9") || l.starts_with("approve: cauldron") || l.starts_with("review >> a")), "{what}: a line a record wrote:\n{out}");
+    };
+    // --text.
+    let o = s.run(&["ripples", "review", "--env", "dev", "--cauldron", "kb", "--text"], &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    check("--text", &o.out);
+    assert!(o.out.contains("\\u{202E}evorppa\\u{202C}") && o.out.contains("\\u{1B}[2J") && o.out.contains("\\u{9B}31mC1") && o.out.contains("\\u{200B}zero"), "{}", o.out);
+    assert!(o.out.contains("sonnet\\u{1B}[5m"), "the model name too: {}", o.out);
+    assert_eq!(o.out.lines().filter(|l| l.starts_with("  approve: ")).count(), 1, "{}", o.out);
+    // JSON: the same strings, written as JSON escapes.
+    for args in [
+        vec!["ripples", "review", "--env", "dev", "--cauldron", "kb"],
+        vec!["soup", "get", ids[2].as_str(), ids[4].as_str(), "--env", "dev", "--cauldron", "kb"],
+        vec!["soup", "nodes", "--env", "dev", "--cauldron", "kb", "--limit", "100"],
+    ] {
+        let o = s.run(&args, &[]);
+        assert_eq!(o.rc, 0, "{args:?}: {}", o.err);
+        assert!(hidden_in(&o.out).is_empty(), "{args:?}: {:?}", hidden_in(&o.out));
+        assert!(o.out.contains("\\u202e"), "{args:?}: {}", o.out);
+        let v = o.json();
+        assert!(v.to_string().contains('\u{202e}'), "{args:?}: the JSON still means the stored text");
+    }
+    // The interactive pass, at a terminal.
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let o = s.on_tty(&["ripples", "review", "--interactive", "--env", "dev", "--cauldron", "kb"], &pids, &["s"], Some("\nreview >> "));
+    assert_eq!(o.rc, 0, "{}", o.out);
+    check("--interactive", &o.out.replace("\r", ""));
+    assert_eq!(o.out.lines().filter(|l| l.starts_with("review >> ")).count(), 1, "one prompt, and no record wrote one:\n{}", o.out);
+    assert!(o.out.contains("\\u{202E}evorppa") && o.out.contains("line one review >> a"), "{}", o.out);
+    svc.stop();
+    // A dump's text: escaped at a terminal, verbatim to a pipe.
+    let text = "a dump \u{1b}]0;title\u{7} with \u{202e}override\u{202c}\nand a second line\n";
+    let mut c = s.command(&["soup", "dump", "-", "--env", "dev", "--cauldron", "kb"], &[]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    c.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    let d = c.wait_with_output().unwrap();
+    assert!(d.status.success(), "{}", String::from_utf8_lossy(&d.stderr));
+    let id: Value = serde_json::from_slice(&d.stdout).unwrap();
+    let id = id["dump_id"].as_str().unwrap().to_string();
+    let o = s.on_tty(&["soup", "dump-get", &id, "--env", "dev", "--cauldron", "kb", "--raw"], &[], &[], None);
+    assert_eq!(o.rc, 0, "{}", o.out);
+    let shown = o.out.replace("\r", "");
+    assert!(hidden_in(&shown).is_empty(), "{:?}: {shown}", hidden_in(&shown));
+    assert!(shown.contains("\\u{1B}]0;title\\u{7}") && shown.contains("\\u{202E}override") && shown.contains("\nand a second line"), "{shown}");
+    let piped = s.command(&["soup", "dump-get", &id, "--env", "dev", "--cauldron", "kb", "--raw"], &[]).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(piped.stdout, text.as_bytes(), "a pipe gets the stored bytes");
+}
+
+/// **One key never half-decides a group.** With records marked approve and
+/// reject, `w` asks for the reason before anything is written; ending the
+/// pass there (end of input) writes nothing, and the group's decision, when
+/// it is made, is one audited act.
+#[test]
+fn rv6_the_interactive_pass_decides_a_group_whole_or_not_at_all() {
+    let s = Scratch::new("rv6", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y")]);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let args = ["ripples", "review", "--interactive", "--env", "dev", "--cauldron", "kb"];
+    // Mark 1 approve, 2 reject, write: the reason is asked; the input ends
+    // there (ctrl-D at the terminal).
+    let o = s.on_tty(&args, &pids, &["1", "2", "2", "w", "\u{4}"], Some(">> "));
+    assert!(o.out.contains("reason for the rejection"), "{}", o.out);
+    let q = s.queue(&[]);
+    assert_eq!((q["counts"]["unreviewed"].clone(), q["counts"]["approved"].clone()), (json!(2), json!(0)), "nothing of the group was written: {q}");
+    assert!(s.calls().iter().all(|l| l["client"] != "cli"), "nothing was sent: {:?}", s.calls());
+    // Answered: one act, both decisions.
+    let o = s.on_tty(&args, &pids, &["1", "2", "2", "w", "dup"], Some(">> "));
+    assert!(o.out.contains("approved 1, rejected 1"), "{}", o.out);
+    let decided: Vec<Value> = s.calls().into_iter().filter(|l| l["client"] == "cli" && l["tool"].as_str().is_some_and(|t| t.starts_with("soup_"))).collect();
+    assert_eq!(decided.len(), 1, "{decided:?}");
+    assert_eq!((decided[0]["tool"].clone(), decided[0]["counts"]["approved"].clone(), decided[0]["counts"]["rejected"].clone()), (json!("soup_approve_and_reject"), json!(1), json!(1)), "{}", decided[0]);
+    let q = s.queue(&[]);
+    assert_eq!((q["counts"]["unreviewed"].clone(), q["counts"]["approved"].clone(), q["counts"]["rejected"].clone()), (json!(0), json!(1), json!(1)), "{q}");
+    let _ = a;
     svc.stop();
 }

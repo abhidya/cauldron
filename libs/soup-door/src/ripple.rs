@@ -16,7 +16,8 @@
 //!   (`duplicate-id-in-batch`, `label-shadows-existing`, as the record
 //!   import names them);
 //! - no `provenance` key (who wrote it is the door's to say) and no
-//!   `meta.approved` (a ripple never approves; the spine refuses it too);
+//!   `meta.approved` or `meta.rejected` (a ripple never reviews; the spine
+//!   refuses both too);
 //! - at most [`MAX_RECORDS`] records.
 //!
 //! [`land`] then writes the batch as ONE statement of `CREATE`s (never the
@@ -105,12 +106,12 @@ pub fn check_batch(c: &env::Cauldron, records: &[Value]) -> Result<Vec<Value>> {
             Some(t) => say(&label, format!("a ripple may not write a `{t}`; it writes only {}", TYPES.join(", "))),
             None => say(&label, "a record needs a `type`".into()),
         }
-        if let Some(m) = r.get("meta") {
-            if !m.is_object() {
-                say(&label, "`meta` is an object".into());
-            } else if m.get("approved").is_some() {
-                say(&label, "a ripple never sets `meta.approved`: its records stay unreviewed until a person approves them".into());
-            }
+        if r.get("meta").is_some_and(|m| !m.is_object()) {
+            say(&label, "`meta` is an object".into());
+        }
+        // The same check every record write makes (`review::review_flag`).
+        if let Some(k) = crate::review::review_flag(r) {
+            say(&label, format!("a ripple never sets or clears a review flag (`{k}`): its records stay unreviewed until the owner approves or rejects them"));
         }
         let edges = match r.get("edges") {
             None => vec![],

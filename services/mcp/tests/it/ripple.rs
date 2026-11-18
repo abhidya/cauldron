@@ -124,6 +124,9 @@ fn rp2_a_put_lands_new_cited_unreviewed_records_under_the_door_s_provenance_once
         ("a link to nothing", json!([{"id": "n1", "type": "idea", "state": "idea", "handle": "x", "edges": [{"kind": "in_region", "to": "R-1"}, {"kind": "ref", "to": "C-99"}]}])),
         ("provenance", json!([{"id": "n1", "type": "idea", "state": "idea", "handle": "x", "provenance": {"created_by": "owner"}, "edges": [{"kind": "in_region", "to": "R-1"}]}])),
         ("approved", json!([{"id": "n1", "type": "idea", "state": "idea", "handle": "x", "meta": {"approved": true}, "edges": [{"kind": "in_region", "to": "R-1"}]}])),
+        ("rejected", json!([{"id": "n1", "type": "idea", "state": "idea", "handle": "x", "meta": {"rejected": null}, "edges": [{"kind": "in_region", "to": "R-1"}]}])),
+        ("Rejected, cased", json!([{"id": "n1", "type": "idea", "state": "idea", "handle": "x", "meta": {"Rejected": {"by": "owner"}}, "edges": [{"kind": "in_region", "to": "R-1"}]}])),
+        ("rejected, nested", json!([{"id": "n1", "type": "idea", "state": "idea", "handle": "x", "meta": {"meta": {"rejected": true}}, "edges": [{"kind": "in_region", "to": "R-1"}]}])),
         ("too many", Value::Array(std::mem::take(&mut many))),
     ];
     for (what, records) in cases {

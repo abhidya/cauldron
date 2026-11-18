@@ -13,8 +13,10 @@
 //! - [`catalogue`]: the tools;
 //! - [`changes`]: `soup_changes`, what landed since a cursor;
 //! - [`writer`]: one writer thread per open cauldron;
-//! - [`approve`]: the owner's approval of a ripple's records (the `APPROVE`
-//!   seam verb, from `cauldron soup approve` at a terminal; no MCP tool);
+//! - [`approve`]: the owner's decision on a ripple's records (the `DECIDE`
+//!   seam verb, from `cauldron soup approve`, `cauldron ripples approve |
+//!   reject` and `cauldron ripples review --interactive` at a terminal, and
+//!   the earlier `APPROVE`; no MCP tool);
 //! - [`ripple`]: the seam verbs only the `ripples` service may call;
 //! - [`dumps`]: the dump tools' store, held per cauldron, and the side
 //!   effects hook a landed dump calls;

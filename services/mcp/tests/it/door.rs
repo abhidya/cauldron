@@ -7,13 +7,14 @@ use crate::support::*;
 const LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
 
 /// Every tool of the design's catalogue, in order.
-const TOOLS: [&str; 14] = [
+const TOOLS: [&str; 15] = [
     "soup_status",
     "soup_regions",
     "soup_region",
     "soup_nodes",
     "soup_search",
     "soup_get",
+    "soup_review",
     "soup_put",
     "soup_link",
     "soup_changes",

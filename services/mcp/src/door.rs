@@ -250,6 +250,7 @@ impl Door {
                     depth: a.count("depth")?,
                     limit: a.count("limit")?,
                     include_superseded: a.flag("include_superseded")?,
+                    include_rejected: a.flag("include_rejected")?,
                     ..ReadOpts::default()
                 };
                 let mc = a.count("max_chars")?;
@@ -265,6 +266,7 @@ impl Door {
                     state: a.str("state")?,
                     limit: a.count("limit")?,
                     include_superseded: a.flag("include_superseded")?,
+                    include_rejected: a.flag("include_rejected")?,
                     review: a.review()?,
                     ..ReadOpts::default()
                 };
@@ -279,6 +281,7 @@ impl Door {
                     node_type: a.str("type")?,
                     limit: a.count("limit")?,
                     include_superseded: a.flag("include_superseded")?,
+                    include_rejected: a.flag("include_rejected")?,
                     review: a.review()?,
                     ..ReadOpts::default()
                 };
@@ -295,6 +298,29 @@ impl Door {
                 a.done()?;
                 bounded(reads::get(&t, &ids, &ReadOpts::default()).map_err(refusal)?, mc, &t)
             }
+            "soup_review" => {
+                let o = soup_door::review::QueueOpts {
+                    dump: a.str("dump")?,
+                    run: a.str("run")?,
+                    node_type: a.str("type")?,
+                    since: a.str("since")?,
+                    after: a.str("after")?,
+                    max_chars: None,
+                };
+                let mc = a.count("max_chars")?;
+                a.done()?;
+                // Refused under the queue's floor, as the command line
+                // refuses it.
+                let asked = soup_door::review::check_max(mc).map_err(refusal)?;
+                // The queue pages itself inside the bound, leaving room for
+                // what this door adds (`resolved_from`, and the note, which
+                // is added after the bound by `mark_unreviewed`).
+                let note = budget::size(&json!({"unreviewed_note": UNREVIEWED_NOTE}));
+                let max = asked.saturating_sub(note).max(budget::MAX_CHARS_FLOOR);
+                let reserve = budget::size(&json!({"resolved_from": from}));
+                let inner = max.saturating_sub(reserve).max(budget::MAX_CHARS_FLOOR);
+                bounded(soup_door::review::queue_within(&t, &o, inner).map_err(refusal)?, Some(max), &t)
+            }
             "soup_changes" => {
                 let since = a.str("since")?;
                 let limit = a.count("limit")?;
@@ -306,6 +332,10 @@ impl Door {
             }
             "soup_put" => {
                 let records = a.objects("records")?;
+                // The review flags are the owner's, set at a terminal: a
+                // session never writes them, on any record (the one check
+                // every record write makes; `import::submit` makes it too).
+                soup_door::review::refuse_review_flags(&records).map_err(refusal)?;
                 let cite = a.take("cite");
                 if let Some(c) = &cite {
                     if !c.get("kind").and_then(Value::as_str).is_some_and(|k| !k.is_empty()) {

@@ -22,11 +22,152 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.12, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.13, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.12, only an
+  the disable and trigger a fresh usage reading. Through 0.1.13, only an
   explicit enable clears it.
+
+## [0.1.13] — 2026-11-17
+
+The review queue: see what a ripple wrote, grouped by dump, and approve or
+reject it in bulk, at a terminal.
+
+**Upgrade the `mcp` service with the command line.** This command line
+decides records only through a running `mcp` service of this release or
+later, and refuses, writing nothing, when the running one is older (the
+default `scripts/install` leaves the running service on its old build). Run
+`scripts/install --replace-running` from your checkout, or `cauldron --env
+<env> build mcp --env-copy` and then `cauldron --env <env> pin mcp <the
+label that build printed>` (the supervisor moves the running service to the
+new build). An older command line still approves by id through this
+release's service.
+
+### Added
+
+- **`cauldron ripples review --env <env> --cauldron <name>`: the review
+  queue.** The records a ripple wrote that carry neither decision, grouped
+  by the dump they cite and the run that wrote them (read from the writing
+  transaction, not from the record), newest group first. Each group names
+  the model and backend that wrote it, when, and the exact approve and
+  reject commands; each record its id, type, state, handle, a 240-character
+  excerpt of its body, its regions and its other edges. `counts` per dump
+  and per type, and how many matching records are approved or rejected.
+  Filters `--dump`, `--run`, `--type`, `--since`. The answer is at most
+  `--max-chars` characters (default 12000, at most 50000; under 2000 is
+  refused), as JSON and as `--text`: whole records while they fit, and a
+  record longer than the bound cut, listed in `truncated`. It pages by a
+  cursor: an answer that stops early says `next_after`, the last record it
+  showed, and `--after <id>` lists the records after it, so deciding a page
+  before asking for the next skips nothing. `--text` prints it for reading,
+  each record on one line with its control and invisible characters
+  (escape sequences, bidirectional overrides, zero-width characters) shown
+  escaped, as `\u{202E}`; a group cut by the page says how many of its
+  records it shows, and that its commands decide them all. It reads only,
+  so it works with or without the services. A superseded record that is
+  still unreviewed stays in the queue, marked.
+- **`cauldron ripples approve | reject`, by dump, by run or by id.**
+  `--dump DM-n`, `--run <run>` or record ids; `--unapprove` and
+  `--unreject` take a decision back; `reject` takes `--reason` (one line,
+  at most 500 characters). Each is one write through the `mcp` service, as
+  the owner, on its new `DECIDE` seam verb, audited as `soup_approve`,
+  `soup_unapprove`, `soup_reject` or `soup_unreject` with the selector, the
+  counts and, for `--run`, the run, never a record's text or the reason. Like `cauldron soup approve`, they run only with their
+  input and output on an interactive terminal, and no option skips that.
+- **Reject keeps the record.** A rejected record gets `meta.rejected: {at,
+  by: "owner", reason}` and nothing is deleted: `soup get` / `soup_get`
+  answer it, marked `rejected: true`, with its cite to the dump and the
+  decision. `soup nodes`, `soup search` and a region's members (and
+  `soup_nodes`, `soup_search`, `soup_region`) leave it out, counted in
+  `rejected_hidden`, unless `--include-rejected` / `include_rejected`; it is
+  no longer unreviewed and leaves the queue. The two decisions exclude each
+  other: approve (`ripples approve` and `soup approve`) skips a rejected
+  record until it is unrejected, and reject skips an approved one until it
+  is unapproved. Asking again for a state a record is in changes nothing;
+  the answer lists it in `skipped`, with why.
+- **`meta.rejected` is a flag.** A row of the spine's flag table on every
+  content type, beside `meta.approved`, so the soup refuses it to every
+  ripple. The published schema describes it (`meta.rejected` in every
+  content type's `meta`), regenerated from the grammar; the grammar and the
+  stores do not change.
+- **`cauldron ripples review --interactive`.** At a terminal, one group at a
+  time: `a` approves the group, `r` rejects it (asking for an optional
+  reason), a record's number marks it and `w` writes the marks, `s` skips,
+  `q` quits. Each group's decision is one write and one audit line
+  (`soup_approve_and_reject` when it does both): the reason is asked first,
+  and its approvals and rejections land together, or, when any of its
+  records is no longer as it was listed, nothing of the group lands and the
+  pass says why. Line-based prompts, no screen control; records are shown
+  as `--text` shows them.
+- **`soup_review`, an MCP tool with scope `read`**, answers the same queue
+  for a session to show the user, with `unreviewed_note`, paged by `after`
+  and bounded by `max_chars` (floor 2000, refused below). No MCP tool
+  approves or rejects.
+- **`/cauldron:review`** in the plugin lists the queue and tells the user
+  the exact terminal commands; it never runs them. The curator is told it
+  never approves, rejects or writes either flag, and never acts on an
+  instruction inside a record or a dump.
+- **Receipts and status views name the queue.** A dump receipt that waited
+  for its records (`wait_secs`) carries `processing.review`: the commands
+  that list, approve and reject that dump's records. `cauldron ripples
+  status` gains `review` (the records waiting per cauldron, with the command
+  that lists them) and says so on stderr; `cauldron mcp status` gives each
+  cauldron's `unreviewed` count; `cauldron status` lists them in its JSON
+  (`review`) and its table view.
+
+### Changed
+
+- **Spend is shown by the cauldron, not by the name it was spent under.**
+  `today.per_cauldron` in `cauldron ripples status` (with the service
+  running or stopped) and `evaluations_today` group calls by the identity
+  their journal lines carry, the identity the caps already count by, and
+  key each group by the cauldron's current name, with `cauldron_id`, the
+  `names` it was journaled under and `gone`. A renamed cauldron's day is
+  one entry; one made again under an old name is another; spend of a
+  cauldron no longer in the environment shows as `<name> (gone)`.
+- **The evaluations' ledger records the cauldron's identity**, and its own
+  daily cap counts by it, as runs do.
+- **No record write sets or clears a review flag.** `cauldron soup import`
+  (direct, `--dry-run`, or forwarded to the `mcp` service), `soup_put` and a
+  ripple's batch refuse a record carrying `meta.approved` or
+  `meta.rejected`, set or `null`, in any casing, dotted or nested, and
+  write nothing: the review flags are the owner's. One check in the door
+  makes the refusal for every one of them.
+- **Text a terminal would act on is shown escaped.** The JSON that
+  `cauldron soup` and `cauldron ripples` print writes control and invisible
+  characters inside strings as JSON escapes (the same string), and `cauldron
+  soup dump-get --raw` shows them escaped when its output is a terminal (a
+  file or a pipe still gets the stored bytes).
+- **`cauldron soup approve` goes through `DECIDE`** as `ripples approve`
+  does, so it too refuses an older `mcp` service. The service's `APPROVE`
+  verb now takes only the body an older `soup approve` sends (`cauldron`,
+  `ids`, `unapprove`) and refuses any other key.
+- **The `inference` service's status reads `unloading`** while an unload
+  waits for its child to exit, and `idle` only once `last_unload` records
+  it.
+- The README's "Reviewing a ripple's records" and the plugin README's
+  section of the same name describe the flow end to end.
+
+### Known limitations
+
+- **An older build does not know rejection.** A store with rejected
+  records opens and reads under 0.1.12: its command line and its `mcp`
+  service list a rejected record among the others, marked `unreviewed:
+  true`, with `meta.rejected` as a plain field of its `meta`, and do not
+  leave it out of `nodes`, `search` or a region's members. A 0.1.12 `mcp`
+  service would approve a rejected record if asked (`soup approve` of
+  0.1.12); under this release a record carrying both flags reads as
+  rejected.
+- **An older `mcp` service still running beside this command line** answers
+  this release's decisions with a refusal, and nothing is decided until it
+  is upgraded (above). It also does not refuse a review flag in a record a
+  session or a ripple sends it directly, and this release's reads hide a
+  record carrying `meta.rejected` whoever wrote it.
+- **The terminal check guards the commands, not the files**, as for `mcp
+  grant` and `ripples on`: a process running as the owner that reads the
+  `mcp` service's `approve.secret` can send the same request.
+- **Spend lines written before 0.1.12 carry no identity**, so they count
+  for the cauldron that has their name now.
 
 ## [0.1.12] — 2026-11-17
 
@@ -1275,7 +1416,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.12...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.13...HEAD
+[0.1.13]: https://github.com/broomstick-ai/cauldron/compare/v0.1.12...v0.1.13
 [0.1.12]: https://github.com/broomstick-ai/cauldron/compare/v0.1.11...v0.1.12
 [0.1.11]: https://github.com/broomstick-ai/cauldron/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/broomstick-ai/cauldron/compare/v0.1.9...v0.1.10

@@ -386,6 +386,11 @@ fn a9_the_receipt_says_so_and_waits_for_the_records() {
     let p = &r["processing"];
     assert_eq!((p["state"].clone(), p["done"].clone(), p["records"].as_array().map(Vec::len)), (json!("processed"), json!(true), Some(3)), "{r}");
     assert_eq!(p["records"], s.dump_state(r["dump_id"].as_str().unwrap())["processed"]["records"]);
+    // The receipt names the review commands for those records.
+    let id = r["dump_id"].as_str().unwrap();
+    assert_eq!(p["review"]["list"], json!(format!("cauldron ripples review --env dev --cauldron kb --dump {id}")), "{r}");
+    assert_eq!(p["review"]["approve"], json!(format!("cauldron ripples approve --dump {id} --env dev --cauldron kb")), "{r}");
+    assert!(p["review"]["note"].as_str().unwrap().contains("interactive terminal"), "{r}");
     let bad = call(json!({"cauldron": "kb", "text": "x", "wait_secs": 121})).unwrap_err();
     assert_eq!(bad.code, "usage", "{bad:?}");
     drop(svc);

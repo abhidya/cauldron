@@ -91,6 +91,10 @@ mod mcp_door;
 mod mcp_bridge;
 // `cauldron ripples`: a dump into records, by hand or automatically, through the ripples service.
 mod ripples;
+// `cauldron ripples review`: the records a ripple wrote, waiting for review.
+mod review;
+// `cauldron ripples review --interactive`: the owner's pass over the queue, at a terminal.
+mod review_pass;
 // `cauldron inference`: local model files registered by hand, and the
 // `inference` service that runs them on demand.
 mod inference;
@@ -144,7 +148,7 @@ const VERBS: &[(&str, &str)] = &[
     ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get | dump-remove | approve (`soup help`)"),
     ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
     ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
-    ("ripples", "a dump into knowledge-graph records: run | status | eval | on | off (`ripples help`); approve them with `soup approve`"),
+    ("ripples", "a dump into knowledge-graph records: run | status | eval | on | off | review | approve | reject (`ripples help`)"),
     ("inference", "local models on this machine: models add | list | remove, status, unload (`inference help`)"),
 ];
 
@@ -1270,6 +1274,9 @@ fn verb_status(args: &[String]) -> Result<i32> {
                     .iter()
                     .map(|(s, _, j)| (s.clone(), j.clone()))
                     .collect::<serde_json::Map<_, _>>(),
+                // Per cauldron, how many records a ripple wrote wait for
+                // the owner's review.
+                "review": review::waiting_all(&env, None),
             }))?
         );
     } else {
@@ -1314,6 +1321,11 @@ fn verb_status(args: &[String]) -> Result<i32> {
         }
         for (svc, line, _) in &gates {
             println!("\n{svc}: {line}");
+        }
+        for w in review::waiting_all(&env, None) {
+            if let Some(cmd) = w["review"].as_str() {
+                println!("\ncauldron {}: {} record(s) a ripple wrote wait for review: {cmd}", w["cauldron"].as_str().unwrap_or("?"), w["unreviewed"]);
+            }
         }
         // WHICH DECLARATION, per service that this environment runs or pins.
         // One line each, because the phrase `shipped (no snapshot)` is the

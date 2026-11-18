@@ -87,6 +87,9 @@ fn store(err: impl std::fmt::Display) -> Error {
 /// Import `records` into the target's soup (see the module docs for every
 /// proof a real import makes first).
 pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<ImportOutcome> {
+    // Before any lock or proof: a batch carrying a review flag is refused
+    // whatever holds the soup (`submit` checks again).
+    crate::review::refuse_review_flags(records)?;
     let (e, c) = (&t.env, &t.cauldron);
     let soup = c.soup();
     let pool = o.pool_name();
@@ -164,6 +167,8 @@ pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<Import
 /// one spine row. Answers the import's JSON and whether it is `validated`
 /// or `landed`. No duplicate-batch check is made here.
 pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &ImportOptions, digest: &str) -> Result<(Value, bool)> {
+    // The review flags are the owner's: no record write sets or clears one.
+    crate::review::refuse_review_flags(records)?;
     let (e, c) = (&t.env, &t.cauldron);
     let mut plan = MigrationPlan::new(spine::envelope::Initiator::Agent {
         thread: o.agent.clone(),

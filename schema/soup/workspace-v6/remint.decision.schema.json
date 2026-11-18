@@ -246,7 +246,7 @@
     "meta": {
       "properties": {
         "approved": {
-          "description": "The review flag. A record a ripple wrote reads as `unreviewed: true` until this is set (any value but false or null; the owner's `cauldron soup approve`, run at a terminal, writes {at, by}; no MCP tool sets it). It is a flag: the soup refuses it to every ripple, so a ripple can never approve its own records. Leave it out when you write a record."
+          "description": "The review flag. A record a ripple wrote reads as `unreviewed: true` until this is set (any value but false or null; the owner's `cauldron ripples approve` or `cauldron soup approve`, run at a terminal, writes {at, by}; no MCP tool sets it; a rejected record is not approved until its rejection is taken back). It is a flag: the soup refuses it to every ripple, so a ripple can never approve its own records. Leave it out when you write a record."
         },
         "cites": {
           "description": "External citations: each a `kind` with the keys that locate it. See README.md, \"Conventions\".",
@@ -435,6 +435,9 @@
             "type": "object"
           },
           "type": "array"
+        },
+        "rejected": {
+          "description": "The rejection flag. A record a ripple wrote that the owner rejected (`cauldron ripples reject`, run at a terminal, writes {at, by, reason?}; no MCP tool sets it) is kept, with its cite to the dump, and is left out of the listing reads (nodes, search, a region's members) unless they are asked to include rejected records; `soup_get` still answers it, marked `rejected: true`. A rejected record cannot be approved until the rejection is taken back (`--unreject`). It is a flag: the soup refuses it to every ripple. Leave it out when you write a record."
         },
         "ripple": {
           "description": "Set by the MCP door on every record a ripple writes, overwriting anything the batch put here: {package, version, run, model}. For display only; who wrote a record is read from the transaction that wrote it, which no field can change. Leave it out when you write a record.",

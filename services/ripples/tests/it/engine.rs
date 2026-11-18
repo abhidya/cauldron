@@ -276,6 +276,22 @@ fn e15_the_daily_cap_follows_the_cauldron_not_its_name() {
     assert_eq!(cauldron_ripples::journal::day(&lines, "kb", Some(&new_id), &today).calls, 2);
     assert_eq!(cauldron_ripples::journal::day(&s.journal(), "kb", Some(&new_id), &today).calls, 1);
     assert_eq!(cauldron_ripples::journal::day(&s.journal(), "kb2", Some(&first_id), &today).calls, 1);
+
+    // The spend VIEW groups the same way, under the current names: kb2's
+    // call (made as `kb`) under kb2, the new kb's under kb.
+    let owners = env::ripples_auto::Owners::of(&s.env());
+    let view = cauldron_ripples::seam::today(&s.journal(), None, &owners);
+    let per = &view["per_cauldron"];
+    assert_eq!((per["kb2"]["calls"].clone(), per["kb2"]["names"].clone(), per["kb2"]["gone"].clone()), (json!(1), json!(["kb"]), json!(false)), "{view}");
+    assert_eq!((per["kb"]["calls"].clone(), per["kb"]["names"].clone()), (json!(1), json!(["kb"])), "{view}");
+    assert!(per["kb2"]["cauldron_id"].as_str().is_some_and(|i| first_id.ends_with(i)), "{view}");
+    assert_ne!(per["kb"]["cauldron_id"], per["kb2"]["cauldron_id"]);
+    let only = cauldron_ripples::seam::today(&s.journal(), Some("kb2"), &owners);
+    assert_eq!((only["calls"].clone(), only["per_cauldron"].as_object().unwrap().len()), (json!(1), 1), "{only}");
+    // kb2 removed from the environment by hand: its spend is shown as gone.
+    std::fs::rename(cauldrons.join("kb2"), s.data().join("kb2-aside")).unwrap();
+    let view = cauldron_ripples::seam::today(&s.journal(), None, &env::ripples_auto::Owners::of(&s.env()));
+    assert_eq!((view["per_cauldron"]["kb (gone)"]["calls"].clone(), view["per_cauldron"]["kb (gone)"]["gone"].clone()), (json!(1), json!(true)), "{view}");
 }
 
 /// **Each call runs in an empty private directory made for it**, removed

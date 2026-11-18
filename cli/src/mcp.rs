@@ -356,6 +356,12 @@ fn status(args: &[String]) -> Result<i32> {
             "dumps_lock_says": soup_door::dumps::lock_says(&c),
             "dumps": dumps_status(&c, dumps_held.as_deref()),
         });
+        if let Some(w) = crate::review::waiting(&e, &c) {
+            row["unreviewed"] = w["unreviewed"].clone();
+            if let Some(r) = w.get("review") {
+                row["review"] = r.clone();
+            }
+        }
         if let Some(w) = name_only.iter().find(|w| w["cauldron"] == c.name.as_str()) {
             row["grant_note"] = w["note"].clone();
             row["regrant"] = w["regrant"].clone();

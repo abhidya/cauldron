@@ -11,6 +11,7 @@
 //! | `meta.blocking` | question |
 //! | `meta.addressed` | idea |
 //! | `meta.approved` | every content type (not region, not viewer): the owner's review of a record a ripple wrote |
+//! | `meta.rejected` | every content type (not region, not viewer): the owner's rejection of a record a ripple wrote |
 //! | `retired`, `provisional`, `deferred_by` | region |
 //! | `sealed` | every type (only the `SEAL` statement touches it) |
 //!
@@ -69,6 +70,15 @@ pub const FLAG_FIELDS: &[FlagField] = &[
     FlagField {
         name: "meta.approved",
         path: &["meta", "approved"],
+        on: Some(&["directive", "milestone", "handoff", "constraint", "danger", "issue", "decision", "question", "task", "idea"]),
+    },
+    // The other review decision: a rejected record is kept (its existence,
+    // the decision and its cite stay readable) and left out of the listing
+    // reads. A flag for the same reason as `meta.approved`: no ripple can
+    // reject, or un-reject, anything.
+    FlagField {
+        name: "meta.rejected",
+        path: &["meta", "rejected"],
         on: Some(&["directive", "milestone", "handoff", "constraint", "danger", "issue", "decision", "question", "task", "idea"]),
     },
     FlagField { name: "retired", path: &["retired"], on: Some(&["region"]) },

@@ -959,3 +959,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+/// **A cauldron's spend identities**: what the ripples journals' `call`
+/// lines carry as `cauldron_id` for it (`id:` and its [`Binding::key`];
+/// for a cauldron given its id after calls were journaled, also the
+/// identity those calls carried, [`Binding::legacy_key`]). A cauldron with
+/// no binding at all is `name:<name>`.
+pub fn spend_identities(e: &crate::Environment, c: &crate::Cauldron) -> Vec<String> {
+    let b = Binding::of(e, c);
+    if b.id.is_none() && b.created_at.is_none() && b.dir_ino.is_none() {
+        return vec![format!("name:{}", c.name)];
+    }
+    let mut out = vec![format!("id:{}", b.key())];
+    if b.id.is_some() && b.created_at.is_some() {
+        out.push(format!("id:{}", b.legacy_key()));
+    }
+    out
+}
+
+/// Whose spend a journal line is, as the spend views group it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner {
+    /// The group's key in a view: the cauldron's current name; for spend of
+    /// a cauldron that is no longer in the environment, the name it was
+    /// journaled under followed by ` (gone)`.
+    pub key: String,
+    /// The cauldron's current name (the journaled one when it is gone).
+    pub name: String,
+    /// The cauldron's id (`cauldron.toml`), when it has one.
+    pub id: Option<String>,
+    pub gone: bool,
+}
+
+/// **The environment's cauldrons by spend identity**, so the spend views
+/// group by the cauldron and not by the name a line was journaled under: a
+/// renamed cauldron's earlier spend shows under its current name, and a
+/// cauldron removed and made again under its name shows apart from it.
+pub struct Owners(Vec<(Vec<String>, String, Option<String>)>);
+
+impl Owners {
+    pub fn of(e: &crate::Environment) -> Owners {
+        Owners(e.cauldrons().unwrap_or_default().into_iter().map(|c| (spend_identities(e, &c), c.name.clone(), c.id())).collect())
+    }
+
+    /// The owner of a line journaled under `name`, carrying `identity`
+    /// (`None` on a line an earlier build wrote, which is the cauldron of
+    /// that name now).
+    pub fn of_line(&self, identity: Option<&str>, name: &str) -> Owner {
+        let found = match identity.filter(|i| !i.starts_with("name:")) {
+            Some(i) => self.0.iter().find(|(ids, _, _)| ids.iter().any(|x| x == i)),
+            None => self.0.iter().find(|(_, n, _)| n == name),
+        };
+        match found {
+            Some((_, n, id)) => Owner { key: n.clone(), name: n.clone(), id: id.clone(), gone: false },
+            None => Owner { key: format!("{name} (gone)"), name: name.to_string(), id: None, gone: true },
+        }
+    }
+}

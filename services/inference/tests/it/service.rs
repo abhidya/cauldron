@@ -116,9 +116,22 @@ fn i1_on_demand_load_one_completion_and_idle_unload() {
     assert!(r2.get("load_ms").is_none(), "{r2}");
     assert_eq!(s.fake_lines("requests.jsonl").iter().filter(|r| r["path"] == "/v1/chat/completions").count(), 2);
 
-    // Idle: unloaded, and the child is gone.
-    assert!(eventually(10, || svc.status(&s)["state"] == "idle"), "{}", svc.status(&s));
+    // Idle: unloaded, and the child is gone. Every status read on the way
+    // is consistent: `idle` only once the unload is recorded (while it waits
+    // for the child to exit, `unloading`).
+    assert!(
+        eventually(10, || {
+            let st = svc.status(&s);
+            let state = st["state"].as_str().unwrap_or("").to_string();
+            assert!(state != "idle" || st["last_unload"].is_object(), "idle with no unload recorded: {st}");
+            assert!(state != "unloading" || st["unloading"]["reason"] == "idle", "{st}");
+            state == "idle"
+        }),
+        "{}",
+        svc.status(&s)
+    );
     let st = svc.status(&s);
+    assert!(st["unloading"].is_null(), "{st}");
     assert_eq!(st["last_unload"]["reason"], "idle", "{st}");
     assert!(eventually(5, || !alive(child)), "the child is gone after an idle unload");
     assert!(!s.dir().join("llama.key").exists(), "its key is gone with it");

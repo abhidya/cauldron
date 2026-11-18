@@ -330,6 +330,7 @@ impl State {
         runs.drain(..keep);
         let running = active.as_ref().map(|(r, _, _)| r.clone());
         let ledger = journal::read(self.ctx.journal.eval_ledger().path());
+        let owners = env::ripples_auto::Owners::of(&self.ctx.env);
         let unsettled: Vec<Value> = journal::unsettled(&lines)
             .into_iter()
             .chain(journal::unsettled(&ledger))
@@ -341,8 +342,8 @@ impl State {
             "service": {"pid": me, "started_at": self.started_at, "backend": self.ctx.inference.name(), "env": self.ctx.env.name},
             "running": active.map(|(r, c, d)| json!({"run": r, "cauldron": c, "dump": d})),
             "runs": runs,
-            "today": today(&lines, cauldron),
-            "evaluations_today": today(&ledger, cauldron),
+            "today": today(&lines, cauldron, &owners),
+            "evaluations_today": today(&ledger, cauldron, &owners),
             "per_dump": journal::per_dump(&lines, cauldron).into_iter().take(20).collect::<Vec<_>>(),
             "possibly_running": unsettled,
             "caps": caps_json(&self.ctx.caps),
@@ -420,27 +421,41 @@ pub fn caps_json(c: &crate::engine::Caps) -> Value {
 }
 
 /// Today's (UTC) spend, from the journal: every cauldron's (or `cauldron`'s)
-/// calls, charged input tokens and dumps.
-pub fn today(lines: &[Value], cauldron: Option<&str>) -> Value {
+/// calls, charged input tokens and dumps, grouped by the cauldron's
+/// identity (`env::ripples_auto::Owners`) and shown under its current name,
+/// so a rename does not split a day's spend and a cauldron made again under
+/// an old name does not inherit it. `cauldron` is a current name.
+pub fn today(lines: &[Value], cauldron: Option<&str>, owners: &env::ripples_auto::Owners) -> Value {
     let day = journal::today();
     let charges = journal::charges(lines);
-    let mut names: Vec<String> = charges.iter().map(|c| c.cauldron.clone()).collect();
-    names.sort();
-    names.dedup();
     let mut u = crate::inference::Usage::default();
     let mut per = serde_json::Map::new();
-    for c in names.iter().filter(|c| cauldron.is_none_or(|x| x == c.as_str())) {
-        let d = journal::day(lines, c, None, &day);
-        if d.calls == 0 {
+    let owner = |c: &journal::Charge| owners.of_line(c.identity.as_deref(), &c.cauldron);
+    let wanted = |o: &env::ripples_auto::Owner| cauldron.is_none_or(|x| !o.gone && o.name == x);
+    let mut dumps: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = Default::default();
+    for c in charges.iter().filter(|c| c.at.starts_with(&day)) {
+        let o = owner(c);
+        if !wanted(&o) {
             continue;
         }
-        per.insert(c.clone(), json!({"calls": d.calls, "charged_input_tokens": d.tokens, "dumps": d.dumps.len()}));
+        let e = per.entry(o.key.clone()).or_insert_with(|| json!({"calls": 0, "charged_input_tokens": 0, "dumps": 0, "cauldron_id": o.id, "gone": o.gone, "names": []}));
+        e["calls"] = json!(e["calls"].as_u64().unwrap_or(0) + 1);
+        e["charged_input_tokens"] = json!(e["charged_input_tokens"].as_u64().unwrap_or(0) + c.tokens);
+        if let Some(n) = e["names"].as_array_mut() {
+            if !n.contains(&json!(c.cauldron)) {
+                n.push(json!(c.cauldron));
+            }
+        }
+        let d = dumps.entry(o.key.clone()).or_default();
+        d.insert(c.dump.clone());
+        e["dumps"] = json!(d.len());
     }
-    let mine = |c: &journal::Charge| c.at.starts_with(&day) && cauldron.is_none_or(|x| c.cauldron == x);
+    let mine = |c: &journal::Charge| c.at.starts_with(&day) && wanted(&owner(c));
     let calls = charges.iter().filter(|c| mine(c)).count();
     let unsettled = charges.iter().filter(|c| mine(c) && !c.settled).count();
+    let runs: std::collections::HashSet<&str> = charges.iter().filter(|c| mine(c)).map(|c| c.run.as_str()).collect();
     for l in lines.iter().filter(|l| l["event"] == "called" && l["at"].as_str().is_some_and(|a| a.starts_with(&day))) {
-        if cauldron.is_some_and(|c| l["cauldron"] != c) {
+        if cauldron.is_some() && !l["run"].as_str().is_some_and(|r| runs.contains(r)) {
             continue;
         }
         if let Ok(x) = serde_json::from_value::<crate::inference::Usage>(l["usage"].clone()) {

@@ -29,8 +29,10 @@ pub const FILE: &str = "door.secret";
 pub const RIPPLES_FILE: &str = "ripples.secret";
 
 /// **The approval key**: a third secret, minted the same way at every boot
-/// into `<dir>/approve.secret`. Only `cauldron soup approve` reads it, and
-/// only after it has checked that its input and output are an interactive
+/// into `<dir>/approve.secret`. Only `cauldron soup approve`, `cauldron
+/// ripples approve | reject` and `cauldron ripples review --interactive`
+/// read it, each only after it has checked that
+/// its input and output are an interactive
 /// terminal: it proves a seam connection is the owner's command line
 /// (`crate::approve`). The bridge and the `ripples` service never read it,
 /// and no tool of the door accepts it.

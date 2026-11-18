@@ -160,6 +160,11 @@ struct Inner {
     /// The load an `unload` ended last, and why: a request that loses its
     /// child to it is told so, not that the child crashed.
     unloaded: Option<(u64, String)>,
+    /// An unload in progress (its model, reason and start), from the moment
+    /// the model stops being loaded until its child has exited and
+    /// `last_unload` is written: status reads `unloading`, never `idle`
+    /// without an unload record.
+    unloading: Option<Value>,
 }
 
 pub struct Supervisor {
@@ -194,6 +199,7 @@ impl Supervisor {
                 in_flight: None,
                 runtime: None,
                 unloaded: None,
+                unloading: None,
             }),
             request: Mutex::new(()),
         })
@@ -261,6 +267,7 @@ impl Supervisor {
             drop(l.stdin.take());
             let out = (l.exit.clone(), l.child_pid, l.guard_pid, l.model.name.clone());
             g.unloaded = Some((l.gen, reason.to_string()));
+            g.unloading = Some(json!({"model": out.3, "reason": reason, "since": now(), "child_pid": out.1}));
             g.loaded = None;
             out
         };
@@ -281,7 +288,12 @@ impl Supervisor {
         // The key answered only that child; the next load mints another.
         let _ = std::fs::remove_file(self.dir.join(LLAMA_KEY_FILE));
         let v = json!({"model": name, "reason": reason, "at": now(), "exit": code, "child_pid": child});
-        self.lock().last_unload = Some(v.clone());
+        {
+            // One step: the unload is recorded as the in-progress one ends.
+            let mut g = self.lock();
+            g.last_unload = Some(v.clone());
+            g.unloading = None;
+        }
         tracing::info!(model = %name, reason, "unloaded");
         Some(v)
     }
@@ -644,7 +656,13 @@ impl Supervisor {
         };
         json!({
             "ok": true,
-            "state": match &g.loaded { Some(l) if l.ready => "ready", Some(_) => "loading", None => "idle" },
+            "state": match (&g.loaded, &g.unloading) {
+                (Some(l), _) if l.ready => "ready",
+                (Some(_), _) => "loading",
+                (None, Some(_)) => "unloading",
+                (None, None) => "idle",
+            },
+            "unloading": g.unloading,
             "model": model,
             "runtime": runtime,
             "settings": match &cfg {

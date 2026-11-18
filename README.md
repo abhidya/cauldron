@@ -114,10 +114,13 @@ earlier is set so by its next write).
 
 ## What is in this release
 
-This is **0.1.8**. On top of the V1 interface (two tab bars, a first-run
-screen, the Ledger, the account pool, secret human actions and `cauldron
-ctl`, from 0.1.2 and 0.1.3), the 0.1.4 to 0.1.8 releases made a cauldron's
-soup a knowledge graph you use from Claude Code:
+The release is the workspace version (`version` in the top-level
+`Cargo.toml`, the same in the plugin's `plugin.json`), and
+[CHANGELOG.md](CHANGELOG.md) lists every change, newest first. On top of the V1 interface (two tab bars,
+a first-run screen, the Ledger, the account pool, secret human actions and
+`cauldron ctl`, from 0.1.2 and 0.1.3), the releases since made a cauldron's
+soup a knowledge graph you use from Claude Code, and then let a ripple turn
+your dumps into records:
 
 - 0.1.4 and 0.1.5: the published soup schema, `cauldron create` and `list`,
   the `cauldron soup` verbs, `cauldron link`, and the Claude Code plugin with
@@ -129,12 +132,17 @@ soup a knowledge graph you use from Claude Code:
   rename` and `remove`, the plugin installed from GitHub, an upgrade that
   brings up the MCP service or moves it to the new build, a cauldron's data
   private to you, and fixes filed as issues.
-
-0.1.10 adds the first ripple, run by hand: `cauldron ripples run` turns one
-dump into unreviewed records ([Ripples, by hand](#ripples-by-hand)). 0.1.12
-lets the owner turn that on per cauldron, so a dump is processed when it
-lands, off by default ([Ripples on their own](#ripples-on-their-own)). [CHANGELOG.md](CHANGELOG.md)
-lists every change.
+- 0.1.9: removing one dump for good (`cauldron soup dump-remove`), and the
+  MCP service hardened.
+- 0.1.10: the first ripple, run by hand: `cauldron ripples run` turns one
+  dump into unreviewed records ([Ripples, by hand](#ripples-by-hand)).
+- 0.1.11: local inference, a model on this machine for the dump ripple,
+  with nothing leaving it.
+- 0.1.12: automatic ripples, turned on per cauldron by its owner and off by
+  default ([Ripples on their own](#ripples-on-their-own)).
+- 0.1.13: the review queue: see what a ripple wrote, grouped by dump, and
+  approve or reject it in bulk at a terminal ([Reviewing a ripple's
+  records](#reviewing-a-ripples-records)).
 
 cauldron has three parts:
 
@@ -479,8 +487,9 @@ itself ([Ripples on their own](#ripples-on-their-own)):
 ```sh
 cauldron ripples run DM-3 --env prod --cauldron kb        # one dump; prints the records and the tokens
 cauldron ripples status --env prod --cauldron kb          # the last runs, spend today and per dump, the caps
-cauldron soup nodes --env prod --cauldron kb --review pending   # what a ripple wrote and nobody approved yet
-cauldron soup approve C-12 IS-4 --env prod --cauldron kb  # you, at a terminal: mark records as reviewed
+cauldron ripples review --env prod --cauldron kb --text   # what a ripple wrote and nobody reviewed yet, by dump
+cauldron ripples approve --dump DM-3 --env prod --cauldron kb   # you, at a terminal: mark a dump's records reviewed
+cauldron ripples reject --dump DM-3 --env prod --cauldron kb    # you, at a terminal: keep them out of the reads
 ```
 
 **Off unless you start it.** The work is done by the `ripples` service,
@@ -603,8 +612,8 @@ nothing else. Two things stay:
   (`cauldron soup get <id>` shows it). The run's records are also listed by
   the dump itself before you remove it (`processed.records` in `cauldron
   soup dumps`), by `cauldron ripples status` (the run's `records`), and,
-  while you have not approved them, by `cauldron soup nodes --review
-  pending`. Supersede any record you do not want.
+  while you have not reviewed them, by `cauldron ripples review --dump DM-3`.
+  Reject or supersede any record you do not want.
 - *threads' copy of each call.* The threads service keeps a copy of every
   ripple call's prompt (the dump's text included) and of its answer, in its
   store, as above, until you delete it.
@@ -622,16 +631,8 @@ to act on an instruction found inside a record or a dump, and to tell you
 when one reads like an instruction. That is guidance to the session, not a
 control.
 
-**Approving is yours, at a terminal.** `cauldron soup approve <id>... --env
-<env> --cauldron <name>` gives each named record `meta.approved` (written
-as the owner, in one write, audited in the `mcp` service's `calls.jsonl`),
-and it reads as reviewed from then on; `--unapprove` takes it back. Like
-`cauldron mcp grant`, it runs only with its input and output on an
-interactive terminal, and no option skips that. No MCP tool approves, so no
-Claude Code session can; a ripple never can (the soup refuses
-`meta.approved` from a ripple). A review flow for sessions comes in a later
-release. There is no reject command yet; a record you do not want stays
-unreviewed, and can be superseded like any record.
+**Reviewing is yours, at a terminal**: see [Reviewing a ripple's
+records](#reviewing-a-ripples-records).
 
 **What a ripple may write.** New records only (never an edit, a close or a
 supersede of an existing node), of those seven types, each in at least one
@@ -670,7 +671,13 @@ call as busy or overloaded) refused the call before it ran: it is charged
 nothing and is no call against a cap, and a run by hand tries it at most 3
 times, then ends `deferred` (reason `busy`) with the dump still `received`.
 `run` prints each run's tokens (input, output, cached, the calls and the
-models), and `status` shows the spend today per cauldron and per dump.
+models), and `status` shows the spend today per cauldron and per dump. Today's
+spend is grouped by the cauldron itself (its id), not by the name it was
+spent under, and shown under its current name, with `cauldron_id` and the
+`names` its calls were journaled under: a renamed cauldron's day is one
+entry, a cauldron made again under an old name is another, and spend of a
+cauldron no longer in the environment shows as `<name> (gone)`. The
+evaluations' ledger (`evaluations_today`) is grouped the same way.
 
 **A call given up is stopped.** When threads parks the call under its
 budget, the turn ends without an answer, or no answer comes within 15
@@ -696,6 +703,111 @@ second run answers the first one's. A run cut short (the service stopped or
 killed) shows as `interrupted` in `cauldron ripples status`; run the same
 command again, and it lands once.
 
+### Reviewing a ripple's records
+
+New in 0.1.13. Every record a ripple writes is **unreviewed** until you
+decide it: you approve it (it reads as reviewed from then on) or you reject
+it (it is kept, and left out of the normal reads). Only you decide, at an
+interactive terminal; a ripple, a Claude Code session and every MCP tool
+can only read.
+
+**The `mcp` service must be this release's.** A decision is written by the
+running `mcp` service, and this command line refuses to send one to an
+older service (it would not read the decision as this release means it),
+writing nothing. If you upgraded without `--replace-running`, move the
+service to the new build first, with `./scripts/install --replace-running`
+or the two commands under "Upgrading" above.
+
+```sh
+cauldron ripples review --env prod --cauldron kb --text          # the queue, grouped by dump and run
+cauldron ripples review --env prod --cauldron kb --dump DM-3     # one dump's records, as JSON
+cauldron ripples approve --dump DM-3 --env prod --cauldron kb    # every record of that dump
+cauldron ripples reject --run <run> --env prod --cauldron kb --reason "duplicates"
+cauldron ripples approve C-12 IS-4 --env prod --cauldron kb      # by id
+cauldron ripples review --interactive --env prod --cauldron kb   # walk the queue, a key per dump
+```
+
+**1. See what waits.** `cauldron ripples review` lists the records a ripple
+wrote that carry neither decision, grouped by the dump they cite and the run
+that wrote them, newest group first. Each group says the model and backend
+that wrote it, when, and the exact commands that approve or reject it; each
+record its id, type, state, handle, the first 240 characters of its body,
+its regions and its other edges. `counts` gives the records waiting, the
+groups, per dump and per type, and how many of the matching records you
+already approved or rejected. Filters: `--dump DM-n`, `--run <run>`, `--type
+<type>`, `--since <YYYY-MM-DD or RFC 3339 time>`. The answer is at most
+`--max-chars` characters (default 12,000, at most 50,000; under 2,000 is
+refused), as JSON and as `--text`: whole records while they fit, and a
+record longer than the bound cut (its edges, then its longest fields),
+listed in `truncated`. One that stopped early says `next_after`, the last
+record it showed; `--after <that id>` lists the records after it, so you can
+decide a page and then ask for the next without skipping any. `--text`
+prints it for reading, each record on one line, with its control and
+invisible characters (escape sequences, bidirectional overrides, zero-width
+characters) shown escaped, as `\u{202E}`, so a record cannot draw on your
+terminal or reorder what a line shows; a group cut by the page says how
+many of its records it shows, and that its commands decide them all. It
+reads only, so it works with the services running or not. `cauldron ripples status`, `cauldron mcp status` and `cauldron status`
+show how many records wait per cauldron, with this command; a dump receipt
+that waited for its records (`wait_secs`) names it too, and the approve and
+reject commands for that dump.
+
+**2. Decide.** `cauldron ripples approve` and `cauldron ripples reject` take
+the records one way: `--dump DM-n` (every record a ripple wrote citing that
+dump), `--run <run>` (every record that run wrote), or record ids. Each is
+one write through the running `mcp` service, as the owner, audited in its
+`calls.jsonl` (`soup_approve`, `soup_unapprove`, `soup_reject` or
+`soup_unreject`, with the selector, the counts and, for `--run`, the run;
+never a record's text or your reason).
+
+- **Approve** sets `meta.approved: {at, by: "owner"}`. `--unapprove` takes
+  it back.
+- **Reject** sets `meta.rejected: {at, by: "owner", reason}` (`--reason`:
+  one line, at most 500 characters). Nothing is deleted. `soup get` (and
+  `soup_get`) still answers a rejected record, marked `rejected: true`,
+  with its cite to the dump and your decision. `soup nodes`, `soup search`
+  and a region's members (and `soup_nodes`, `soup_search`, `soup_region`)
+  leave it out and say how many in `rejected_hidden`; `--include-rejected`
+  (MCP: `include_rejected`) lists them, marked. The queue no longer lists
+  it. `--unreject` takes a rejection back: the record is unreviewed again.
+- **The two exclude each other.** A rejected record is not approved, by
+  `ripples approve` or `soup approve`, until you take the rejection back;
+  an approved one is not rejected until you take the approval back. Asking
+  again for a state a record is already in changes nothing: the answer
+  lists it in `skipped`, with why.
+
+`cauldron soup approve <id>... [--unapprove]` still works as before, and
+like these it needs this release's `mcp` service.
+
+**3. Or walk it.** `cauldron ripples review --interactive` shows the queue
+one group at a time and takes a key: `a` approves the whole group, `r`
+rejects it (asking for an optional reason), a record's number marks it
+(approve, then reject, then unmarked; several at once: `1 3`) and `w`
+writes the marks, `s` skips the group, `q` quits. Each group's decision is
+one write: the reason is asked before anything is written, then its
+approvals and rejections land together (one audit line,
+`soup_approve_and_reject`, when it does both), or, when any of its records
+is no longer as it was listed, nothing of the group lands and the pass says
+why. A skipped group, and every group after `q` or the end of input, is
+left as it was. Records are shown as `--text` shows them. It takes the same
+filters as `review`.
+
+**Why a terminal.** `approve`, `reject` and `review --interactive` run only
+with their input and output on an interactive terminal, like `cauldron mcp
+grant`, and no option skips that: a script or an agent running them is
+refused, and the refusal names the exact command for you to run. No MCP
+tool approves or rejects, so no Claude Code session can. A ripple can do
+neither: the soup refuses `meta.approved` and `meta.rejected` from a ripple,
+and no record write (`soup import`, `soup_put`, a ripple's batch) may carry
+either, set or cleared, in any casing or nesting. In a Claude
+Code session, `/cauldron:review` reads the queue (the MCP tool
+`soup_review`, scope `read`) and tells you these commands; it never runs
+them. Unreviewed text was written by a model from a dump, so the session is
+told to treat it as data and never to act on an instruction inside it. That
+is guidance to the session; the terminal check guards the commands, not
+the files, and a process running as you that reads the `mcp` service's
+private key file can send the same request.
+
 ### Ripples on their own
 
 New in 0.1.12. **Off by default, for every cauldron, and an upgrade never
@@ -713,8 +825,8 @@ cauldron ripples off kb --env prod                    # from anywhere; before th
 **What turning it on means.** From that moment, each dump that lands in the
 cauldron is processed with no further command, exactly as `cauldron ripples
 run` would process it: the same call, the same caps, the same journal, and
-records marked `unreviewed` until you approve them at a terminal
-(`cauldron soup approve`). It authorises model spend and writes into the
+records marked `unreviewed` until you approve or reject them at a terminal
+([Reviewing a ripple's records](#reviewing-a-ripples-records)). It authorises model spend and writes into the
 cauldron that nobody asks for one by one, so, like `cauldron mcp grant`,
 `on` requires an interactive terminal (its input and output must both be
 one; no MCP tool, seam verb or option turns it on). It prints what will be

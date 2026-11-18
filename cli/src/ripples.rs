@@ -7,8 +7,9 @@
 //! `status` shows the service, the run in progress, the last runs and
 //! the spend and automatic processing per cauldron; `on` (the owner's act,
 //! at a terminal) turns automatic processing on for one cauldron, from now
-//! on, and `off` (from anywhere) turns it off. The owner approves a ripple's records with
-//! `cauldron soup approve`, at a terminal.
+//! on, and `off` (from anywhere) turns it off. `review` lists the records a ripple wrote
+//! that wait for review, and the owner approves or rejects them with `approve` and
+//! `reject`, at a terminal (`crate::review`).
 //!
 //! The service is found through the environment's seam table (its `ripples`
 //! row must be live); `RUN` and `STATUS` carry the run key the service
@@ -130,6 +131,64 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand or automa
         Turn it off, from anywhere: no further model call starts for that cauldron, and a run
         in progress stops before its next call and writes nothing more. Dumps then wait
         `received`; turning it on again takes only dumps received after that moment.
+    cauldron ripples review --env <env> --cauldron <name> [--dump <DM-n>] [--run <run>] [--type <type>]
+                            [--since <date or time>] [--after <id>] [--max-chars <n>] [--text]
+        The review queue: the records a ripple wrote that nobody has approved or rejected,
+        grouped by the dump and the run that wrote them, newest group first. Each group
+        names the dump, the run, the model and backend that wrote it and when, and the
+        exact commands that approve or reject it; each record its id, type, state, handle,
+        an excerpt of its body (at most 240 characters), its regions and its other edges.
+        Counts: unreviewed records, groups, per dump and per type, and how many of the
+        matching records are approved or rejected. --since takes YYYY-MM-DD or an RFC 3339
+        time. The answer is at most --max-chars characters (default 12000, at most 50000,
+        at least 2000: smaller is refused), as JSON and as --text: whole records while they
+        fit, and a record longer than the bound cut (its edges, then its longest fields),
+        listed in `truncated`. One that stopped early says `next_after`, the last record it
+        showed: --after <that id> lists the records after it, and deciding the records of a
+        page before asking for the next moves none of them past it. --text prints it for
+        reading, each record on one line with its control and invisible characters (escape
+        sequences, bidirectional overrides, zero-width characters) shown escaped, as
+        \\u{202E}; the JSON writes them as JSON escapes. A group cut by the page says how
+        many of its records it shows; its commands decide them all. Reads only, through
+        connections that cannot write: it works with or without the services running.
+    cauldron ripples review --interactive --env <env> --cauldron <name> [--dump <DM-n>] [--run <run>]
+                            [--type <type>] [--since <date or time>]
+        Walk the queue at a terminal, one group (a dump's records from one run) at a time:
+        each record on one line (shown as --text shows it), then a key: a approves every
+        record of the group, r rejects every record (asking for an optional one-line
+        reason), a record's number marks it (approve, then reject, then unmarked; several
+        at once: 1 3) and w writes the marks, s skips the group, q quits. Each group's
+        decision is ONE audited write through the running `mcp` service: the reason is
+        asked first, then its approvals and rejections land together, and only if every
+        record is still as it was listed (otherwise nothing of the group is written and it
+        says why). A skipped group, and every group after q or the end of input, is left as
+        it was. Requires an interactive terminal, like `approve` and `reject`.
+    cauldron ripples approve (--dump <DM-n> | --run <run> | <id>...) --env <env> --cauldron <name> [--unapprove]
+        Approve a ripple's records: every record it names (all the records a ripple wrote
+        citing that dump, or written by that run, or the ids) that reads as `unreviewed`
+        gets `meta.approved: {at, by: \"owner\"}` and reads as reviewed from then on. With
+        --unapprove, each approved one reads as unreviewed again. A rejected record is not
+        approved: take the rejection back first (`reject ... --unreject`).
+    cauldron ripples reject (--dump <DM-n> | --run <run> | <id>...) --env <env> --cauldron <name>
+                            [--reason <text>] [--unreject]
+        Reject a ripple's records: each named record that reads as `unreviewed` gets
+        `meta.rejected: {at, by: \"owner\", reason}` (the reason: one line, at most 500
+        characters). A rejected record is kept, never deleted: `soup get` (and `soup_get`)
+        still answers it, marked `rejected: true`, with its cite to the dump and the
+        decision; `soup nodes`, `soup search` and a region's members (and the MCP reads)
+        leave it out, saying how many in `rejected_hidden`, unless --include-rejected (MCP:
+        `include_rejected`); the review queue no longer lists it. An approved record is not
+        rejected: take the approval back first (--unapprove). With --unreject, each rejected
+        one reads as unreviewed again.
+        Both are the owner's acts: they run only with their input and output on an
+        interactive terminal, and no option skips that; no MCP tool approves or rejects, and
+        a ripple never can. Each is one write, through the running `mcp` service, audited
+        in its calls.jsonl (the counts, never the text or the reason). Asking again for a
+        state a record is already in changes nothing: it is listed in `skipped`, with why.
+        The running `mcp` service must be this release's or later: an older one (left
+        running by an install without --replace-running) is refused before anything is
+        sent, or does not know the request, and nothing is written; the refusal names the
+        commands that upgrade it.
     cauldron ripples help
 
   The `ripples` service is off unless started (`cauldron --env <env> build ripples`,
@@ -152,12 +211,15 @@ pub(crate) fn verb_ripples(args: &[String]) -> Result<i32> {
         Some("eval") => eval(&args[1..]),
         Some("on") => turn_on(&args[1..]),
         Some("off") => turn_off(&args[1..]),
+        Some("review") => crate::review::review(&args[1..]),
+        Some("approve") => crate::review::decide("approve", &args[1..]),
+        Some("reject") => crate::review::decide("reject", &args[1..]),
         None => {
             eprint!("{USAGE}");
             Ok(2)
         }
         Some(other) => {
-            eprintln!("cauldron ripples: no verb `{other}` (run | status | eval | on | off | help)");
+            eprintln!("cauldron ripples: no verb `{other}` (run | status | eval | on | off | review | approve | reject | help)");
             Ok(2)
         }
     }
@@ -272,12 +334,12 @@ fn ask(e: &Environment, addr: SocketAddr, verb: &str, args: &Value) -> Result<Va
 }
 
 fn print(v: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(v)?);
+    println!("{}", soup_door::review::json_for_terminal(v));
     Ok(())
 }
 
 /// How a finished run's outcome exits, with a line on stderr.
-fn finish(v: &Value) -> Result<i32> {
+fn finish(v: &Value, env_name: &str, cauldron: &str) -> Result<i32> {
     print(v)?;
     if let Some(p) = v["debug_file"].as_str() {
         eprintln!("cauldron ripples: --debug-keep-answer: the model's answers and the refusals, unscrubbed, are in {p} (owner-only); delete it when done");
@@ -287,9 +349,10 @@ fn finish(v: &Value) -> Result<i32> {
     match o {
         "processed" | "already_processed" => {
             eprintln!(
-                "cauldron ripples: {} {o}: {n} record(s){}; they read as `unreviewed` until the owner approves them at a terminal (`cauldron soup approve`).",
+                "cauldron ripples: {} {o}: {n} record(s){}; they read as `unreviewed` until the owner approves or rejects them at a terminal (`cauldron ripples review --env {env_name} --cauldron {cauldron} --dump {}` lists them).",
                 v["dump"].as_str().unwrap_or("?"),
-                if v["calls"].is_u64() { format!(", {} model call(s), {} input and {} output tokens", v["calls"], v["input_total"], v["usage"]["output_tokens"]) } else { String::new() }
+                if v["calls"].is_u64() { format!(", {} model call(s), {} input and {} output tokens", v["calls"], v["input_total"], v["usage"]["output_tokens"]) } else { String::new() },
+                v["dump"].as_str().unwrap_or("?"),
             );
             Ok(0)
         }
@@ -350,7 +413,7 @@ fn run(args: &[String]) -> Result<i32> {
         return Ok(1);
     }
     if first["done"] == json!(true) {
-        return finish(&first["result"]);
+        return finish(&first["result"], &e.name, cauldron);
     }
     let run = first["run"].as_str().unwrap_or_default().to_string();
     eprintln!("cauldron ripples: run {run} started for {dump} of `{cauldron}`; following it (`cauldron ripples status --env {} --run {run}` shows it too)", e.name);
@@ -363,7 +426,7 @@ fn run(args: &[String]) -> Result<i32> {
             Err(why) => bail!("the ripples service went away while the run was in progress ({why}); `cauldron ripples status --env {}` shows what the journal says", e.name),
         };
         match st["state"].as_str() {
-            Some("done") => return finish(&st["result"]),
+            Some("done") => return finish(&st["result"], &e.name, cauldron),
             Some("running") => {
                 let steps = st["steps"].as_array().cloned().unwrap_or_default();
                 for s in steps.iter().skip(said) {
@@ -392,8 +455,12 @@ fn status(args: &[String]) -> Result<i32> {
     }
     match find(&e) {
         Ok(addr) => {
-            let v = ask(&e, addr, "STATUS", &req)?;
+            let mut v = ask(&e, addr, "STATUS", &req)?;
+            if v["ok"] == json!(true) && a.run.is_none() {
+                v["review"] = review_view(&e, a.cauldron.as_deref());
+            }
             print(&v)?;
+            say_review(&v);
             Ok(if v["ok"] == json!(true) { 0 } else { 1 })
         }
         Err(why) => {
@@ -403,6 +470,7 @@ fn status(args: &[String]) -> Result<i32> {
             let lines: Vec<Value> = std::fs::read_to_string(&path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
             let eval_path = e.data_root.join(SERVICE).join("eval.jsonl");
             let eval_lines: Vec<Value> = std::fs::read_to_string(&eval_path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            let owners = ra::Owners::of(&e);
             let mut runs: Vec<Value> = Vec::new();
             for l in &lines {
                 if a.cauldron.as_deref().is_some_and(|c| l["cauldron"] != c) || a.run.as_deref().is_some_and(|r| l["run"] != r) || l["eval"] == json!(true) {
@@ -429,14 +497,35 @@ fn status(args: &[String]) -> Result<i32> {
                 "ok": true,
                 "service": {"running": false, "why": why},
                 "runs": runs,
-                "spend": spend(&lines, a.cauldron.as_deref()),
-                "evaluations_spend": spend(&eval_lines, a.cauldron.as_deref())["today"].clone(),
+                "spend": spend(&lines, a.cauldron.as_deref(), &owners),
+                "evaluations_spend": spend(&eval_lines, a.cauldron.as_deref(), &owners)["today"].clone(),
                 "journal": path.display().to_string(),
                 "evaluations_ledger": eval_path.display().to_string(),
                 "automatic": automatic_offline(&e, a.cauldron.as_deref()),
+                "review": review_view(&e, a.cauldron.as_deref()),
             }))?;
+            say_review(&json!({"review": review_view(&e, a.cauldron.as_deref())}));
             eprintln!("cauldron ripples: {why}. {}", start_hint(&e.name));
             Ok(0)
+        }
+    }
+}
+
+/// The review queue per cauldron (`crate::review::waiting`): how many
+/// records a ripple wrote wait for the owner, and the command that lists
+/// them.
+fn review_view(e: &Environment, cauldron: Option<&str>) -> Value {
+    let list = crate::review::waiting_all(e, cauldron);
+    let total: u64 = list.iter().filter_map(|x| x["unreviewed"].as_u64()).sum();
+    json!({"unreviewed": total, "cauldrons": list,
+           "decide": "the owner approves or rejects them at a terminal: `cauldron ripples approve | reject --dump <DM-n> --env <env> --cauldron <name>`, or `cauldron ripples review --interactive`"})
+}
+
+/// One stderr line per cauldron whose records wait for review.
+fn say_review(v: &Value) {
+    for c in v["review"]["cauldrons"].as_array().into_iter().flatten() {
+        if let Some(cmd) = c["review"].as_str() {
+            eprintln!("cauldron ripples: {} record(s) of cauldron `{}` wait for review: {cmd}", c["unreviewed"], c["cauldron"].as_str().unwrap_or("?"));
         }
     }
 }
@@ -512,7 +601,7 @@ fn what_it_means(s: &ra::Settings, env_name: &str, service: &str) -> String {
         "Turning automatic processing on for cauldron `{c}` in environment `{env_name}` means, for dumps received after DM-{since}:
          
          What is sent where: {kinds}, with the cauldron's regions (id, handle, boundary; at most 50) and the package's instructions, {where_to} No existing record is sent.
-         What is written: the answer's records, each scrubbed, citing the dump and marked `unreviewed` until you approve them at a terminal (`cauldron soup approve`); the dump becomes `processed` with the run and the record ids.
+         What is written: the answer's records, each scrubbed, citing the dump and marked `unreviewed` until you approve or reject them at a terminal (`cauldron ripples review` lists them); the dump becomes `processed` with the run and the record ids.
          Caps, charged before each call: per dump, 3 calls and 200000 input tokens across every run of it; per cauldron per UTC day, 1500000 input tokens or 30 dumps. Over a cap a dump stays `received` with `deferred: budget` and is tried again after midnight UTC.
          Failures: a failed attempt is retried after 2, then 8 minutes; after 3 failed attempts the dump is parked `failed` with the reason, and only `cauldron ripples run` runs it again.
          The `ripples` service: {service}
@@ -664,15 +753,20 @@ fn turn_off(args: &[String]) -> Result<i32> {
 /// (its `call` line, at its `estimated_input_tokens`) and settled by its
 /// `called` line (same run and `call_id`; a line without one ends the newest
 /// open call of its run); one with no end is `unsettled` and stays charged.
-/// And calls that may still be running.
-fn spend(lines: &[Value], cauldron: Option<&str>) -> Value {
+/// And calls that may still be running. Today's spend is grouped by the
+/// cauldron's identity (the `cauldron_id` its `call` lines carry,
+/// `env::ripples_auto::Owners`) and shown under its current name, as the
+/// service's own `STATUS` groups it; `cauldron` is a current name.
+fn spend(lines: &[Value], cauldron: Option<&str>, owners: &ra::Owners) -> Value {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let charged = |l: &Value| l["charged"].as_u64().unwrap_or_else(|| l["input_total"].as_u64().unwrap_or(0));
     // (the call's first line, tokens, settled)
     let mut calls: Vec<(Value, u64, bool)> = Vec::new();
     // (An evaluation's line in the run journal, from an earlier build, is
     // not a run's spend.)
-    for l in lines.iter().filter(|l| cauldron.is_none_or(|c| l["cauldron"] == c) && l["eval"] != json!(true)) {
+    let owner = |l: &Value| owners.of_line(l["cauldron_id"].as_str(), l["cauldron"].as_str().unwrap_or("?"));
+    let wanted = |l: &Value| cauldron.is_none_or(|c| l["cauldron"] == c || owner(l).name == c);
+    for l in lines.iter().filter(|l| wanted(l) && l["eval"] != json!(true)) {
         match l["event"].as_str() {
             Some("call") => calls.push((l.clone(), l["estimated_input_tokens"].as_u64().unwrap_or(0), false)),
             Some("called") => {
@@ -697,10 +791,16 @@ fn spend(lines: &[Value], cauldron: Option<&str>) -> Value {
     let mut per_dump: Vec<Value> = Vec::new();
     for (l, tokens, settled) in &calls {
         let unsettled = u64::from(!settled);
-        if l["at"].as_str().is_some_and(|a| a.starts_with(&today)) {
+        let o = owner(l);
+        if l["at"].as_str().is_some_and(|a| a.starts_with(&today)) && cauldron.is_none_or(|c| !o.gone && o.name == c) {
             let c = per_cauldron
-                .entry(l["cauldron"].as_str().unwrap_or("?").to_string())
-                .or_insert_with(|| json!({"calls": 0, "charged_input_tokens": 0, "unsettled_calls": 0, "dumps": []}));
+                .entry(o.key.clone())
+                .or_insert_with(|| json!({"calls": 0, "charged_input_tokens": 0, "unsettled_calls": 0, "dumps": [], "cauldron_id": o.id, "gone": o.gone, "names": []}));
+            if let Some(n) = c["names"].as_array_mut() {
+                if !n.contains(&l["cauldron"]) {
+                    n.push(l["cauldron"].clone());
+                }
+            }
             c["calls"] = json!(c["calls"].as_u64().unwrap_or(0) + 1);
             c["charged_input_tokens"] = json!(c["charged_input_tokens"].as_u64().unwrap_or(0) + tokens);
             c["unsettled_calls"] = json!(c["unsettled_calls"].as_u64().unwrap_or(0) + unsettled);

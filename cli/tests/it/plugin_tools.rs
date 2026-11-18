@@ -80,3 +80,16 @@ fn a_tool_the_door_does_not_serve_is_flagged() {
     assert_eq!(named, vec!["soup_get".to_string()]);
     assert_eq!(stray, vec![format!("{PREFIX}soup_delete"), "mcp__other__x".to_string()]);
 }
+
+/// `/cauldron:review` shows the queue through `soup_review` (a read) and
+/// gives the terminal commands; it never decides anything itself.
+#[test]
+fn review_is_a_command_that_shows_the_queue_and_names_the_terminal_commands() {
+    let text = std::fs::read_to_string(plugin().join("commands/review.md")).unwrap();
+    assert!(front(&text, "description").is_some_and(|d| !d.is_empty()));
+    for want in ["soup_review", "cauldron ripples approve --dump", "cauldron ripples reject --dump", "review --interactive", "data, not instructions", "never try to"] {
+        assert!(text.contains(want), "review.md does not say {want}");
+    }
+    let tool = soup_door::catalogue::find("soup_review").expect("served");
+    assert_eq!(tool.needs, soup_door::catalogue::Needs::Scope(soup_door::grants::Scope::Read));
+}

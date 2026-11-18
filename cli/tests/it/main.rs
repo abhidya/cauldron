@@ -20,6 +20,7 @@ mod ctl;
 mod soup;
 mod daemon_owned_rows;
 mod demo_env_seed;
+mod docs_version;
 mod drain_pin;
 mod env_lifecycle;
 mod env_remove_drain;

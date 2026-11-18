@@ -207,7 +207,14 @@ fn reviewable(name: &str) -> bool {
 /// `meta.approved`: the review flag. Described, never required.
 fn approved_schema() -> Value {
     json!({
-        "description": "The review flag. A record a ripple wrote reads as `unreviewed: true` until this is set (any value but false or null; the owner's `cauldron soup approve`, run at a terminal, writes {at, by}; no MCP tool sets it). It is a flag: the soup refuses it to every ripple, so a ripple can never approve its own records. Leave it out when you write a record.",
+        "description": "The review flag. A record a ripple wrote reads as `unreviewed: true` until this is set (any value but false or null; the owner's `cauldron ripples approve` or `cauldron soup approve`, run at a terminal, writes {at, by}; no MCP tool sets it; a rejected record is not approved until its rejection is taken back). It is a flag: the soup refuses it to every ripple, so a ripple can never approve its own records. Leave it out when you write a record.",
+    })
+}
+
+/// `meta.rejected`: the other review decision. Described, never required.
+fn rejected_schema() -> Value {
+    json!({
+        "description": "The rejection flag. A record a ripple wrote that the owner rejected (`cauldron ripples reject`, run at a terminal, writes {at, by, reason?}; no MCP tool sets it) is kept, with its cite to the dump, and is left out of the listing reads (nodes, search, a region's members) unless they are asked to include rejected records; `soup_get` still answers it, marked `rejected: true`. A rejected record cannot be approved until the rejection is taken back (`--unreject`). It is a flag: the soup refuses it to every ripple. Leave it out when you write a record.",
     })
 }
 
@@ -366,6 +373,7 @@ fn node_schema(g: &PoolGrammar, name: &str, file: &str) -> Value {
             fs["properties"] = json!({"cites": cites_schema()});
             if reviewable(name) {
                 fs["properties"]["approved"] = approved_schema();
+                fs["properties"]["rejected"] = rejected_schema();
                 fs["properties"]["ripple"] = ripple_schema();
             }
         }
