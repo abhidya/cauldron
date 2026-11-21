@@ -34,8 +34,9 @@ use std::path::Path;
 ///   `database disk image is malformed`, or, worse, a wrong answer that
 ///   happens to parse. (Seen by readers hammering a store while a service
 ///   wrote to it.) So the file is first copied to a private file in a
-///   directory of the temporary directory only its owner can enter
-///   ([`private_dir`]; a clone, on APFS: no data is copied), and the copy
+///   directory made for this one read in the temporary directory, which
+///   only its owner can enter and which is removed before the read returns
+///   ([`ReadDir`]; a clone, on APFS: no data is copied), and the copy
 ///   is kept only if no `-wal` appeared and the original's identity (inode,
 ///   size, modification and change times) did not change across the copy;
 ///   the copy is opened `immutable=1` and unlinked at once, so the reader
@@ -45,12 +46,17 @@ use std::path::Path;
 ///   of times; after that it is read `mode=ro`, which is correct but may
 ///   leave `-wal` and `-shm` beside the file.
 pub fn read_only_connection(path: &Path) -> Result<Connection> {
+    read_only_connection_in(path, &std::env::temp_dir())
+}
+
+/// [`read_only_connection`], with its private directories made in `base`.
+fn read_only_connection_in(path: &Path, base: &Path) -> Result<Connection> {
     let wal = side_file(path, "-wal");
     for attempt in 0..SNAPSHOT_ATTEMPTS {
         if wal.exists() {
             return open_uri(path, "mode=ro");
         }
-        if let Some(conn) = settled_copy(path, &wal)? {
+        if let Some(conn) = settled_copy(path, &wal, base)? {
             return Ok(conn);
         }
         std::thread::sleep(std::time::Duration::from_millis(1 + attempt as u64));
@@ -81,52 +87,168 @@ fn identity(path: &Path) -> Result<(u64, u64, u64, i64, i64, i64, i64)> {
 /// `immutable=1` and already unlinked; `None` when a write was seen during
 /// the copy, or when no private directory can be had for the copy (then the
 /// caller reads through SQLite's locking instead).
-fn settled_copy(path: &Path, wal: &Path) -> Result<Option<Connection>> {
-    use std::os::unix::fs::MetadataExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
+fn settled_copy(path: &Path, wal: &Path, base: &Path) -> Result<Option<Connection>> {
     let before = identity(path)?;
-    let owner = std::fs::metadata(path)
-        .map_err(|e| SpineError::hard(format!("cannot open `{}` read-only: {e}", path.display())))?
-        .uid();
-    let Some(dir) = private_dir(&std::env::temp_dir(), owner) else {
+    let Some(dir) = ReadDir::new(base) else {
         return Ok(None);
     };
-    let copy = dir.join(format!(
-        "{}-{}-{}.db",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
-    ));
+    let copy = dir.path.join("copy.db");
     if let Err(e) = std::fs::copy(path, &copy) {
-        let _ = std::fs::remove_file(&copy);
+        if !dir.path.is_dir() {
+            // Our own directory went away under us: try again.
+            return Ok(None);
+        }
         return Err(SpineError::hard(format!("cannot open `{}` read-only (copying it to read: {e})", path.display())));
     }
     let settled = !wal.exists() && identity(path)? == before;
     if !settled {
-        let _ = std::fs::remove_file(&copy);
         return Ok(None);
     }
     let conn = open_uri(&copy, "immutable=1");
-    let _ = std::fs::remove_file(&copy);
     let conn = conn.map_err(|e| SpineError::hard(format!("cannot open `{}` read-only: {e}", path.display())))?;
     Ok(Some(conn))
+    // `dir` drops here: the copy (already open) and the directory go.
 }
 
-/// The directory the private copies go in: `spine-read-<uid>` in the
-/// temporary directory, made with mode 0700 and used only while it is a
-/// real directory (not a symlink) owned by the store's owner that nobody
-/// else can enter. One someone else made first is never used.
-fn private_dir(base: &Path, owner: u32) -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    let dir = base.join(format!("spine-read-{owner}"));
-    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return None,
+/// The prefix of every directory a read makes for its private copy:
+/// `spine-read-<pid>.<n>.<random>` in the temporary directory.
+const READ_DIR_PREFIX: &str = "spine-read-";
+
+/// The file in a read's directory whose lock says the read is alive.
+const READ_DIR_LOCK: &str = ".lock";
+
+/// A directory of the sweep's age with no lock file is a crash between its
+/// `mkdir` and its lock, never a live read.
+const UNLOCKED_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// **One read's private directory**, made for that read and removed when it
+/// is dropped (on every return, error and unwind included), so a read leaves
+/// nothing in the temporary directory and two reads never share one.
+///
+/// - Its name, `spine-read-<pid>.<n>.<random>`, is new: it is made
+///   with a non-recursive create, mode 0700, which fails if anything is
+///   already at that path (a name someone else made first is never used:
+///   another name is tried), and it is used only while it is a real
+///   directory (not a symlink) of this process's user that nobody else can
+///   enter. The random part comes from the standard library's per-process
+///   hash keys, so the name is not predictable from the pid and the clock.
+/// - It holds a lock file, locked for the read's life. A process that dies
+///   mid-read (SIGKILL, a crash) leaves its directory, and the OS drops the
+///   lock with the process: the first read of every later process sweeps
+///   every directory of this user whose lock it can take (or that has no
+///   lock file and is older than a minute), so a leftover lasts until the
+///   next read, never longer.
+struct ReadDir {
+    path: std::path::PathBuf,
+    _lock: std::fs::File,
+}
+
+impl ReadDir {
+    fn new(base: &Path) -> Option<ReadDir> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..8 {
+            let path = base.join(format!(
+                "{READ_DIR_PREFIX}{}.{}.{:016x}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+                random_u64()
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {}
+                // Someone made this name first: never use it, take another.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            }
+            // Made by this create, so its owner is this process's user.
+            let m = std::fs::symlink_metadata(&path).ok()?;
+            if !m.file_type().is_dir() || m.mode() & 0o077 != 0 {
+                return None;
+            }
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path.join(READ_DIR_LOCK))
+                .ok()
+                .filter(|f| f.try_lock().is_ok());
+            let Some(lock) = lock else {
+                remove_read_dir(&path);
+                return None;
+            };
+            sweep_once(base, m.uid());
+            return Some(ReadDir { path, _lock: lock });
+        }
+        None
     }
-    let m = std::fs::symlink_metadata(&dir).ok()?;
-    (m.file_type().is_dir() && m.uid() == owner && m.mode() & 0o077 == 0).then_some(dir)
+}
+
+impl Drop for ReadDir {
+    fn drop(&mut self) {
+        remove_read_dir(&self.path);
+    }
+}
+
+/// Remove a read's directory: the files directly in it (a symlink is
+/// removed as a link, never followed), then the directory.
+fn remove_read_dir(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// 64 bits no other process can guess: the standard library seeds each
+/// `RandomState` from the OS's random source.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    h.finish()
+}
+
+/// Once per process: sweep what reads of dead processes left in `base`.
+fn sweep_once(base: &Path, uid: u32) {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    DONE.get_or_init(|| sweep(base, uid));
+}
+
+/// Remove every read directory of user `uid` in `base` that no live read
+/// holds: its lock can be taken (the process that made it is gone), or it
+/// has no lock file and is older than [`UNLOCKED_STALE`]. Only a real
+/// directory owned by `uid` is touched; anything else is left alone.
+fn sweep(base: &Path, uid: u32) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // `spine-read-<pid>.…`: the 0.1.16 directory (`spine-read-<uid>`,
+        // shared by every read of a user) has no dot and is left alone.
+        if !name.strip_prefix(READ_DIR_PREFIX).is_some_and(|rest| rest.contains('.')) {
+            continue;
+        }
+        let dir = e.path();
+        let Ok(m) = std::fs::symlink_metadata(&dir) else { continue };
+        if !m.file_type().is_dir() || m.uid() != uid {
+            continue;
+        }
+        let stale = match std::fs::OpenOptions::new().write(true).open(dir.join(READ_DIR_LOCK)) {
+            // Held across the removal, so no read can be holding it.
+            Ok(f) => match f.try_lock() {
+                Ok(()) => {
+                    remove_read_dir(&dir);
+                    continue;
+                }
+                Err(_) => false,
+            },
+            Err(_) => m.modified().ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > UNLOCKED_STALE),
+        };
+        if stale {
+            remove_read_dir(&dir);
+        }
+    }
 }
 
 fn open_uri(path: &Path, mode: &str) -> Result<Connection> {
@@ -390,65 +512,151 @@ mod tests {
         assert!(all.is_empty(), "{} of {reads} reads failed: {:?}", all.len(), &all[..all.len().min(5)]);
     }
 
-    /// No side file and no copy is left behind by a read of a file at rest.
+    /// A fresh base for one test's private directories, under the
+    /// temporary directory, and the entries in it.
+    fn base(tag: &str) -> std::path::PathBuf {
+        let b = std::env::temp_dir().join(format!("spine-offline-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&b);
+        std::fs::create_dir_all(&b).unwrap();
+        b
+    }
+
+    fn entries(d: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
+        v.sort();
+        v
+    }
+
+    fn store(d: &std::path::Path) -> std::path::PathBuf {
+        let p = d.join("pool.db");
+        let c = Connection::open(&p).unwrap();
+        c.pragma_update(None, "journal_mode", "WAL").unwrap();
+        c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);").unwrap();
+        p
+    }
+
+    /// No side file beside the store, and nothing at all in the temporary
+    /// directory, is left by a read of a file at rest: not while the
+    /// connection is open (the copy and its directory are gone before the
+    /// read returns), and not after.
     #[test]
     fn a_read_of_a_file_at_rest_leaves_nothing() {
-        let d = std::env::temp_dir().join(format!("spine-offline-rest-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        let p = d.join("pool.db");
-        {
-            let c = Connection::open(&p).unwrap();
-            c.pragma_update(None, "journal_mode", "WAL").unwrap();
-            c.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);").unwrap();
-        }
-        let list = || {
-            let mut v: Vec<String> = std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
-            v.sort();
-            v
-        };
-        let before = (list(), super::identity(&p).unwrap());
-        use std::os::unix::fs::MetadataExt;
-        let owner = std::fs::metadata(&p).unwrap().uid();
-        let mine = || {
-            super::private_dir(&std::env::temp_dir(), owner).map_or(0, |dir| {
-                std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{}-", std::process::id()))).count()
-            })
-        };
-        let tmp_before = mine();
-        let c = super::read_only_connection(&p).unwrap();
+        let d = base("rest");
+        let tmp = base("rest-tmp");
+        let p = store(&d);
+        let before = (entries(&d), super::identity(&p).unwrap());
+        let c = super::read_only_connection_in(&p, &tmp).unwrap();
+        assert!(entries(&tmp).is_empty(), "left in the temporary directory while open: {:?}", entries(&tmp));
         assert_eq!(c.query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         assert!(c.execute("INSERT INTO t VALUES (2)", []).is_err(), "the connection cannot write");
         drop(c);
-        assert_eq!((list(), super::identity(&p).unwrap()), before, "the read wrote beside or to the file");
-        let tmp_after = mine();
-        assert!(tmp_after <= tmp_before, "a private copy was left behind");
+        assert_eq!((entries(&d), super::identity(&p).unwrap()), before, "the read wrote beside or to the file");
+        assert!(entries(&tmp).is_empty(), "left in the temporary directory: {:?}", entries(&tmp));
+        // Many reads, from several threads at once: still nothing left.
+        std::thread::scope(|sc| {
+            for _ in 0..4 {
+                sc.spawn(|| {
+                    for _ in 0..25 {
+                        let c = super::read_only_connection_in(&p, &tmp).unwrap();
+                        assert_eq!(c.query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+                    }
+                });
+            }
+        });
+        assert!(entries(&tmp).is_empty(), "left after 100 reads: {:?}", entries(&tmp));
         let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The directory for the private copies is used only when it is a real
-    /// directory of the store's owner that nobody else can enter: one that is
-    /// a symlink, or open to others, is refused (and the read goes through
-    /// SQLite's locking instead).
+    /// A read's directory is made new for it, mode 0700, a real directory of
+    /// this user, under a name not seen before (two at once never share
+    /// one), holding a lock file it keeps locked; dropping it removes it.
     #[test]
-    fn a_private_directory_someone_could_reach_is_not_used() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let base = std::env::temp_dir().join(format!("spine-offline-dir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        let me = std::fs::metadata(&base).unwrap().uid();
-        let made = super::private_dir(&base, me).expect("made fresh");
-        assert_eq!(std::fs::metadata(&made).unwrap().mode() & 0o777, 0o700);
-        assert_eq!(super::private_dir(&base, me), Some(made.clone()), "reused");
-        std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert_eq!(super::private_dir(&base, me), None, "open to others");
-        std::fs::remove_dir(&made).unwrap();
-        let elsewhere = base.join("elsewhere");
-        std::fs::create_dir(&elsewhere).unwrap();
-        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, &made).unwrap();
-        assert_eq!(super::private_dir(&base, me), None, "a symlink");
-        assert_eq!(super::private_dir(&base, me + 1), None, "another owner's name");
-        let _ = std::fs::remove_dir_all(&base);
+    fn a_read_directory_is_private_new_locked_and_removed_on_drop() {
+        use std::os::unix::fs::MetadataExt;
+        let b = base("dir");
+        let one = super::ReadDir::new(&b).expect("made");
+        let two = super::ReadDir::new(&b).expect("made");
+        assert_ne!(one.path, two.path);
+        for d in [&one.path, &two.path] {
+            let m = std::fs::symlink_metadata(d).unwrap();
+            assert!(m.file_type().is_dir());
+            assert_eq!(m.mode() & 0o777, 0o700, "{}", d.display());
+            let name = d.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with(&format!("spine-read-{}.", std::process::id())), "{name}");
+            let lock = std::fs::OpenOptions::new().write(true).open(d.join(super::READ_DIR_LOCK)).unwrap();
+            assert!(lock.try_lock().is_err(), "a live read's lock cannot be taken");
+        }
+        drop(one);
+        assert_eq!(entries(&b).len(), 1, "{:?}", entries(&b));
+        drop(two);
+        assert!(entries(&b).is_empty(), "{:?}", entries(&b));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// Where no private directory can be made (the temporary directory is
+    /// not writable), the read still answers, through SQLite's locking.
+    #[test]
+    fn a_read_with_no_private_directory_reads_through_the_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = base("nodir");
+        let tmp = base("nodir-tmp");
+        let p = store(&d);
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(super::ReadDir::new(&tmp).is_none());
+        let c = super::read_only_connection_in(&p, &tmp).unwrap();
+        assert_eq!(c.query_row("SELECT x FROM t", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        drop(c);
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(entries(&tmp).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// **The sweep.** What a read of a process that died mid-read left (its
+    /// lock released by the OS, a copy still in it) is removed; a live
+    /// read's directory (its lock held), one being made (no lock file yet,
+    /// and young), the shared directory of the release before, anything
+    /// that is a symlink, and every other name are left alone, and a
+    /// symlink's target is never entered.
+    #[test]
+    fn the_sweep_removes_what_dead_reads_left_and_nothing_else() {
+        use std::os::unix::fs::MetadataExt;
+        let b = base("sweep");
+        let me = std::fs::metadata(&b).unwrap().uid();
+        let mk = |name: &str| {
+            let d = b.join(name);
+            std::fs::create_dir(&d).unwrap();
+            d
+        };
+        let dead = mk("spine-read-1.0.00000000000000aa");
+        std::fs::write(dead.join(super::READ_DIR_LOCK), b"").unwrap();
+        std::fs::write(dead.join("copy.db"), b"left").unwrap();
+        let alive = mk("spine-read-2.0.00000000000000bb");
+        let held = std::fs::OpenOptions::new().write(true).create_new(true).open(alive.join(super::READ_DIR_LOCK)).unwrap();
+        held.try_lock().unwrap();
+        let young = mk("spine-read-3.0.00000000000000cc");
+        let legacy = mk(&format!("spine-read-{me}"));
+        let target = mk("target");
+        std::fs::write(target.join(super::READ_DIR_LOCK), b"").unwrap();
+        std::fs::write(target.join("keep"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, b.join("spine-read-4.0.00000000000000dd")).unwrap();
+        let other = mk("not-ours.0.1");
+        std::fs::write(other.join(super::READ_DIR_LOCK), b"").unwrap();
+        super::sweep(&b, me);
+        let left = entries(&b);
+        assert!(!dead.exists(), "a dead read's directory is swept: {left:?}");
+        for kept in [&alive, &young, &legacy, &target, &other] {
+            assert!(kept.exists(), "{} kept: {left:?}", kept.display());
+        }
+        assert!(b.join("spine-read-4.0.00000000000000dd").symlink_metadata().is_ok(), "a symlink is left alone");
+        assert!(target.join("keep").exists(), "a symlink's target is never entered");
+        // Another user's sweep touches none of ours.
+        drop(held);
+        super::sweep(&b, me + 1);
+        assert!(alive.exists());
+        super::sweep(&b, me);
+        assert!(!alive.exists(), "swept once its process let go");
+        let _ = std::fs::remove_dir_all(&b);
     }
 }

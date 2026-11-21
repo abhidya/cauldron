@@ -127,8 +127,7 @@ pub(crate) fn review(args: &[String]) -> Result<i32> {
 
 /// Is this command's input and output an interactive terminal?
 pub(crate) fn at_terminal() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    crate::owner_acts::at_terminal()
 }
 
 /// `x.y.z` (anything after a `-` or `+` is ignored) as numbers.
@@ -162,15 +161,22 @@ fn old_service(e: &env::Environment, service: Option<&str>, why: &str, sent: boo
 }
 
 /// **Send one decision to the running `mcp` service**, after the caller
-/// checked the terminal: its `DECIDE` seam verb, with the approval key it
-/// minted. `body` is what `DECIDE` takes, less the cauldron, which is added.
-/// The service's JSON answer.
+/// asked the owner acts' gate (`crate::owner_acts::act`): its `DECIDE` seam
+/// verb for a person at a terminal (`by: tty`), `ADECIDE` for an agent the
+/// owner allowed (`by: agent`), with the approval key it minted. `body` is
+/// what either takes, less the cauldron, which is added. The service's JSON
+/// answer. A service older than `ADECIDE` answers `ERR unknown request` and
+/// writes nothing, so an agent's decision is never recorded as a person's.
 ///
 /// Refused, with nothing sent, when the service is older than this command
 /// line or its version cannot be read; and when the service does not know
 /// `DECIDE` (a service from before it: it answers `ERR unknown request` and
 /// writes nothing), with the upgrade commands.
-pub(crate) fn send(e: &env::Environment, cauldron: &str, mut body: Value) -> Result<Value> {
+pub(crate) fn send(e: &env::Environment, cauldron: &str, mut body: Value, by: env::owner_acts::By) -> Result<Value> {
+    let verb = match by {
+        env::owner_acts::By::Tty => DECIDE,
+        env::owner_acts::By::Agent => ADECIDE,
+    };
     let found = match crate::mcp_door::find(e) {
         Ok(f) => f,
         Err(why) => bail!(
@@ -193,15 +199,19 @@ pub(crate) fn send(e: &env::Environment, cauldron: &str, mut body: Value) -> Res
     let key = std::fs::read_to_string(&key_path)
         .with_context(|| format!("reading the approval key {} (the `mcp` service mints it when it starts)", key_path.display()))?;
     body["cauldron"] = Value::String(cauldron.to_string());
-    let answer = crate::mcp_door::seam_ask(&found.seam, &format!("{DECIDE} {} {body}", key.trim()))?;
+    let answer = crate::mcp_door::seam_ask(&found.seam, &format!("{verb} {} {body}", key.trim()))?;
     if answer.starts_with("ERR unknown request") {
-        return Err(old_service(e, service.as_deref(), &format!("the running `mcp` service does not know `{DECIDE}`, the verb this cauldron decides records with (it answered `{answer}`)"), true));
+        return Err(old_service(e, service.as_deref(), &format!("the running `mcp` service does not know `{verb}`, the verb this cauldron decides records with (it answered `{answer}`)"), true));
     }
     serde_json::from_str(&answer).with_context(|| format!("the mcp service answered `{answer}`"))
 }
 
-/// The `mcp` seam verb every owner decision goes on.
+/// The `mcp` seam verb a decision made at a terminal goes on.
 pub(crate) const DECIDE: &str = "DECIDE";
+
+/// The `mcp` seam verb a decision made without a terminal goes on, where
+/// the owner opened `approve` (`env::owner_acts`).
+pub(crate) const ADECIDE: &str = "ADECIDE";
 
 /// **`cauldron ripples approve | reject`**: the owner's decision on a
 /// ripple's records, by dump, by run or by id, at a terminal.
@@ -263,15 +273,18 @@ pub(crate) fn decide(verb: &str, args: &[String]) -> Result<i32> {
     }
     // Checked before anything is read or sent, so the command the refusal
     // names is one that would work.
-    if !at_terminal() {
-        bail!(
+    let allowed = crate::owner_acts::act(
+        env::owner_acts::Act::Approve,
+        &e,
+        cauldron,
+        &format!(
             "REFUSED: {} a ripple's records is the owner's act at a terminal. `cauldron ripples {verb}` runs only with its \
-             input and output on an interactive terminal, so an agent, a ripple or a script cannot {action} records by \
-             itself, and no option skips this. Nothing was written. Ask the user to run, in a terminal on this machine:\n    \
-             {command}",
+             input and output on an interactive terminal, unless the owner has let agents approve (owner_acts), so an \
+             agent, a ripple or a script cannot {action} records by itself. Nothing was written. Ask the user to run, in a \
+             terminal on this machine:\n    {command}",
             if reject { "rejecting" } else { "approving" }
-        );
-    }
+        ),
+    )?;
     let mut body = serde_json::json!({"action": action, "from": format!("cauldron ripples {verb}")});
     if let Some(d) = &a.dump {
         body["dump"] = d.clone().into();
@@ -283,7 +296,7 @@ pub(crate) fn decide(verb: &str, args: &[String]) -> Result<i32> {
     if let Some(r) = &a.reason {
         body["reason"] = r.clone().into();
     }
-    let v = send(&e, cauldron, body)?;
+    let v = send(&e, cauldron, body, allowed.by())?;
     print(&v)?;
     if v["ok"] == serde_json::json!(true) {
         let done = v[match action {
@@ -295,7 +308,11 @@ pub(crate) fn decide(verb: &str, args: &[String]) -> Result<i32> {
         .as_array()
         .map_or(0, Vec::len);
         let skipped = v["skipped"].as_array().map_or(0, Vec::len);
-        eprintln!("cauldron ripples: {action}: {done} record(s) written, {skipped} skipped (each with why in `skipped`).");
+        eprintln!(
+            "cauldron ripples: {action}: {done} record(s) written, {skipped} skipped (each with why in `skipped`); by: {} ({}).",
+            allowed.by(),
+            allowed.said()
+        );
         Ok(0)
     } else {
         eprintln!("cauldron ripples: refused ({}): {}", v["code"].as_str().unwrap_or("?"), v["message"].as_str().unwrap_or(""));

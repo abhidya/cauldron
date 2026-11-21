@@ -24,6 +24,10 @@
 //!   holders of disjoint regions both land; the revision check; expiry and
 //!   renewal; a held child region and its parent; (under `--features
 //!   fault-injection`) a kill between the landing and the release.
+//! - `edges`: `soup_unlink` and `soup_cite`, correcting a record after the
+//!   fact (issue #24).
+//! - `interface`: the consumer's interface table (issue #10), one test per
+//!   row, each tool called exactly as the table writes it.
 //! - `issues`: the consumer's filed issues, each reproduction as the door
 //!   answers it (the CLI's twins are the `i<n>_` tests of `cli/tests/it/soup.rs`).
 //! - `writes`: the writer: concurrency, `partial`, refusals named by id,
@@ -42,6 +46,8 @@ mod changes;
 mod clusters;
 mod door;
 mod dumps;
+mod edges;
+mod interface;
 mod issues;
 mod limits;
 mod reads;

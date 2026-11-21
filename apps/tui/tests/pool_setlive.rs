@@ -77,4 +77,33 @@ async fn s_runs_the_preflight_then_hands_over_or_records() {
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     assert!(matches!(&out, Outcome::Done(n, Tone::Bad) if n.contains("CLAUDE_CONFIG_DIR")), "{out:?}");
     assert!(calls(dir).is_empty(), "{:?}", calls(dir));
+
+    // 5. Started from a project holding a planted `json.py`, with variables
+    //    that would make a shell or python load a file: the helper runs from
+    //    the store (or `/`), never that directory, and inherits none of them.
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("json.py"), "raise SystemExit('planted')\n").unwrap();
+    let where_ = dir.join("where");
+    stub(dir, &format!(r#"echo "$(pwd -P)|${{PYTHONPATH:-}}|${{PYTHONSTARTUP:-}}|${{BASH_ENV:-}}|${{ENV:-}}|$PATH" > '{}'; echo "--dry-run: stopping here""#, where_.display()));
+    let back = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&project).unwrap();
+    for (k, v) in [("PYTHONPATH", &project), ("PYTHONSTARTUP", &project.join("json.py")), ("BASH_ENV", &project.join("json.py")), ("ENV", &project.join("json.py"))] {
+        std::env::set_var(k, v);
+    }
+    let path_before = std::env::var_os("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!(".:{}", path_before.to_string_lossy()));
+    let out = perform(&h, &a).await;
+    std::env::set_current_dir(&back).unwrap();
+    std::env::set_var("PATH", &path_before);
+    for k in ["PYTHONPATH", "PYTHONSTARTUP", "BASH_ENV", "ENV"] {
+        std::env::remove_var(k);
+    }
+    assert!(matches!(&out, Outcome::NeedsTerminal(_)), "{out:?}");
+    let seen = std::fs::read_to_string(&where_).unwrap();
+    let f: Vec<&str> = seen.trim_end().split('|').collect();
+    let project_real = std::fs::canonicalize(&project).unwrap();
+    assert_ne!(std::path::Path::new(f[0]), project_real, "the helper ran from the project: {seen}");
+    assert_eq!(&f[1..5], ["", "", "", ""], "a variable that loads a file reached the helper: {seen}");
+    assert!(f[5].split(':').all(|d| d.starts_with('/')), "a relative PATH entry reached the helper: {seen}");
 }

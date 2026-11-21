@@ -44,7 +44,7 @@
 //! finishes, then the handle and the lock are dropped and the thread is
 //! joined, so when [`Writers::close`] returns the lock is free.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -58,8 +58,6 @@ use shapewire::envelope::Refusal;
 use soup_door::import::{self, ImportOptions, ImportOutcome};
 use soup_door::reads::DEFAULT_POOL;
 use soup_door::Target;
-use spine::envelope::{Envelope, Initiator, Instrument, Mode, Provenance, ENVELOPE_FORMAT_VERSION};
-use spine::pool::{NodeId, Pool};
 use spine::schema_def::PoolName;
 
 use crate::access::Access;
@@ -77,14 +75,8 @@ pub struct Put {
     pub allow_duplicate: bool,
 }
 
-/// One `soup_link` link.
-#[derive(Debug, Clone)]
-pub struct Link {
-    pub from: String,
-    pub kind: String,
-    pub to: String,
-    pub note: Option<String>,
-}
+/// One `soup_link` (or `soup_unlink`) link.
+pub use soup_door::edges::Link;
 
 /// Who is writing: the client, the spine initiator's `thread`, and the
 /// session to cite.
@@ -691,126 +683,8 @@ fn mcp_words(why: &str) -> String {
 // -------------------------------------------------------------- soup_link
 
 fn link(c: &spine::Cauldron, t: &Target, links: &[Link], who: &Who) -> Result<Value, Refusal> {
-    let pool = pool();
-    let grammar = c.grammar(&pool).ok_or_else(|| Refusal::new("store", "the soup has no `ws` pool"))?.clone();
-    let handle = Pool::open_read_only(&Pool::path_in(&t.soup(), &pool)).map_err(|e| Refusal::new("store", e.to_string()))?;
-    let snap = handle.snapshot().map_err(|e| Refusal::new("store", e.to_string()))?;
-    let type_of = |id: &str| -> Result<Option<String>, Refusal> {
-        Ok(snap.node(&NodeId(id.to_string())).map_err(|e| Refusal::new("store", e.to_string()))?.map(|n| n.node_type))
-    };
-    let mut answers = Vec::new();
-    let mut types: BTreeMap<String, String> = BTreeMap::new();
-    let mut any_refused = false;
-    for l in links {
-        let mut why: Option<Value> = None;
-        for end in [&l.from, &l.to] {
-            if why.is_some() || types.contains_key(end) {
-                continue;
-            }
-            match type_of(end)? {
-                Some(ty) => {
-                    types.insert(end.clone(), ty);
-                }
-                None => why = Some(json!({"reason": "unknown-node", "detail": format!("`{end}` is not a node in cauldron `{}`", t.cauldron.name)})),
-            }
-        }
-        if why.is_none() && !grammar.edge_kinds.contains_key(&l.kind) {
-            why = Some(json!({"reason": "unknown-kind", "detail": format!("`{}` is not an edge kind of this soup's grammar", l.kind)}));
-        }
-        if why.is_none() {
-            let env = envelope(std::slice::from_ref(l), &types, who, Mode::Validate);
-            match c.submit(env) {
-                Ok(_) => {}
-                Err(spine::error::SpineError::Refused { witnesses }) => {
-                    why = Some(json!({"reason": "door-refused", "witnesses": witnesses}));
-                }
-                Err(e) => return Err(Refusal::new("store", format!("judging a link: {e}"))),
-            }
-        }
-        let mut a = json!({"from": l.from, "kind": l.kind, "to": l.to});
-        match why {
-            Some(w) => {
-                any_refused = true;
-                a["status"] = json!("refused");
-                a["refused"] = w;
-            }
-            None => a["status"] = json!("accepted"),
-        }
-        answers.push(a);
-    }
-    let mut doc = json!({"env": t.env.name, "cauldron": t.cauldron.name, "pool": pool.as_str(), "links": answers});
-    if any_refused {
-        doc["outcome"] = json!("refused");
-        let n = doc["links"].as_array().map(|a| a.iter().filter(|x| x["status"] == "refused").count()).unwrap_or(0);
-        return Err(Refusal::with_detail(
-            "links_refused",
-            format!("{n} of {} link(s) were refused, so none was written (all or nothing); `detail.links` says why.", links.len()),
-            doc,
-        ));
-    }
-    match c.submit(envelope(links, &types, who, Mode::Commit)) {
-        Ok(spine::Outcome::Committed { tx, seq, deduplicated, .. }) => {
-            for a in doc["links"].as_array_mut().into_iter().flatten() {
-                a["status"] = json!("linked");
-            }
-            doc["outcome"] = json!("linked");
-            doc["landed"] = json!({"tx": tx.to_hex(), "seq": seq, "deduplicated": deduplicated});
-            doc["cursor"] = cursor_after(c, t);
-            Ok(doc)
-        }
-        Ok(spine::Outcome::Validated { .. }) => Err(Refusal::new("store", "the link statement was validated and not committed")),
-        Err(spine::error::SpineError::Refused { witnesses }) => {
-            doc["outcome"] = json!("refused");
-            doc["witnesses"] = json!(witnesses);
-            Err(Refusal::with_detail("links_refused", "every link passed alone and the whole set was refused; nothing was written", doc))
-        }
-        Err(e @ spine::error::SpineError::RegionLocked { .. }) => Err(crate::refusal(soup_door::region_lock::spine_error(e))),
-        Err(e) => Err(Refusal::new("store", format!("writing the links: {e}"))),
-    }
-}
-
-/// One statement: a MATCH (pinned to exactly one node) per distinct
-/// endpoint, then a CREATE per link. Values ride as parameters, never in
-/// the text; the type and kind names spliced in are the grammar's own.
-fn envelope(links: &[Link], types: &BTreeMap<String, String>, who: &Who, mode: Mode) -> Envelope {
-    let mut binding: BTreeMap<&str, String> = BTreeMap::new();
-    let mut lines = Vec::new();
-    let mut expects = Vec::new();
-    let mut creates = Vec::new();
-    let mut params = BTreeMap::new();
-    for l in links {
-        for end in [&l.from, &l.to] {
-            if !binding.contains_key(end.as_str()) {
-                let b = format!("n{}", binding.len());
-                lines.push(format!("MATCH ({b}: {}/{} {{ id: $id_{b} }})", DEFAULT_POOL, types[end]));
-                expects.push(format!("EXPECT COUNT({b}) = 1"));
-                params.insert(format!("id_{b}"), json!(end));
-                binding.insert(end, b);
-            }
-        }
-    }
-    for (i, l) in links.iter().enumerate() {
-        let mut line = format!("CREATE ({}) -[{}]-> ({})", binding[l.from.as_str()], l.kind, binding[l.to.as_str()]);
-        if let Some(n) = &l.note {
-            line.push_str(&format!(" NOTE $note_{i}"));
-            params.insert(format!("note_{i}"), json!(n));
-        }
-        creates.push(line);
-    }
-    let statement = lines.into_iter().chain(expects).chain(creates).collect::<Vec<_>>().join("\n");
-    Envelope {
-        statement,
-        bindings: params,
-        format_version: ENVELOPE_FORMAT_VERSION,
-        provenance: Provenance {
-            initiator: Initiator::Agent { thread: who.thread.clone(), dispatch: "mcp soup_link".into() },
-            instrument: Instrument { name: "cauldron-mcp".into(), version: env!("CARGO_PKG_VERSION").into() },
-        },
-        mode,
-        idempotency_nonce: Some(format!(
-            "mcp-link:{}:{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
-        )),
-    }
+    let w = soup_door::clusters::Writer { thread: who.thread.clone(), dispatch: "mcp soup_link".into() };
+    let mut doc = soup_door::edges::link(c, t, links, &w).map_err(refusal)?;
+    doc["cursor"] = cursor_after(c, t);
+    Ok(doc)
 }

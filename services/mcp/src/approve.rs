@@ -4,10 +4,11 @@
 //! id, by the dump they cite, or by the run that wrote them, each decision
 //! in ONE statement on the cauldron's writer:
 //!
-//! - approve: `meta.approved: {at, by: "owner"}`; the record reads as
+//! - approve: `meta.approved: {at, by, session?}` (`by`: `tty` or `agent`,
+//!   [`Decider`]); the record reads as
 //!   reviewed from then on;
 //! - unapprove: `meta.approved: null`; unreviewed again;
-//! - reject: `meta.rejected: {at, by: "owner", reason?}`; the record is
+//! - reject: `meta.rejected: {at, by, session?, reason?}`; the record is
 //!   kept (its id, its text, its cite to the dump and the decision stay
 //!   readable through `get`) and the listing reads leave it out
 //!   (`soup_door::reads`);
@@ -38,14 +39,17 @@
 //!   is refused, so an approval is never read into a request that meant
 //!   something else.
 //!
-//! **Only the owner's command line can ask.** The key is the approval key
-//! this service mints into `approve.secret` at every start
+//! **Only the owner's side can ask.** The key is the approval key this
+//! service mints into `approve.secret` at every start
 //! ([`crate::secret::APPROVE_FILE`]). The command line reads it only after
-//! checking that its input and output are an interactive terminal, as
-//! `cauldron mcp grant` does. No MCP tool approves or rejects, so no session
-//! can; the `ripples` service holds only the ripples key, which these verbs
-//! refuse; and the spine's flag rule refuses `meta.approved` and
-//! `meta.rejected` to every ripple anyway. The limit, as for every key here:
+//! the owner acts' gate (`env::owner_acts`) let it: at an interactive
+//! terminal it sends `DECIDE` (`by: "tty"`); without one, where the owner
+//! opened `approve` to agents, it sends `ADECIDE` (`by: "agent"`). A session
+//! decides only through the tools `soup_approve` / `soup_reject`, which the
+//! door refuses unless the owner opened `approve` for the cauldron (and
+//! records `by: "agent"` with the session); the `ripples` service holds only
+//! the ripples key, which these verbs refuse; and the spine's flag rule
+//! refuses `meta.approved` and `meta.rejected` to every ripple anyway. The limit, as for every key here:
 //! a process of this user that reads the private file can send the line.
 //! Every decision is audited in `calls.jsonl` under the act it is (client
 //! `cli`, tool `soup_approve`, `soup_unapprove`, `soup_reject`,
@@ -68,8 +72,32 @@ fn store(e: impl std::fmt::Display) -> Refusal {
     Refusal::new("store", e.to_string())
 }
 
-/// Who a decision is written as.
+/// The spine initiator's thread of a decision the owner's command line
+/// sends (`DECIDE`, `ADECIDE`).
 pub const BY: &str = "owner";
+
+/// **Who decides**: written into each decided record's flag (`{at, by,
+/// session?}`), the answer and the audit line, so a reviewer can always
+/// tell a decision made by a person at a terminal from one an agent made
+/// under the owner's `owner_acts` setting.
+#[derive(Debug, Clone)]
+pub struct Decider {
+    /// `tty` or `agent`.
+    pub by: env::owner_acts::By,
+    /// The spine initiator's thread.
+    pub thread: String,
+    /// The session, for a decision made through the MCP door.
+    pub session: Option<String>,
+    /// The transaction's dispatch when the request names none.
+    pub dispatch: Option<String>,
+}
+
+impl Decider {
+    /// The owner's command line: `tty` (`DECIDE`) or `agent` (`ADECIDE`).
+    pub fn cli(by: env::owner_acts::By) -> Decider {
+        Decider { by, thread: match by { env::owner_acts::By::Tty => BY.into(), env::owner_acts::By::Agent => format!("{BY}:agent") }, session: None, dispatch: None }
+    }
+}
 
 /// The most records one decision writes.
 pub const MAX_RECORDS: usize = 2000;
@@ -236,8 +264,8 @@ fn split(t: &Target, act: Act, pick: &Pick, skipped: &mut Vec<Value>) -> Result<
 /// With `all_or_nothing`, a record that would be skipped refuses the whole
 /// decision, so nothing is written unless every record named is decided as
 /// asked.
-pub fn decide(c: &spine::Cauldron, t: &Target, ask: &Ask, reason: Option<&str>, all_or_nothing: bool, from: Option<&str>) -> Result<Value, Refusal> {
-    let by = BY;
+pub fn decide(c: &spine::Cauldron, t: &Target, ask: &Ask, reason: Option<&str>, all_or_nothing: bool, from: Option<&str>, d: &Decider) -> Result<Value, Refusal> {
+    let by = d.by.as_str();
     let pool = PoolName::new(DEFAULT_POOL);
     let mut skipped: Vec<Value> = Vec::new();
     // (act, records it decides)
@@ -259,7 +287,10 @@ pub fn decide(c: &spine::Cauldron, t: &Target, ask: &Ask, reason: Option<&str>, 
     }
     let word = ask.word();
     let mut doc = json!({"env": t.env.name, "cauldron": t.cauldron.name, "pool": pool.as_str(), "action": word,
-                         "selected": selected, "skipped": skipped});
+                         "selected": selected, "skipped": skipped, "by": by});
+    if let Some(s) = &d.session {
+        doc["session"] = json!(s);
+    }
     if let Ask::One(_, p) = ask {
         match p {
             Pick::Ids(_) => {}
@@ -305,11 +336,15 @@ pub fn decide(c: &spine::Cauldron, t: &Target, ask: &Ask, reason: Option<&str>, 
     let mut params: BTreeMap<String, Value> = BTreeMap::new();
     let mut i = 0;
     for (act, take) in parts.iter().filter(|(_, take)| !take.is_empty()) {
+        let mut decided = json!({"at": at, "by": by});
+        if let Some(s) = &d.session {
+            decided["session"] = json!(s);
+        }
         let value = match act {
             Act::Unapprove | Act::Unreject => Value::Null,
-            Act::Approve => json!({"at": at, "by": by}),
+            Act::Approve => decided,
             Act::Reject => {
-                let mut v = json!({"at": at, "by": by});
+                let mut v = decided;
                 if let Some(r) = reason {
                     v["reason"] = json!(r);
                 }
@@ -326,8 +361,8 @@ pub fn decide(c: &spine::Cauldron, t: &Target, ask: &Ask, reason: Option<&str>, 
             i += 1;
         }
     }
-    let dispatch = match from {
-        Some(f) => f.to_string(),
+    let dispatch = match from.map(str::to_string).or_else(|| d.dispatch.clone()) {
+        Some(f) => f,
         None => match ask {
             Ask::One(Act::Approve | Act::Unapprove, _) => "cauldron ripples approve".into(),
             Ask::One(Act::Reject | Act::Unreject, _) => "cauldron ripples reject".into(),
@@ -339,7 +374,7 @@ pub fn decide(c: &spine::Cauldron, t: &Target, ask: &Ask, reason: Option<&str>, 
         bindings: params,
         format_version: ENVELOPE_FORMAT_VERSION,
         provenance: Provenance {
-            initiator: Initiator::Agent { thread: by.to_string(), dispatch },
+            initiator: Initiator::Agent { thread: d.thread.clone(), dispatch },
             instrument: Instrument { name: "cauldron-mcp".into(), version: env!("CARGO_PKG_VERSION").into() },
         },
         mode: Mode::Commit,
@@ -376,7 +411,7 @@ pub fn decide(c: &spine::Cauldron, t: &Target, ask: &Ask, reason: Option<&str>, 
 /// writer thread): [`decide`] by id.
 pub fn approve(c: &spine::Cauldron, t: &Target, ids: &[String], unapprove: bool) -> Result<Value, Refusal> {
     let act = if unapprove { Act::Unapprove } else { Act::Approve };
-    decide(c, t, &Ask::One(act, Pick::Ids(ids.to_vec())), None, false, Some("cauldron soup approve"))
+    decide(c, t, &Ask::One(act, Pick::Ids(ids.to_vec())), None, false, Some("cauldron soup approve"), &Decider::cli(env::owner_acts::By::Tty))
 }
 
 /// A rejection's reason, checked: one line (control characters become
@@ -502,14 +537,30 @@ fn read_approve(args: &serde_json::Map<String, Value>) -> Result<Asked, Refusal>
 }
 
 /// **Answer one `DECIDE` line**: `rest` is `<key> <json>`. Always one JSON
-/// line, never an error; every call after the key is audited.
+/// line, never an error; every call after the key is audited. Recorded
+/// `by: "tty"`: every command line that sends `DECIDE` checked that its
+/// input and output were a terminal first (an older one always; this one
+/// when it found one). That is what `tty` means, a command run with a
+/// terminal attached, not proof of a person: any process of this user that
+/// can read the key could send it.
 pub fn answer_decide(door: &crate::door::Door, key: &crate::secret::Secret, rest: &str) -> String {
-    answer(door, key, "DECIDE", rest, read_decide)
+    answer(door, key, "DECIDE", rest, read_decide, env::owner_acts::By::Tty)
+}
+
+/// **Answer one `ADECIDE` line**: the same body as `DECIDE`, sent by the
+/// owner's command line WITHOUT a terminal: decided by an agent (`by:
+/// "agent"`), and taken only where the owner's persisted `owner_acts`
+/// setting opens `approve` for the cauldron (refused `owner_act_closed`
+/// otherwise, whatever the command line's environment said). A verb of its own, so that a
+/// service older than it answers `ERR unknown request` and writes nothing
+/// rather than recording an agent's decision as a person's.
+pub fn answer_adecide(door: &crate::door::Door, key: &crate::secret::Secret, rest: &str) -> String {
+    answer(door, key, "ADECIDE", rest, read_decide, env::owner_acts::By::Agent)
 }
 
 /// **Answer one `APPROVE` line** (the earlier command line's body only).
 pub fn answer_approve(door: &crate::door::Door, key: &crate::secret::Secret, rest: &str) -> String {
-    answer(door, key, "APPROVE", rest, read_approve)
+    answer(door, key, "APPROVE", rest, read_approve, env::owner_acts::By::Tty)
 }
 
 fn answer(
@@ -518,6 +569,7 @@ fn answer(
     verb: &str,
     rest: &str,
     read: fn(&serde_json::Map<String, Value>) -> Result<Asked, Refusal>,
+    by: env::owner_acts::By,
 ) -> String {
     let fail = |r: &Refusal| {
         let mut v = json!({"ok": false, "code": r.code, "message": r.message});
@@ -532,9 +584,10 @@ fn answer(
         return fail(&Refusal::new(
             "unauthorized",
             "approving and rejecting are the owner's acts: this verb answers only `cauldron soup approve`, `cauldron \
-             ripples approve | reject` and `cauldron ripples review --interactive`, run at a terminal, which carry the key \
-             this service minted into its directory (approve.secret) at its last start. No MCP session and no ripple can \
-             approve or reject. Nothing was written.",
+             ripples approve | reject` and `cauldron ripples review --interactive` (at a terminal, or without one where \
+             the owner's owner_acts setting opens `approve`), which carry the key this service minted into its directory \
+             (approve.secret) at its last start. A ripple never approves or rejects; an MCP session does so only through \
+             the tools soup_approve and soup_reject, where the owner opened it. Nothing was written.",
         ));
     }
     let args: serde_json::Map<String, Value> = match serde_json::from_str::<Value>(body.trim()) {
@@ -557,17 +610,43 @@ fn answer(
             return Err(Refusal::new("usage", "`cauldron` must be a non-empty string. Nothing was written."));
         }
         let t = door.owner_target(&cauldron)?;
-        let who = crate::writer::Who { client: "cli".into(), thread: BY.into(), session: None };
+        // What this service can check of the caller's claim: a decision
+        // claimed as an agent's (`ADECIDE`) is taken only where the owner's
+        // PERSISTED owner_acts setting opens `approve` for this cauldron.
+        // (A claim of a terminal, `DECIDE`, cannot be checked from here: it
+        // is recorded as what it says, a command run with a terminal
+        // attached.)
+        if by == env::owner_acts::By::Agent {
+            let setting = env::owner_acts::load(&door.env.root)
+                .map_err(|e| Refusal::new("store", format!("reading the owner_acts setting: {e}. Nothing was written.")))?;
+            let id = t.cauldron.id();
+            if env::owner_acts::decide(env::owner_acts::Act::Approve, &setting, &door.env.name, &t.cauldron.name, id.as_deref(), false, None).is_err() {
+                return Err(Refusal::new(
+                    crate::door::OWNER_ACT_CLOSED,
+                    format!(
+                        "an agent's decision (ADECIDE) is taken only where the owner's persisted owner_acts setting opens \
+                         `approve`, and for cauldron `{c}` it keeps it at a terminal. Nothing was written. CAULDRON_OWNER_ACTS \
+                         does not open it here: record the choice with `cauldron owner-acts open --only approve --cauldron {c} \
+                         --env {e}` (at a terminal, or with the variable set for that command).",
+                        c = t.cauldron.name,
+                        e = door.env.name
+                    ),
+                ));
+            }
+        }
+        let d = Decider::cli(by);
+        let who = crate::writer::Who { client: "cli".into(), thread: d.thread.clone(), session: None };
         door.writers.with(
             &t,
             who,
-            Box::new(move |c, t| decide(c, t, &asked.ask, asked.reason.as_deref(), asked.all_or_nothing, asked.from.as_deref())),
+            Box::new(move |c, t| decide(c, t, &asked.ask, asked.reason.as_deref(), asked.all_or_nothing, asked.from.as_deref(), &d)),
         )
     })();
     let mut line = crate::audit::Line {
         client: Some("cli".into()),
         cauldron: (!cauldron.is_empty()).then_some(cauldron),
         tool,
+        by: Some(by.as_str().into()),
         ..crate::audit::Line::default()
     };
     match &out {

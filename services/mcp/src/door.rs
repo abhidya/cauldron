@@ -370,8 +370,9 @@ impl Door {
         let (t, grant, from) = self.target(ctx, explicit.as_deref(), &scopes, named)?;
         let mut doc = match tool.name {
             "soup_status" => {
+                let mc = a.count("max_chars")?;
                 a.done()?;
-                self.status(&t, &grant)?
+                bounded(self.status(&t, &grant)?, mc, &t)
             }
             "soup_regions" => {
                 let mc = a.count("max_chars")?;
@@ -502,11 +503,16 @@ impl Door {
                 doc
             }
             "soup_put" => {
-                let records = a.objects("records")?;
-                // The review flags are the owner's, set at a terminal: a
-                // session never writes them, on any record (the one check
-                // every record write makes; `import::submit` makes it too).
+                // What a read adds (`superseded_by`, `unreviewed`, a
+                // cluster's `claims`) is dropped and named in `ignored`, so a
+                // record read with soup_get is written back as read.
+                let (records, ignored) = soup_door::writeback::strip_read_only(&a.objects("records")?);
+                // The review flags are the owner's, set at a terminal, and
+                // `meta.ripple` is the door's on a ripple's records: a
+                // session never writes either, on any record (the checks
+                // every record write makes; `import::submit` makes them too).
                 soup_door::review::refuse_review_flags(&records).map_err(refusal)?;
+                soup_door::review::refuse_ripple_provenance(&records).map_err(refusal)?;
                 let cite = a.take("cite");
                 if let Some(c) = &cite {
                     if !c.get("kind").and_then(Value::as_str).is_some_and(|k| !k.is_empty()) {
@@ -522,7 +528,9 @@ impl Door {
                     allow_duplicate: a.flag("allow_duplicate")?,
                 };
                 a.done()?;
-                self.writers.put(&t, who(ctx), put)?
+                let mut doc = self.writers.put(&t, who(ctx), put)?;
+                soup_door::writeback::note_ignored(&mut doc, &ignored);
+                doc
             }
             "soup_link" => {
                 let links = a.links()?;
@@ -533,6 +541,49 @@ impl Door {
                     }
                 }
                 self.writers.link(&t, who(ctx), links)?
+            }
+            "soup_unlink" => {
+                let links = a.links()?;
+                a.done()?;
+                let thread = who(ctx).thread;
+                self.writers.with(
+                    &t,
+                    who(ctx),
+                    Box::new(move |c, t| {
+                        let w = soup_door::clusters::Writer { thread, dispatch: "mcp soup_unlink".into() };
+                        let mut doc = soup_door::edges::unlink(c, t, &links, &w).map_err(refusal)?;
+                        doc["cursor"] = writer::cursor_after(c, t);
+                        Ok(doc)
+                    }),
+                )?
+            }
+            "soup_cite" => {
+                let id = a.required_str("id")?;
+                let add = a.take("add");
+                let remove = a.take("remove");
+                a.done()?;
+                let op = match (add, remove) {
+                    (Some(v @ Value::Object(_)), None) => soup_door::edges::CiteOp::Add(v),
+                    (Some(_), None) => return Err(usage("`add` of soup_cite must be one citation object, e.g. {\"kind\":\"url\",\"url\":\"…\"}")),
+                    (None, Some(Value::Object(m))) => soup_door::edges::CiteOp::Remove(soup_door::edges::Which::Matching(m)),
+                    (None, Some(v)) => match v.as_u64() {
+                        Some(i) => soup_door::edges::CiteOp::Remove(soup_door::edges::Which::Index(i as usize)),
+                        None => return Err(usage("`remove` of soup_cite is a citation's index (from 0) or an object its entry matches")),
+                    },
+                    (Some(_), Some(_)) => return Err(usage("soup_cite takes `add` or `remove`, not both")),
+                    (None, None) => return Err(usage("soup_cite needs `add` (a citation) or `remove` (an index or a match)")),
+                };
+                let thread = who(ctx).thread;
+                self.writers.with(
+                    &t,
+                    who(ctx),
+                    Box::new(move |c, t| {
+                        let w = soup_door::clusters::Writer { thread, dispatch: "mcp soup_cite".into() };
+                        let mut doc = soup_door::edges::cite(c, t, &id, &op, &w).map_err(refusal)?;
+                        doc["cursor"] = writer::cursor_after(c, t);
+                        Ok(doc)
+                    }),
+                )?
             }
             "soup_claim" => {
                 let claim = soup_door::clusters::Claim {
@@ -614,6 +665,51 @@ impl Door {
                 doc["truncated"] = json!({"fields": [], "items_dropped": 0});
                 doc
             }
+            "soup_approve" | "soup_reject" => {
+                let reject = tool.name == "soup_reject";
+                // Two limits no setting changes: a ripple never decides,
+                // and the decision is the owner's, opened to agents only by
+                // the owner's choice.
+                refuse_ripple(ctx)?;
+                self.owner_act_open(&t)?;
+                let ids = match a.take("ids") {
+                    None => None,
+                    Some(Value::Array(v)) if !v.is_empty() && v.len() <= crate::approve::MAX_IDS && v.iter().all(|x| x.as_str().is_some_and(|s| !s.trim().is_empty())) => {
+                        Some(v.iter().filter_map(Value::as_str).map(str::to_string).collect::<Vec<_>>())
+                    }
+                    Some(_) => return Err(usage(format!("`ids` of {} must be a list of 1 to {} record ids", tool.name, crate::approve::MAX_IDS))),
+                };
+                let dump = a.str("dump")?;
+                let run = a.str("run")?;
+                let reason = if reject { a.str("reason")? } else { None };
+                let undo = a.flag("undo")?;
+                a.done()?;
+                let pick = match (ids, dump, run) {
+                    (Some(v), None, None) => crate::approve::Pick::Ids(v),
+                    (None, Some(d), None) => crate::approve::Pick::Dump(soup_door::review::checked_dump(&d).map_err(refusal)?),
+                    (None, None, Some(r)) => crate::approve::Pick::Run(soup_door::review::checked_run(&r).map_err(refusal)?),
+                    _ => return Err(usage(format!("{} names the records one way: `ids`, `dump` or `run`. Nothing was written.", tool.name))),
+                };
+                let reason = match reason {
+                    Some(_) if undo => return Err(usage("`reason` goes with a rejection, not with `undo`. Nothing was written.")),
+                    Some(r) => Some(crate::approve::checked_reason(&r)?),
+                    None => None,
+                };
+                let act = match (reject, undo) {
+                    (false, false) => crate::approve::Act::Approve,
+                    (false, true) => crate::approve::Act::Unapprove,
+                    (true, false) => crate::approve::Act::Reject,
+                    (true, true) => crate::approve::Act::Unreject,
+                };
+                let ask = crate::approve::Ask::One(act, pick);
+                let d = crate::approve::Decider {
+                    by: env::owner_acts::By::Agent,
+                    thread: ctx.initiator_thread(),
+                    session: ctx.session_id.clone(),
+                    dispatch: Some(format!("mcp {}", tool.name)),
+                };
+                self.writers.with(&t, who(ctx), Box::new(move |c, t| crate::approve::decide(c, t, &ask, reason.as_deref(), false, None, &d)))?
+            }
             other => return Err(Refusal::new(codes::UNKNOWN_METHOD, other.to_string())),
         };
         if let Some(o) = doc.as_object_mut() {
@@ -622,7 +718,41 @@ impl Door {
         Ok(doc)
     }
 
-    /// `soup_dump`: the text's bytes to the blob store, then one write.
+    /// **Is `approve` open to MCP sessions for `t`'s cauldron?** The owner's
+/// PERSISTED `owner_acts` choice (`env::owner_acts`, read from the root on
+/// every call) and nothing else. `CAULDRON_OWNER_ACTS` is never read here:
+/// it means "the command the owner ran may act" and belongs to that one CLI
+/// process. Neither the session's variable (the bridge does not carry it)
+/// nor this service's own environment (the supervisor removes it, and it
+/// would be ignored if it were there) opens anything: opening the door's
+/// approve and reject to sessions is the explicit, persisted
+/// `cauldron owner-acts open`.
+fn owner_act_open(&self, t: &Target) -> Result<(), Refusal> {
+    let setting = env::owner_acts::load(&self.env.root)
+        .map_err(|e| Refusal::new("store", format!("reading the owner_acts setting: {e}. Nothing was written.")))?;
+    let id = t.cauldron.id();
+    match env::owner_acts::decide(env::owner_acts::Act::Approve, &setting, &self.env.name, &t.cauldron.name, id.as_deref(), false, None) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            Err(Refusal::new(
+                OWNER_ACT_CLOSED,
+                format!(
+                    "approving and rejecting a ripple's records are the owner's acts, and the owner keeps them at a terminal \
+                     for cauldron `{c}` (owner_acts: `approve` is not open to agents). Nothing was written. Give the user the \
+                     command to run in a terminal (`cauldron ripples approve | reject … --env {e} --cauldron {c}`, or `cauldron \
+                     ripples review --interactive --env {e} --cauldron {c}`); do not try to run it yourself. The owner can \
+                     open it to agents: `cauldron owner-acts open --only approve --cauldron {c} --env {e}` (without \
+                     --cauldron, for every cauldron) run at a terminal. CAULDRON_OWNER_ACTS opens nothing here, in a \
+                     session's environment or in this service's: it applies only to the CLI command that carries it.",
+                    c = t.cauldron.name,
+                    e = self.env.name
+                ),
+            ))
+        }
+    }
+}
+
+/// `soup_dump`: the text's bytes to the blob store, then one write.
     #[allow(clippy::too_many_arguments)]
     fn dump_text(
         &self,
@@ -799,10 +929,17 @@ impl Door {
                 })
             }
         };
+        // What this door lets a session do for the owner: the persisted
+        // owner_acts setting alone (`owner_act_open`).
+        let owner_acts = match env::owner_acts::load(&self.env.root) {
+            Ok(s) => env::owner_acts::sessions_view(&s, &self.env.name, &t.cauldron.name, t.cauldron.id().as_deref()),
+            Err(e) => json!({"approve": "terminal", "error": e.to_string()}),
+        };
         Ok(json!({
             "env": t.env.name,
             "cauldron": t.cauldron.name,
             "scopes": grant.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "owner_acts": owner_acts,
             "schema": SCHEMA,
             "cluster_schema": soup_door::clusters::SCHEMA,
             "clusters": clusters,
@@ -824,6 +961,29 @@ impl Door {
             "region_locks": env::region_locks::view_of(&t.cauldron),
         }))
     }
+}
+
+/// The refusal code of an owner act the owner keeps at a terminal.
+pub const OWNER_ACT_CLOSED: &str = "owner_act_closed";
+
+/// The refusal code of a review decision asked by a ripple.
+pub const RIPPLE_REFUSED: &str = "ripple_refused";
+
+/// **A ripple never decides**, whatever the owner chose: a call whose
+/// client is the ripples service's identity (`ripples`, or any name of the
+/// `ripple` family) is refused. (The ripples service never reaches the door
+/// at all: it holds only the ripples key, on the seam; this is the door's
+/// own refusal of that identity.)
+fn refuse_ripple(ctx: &Ctx) -> Result<(), Refusal> {
+    let c = ctx.client.to_ascii_lowercase();
+    if c.starts_with("ripple") || c == "cauldron-ripples" || c.ends_with("-ripples") {
+        return Err(Refusal::new(
+            RIPPLE_REFUSED,
+            "a ripple never approves or rejects records, whatever the owner's owner_acts setting says: its own output must \
+             not read as reviewed. Nothing was written.",
+        ));
+    }
+    Ok(())
 }
 
 fn who(ctx: &Ctx) -> Who {
@@ -912,6 +1072,22 @@ fn audit_line(tool: &str, ctx: &Ctx, cauldron: Option<String>, out: &Result<Valu
             }
         }
     }
+    // A review decision: who made it (an agent, through the door), and its
+    // counts, as the owner's own decisions are audited.
+    let mut by = None;
+    if matches!(tool, "soup_approve" | "soup_reject") {
+        by = Some(env::owner_acts::By::Agent.as_str().to_string());
+        if let Some(d) = doc {
+            let n = |k: &str| d.get(k).and_then(Value::as_array).map_or(0, Vec::len);
+            counts.insert("selected".into(), d.get("selected").cloned().unwrap_or(json!(0)));
+            counts.insert("skipped".into(), json!(n("skipped")));
+            for k in ["approved", "unapproved", "rejected", "unrejected"] {
+                if d.get(k).is_some() {
+                    counts.insert(k.into(), json!(n(k)));
+                }
+            }
+        }
+    }
     let outcome = match out {
         Ok(d) if d.get("dump_id").is_some() => "received".to_string(),
         Ok(d) if read && d.get("removed") == Some(&json!(true)) => "removed".to_string(),
@@ -928,6 +1104,7 @@ fn audit_line(tool: &str, ctx: &Ctx, cauldron: Option<String>, out: &Result<Valu
         tx,
         counts: Value::Object(counts),
         dump,
+        by,
         ..Line::default()
     }
 }
@@ -1002,12 +1179,39 @@ impl Args {
         }
     }
 
+    /// `soup_link`'s links, in either form: `links: [{from, kind, to,
+    /// note?}, …]`, or ONE link given flat as `{from, kind, to, note?}`. Both
+    /// forms in one call are refused, naming the keys that clash.
     fn links(&mut self) -> Result<Vec<writer::Link>, Refusal> {
-        let err = self.wrong("links", "a non-empty list of {from, kind, to, note?} with non-empty strings");
-        let Some(Value::Array(list)) = self.take("links") else { return Err(err) };
-        if list.is_empty() {
-            return Err(err);
-        }
+        const FLAT: [&str; 4] = ["from", "kind", "to", "note"];
+        let flat: Vec<&str> = FLAT.iter().copied().filter(|k| self.m.contains_key(*k)).collect();
+        let list = match (self.m.contains_key("links"), flat.is_empty()) {
+            (true, false) => {
+                let named = flat.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+                return Err(usage(format!(
+                    "{} takes either `links` (a list) or one link given flat ({{from, kind, to, note?}}), not both: this call \
+                     has `links` and {named}. Put that link in `links`, or call once per form",
+                    self.tool
+                )));
+            }
+            (false, false) => {
+                let mut one = Map::new();
+                for k in flat {
+                    if let Some(v) = self.m.remove(k) {
+                        one.insert(k.to_string(), v);
+                    }
+                }
+                vec![Value::Object(one)]
+            }
+            _ => {
+                let err = self.wrong("links", "a non-empty list of {from, kind, to, note?} with non-empty strings (or give one link flat: {from, kind, to, note?})");
+                match self.take("links") {
+                    Some(Value::Array(list)) if !list.is_empty() => list,
+                    _ => return Err(err),
+                }
+            }
+        };
+        let err = usage(format!("a link of {} is {{from, kind, to, note?}}, each a non-empty string (`note` optional)", self.tool));
         let mut out = Vec::new();
         for l in list {
             let Value::Object(mut m) = l else { return Err(err) };

@@ -2,7 +2,9 @@
 #  ripples — A DUMP BECOMES KNOWLEDGE-GRAPH RECORDS, WHEN ITS OWNER ASKS.
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# One per environment. OFF unless started: the installer does not pin it, and
+# One per environment. OFF unless started: the installer does not pin it (a
+# release bundle carries its image; `cauldron --env <env> build ripples`
+# installs it with no cargo), and
 # in this release it processes nothing on its own. It runs one dump only when
 # the owner runs `cauldron ripples run <DM-n> --env <env> --cauldron <name>`.
 #
@@ -10,7 +12,8 @@
 #   records, only through the `mcp` service's ripple seam, which mints the
 #   records' provenance and is still the one writer of every granted soup.
 # * The model call goes through the `threads` service (the owner's own Claude
-#   login): one structured-output call, Sonnet, with one Opus retry.
+#   login): one structured-output call, Opus unless `--model` chooses
+#   another, with one Opus retry.
 # * Its files live in `data/<env>/ripples/`: `run.secret` (0600, minted at
 #   every start; `cauldron ripples` reads it) and `runs.jsonl` (the run
 #   journal: every step of every run, with its token counts; never dump text).

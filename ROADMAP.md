@@ -50,6 +50,29 @@ recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Next
 
+- **0.1.17: the consumer interface as written** (issue #1): every tool in
+  the interface table of issue #10 answers when called as the table writes
+  it (`soup_link` takes one flat link too), and a Claude Code project can
+  have a server for one cauldron (`cauldron mcp stdio --cauldron` pins it,
+  `cauldron mcp config` prints its `.mcp.json` entry). With it, a quiet
+  threads store is read safely, and the plugin launcher finds the project
+  root from a subdirectory. **Who may act for the owner** (issue #25):
+  granting, approving and turning automatic ripples on stay the owner's
+  acts at a terminal by default, and the owner can let agents do them
+  (`cauldron owner-acts`, the `CAULDRON_OWNER_ACTS` variable,
+  `scripts/install --owner-acts`), with every act recorded as a person's or
+  an agent's; a Claude Code session can approve and reject through
+  `soup_approve` / `soup_reject` where the owner allows it. **Local
+  inference on a prebuilt install**: the bundle carries the `inference` and
+  `ripples` services (installed, never started by the installer), `cauldron
+  inference models pull` fetches one of the two measured models after a
+  yes, and `cauldron inference status` says what is missing.
+- **Threads on a local model**, in a release after it: the `inference`
+  service stays the one owner of `llama-server`, the model registry and the
+  memory budget, and the threads daemon leases a loaded model from it for a
+  turn (load, renew, release), so one budget covers both. The chat face
+  then offers a local model at thread creation, and an install with no
+  Claude account can run threads.
 - **Ripples on by default in a fresh install**, once the conditions hold:
   enough real dumps processed and reviewed with a reject rate the owner
   accepts, tokens per dump measured with no cap ever passed silently, the
@@ -63,6 +86,10 @@ recorded in [CHANGELOG.md](CHANGELOG.md).
   changed in a soup, and a history of which write changed what.
   (`soup_changes` can already wait for the next change.)
 - **Ripples proposing clusters and claims**: a ripple writes neither today.
+- **Ripples that split writing from reasoning** (issue #27): cheaper models
+  write to the graph, and a stronger one reasons over issues,
+  contradictions and work items to harmonize them. Until then a ripple's
+  first call is Opus.
 - **Merging cauldrons** (issue #9).
 - **A summary page in the face** (issue #11).
 - **Comparisons with two other tools**, as input for design: octomind's
@@ -81,7 +108,8 @@ releases carry only the dump ripple.
 
 - **Inference adapters** on the threads daemon: Codex first, then others.
 - **Local models** for the rest of cauldron's model work (0.1.11 runs only
-  the dump ripple and its evaluation on one).
+  the dump ripple and its evaluation on one; threads on a local model are
+  under Next).
 - **Encrypted cauldrons**: local inference only, everything encrypted at
   rest.
 - **Cloud and remote cauldrons**, and **mesh setups** of several machines.

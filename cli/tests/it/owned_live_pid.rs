@@ -486,3 +486,35 @@ fn f2g_a_launch_that_never_writes_its_seam_fails_at_the_60s_start_timeout_within
     assert!(took < BUDGET, "failed after {took:?}, past {BUDGET:?}:\n{out}");
     assert!(sb.row("svc").is_none(), "a row was left for a service that never came up: {:?}", sb.row("svc"));
 }
+
+/// **`CAULDRON_OWNER_ACTS` never reaches a service.** It means "the command
+/// the owner ran may act", so `cauldron start` run from a shell that carries
+/// it, for a declaration that names it in its own `[env]`, starts a service
+/// whose environment has no such variable. (The mcp service decides MCP
+/// approve and reject from the persisted setting alone; see `mcp_service`.)
+#[test]
+fn a_service_started_with_the_owner_acts_variable_set_does_not_inherit_it() {
+    let sb = Sandbox::new("oav");
+    let fake = FAKE.replace("note(\"up\")\n", "note(\"up\")\nnote(\"oa=\" + E.get(\"CAULDRON_OWNER_ACTS\", \"-\"))\n");
+    assert_ne!(fake, FAKE, "the fake records the variable");
+    sb.register_script("oafake", "0", &fake);
+    let decl = sb.root.join("services/oafake.toml");
+    let text = std::fs::read_to_string(&decl).unwrap().replacen("[env]\n", "[env]\nCAULDRON_OWNER_ACTS = \"open\"\n", 1);
+    std::fs::write(&decl, text).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_cauldron"))
+        .args(["start", "oafake"])
+        .env("CAULDRON_HOME", &sb.root)
+        .env("CAULDRON_ENV", &sb.env)
+        .env(crate::grants::ALLOW_ENV, crate::grants::owned(&sb.root, &[]))
+        .env("CAULDRON_OWNER_ACTS", "open")
+        .output()
+        .expect("spawn cauldron");
+    assert!(out.status.success(), "start: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let pid = wait_for("the fake up", BUDGET, || sb.ups().last().copied());
+    let seen = wait_for("the fake to record the variable", BUDGET, || {
+        sb.events().into_iter().find(|(w, p)| *p == pid && w.starts_with("oa=")).map(|(w, _)| w)
+    });
+    assert_eq!(seen, "oa=-", "the service inherited CAULDRON_OWNER_ACTS");
+    let (rc, out) = sb.cauldron(&["stop", "oafake"]);
+    assert_eq!(rc, 0, "stop: {out}");
+}

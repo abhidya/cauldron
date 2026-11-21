@@ -250,6 +250,27 @@ cauldron soup — a cauldron's soup, offline
         region the soup does not hold, an id that is not a region, and while a ripple holds
         the region (`region_locked`, as for an import). Written directly, or, while the `mcp`
         service holds the soup, sent to it as `soup_claim`.
+    cauldron soup link <from> <kind> <to> [--cauldron <name>] [--env <env>] [--note <text>]
+                       [--agent <label>]
+        Add one edge between two records the soup holds (`soup_link` from a shell), judged by
+        the grammar first: `cauldron soup link DEC-2 ref T-4 --note evidence`. Not
+        `cauldron link`, which writes a project's `.cauldron` marker. Written directly, or,
+        while the `mcp` service holds the soup, sent to it as `soup_link`.
+    cauldron soup unlink <from> <kind> <to> [--cauldron <name>] [--env <env>] [--agent <label>]
+        Remove one edge between two records the soup holds (`soup_unlink`): the record keeps
+        no wrong edge (`get` stops showing it) and the change feed records an `unlink`.
+        Idempotent: an edge that is not there prints `not-linked` and writes nothing. Refused
+        by name: a record's last `in_region` (or the last edges its type requires: add the
+        replacement first), a `supersedes` edge (history: write a new record instead), a
+        cluster's `claims` (use `soup claim --release`), and while a ripple holds a region it
+        touches (`region_locked`). Written directly, or sent to the `mcp` service.
+    cauldron soup cite <id> --add <json> | --remove <index-or-json> [--cauldron <name>]
+                       [--env <env>] [--agent <label>]
+        Add or remove ONE entry of a record's `meta.cites` (`soup_cite`): --add takes one
+        citation as JSON (`{\"kind\":\"url\",\"url\":\"…\"}`), judged by the import's citation table;
+        --remove takes its index (from 0, as `get` lists them) or a JSON object its entry
+        matches. Only `meta.cites` is written. Idempotent: `already-cited`, `not-cited`.
+        Written directly, or sent to the `mcp` service.
     cauldron soup changes [--cauldron <name>] [--env <env>] [--since <cursor>] [--wait <secs>]
                           [--limit N] [--max-chars N]
         What landed since a cursor, oldest first, as `soup_changes` answers it: `changes`
@@ -321,12 +342,13 @@ cauldron soup — a cauldron's soup, offline
         then grant again. Never an MCP tool.
     cauldron soup approve <id>... --env <env> --cauldron <name> [--unapprove]
         Approve records a ripple wrote (`cauldron ripples run`): each named record that
-        reads as `unreviewed` gets `meta.approved: {at, by: \"owner\"}` and reads as
+        reads as `unreviewed` gets `meta.approved: {at, by}` and reads as
         reviewed from then on; with --unapprove, each approved one reads as unreviewed
         again. All in one write, through the running `mcp` service, audited in its
-        calls.jsonl. Approving is the owner's act: this runs only with its input and output
-        on an interactive terminal, and no option skips that; no MCP tool approves, and a
-        ripple never can. An id that is not a ripple's record, is rejected, or is already in
+        calls.jsonl. Approving is the owner's act: this runs with its input and output on
+        an interactive terminal (`by: \"tty\"`), or without one only where the owner opened
+        `approve` to agents (`cauldron owner-acts help`; `by: \"agent\"`); a ripple never
+        can. An id that is not a ripple's record, is rejected, or is already in
         the asked state, is listed in `skipped` with why. `cauldron ripples review` lists
         the records waiting, and `cauldron ripples approve | reject` decides them by dump,
         by run or by id. Like those, it needs the running `mcp` service to be this
@@ -344,7 +366,9 @@ cauldron soup — a cauldron's soup, offline
   A record a ripple wrote (`cauldron ripples run`) is unreviewed until its owner approves
   or rejects it (`cauldron ripples review | approve | reject`, or `cauldron soup approve`):
   every read shows it, marked `unreviewed: true`.
-  --review pending lists only those; --review reviewed only the rest.
+  --review pending lists only those; --review reviewed only the rest; --review by-tty
+  or by-agent only the records approved or rejected by a person at a terminal, or by an
+  agent the owner allowed (each listed with `decided_by`).
   A record its owner rejected (`cauldron ripples reject`) is kept, and `get` answers it
   marked `rejected: true`; `nodes`, `search` and `region`'s members leave it out and say
   how many they left out in `rejected_hidden`; --include-rejected lists them too.
@@ -380,6 +404,9 @@ pub(crate) fn verb_soup(args: &[String]) -> Result<i32> {
         Some("dump-remove") => dump_remove(&args[1..]),
         Some("approve") => approve(&args[1..]),
         Some("claim") => claim(&args[1..]),
+        Some("link") => link(&args[1..], false),
+        Some("unlink") => link(&args[1..], true),
+        Some("cite") => cite(&args[1..]),
         Some("changes") => changes(&args[1..]),
         None => {
             eprint!("{USAGE}");
@@ -387,7 +414,7 @@ pub(crate) fn verb_soup(args: &[String]) -> Result<i32> {
         }
         Some(other) => {
             eprintln!(
-                "cauldron soup: no verb `{other}` (import | import-corpus | recover | regions | region | nodes | search | get | claim | changes | dump | dumps | dump-get | dump-remove | approve | help)"
+                "cauldron soup: no verb `{other}` (import | import-corpus | recover | regions | region | nodes | search | get | claim | link | unlink | cite | changes | dump | dumps | dump-get | dump-remove | approve | help)"
             );
             Ok(2)
         }
@@ -424,6 +451,8 @@ struct Args {
     wait_secs: Option<usize>,
     release: bool,
     note: Option<String>,
+    add: Option<String>,
+    remove: Option<String>,
     since: Option<String>,
     wait: Option<usize>,
     pos: Vec<String>,
@@ -481,6 +510,8 @@ fn parse(verb: &str, args: &[String], allow: &[&str]) -> Result<Args> {
             "--since" => a.since = Some(take(&mut it)?),
             "--wait" => a.wait = Some(count(flag, &take(&mut it)?)?),
             "--note" => a.note = Some(take(&mut it)?),
+            "--add" => a.add = Some(take(&mut it)?),
+            "--remove" => a.remove = Some(take(&mut it)?),
             _ => a.pos.push(s.clone()),
         }
     }
@@ -607,10 +638,13 @@ fn import_corpus(args: &[String]) -> Result<i32> {
 static CORPUS_REPORT: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
 
 fn import_records(a: &Args, input: &str, records: &[Value]) -> Result<i32> {
-    let records = records.to_vec();
-    // Checked here, before the batch can be forwarded to a running service
-    // (which may be an older one that does not check it).
+    // What a read adds is dropped (and named in `ignored`), and the review
+    // flags and ripple provenance are refused, here, before the batch can be
+    // forwarded to a running service (which may be an older one that does
+    // not do either).
+    let (records, ignored) = soup_door::writeback::strip_read_only(records);
     soup_door::review::refuse_review_flags(&records)?;
+    soup_door::review::refuse_ripple_provenance(&records)?;
     let t = target("import", a, !a.dry_run)?;
     let opts = ImportOptions {
         pool: a.pool.clone(),
@@ -625,7 +659,7 @@ fn import_records(a: &Args, input: &str, records: &[Value]) -> Result<i32> {
     };
     let outcome = match soup_door::import::import(&t, &records, &opts) {
         Err(e) if e.code == soup_door::Code::Locked && !opts.dry_run => match soup_door::lock::held_by_service(&t.cauldron) {
-            Some(pid) => match forward(&t, &records, &opts, pid)? {
+            Some(pid) => match forward(&t, &records, &opts, pid, &ignored)? {
                 Forwarded::Done(rc) => return Ok(rc),
                 // The service let the cauldron go between the lock and the
                 // call (a revoke): the soup is free again, so import directly.
@@ -636,11 +670,13 @@ fn import_records(a: &Args, input: &str, records: &[Value]) -> Result<i32> {
         other => other?,
     };
     match outcome {
-        ImportOutcome::Judged { doc, ok } => {
+        ImportOutcome::Judged { mut doc, ok } => {
+            soup_door::writeback::note_ignored(&mut doc, &ignored);
             print(&doc)?;
             Ok(if ok { 0 } else { 1 })
         }
-        ImportOutcome::AlreadyLanded { doc, why } => {
+        ImportOutcome::AlreadyLanded { mut doc, why } => {
+            soup_door::writeback::note_ignored(&mut doc, &ignored);
             print(&doc)?;
             eprintln!("cauldron soup import: REFUSED (batch-already-landed): {why}");
             Ok(1)
@@ -661,7 +697,7 @@ enum Forwarded {
 /// the batch-already-landed guard sees the same batch whichever way it
 /// landed. Printed in the import's own shape, plus `forwarded_to`. Only when
 /// the service's `mcp` seam row is LIVE and names the pid the lock names.
-fn forward(t: &Target, records: &[Value], o: &ImportOptions, pid: u32) -> Result<Forwarded> {
+fn forward(t: &Target, records: &[Value], o: &ImportOptions, pid: u32, ignored: &[Value]) -> Result<Forwarded> {
     let svc = crate::mcp_door::SERVICE;
     let holder = format!("the `{svc}` service (pid {pid})");
     let found = match crate::mcp_door::find(&t.env) {
@@ -740,6 +776,7 @@ fn forward(t: &Target, records: &[Value], o: &ImportOptions, pid: u32) -> Result
             m.remove("cursor");
             m.insert("forwarded_to".into(), via);
         }
+        soup_door::writeback::note_ignored(&mut doc, ignored);
         print(&doc)?;
         return Ok(Forwarded::Done(0));
     }
@@ -752,6 +789,7 @@ fn forward(t: &Target, records: &[Value], o: &ImportOptions, pid: u32) -> Result
             if let Some(m) = doc.as_object_mut() {
                 m.insert("forwarded_to".into(), via);
             }
+            soup_door::writeback::note_ignored(&mut doc, ignored);
             print(&doc)?;
             Ok(Forwarded::Done(1))
         }
@@ -875,6 +913,143 @@ fn claim_forward(t: &Target, k: &soup_door::clusters::Claim, pid: u32) -> Result
             "REFUSED: {holder} is from before clusters (it answers `soup_claim` as unsupported), so it cannot write a claim. \
              Nothing was written. Upgrade it (`scripts/install --replace-running`), then claim again."
         );
+    }
+    bail!("REFUSED ({holder} answered `{code}`): {message}")
+}
+
+// -------------------------------------------------------- link, unlink, cite
+
+/// **`cauldron soup link | unlink <from> <kind> <to>`**: one edge added or
+/// removed (`soup_door::edges`). Written directly when nothing holds the
+/// soup; while the `mcp` service holds it, sent to it as `soup_link` or
+/// `soup_unlink`.
+fn link(args: &[String], remove: bool) -> Result<i32> {
+    let verb = if remove { "unlink" } else { "link" };
+    let allow: &[&str] = if remove { &["--env", "--cauldron", "-c", "--agent"] } else { &["--env", "--cauldron", "-c", "--note", "--agent"] };
+    let a = parse(verb, args, allow)?;
+    let [from, kind, to] = a.pos.as_slice() else {
+        bail!("`cauldron soup {verb}` takes a record, an edge kind and a record (`cauldron soup {verb} DEC-2 ref T-4`); got {} argument(s)", a.pos.len());
+    };
+    let t = target(verb, &a, true)?;
+    let l = soup_door::edges::Link { from: from.clone(), kind: kind.clone(), to: to.clone(), note: a.note.clone() };
+    let w = soup_door::clusters::Writer {
+        thread: a.agent.clone().unwrap_or_else(|| "outside-agent".to_string()),
+        dispatch: format!("cauldron soup {verb}"),
+    };
+    let links = vec![l.clone()];
+    let done = soup_door::edges::direct(&t, verb, |h| if remove { soup_door::edges::unlink(h, &t, &links, &w) } else { soup_door::edges::link(h, &t, &links, &w) });
+    let doc = match done {
+        Err(e) if e.code == soup_door::Code::Locked => match soup_door::lock::held_by_service(&t.cauldron) {
+            Some(pid) => {
+                let mut args = json!({"cauldron": t.cauldron.name, "from": l.from, "kind": l.kind, "to": l.to});
+                if let Some(n) = &l.note {
+                    args["note"] = json!(n);
+                }
+                return forward_tool(&t, verb, if remove { "soup_unlink" } else { "soup_link" }, args, pid);
+            }
+            None => return Err(e.into()),
+        },
+        Err(e) => return refused_doc(verb, e),
+        Ok(d) => d,
+    };
+    print(&doc)?;
+    Ok(0)
+}
+
+/// **`cauldron soup cite <id> --add <json> | --remove <index-or-json>`**:
+/// one entry of a record's `meta.cites` added or removed
+/// (`soup_door::edges::cite`), directly or through the `mcp` service.
+fn cite(args: &[String]) -> Result<i32> {
+    let a = parse("cite", args, &["--env", "--cauldron", "-c", "--add", "--remove", "--agent"])?;
+    let [id] = a.pos.as_slice() else {
+        bail!("`cauldron soup cite` takes one record id and --add or --remove (`cauldron soup cite DEC-2 --add '{{\"kind\":\"url\",\"url\":\"…\"}}'`)");
+    };
+    let (op, sent) = match (&a.add, &a.remove) {
+        (Some(j), None) => {
+            let v: serde_json::Value = serde_json::from_str(j).with_context(|| format!("--add takes one citation as JSON, not `{j}`"))?;
+            if !v.is_object() {
+                bail!("--add takes one citation object, e.g. '{{\"kind\":\"url\",\"url\":\"…\"}}'");
+            }
+            (soup_door::edges::CiteOp::Add(v.clone()), json!({"add": v}))
+        }
+        (None, Some(r)) => match r.trim().parse::<usize>() {
+            Ok(i) => (soup_door::edges::CiteOp::Remove(soup_door::edges::Which::Index(i)), json!({"remove": i})),
+            Err(_) => match serde_json::from_str::<serde_json::Value>(r) {
+                Ok(serde_json::Value::Object(m)) => (soup_door::edges::CiteOp::Remove(soup_door::edges::Which::Matching(m.clone())), json!({"remove": m})),
+                _ => bail!("--remove takes a citation's index (from 0) or a JSON object its entry matches, not `{r}`"),
+            },
+        },
+        (Some(_), Some(_)) => bail!("`cauldron soup cite` takes --add or --remove, not both"),
+        (None, None) => bail!("`cauldron soup cite` needs --add <json> or --remove <index-or-json>"),
+    };
+    let t = target("cite", &a, true)?;
+    let w = soup_door::clusters::Writer {
+        thread: a.agent.clone().unwrap_or_else(|| "outside-agent".to_string()),
+        dispatch: "cauldron soup cite".into(),
+    };
+    let doc = match soup_door::edges::direct(&t, "cite", |h| soup_door::edges::cite(h, &t, id, &op, &w)) {
+        Err(e) if e.code == soup_door::Code::Locked => match soup_door::lock::held_by_service(&t.cauldron) {
+            Some(pid) => {
+                let mut args = sent;
+                args["cauldron"] = json!(t.cauldron.name);
+                args["id"] = json!(id);
+                return forward_tool(&t, "cite", "soup_cite", args, pid);
+            }
+            None => return Err(e.into()),
+        },
+        Err(e) => return refused_doc("cite", e),
+        Ok(d) => d,
+    };
+    print(&doc)?;
+    Ok(0)
+}
+
+/// A refusal that carries facts (`links_refused`): the facts on stdout as
+/// JSON, the sentence on stderr, exit 1. Any other refusal as usual.
+fn refused_doc(verb: &str, e: soup_door::Error) -> Result<i32> {
+    match &e.detail {
+        Some(d) => {
+            print(d)?;
+            eprintln!("cauldron soup {verb}: REFUSED ({}): {}", e.code, e.message);
+            Ok(1)
+        }
+        None => Err(e.into()),
+    }
+}
+
+/// An act sent to the `mcp` service (pid `pid`) that holds the soup, as
+/// the tool `tool`; its answer printed as the direct write prints it.
+fn forward_tool(t: &Target, verb: &str, tool: &str, mut args: serde_json::Value, pid: u32) -> Result<i32> {
+    let svc = crate::mcp_door::SERVICE;
+    let holder = format!("the `{svc}` service (pid {pid})");
+    let found = match crate::mcp_door::find(&t.env) {
+        Ok(f) if f.pid == pid => f,
+        Ok(f) => bail!("REFUSED: {holder} holds cauldron `{}`'s soup, but the running `{svc}` service is pid {}. Nothing was written.", t.cauldron.name, f.pid),
+        Err(why) => bail!("REFUSED: {holder} holds cauldron `{}`'s soup, so this would be sent to it, but {}. Nothing was written.", t.cauldron.name, why.say()),
+    };
+    args["_ctx"] = json!({"client": "cli"});
+    eprintln!("cauldron soup {verb}: {holder} holds cauldron `{}`'s soup; this is sent to it and lands through it", t.cauldron.name);
+    let result = crate::mcp_door::call(&t.env, found.door, tool, args)
+        .with_context(|| format!("sending `{tool}` to {holder}; nothing is known to have been written, check `cauldron soup changes`"))?;
+    let refused = &result["structuredContent"]["refused"];
+    if result["isError"] != json!(true) {
+        let mut doc = result["structuredContent"].clone();
+        if let Some(m) = doc.as_object_mut() {
+            m.remove("resolved_from");
+            m.insert("forwarded_to".into(), json!({"service": svc, "pid": pid}));
+        }
+        print(&doc)?;
+        return Ok(0);
+    }
+    let code = refused["code"].as_str().unwrap_or("");
+    let message = refused["message"].as_str().unwrap_or("");
+    if code == "-32602" || message.contains("unknown tool") || code == "unknown_method" {
+        bail!("REFUSED: {holder} does not know `{tool}` (it is older than this cauldron). Nothing was written. Upgrade it (`scripts/install --replace-running`).");
+    }
+    if !refused["detail"].is_null() {
+        print(&refused["detail"])?;
+        eprintln!("cauldron soup {verb}: REFUSED ({holder} answered `{code}`): {message}");
+        return Ok(1);
     }
     bail!("REFUSED ({holder} answered `{code}`): {message}")
 }
@@ -1119,9 +1294,9 @@ fn dump_forward(t: &Target, text: &str, a: &Args, pid: u32) -> Result<Option<i32
 /// service's `DECIDE` seam verb with the approval key it minted
 /// (`approve.secret`), as `ripples approve` sends it
 /// (`crate::review::send`). Refused unless stdin and stdout are an interactive
-/// terminal, checked before the key is read, as `cauldron mcp grant` is.
+/// terminal or the owner opened `approve` (`crate::owner_acts::act`),
+/// checked before the key is read, as `cauldron mcp grant` is.
 fn approve(args: &[String]) -> Result<i32> {
-    use std::io::IsTerminal;
     let a = parse("approve", args, &["--env", "--cauldron", "-c", "--unapprove"])?;
     if a.pos.is_empty() {
         bail!("`cauldron soup approve` takes one or more record ids (`cauldron soup nodes --review pending` lists them)");
@@ -1142,16 +1317,19 @@ fn approve(args: &[String]) -> Result<i32> {
     );
     // Checked before anything is read or sent, so the command the refusal
     // names is one that would work.
-    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-        bail!(
+    let allowed = crate::owner_acts::act(
+        env::owner_acts::Act::Approve,
+        &e,
+        cauldron,
+        &format!(
             "REFUSED: approving a ripple's records is the owner's act at a terminal. `cauldron soup approve` runs only with \
-             its input and output on an interactive terminal, so an agent, a ripple or a script cannot {word} records by \
-             itself, and no option skips this. Nothing was written. Ask the user to run, in a terminal on this machine:\n    \
-             {command}"
-        );
-    }
+             its input and output on an interactive terminal, unless the owner has let agents approve (owner_acts), so an \
+             agent, a ripple or a script cannot {word} records by itself. Nothing was written. Ask the user to run, in a \
+             terminal on this machine:\n    {command}"
+        ),
+    )?;
     let body = serde_json::json!({"action": word, "ids": a.pos, "from": "cauldron soup approve"});
-    let v = crate::review::send(&e, cauldron, body)?;
+    let v = crate::review::send(&e, cauldron, body, allowed.by())?;
     print(&v)?;
     Ok(if v["ok"] == serde_json::json!(true) { 0 } else { 1 })
 }

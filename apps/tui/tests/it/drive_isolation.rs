@@ -101,6 +101,7 @@ const NOT_ENDPOINT: &[(&str, &str)] = &[
     ("TUI_MIC_PLAY", "local playback command"),
     ("RETRANSCRIBE_MODEL", "local model name"),
     ("TUI_POOL_ACCOUNTS_TOOL", "`tui pool` only; no drive script runs the pool verb"),
+    ("CLAUDE_ACCOUNTS_HOME", "set on the `tui pool` helper child (the threads store), never read by the face; no drive script runs the pool verb"),
     ("CLAUDE_CONFIG_DIR", "`tui pool` only; account config dir"),
     // REL-1.S1b (globs2's `--cauldron` face). These three are read only by
     // `seeding::real_call` AFTER its `CAULDRON_TYPE_ONE=off` early return,

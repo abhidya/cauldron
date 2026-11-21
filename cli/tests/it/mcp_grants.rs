@@ -182,6 +182,7 @@ fn g1_a_grant_needs_a_terminal_and_nothing_is_granted_before_it() {
     assert_eq!(d["grant"]["scopes"], serde_json::json!(["read", "write", "dump"]));
     assert_eq!(projects(&d["grant"]), [p]);
     assert_eq!(d["grant"]["by"], "tty");
+    assert_eq!(d["by"], "tty", "the answer says who granted");
     assert_eq!(std::fs::metadata(s.store()).unwrap().permissions().mode() & 0o777, 0o600);
     let g = grants(&s);
     assert_eq!(g.len(), 1);
@@ -588,7 +589,7 @@ fn turn_on(e: &env::Environment, name: &str) {
     let c = e.find_cauldron(name).unwrap().unwrap();
     let now = "2026-01-01T00:00:00.000Z".to_string();
     let s = ra::Settings {
-        cauldron: name.into(), on: true, since_at: now.clone(), since_dump: 0, backend: "local".into(), model: None, include_sessions: false,
+        cauldron: name.into(), on: true, since_at: now.clone(), since_dump: 0, backend: "local".into(), model: None, default_model: None, include_sessions: false,
         scrub_local: true, changed_at: now, off_at: None, bound_to: Some(ra::Binding::of(e, &c)),
     };
     ra::store(&e.data_root, &s).unwrap();

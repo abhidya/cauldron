@@ -197,3 +197,30 @@ fn a_checkout_builds_default_helper_is_its_own_script() {
     let d = tui::pool::action::default_accounts_tool().expect("a checkout build has a default helper");
     assert!(d.ends_with("services/threads/scripts/claude-accounts"), "{}", d.display());
 }
+
+/// An installed `tui` finds the helper installed beside it (issue #30):
+/// `<root>/share/cauldron/scripts/threads/claude-accounts` for a binary in `<root>/bin/`,
+/// also through a link to the binary elsewhere, and that copy passes the
+/// same check; with no copy there, none.
+#[test]
+fn an_installed_tui_finds_the_helper_installed_beside_it() {
+    use std::os::unix::fs::PermissionsExt;
+    use tui::pool::action::{helper_refusal, installed_tool_for, INSTALLED_HELPER};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap().join("root");
+    let exe = root.join("bin/board");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, "").unwrap();
+    assert_eq!(installed_tool_for(&exe), None, "nothing installed yet");
+    let helper = root.join(INSTALLED_HELPER);
+    std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(installed_tool_for(&exe).as_deref(), Some(helper.as_path()));
+    assert_eq!(helper_refusal(&helper), None, "the installed copy runs");
+    let link = dir.path().canonicalize().unwrap().join("elsewhere/bin/board");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&exe, &link).unwrap();
+    assert_eq!(installed_tool_for(&link).as_deref(), Some(helper.as_path()), "a link resolves to the root's copy");
+}
+

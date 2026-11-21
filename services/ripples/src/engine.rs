@@ -24,7 +24,7 @@
 //!    larger of the tokens it reported and that estimate. A call a kill or a
 //!    stop cut short stays charged. Over a cap the
 //!    run stops as `deferred` (reason `budget` or `daily_cap`): nothing is
-//!    sent, the dump stays `received`. The first call is Sonnet (or
+//!    sent, the dump stays `received`. The first call is Opus (or
 //!    `--model`); an answer that misses the schema (checked here, with the
 //!    schema itself), or that the door refuses, gets ONE retry on Opus with
 //!    the refusal added to the prompt; a busy backend is tried again, within
@@ -82,9 +82,12 @@ pub const MAX_OUTPUT_TOKENS: u32 = crate::threads::MAX_OUTPUT_TOKENS;
 /// nothing and is not a call against the caps.
 pub const BUSY_TRIES: u32 = 3;
 
-/// The model of the first call, unless asked otherwise.
-pub const FIRST_MODEL: &str = "sonnet";
-/// The model of the one retry.
+/// The model of the first call, unless asked otherwise. Opus until further
+/// notice: a ripple does its task logic (issues, contradictions, work items)
+/// while it thinks, and that reasoning is not yet split out to a stronger
+/// model over cheaper graph writers.
+pub const FIRST_MODEL: &str = "opus";
+/// The model of the one retry (Opus, the same as the first call by default).
 pub const RETRY_MODEL: &str = "opus";
 /// A session dump's text is read in pages of this many characters.
 pub const PAGE_CHARS: u64 = 20_000;

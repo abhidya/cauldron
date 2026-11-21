@@ -91,11 +91,26 @@ fn store(err: impl std::fmt::Display) -> Error {
 
 /// Import `records` into the target's soup (see the module docs for every
 /// proof a real import makes first).
+///
+/// The keys a read adds (`superseded_by`, `unreviewed`, a cluster's
+/// `claims`; [`crate::writeback::IGNORED`]) are dropped first and named in
+/// the answer's `ignored`, so a record read back can be written as read.
 pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<ImportOutcome> {
-    // Before any lock or proof: a batch carrying a review flag is refused
-    // whatever holds the soup (`submit` checks again).
+    let (records, ignored) = crate::writeback::strip_read_only(records);
+    let mut out = import_stripped(t, &records, o)?;
+    match &mut out {
+        ImportOutcome::Judged { doc, .. } | ImportOutcome::AlreadyLanded { doc, .. } => crate::writeback::note_ignored(doc, &ignored),
+    }
+    Ok(out)
+}
+
+fn import_stripped(t: &Target, records: &[Value], o: &ImportOptions) -> Result<ImportOutcome> {
+    // Before any lock or proof: a batch carrying a review flag, or ripple
+    // provenance, is refused whatever holds the soup (`submit` checks again).
     crate::review::refuse_review_flags(records)?;
+    crate::review::refuse_ripple_provenance(records)?;
     crate::notes::refuse_long_notes(records)?;
+    crate::edges::refuse_edge_loops(records)?;
     let (e, c) = (&t.env, &t.cauldron);
     let soup = c.soup();
     let pool = o.pool_name();
@@ -198,9 +213,12 @@ pub fn import(t: &Target, records: &[Value], o: &ImportOptions) -> Result<Import
 /// one spine row. Answers the import's JSON and whether it is `validated`
 /// or `landed`. No duplicate-batch check is made here.
 pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &ImportOptions, digest: &str) -> Result<(Value, bool)> {
-    // The review flags are the owner's: no record write sets or clears one.
+    // The review flags are the owner's: no record write sets or clears one;
+    // and `meta.ripple` is the door's, on a ripple's records only.
     crate::review::refuse_review_flags(records)?;
+    crate::review::refuse_ripple_provenance(records)?;
     crate::notes::refuse_long_notes(records)?;
+    crate::edges::refuse_edge_loops(records)?;
     let (e, c) = (&t.env, &t.cauldron);
     let mut plan = MigrationPlan::new(spine::envelope::Initiator::Agent {
         thread: o.agent.clone(),
@@ -242,6 +260,11 @@ pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &Imp
             }
         }
     }
+    for r in records_doc.as_array_mut().into_iter().flatten() {
+        if let Some(h) = hint(r, o.remint) {
+            r["hint"] = json!(h);
+        }
+    }
     let mut doc = json!({
         "env": e.name,
         "cauldron": c.name,
@@ -272,6 +295,33 @@ pub fn submit(cauldron: &spine::Cauldron, t: &Target, records: &[Value], o: &Imp
         doc["refusal"] = json!(if doc.get("landing_refused").is_some() { "landing-refused" } else { "records-refused" });
     }
     Ok((doc, outcome == "landed" || outcome == "validated"))
+}
+
+/// **What to do about a refused record**, for the two refusals a writer who
+/// expects an upsert meets: an id the soup already holds (the soup never
+/// writes over a record: a change is a new record that supersedes it), and
+/// a label sent without `remint`.
+fn hint(record: &Value, remint: bool) -> Option<&'static str> {
+    if record["disposition"] != "refused" {
+        return None;
+    }
+    let says = |what: &str| {
+        record["reasons"].as_array().into_iter().flatten().any(|r| {
+            r["witnesses"].as_array().into_iter().flatten().any(|w| w["message"].as_str().is_some_and(|m| m.starts_with(what)))
+        })
+    };
+    // Neither a viewer nor a cluster (cauldron@1) can be superseded.
+    let supersedable = !matches!(record["type"].as_str(), Some("viewer") | Some("cluster"));
+    if supersedable && says("duplicate_node_id") {
+        return Some(
+            "the soup already holds this id, and a write never replaces a record: write the new version under a new id \
+             (a label, with remint) carrying a `supersedes` edge to this one, with what changed in its note",
+        );
+    }
+    if !remint && says("id_prefix_mismatch") {
+        return Some("an id that is not `<PREFIX>-<n>` is a batch-local label, which needs remint: true (the answer's id_map gives the ids minted)");
+    }
+    None
 }
 
 fn to_value<T: serde::Serialize>(v: &T) -> Result<Value> {

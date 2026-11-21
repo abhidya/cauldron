@@ -54,6 +54,9 @@ pub enum Code {
     CursorUnknown,
     /// A change cursor ahead of the cauldron's (`changes`).
     CursorStale,
+    /// A link or unlink of which at least one edge was refused, so none
+    /// was written (`edges`).
+    LinksRefused,
 }
 
 impl Code {
@@ -80,6 +83,7 @@ impl Code {
             Code::RegionLocked => "region_locked",
             Code::CursorUnknown => "cursor_unknown",
             Code::CursorStale => "cursor_stale",
+            Code::LinksRefused => "links_refused",
         }
     }
 }

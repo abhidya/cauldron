@@ -120,6 +120,43 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] \
   exit 1
 fi
 
+# ── NOTHING IS FOUND THROUGH THE DIRECTORY THIS WAS STARTED FROM ─────────────
+# This may be started from anywhere, a cloned project included, so nothing it
+# runs may be looked up there:
+#   * PATH keeps only its absolute entries (an empty entry or `.` would find a
+#     planted `security`, `claude` or `git` in the current directory);
+#   * CDPATH, GLOBIGNORE and BASH_ENV/ENV are dropped, so no `cd` lands
+#     elsewhere and no child bash sources a file first;
+#   * every python runs as `py`: one interpreter at a fixed absolute path, not
+#     writable by group or others, started with -I (isolated: neither the
+#     current directory nor the script's directory is on sys.path, no user
+#     site-packages, no PYTHON* variables). A `json.py` planted where this was
+#     started is never imported, and the keychain secret piped into python
+#     reaches only the standard library.
+IFS=: read -r -a _path_entries <<<"${PATH:-}" || true
+_safe_path=""
+for _d in "${_path_entries[@]+"${_path_entries[@]}"}"; do
+  case "$_d" in /*) _safe_path="${_safe_path:+$_safe_path:}$_d" ;; esac
+done
+PATH="${_safe_path:-/usr/bin:/bin:/usr/sbin:/sbin}"; export PATH
+unset _path_entries _safe_path _d CDPATH GLOBIGNORE BASH_ENV ENV
+PY3=""
+for _py in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  [ -f "$_py" ] && [ -x "$_py" ] || continue
+  # /usr/bin/python3 is a stub until the Command Line Tools are installed, and
+  # the stub opens an install dialog: use it only when they are.
+  [ "$_py" != /usr/bin/python3 ] || /usr/bin/xcode-select -p >/dev/null 2>&1 || continue
+  case "$(/usr/bin/stat -Lf '%Lp' "$_py" 2>/dev/null)" in
+    ''|*[2367]|*[2367]?) continue ;;   # unreadable, or writable by group or others
+  esac
+  PY3="$_py"; break
+done
+unset _py
+py() {
+  [ -n "$PY3" ] || { printf '%s: no python3 at /opt/homebrew/bin, /usr/local/bin or /usr/bin\n' "${0##*/}" >&2; return 127; }
+  "$PY3" -I "$@"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 THREADS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # CLAUDE_ACCOUNTS_HOME: the threads home whose `accounts/` holds the slot, the
@@ -139,6 +176,22 @@ fi
 # repository" on every board sign-in). THREADS_DIR stays the invoking home on
 # purpose: it is the data dir (threads.db, accounts) the caller meant.
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/../../.." && pwd -P)"
+# WHERE THIS COPY RUNS FROM (issue #30). In a source checkout (the physical
+# scripts dir is <repo>/services/threads/scripts) it may build threads with
+# cargo, as it always has. Anywhere else it is an INSTALLED copy
+# (<cauldron root>/share/cauldron/scripts/threads/): it never runs cargo, it
+# runs the `threads` it is given (CAULDRON_THREADS_BIN, which the daemon sets
+# to itself) or the one cauldron pins, and it needs the store named
+# (CLAUDE_ACCOUNTS_HOME, which the daemon and `claude-accounts` pass), since
+# no store sits beside an installed copy.
+IN_CHECKOUT=0
+case "$(cd -P "$SCRIPT_DIR" && pwd -P)" in
+  */services/threads/scripts) [ -f "$REPO_ROOT/Cargo.toml" ] && IN_CHECKOUT=1 ;;
+esac
+INSTALLED_ROOT=""
+case "$(cd -P "$SCRIPT_DIR" && pwd -P)" in
+  */share/cauldron/scripts/threads) INSTALLED_ROOT="$(cd -P "$SCRIPT_DIR/../../../.." && pwd -P)" ;;
+esac
 
 KEYCHAIN_SERVICE_BASE="Claude Code-credentials"
 
@@ -209,7 +262,7 @@ kc_mdat() {
 fingerprint() {
   local f="$1"
   [ -f "$f" ] || { printf ''; return 0; }
-  python3 - "$f" <<'PY' || true
+  py - "$f" <<'PY' || true
 import hashlib, json, sys
 def h(v):
     return hashlib.sha256(v.encode()).hexdigest()[:8] if isinstance(v, str) else "-"
@@ -228,6 +281,63 @@ PY
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'add-account: %s\n' "$*" >&2; exit 1; }
+
+# The `threads` an installed copy runs, read the way cauldron exposes it: the
+# image of the version `cauldron status --json threads` says runs (or is
+# pinned), under <root>/data/shared/builds/threads/. The cauldron asked is the
+# one installed beside this copy (<root>/bin/cauldron). Prints nothing when
+# none is found.
+installed_threads() {
+  local cbin="${INSTALLED_ROOT:+$INSTALLED_ROOT/bin/cauldron}"
+  [ -n "$cbin" ] && [ -x "$cbin" ] || return 0
+  "$cbin" status --json threads 2>/dev/null | py -c '
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+root = (d.get("environment") or {}).get("root")
+for s in (d.get("services") or []) if root else []:
+    if s.get("service") != "threads":
+        continue
+    for label in (s.get("running_version"), s.get("pinned")):
+        if not label or label == "latest" or "/" in label or label.startswith("."):
+            continue
+        p = os.path.join(root, "data", "shared", "builds", "threads", label, "threads")
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            print(p)
+            sys.exit(0)
+' 2>/dev/null || true
+}
+
+# threads_run <args...>: run a registry step of `threads` against THREADS_HOME.
+#   1. CAULDRON_THREADS_BIN, when set: an absolute path to an executable (the
+#      daemon sets it to its own binary), else refused;
+#   2. in a source checkout: `cargo run` of the checkout's threads, as before;
+#   3. an installed copy: the threads cauldron runs for this root.
+threads_run() {
+  if [ -n "${CAULDRON_THREADS_BIN:-}" ]; then
+    case "$CAULDRON_THREADS_BIN" in
+      /*) ;;
+      *) die "CAULDRON_THREADS_BIN=${CAULDRON_THREADS_BIN@Q} is not an absolute path" ;;
+    esac
+    [ -f "$CAULDRON_THREADS_BIN" ] && [ -x "$CAULDRON_THREADS_BIN" ] \
+      || die "CAULDRON_THREADS_BIN=${CAULDRON_THREADS_BIN@Q} is not an executable file"
+    "$CAULDRON_THREADS_BIN" "$@"
+    return
+  fi
+  if [ "$IN_CHECKOUT" = 1 ]; then
+    # From the checkout, so no `.cargo/config.toml` of the caller's directory applies.
+    ( cd "$REPO_ROOT" && cargo run --quiet --manifest-path "$REPO_ROOT/Cargo.toml" -p threads --bin threads -- "$@" )
+    return
+  fi
+  local bin; bin="$(installed_threads)"
+  [ -n "$bin" ] || die "no threads binary to run: this copy is not in a source checkout, CAULDRON_THREADS_BIN is
+  not set, and $( [ -n "$INSTALLED_ROOT" ] && printf '%s' "$INSTALLED_ROOT/bin/cauldron names no threads version" || printf 'it is not in an installed layout') .
+  Log in from the terminal UI (the daemon runs this script with its own threads), or set
+  CAULDRON_THREADS_BIN to the threads cauldron runs (cauldron status threads)."
+  "$bin" "$@"
+}
 
 # ── THE VERDICT → ACTION TABLE, as a pure function ───────────────────────────
 #
@@ -265,6 +375,14 @@ login_verdict_action() {
 # yet) fixes itself silently instead of stopping a login.
 require_gitignored() {
   local label="$1"
+  # Out of a checkout there is no repository a credential could be committed
+  # to; the store still carries its catch-all ignore rule, written here.
+  if [ "$IN_CHECKOUT" = 0 ]; then
+    mkdir -p "$THREADS_DIR/accounts" 2>/dev/null || true
+    [ -f "$THREADS_DIR/accounts/.gitignore" ] \
+      || printf '*\n' > "$THREADS_DIR/accounts/.gitignore" 2>/dev/null || true
+    return 0
+  fi
   ( cd "$REPO_ROOT" && git check-ignore -q "services/threads/accounts/$label/.probe" ) && return 0
   mkdir -p "$THREADS_DIR/accounts" 2>/dev/null || true
   [ -f "$THREADS_DIR/accounts/.gitignore" ] \
@@ -312,6 +430,13 @@ done
 printf '%s' "$LABEL" | grep -Eq '^[A-Za-z0-9_-]{1,64}$' \
   || die "invalid label ${LABEL@Q}: use [A-Za-z0-9_-], max 64 chars"
 
+# An installed copy has no store beside it: the store must be named.
+if [ "$IN_CHECKOUT" = 0 ] && [ -z "${CLAUDE_ACCOUNTS_HOME:-}" ]; then
+  die "this copy runs from $SCRIPT_DIR, which is not a source checkout, so the account
+  store must be named: set CLAUDE_ACCOUNTS_HOME to the threads store
+  (<cauldron root>/data/<env>/threads/store). The daemon and claude-accounts pass it."
+fi
+
 # ── CAPTURE mode (unchanged behaviour, now with a warning) ───────────────────
 
 if [ "$MODE" = capture ]; then
@@ -323,15 +448,15 @@ if [ "$MODE" = capture ]; then
   # `--clone-session` is REQUIRED by `threads accounts add` (F-1): the clone is
   # only reachable when someone has said out loud that they want a shared
   # session. This script says it, right after the warning above.
-  exec cargo run --quiet --manifest-path "$REPO_ROOT/Cargo.toml" -p threads --bin threads \
-    -- accounts add "$LABEL" --clone-session
+  threads_run accounts add "$LABEL" --clone-session
+  exit $?
 fi
 
 # ── OWN-LOGIN mode ───────────────────────────────────────────────────────────
 
 [ "$(uname -s)" = "Darwin" ] || die "own-login mode is macOS-only (keychain-backed)"
 command -v claude >/dev/null 2>&1 || die "claude is not on PATH"
-command -v python3 >/dev/null 2>&1 || die "python3 is required (fingerprinting)"
+[ -n "$PY3" ] || die "python3 is required (fingerprinting); none at /opt/homebrew/bin, /usr/local/bin or /usr/bin"
 
 # ── THE ONE ENVIRONMENT REFUSAL ──────────────────────────────────────────────
 # This is NOT about the slot and NOT about prior state. With this variable set,
@@ -545,7 +670,7 @@ fi
 #    and is a pure local read: no turn, no spend, no token refresh.
 AUTH_JSON="$(env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY \
   CLAUDE_CONFIG_DIR="$SLOT_DIR" claude auth status --json 2>/dev/null || true)"
-# The program goes in a VARIABLE, not a `python3 - <<PY` heredoc. A heredoc is
+# The program goes in a VARIABLE, not a `py - <<PY` heredoc. A heredoc is
 # a stdin redirection, so it collides with the JSON piped in: python ends up
 # reading `<the json><the program>` as its source, dies with a SyntaxError, and
 # the `||` fallback fires every single time. (Found while building
@@ -564,7 +689,7 @@ print("loggedIn={} authMethod={} subscription={} email={} org={}".format(
     d.get("loggedIn"), d.get("authMethod"), d.get("subscriptionType"),
     h(d.get("email")), h(d.get("orgId"))))
 PY
-AUTH_SUMMARY="$(printf '%s' "$AUTH_JSON" | python3 -c "$AUTH_SUMMARY_PY" 2>/dev/null \
+AUTH_SUMMARY="$(printf '%s' "$AUTH_JSON" | py -c "$AUTH_SUMMARY_PY" 2>/dev/null \
   || printf 'loggedIn=? (unparseable)')"
 say "  slot auth status : $AUTH_SUMMARY"
 
@@ -705,7 +830,7 @@ chmod 600 "$SLOT_DIR/manifest.toml"
 # the 0700 `*`-gitignored slot dir.
 HINT_EMAIL="$EMAIL"
 if [ -z "$HINT_EMAIL" ]; then
-  HINT_EMAIL="$(python3 - "$SLOT_DIR/.claude.json" <<'PY' 2>/dev/null || true
+  HINT_EMAIL="$(py - "$SLOT_DIR/.claude.json" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -726,8 +851,7 @@ else
 fi
 
 export THREADS_HOME="$THREADS_DIR"
-cargo run --quiet --manifest-path "$REPO_ROOT/Cargo.toml" -p threads --bin threads \
-  -- accounts adopt "$LABEL" \
+threads_run accounts adopt "$LABEL" \
   || die "manifest written but \`threads accounts adopt $LABEL\` failed — the login
   is good and the slot is usable by hand; only the registry entry is missing."
 

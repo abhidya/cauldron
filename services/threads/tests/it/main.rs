@@ -88,6 +88,7 @@ mod live_log;
 mod live_log_size;
 mod live_push_daemon;
 mod live_turn_spawns_subagent;
+mod installed_helpers;
 mod login_flow;
 mod login_restored;
 mod managed_idle_lock;

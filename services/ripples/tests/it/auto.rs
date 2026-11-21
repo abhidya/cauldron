@@ -31,6 +31,7 @@ pub(crate) fn on_for(s: &Scratch, name: &str, since: u64, sessions: bool) {
             since_dump: since,
             backend: "threads".into(),
             model: None,
+            default_model: Some(ra::DEFAULT_MODEL.into()),
             include_sessions: sessions,
             scrub_local: true,
             changed_at: cauldron_ripples::auto::now(),
@@ -699,4 +700,43 @@ fn a17_a_flood_of_500_dumps_respects_the_caps_and_holds_nothing_after() {
     let st = svc.say(&format!("STATUS {k} {}", json!({"cauldron": "kb"})));
     assert_eq!(st["today"]["per_cauldron"]["kb"]["dumps"], 30, "{}", st["today"]);
     assert_eq!(st["region_locks"], json!([]), "{}", st["region_locks"]);
+}
+
+/// **A cauldron turned on under the old default is told it moved.** A
+/// setting written before 0.1.17 (no `default_model`, no `--model`) runs on
+/// opus now: `STATUS` says so with the cost and the command that keeps
+/// sonnet, and its first run after the upgrade writes one
+/// `default_model_changed` line, not one per run. A setting that recorded a
+/// model keeps it and says nothing.
+#[test]
+fn dm1_the_default_model_change_is_said_once_and_an_explicit_model_is_kept() {
+    let s = Scratch::new("dm1");
+    let door = Door::start(&s);
+    on(&s, 0, false);
+    let mut x = ra::load(&s.data(), "kb").unwrap().unwrap();
+    x.default_model = None;
+    ra::store(&s.data(), &x).unwrap();
+    let script = s.script("dm1", json!([{"output": ideas(1)}, {"output": ideas(1)}]));
+    let svc = start(&s, &door, &script, &[]);
+    let k = Service::key(&s);
+    let st = svc.say(&format!("STATUS {k} {}", json!({"cauldron": "kb"})));
+    let a = &st["automatic"]["cauldrons"][0];
+    assert_eq!((a["model"].clone(), a["default_changed"]["was"].clone(), a["default_changed"]["now"].clone()), (json!("opus"), json!("sonnet"), json!("opus")), "{st}");
+    assert!(a["default_changed"]["note"].as_str().unwrap().contains("costs more"), "{st}");
+    assert!(a["default_changed"]["keep_sonnet"].as_str().unwrap().contains("--model sonnet"), "{st}");
+    let first = door.dump("the first note after the upgrade");
+    wait_for("the first processed", 30, || s.dump_state(&first)["state"] == "processed" && !outcomes(&s, &first).is_empty());
+    let second = door.dump("the second note after the upgrade");
+    wait_for("the second processed", 30, || s.dump_state(&second)["state"] == "processed" && !outcomes(&s, &second).is_empty());
+    let said: Vec<Value> = auto_lines(&s).into_iter().filter(|l| l["event"] == "default_model_changed").collect();
+    assert_eq!(said.len(), 1, "said once: {said:?}");
+    assert_eq!((said[0]["dump"].clone(), said[0]["was"].clone(), said[0]["now"].clone()), (json!(first), json!("sonnet"), json!("opus")));
+    // An explicit model stays, and nothing is said.
+    let mut x = ra::load(&s.data(), "kb").unwrap().unwrap();
+    x.model = Some("sonnet".into());
+    ra::store(&s.data(), &x).unwrap();
+    let st = svc.say(&format!("STATUS {k} {}", json!({"cauldron": "kb"})));
+    let a = &st["automatic"]["cauldrons"][0];
+    assert_eq!((a["model"].clone(), a.get("default_changed")), (json!("sonnet"), None), "{st}");
+    drop(svc);
 }

@@ -200,7 +200,7 @@ fn ev3_an_evaluation_through_the_service() {
     let plan = svc.say(&format!("EVAL {k} {p}"));
     assert_eq!(plan["ok"], true, "{plan}");
     let t = &plan["plan"]["threads"];
-    assert_eq!((t["model"].clone(), t["max_calls"].clone(), t["calls_at_most"].clone()), (json!("sonnet"), json!(3), json!(3)), "{plan}");
+    assert_eq!((t["model"].clone(), t["max_calls"].clone(), t["calls_at_most"].clone()), (json!("opus"), json!(3), json!(3)), "the threads model follows the ripple default: {plan}");
     assert!(t["estimated_input_tokens_at_most"].as_u64().unwrap() > 0);
     assert!(calls(&script).is_empty() && !out.exists() && s.eval_ledger().is_empty(), "nothing sent or written");
     let mut go = req.clone();

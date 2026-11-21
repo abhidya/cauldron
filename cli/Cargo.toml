@@ -98,3 +98,5 @@ cauldron-mcp = { path = "../services/mcp" }
 
 [lints.rust]
 unsafe_code = "forbid"
+# Set by scripts/build-release-bundle for the prebuilt binaries.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(cauldron_release_bundle)"] }

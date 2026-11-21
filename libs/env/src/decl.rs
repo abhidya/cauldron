@@ -885,8 +885,23 @@ fn default_stop_grace_secs() -> u64 {
 /// then the ones that ship with this workspace, so `cauldron start echo` works
 /// with no setup and can still be overridden per root by dropping a file in
 /// `<root>/services/`.
+///
+/// A release-bundle binary also looks, last, in `<root>/share/cauldron/services`
+/// (the declarations `scripts/install --prebuilt` places there). The services
+/// a release ships (`cauldron-ripples`, ...) run from the root's version store
+/// (`data/shared/builds/<service>/<label>/`), where nothing ships beside
+/// them, so this is the only place they find another service's declaration
+/// (`ripples` reads `threads`'s to find its address).
 pub fn search_paths(root_services: &Path) -> Vec<PathBuf> {
-    vec![root_services.to_path_buf(), shipped_services_dir()]
+    let mut v = vec![root_services.to_path_buf(), shipped_services_dir()];
+    #[cfg(cauldron_release_bundle)]
+    if let Some(root) = root_services.parent() {
+        let installed = root.join("share/cauldron/services");
+        if !v.contains(&installed) {
+            v.push(installed);
+        }
+    }
+    v
 }
 
 /// **A RELEASE BUNDLE'S BINARY HAS NO SOURCE TREE.** `scripts/build-release-bundle`

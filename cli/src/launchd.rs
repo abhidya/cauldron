@@ -781,12 +781,32 @@ pub(crate) struct InstallOpts {
 /// **`cauldron install` — put this environment's holder under launchd.**
 pub fn verb_install(args: &[String]) -> Result<i32> {
     let mut opts = InstallOpts::default();
-    for a in args {
+    // `--owner-acts open|terminal`: the root's owner_acts choice, recorded
+    // after the install as set by it (`how: install`). The only code path
+    // that records `install`; opening without a terminal still needs
+    // CAULDRON_OWNER_ACTS in this command's environment, as for
+    // `cauldron owner-acts open`.
+    let mut owner_acts: Option<bool> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let value = match a.as_str() {
+            "--owner-acts" => Some(it.next().cloned().unwrap_or_default()),
+            x if x.starts_with("--owner-acts=") => Some(x["--owner-acts=".len()..].to_string()),
+            _ => None,
+        };
+        if let Some(v) = value {
+            owner_acts = Some(match v.as_str() {
+                "open" => true,
+                "terminal" => false,
+                _ => bail!("`cauldron install --owner-acts` is `open` or `terminal`, not `{v}`"),
+            });
+            continue;
+        }
         match a.as_str() {
             "--dry-run" => opts.dry = true,
             "--replace-running" => opts.replace_running = true,
             other => bail!(
-                "unknown option `{other}` for `cauldron install` (only `--dry-run`, `--replace-running`)"
+                "unknown option `{other}` for `cauldron install` (only `--dry-run`, `--replace-running`, `--owner-acts open|terminal`)"
             ),
         }
     }
@@ -802,7 +822,15 @@ pub fn verb_install(args: &[String]) -> Result<i32> {
         target: format!("{dom}/{lab}"),
         plist_file: agents.join(format!("{lab}.plist")),
     };
-    install_with(&env, opts, &me, &agents, &dom, &LaunchctlQuery, &jobs)
+    let code = install_with(&env, opts, &me, &agents, &dom, &LaunchctlQuery, &jobs)?;
+    match owner_acts {
+        Some(open) if code == 0 && opts.dry => {
+            println!("cauldron: would record the root's owner_acts choice `{}` (how: install)", if open { "open" } else { "terminal" });
+            Ok(0)
+        }
+        Some(open) if code == 0 => crate::owner_acts::set_as(open, &[], Some(env::owner_acts::How::Install)),
+        _ => Ok(code),
+    }
 }
 
 /// [`verb_install`] with every outside thing injected — the binary being

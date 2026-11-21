@@ -1614,7 +1614,7 @@ pub(crate) async fn handle(
                 false,
                 None,
             );
-            let script = manager.data_dir().join("scripts").join("claude-accounts");
+            let script = manager.claude_accounts_script();
             let outcome = crate::login::rotate(
                 &script,
                 manager.data_dir(),

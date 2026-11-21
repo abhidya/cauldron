@@ -177,7 +177,8 @@ pub fn stdio(args: &[String]) -> Result<i32> {
     if let Err(u) = &e {
         eprintln!("cauldron mcp stdio: {}", u.say());
     }
-    let bridge = Arc::new(Bridge { e, ctx: Ctx::from_process(a.cauldron.as_deref()), out: Mutex::new(std::io::stdout()) });
+    let pin = a.cauldron.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+    let bridge = Arc::new(Bridge { e, ctx: Ctx::from_process(a.cauldron.as_deref()), pin, out: Mutex::new(std::io::stdout()) });
     let mut threads = Vec::new();
     for line in std::io::stdin().lock().lines() {
         let line = match line {
@@ -203,8 +204,56 @@ pub fn stdio(args: &[String]) -> Result<i32> {
 struct Bridge {
     e: std::result::Result<Environment, Unusable>,
     ctx: Ctx,
+    /// `--cauldron <name>`: the one cauldron this bridge serves (see
+    /// [`pinned_elsewhere`]).
+    pin: Option<String>,
     out: Mutex<std::io::Stdout>,
 }
+
+/// **A pinned bridge serves one cauldron.** Started with `--cauldron
+/// <name>`, the bridge sends that name with every call (`_ctx.cauldron_var`,
+/// ahead of the session's project), and a `tools/call` whose own `cauldron`
+/// argument names ANOTHER cauldron is refused here, as `cauldron_pinned`,
+/// and never relayed (a notification naming one is dropped). So a project's
+/// `.mcp.json` entry running `cauldron mcp stdio --cauldron <name>` is a
+/// server for that cauldron alone, whatever a model passes.
+/// (`$CAULDRON_CAULDRON` only chooses a default: it pins nothing.) Answers
+/// the other name, or `None` when the call may go on.
+fn pinned_elsewhere(pin: &str, msg: &Value) -> Option<String> {
+    if msg.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let named = msg.pointer("/params/arguments/cauldron").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty())?;
+    (named != pin).then(|| named.to_string())
+}
+
+/// The refusal a pinned bridge answers a call naming `named` with.
+fn pinned_refusal(pin: &str, named: &str) -> Down {
+    Down {
+        refusal: Refusal::new(
+            PINNED,
+            format!(
+                "this MCP server serves cauldron `{pin}` only (it was started as `cauldron mcp stdio --cauldron {pin}`), \
+                 and this call names `{named}`. Nothing was read or written. Leave `cauldron` out (or name `{pin}`); \
+                 another cauldron is reached through a server of its own (`cauldron mcp config --cauldron {named}` \
+                 prints its `.mcp.json` entry)."
+            ),
+        ),
+        instructions: String::new(),
+    }
+}
+
+/// What a pinned bridge adds to the instructions `initialize` answers.
+fn pin_note(pin: &str) -> String {
+    format!(
+        "This server is pinned to cauldron `{pin}`: every call reaches `{pin}` (leave `cauldron` out), and a call naming \
+         another cauldron is refused as `cauldron_pinned`."
+    )
+}
+
+/// The refusal code for a call that names another cauldron than the one a
+/// pinned bridge serves.
+pub const PINNED: &str = "cauldron_pinned";
 
 /// The environment the bridge was asked for, and why it cannot be used.
 #[derive(Debug, Clone)]
@@ -226,6 +275,15 @@ impl Unusable {
 
 impl Bridge {
     fn write(&self, v: &Value) {
+        let mut v = v.clone();
+        // An `initialize` answer (it alone carries `instructions`) of a
+        // pinned bridge says what it is pinned to.
+        if let (Some(pin), Some(r)) = (&self.pin, v.get_mut("result").and_then(Value::as_object_mut)) {
+            if let Some(Value::String(before)) = r.get("instructions") {
+                let joined = format!("{before} {}", pin_note(pin));
+                r.insert("instructions".into(), json!(joined));
+            }
+        }
         let mut out = self.out.lock().unwrap_or_else(|p| p.into_inner());
         let _ = writeln!(out, "{v}");
         let _ = out.flush();
@@ -252,6 +310,14 @@ impl Bridge {
         }
         self.ctx.apply(&mut msg);
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
+        if let Some(pin) = &self.pin {
+            if let Some(named) = pinned_elsewhere(pin, &msg) {
+                if let Some(v) = answer_locally(pinned_refusal(pin, &named), &msg) {
+                    self.write(&v);
+                }
+                return;
+            }
+        }
         let e = match &self.e {
             Ok(e) => e,
             Err(u) => {

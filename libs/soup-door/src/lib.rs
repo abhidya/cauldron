@@ -24,6 +24,7 @@ pub mod corpus;
 pub mod cursor;
 pub mod cut;
 pub mod dumps;
+pub mod edges;
 pub mod grants;
 pub mod import;
 pub mod notes;
@@ -35,6 +36,7 @@ pub mod region_lock;
 pub mod review;
 pub mod ripple;
 pub mod target;
+pub mod writeback;
 
 pub use error::{Code, Error, Result};
 pub use target::Target;

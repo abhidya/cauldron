@@ -2,14 +2,19 @@
 #  inference — LOCAL MODELS, ON DEMAND, ON LOOPBACK.
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# One per environment. OFF unless started: the installer does not pin it.
+# One per environment. OFF unless started: the installer does not pin it
+# (a release bundle carries its image; `cauldron --env <env> build inference`
+# installs it with no cargo).
 # It supervises at most one `llama-server` child (llama.cpp, the binary on
 # PATH or `llama_server` in its settings; never bundled, never downloaded).
 #
 # * Nothing is loaded until a request names a model. A model is a `.gguf`
 #   file the owner placed on this machine and registered by name with
 #   `cauldron inference models add <name> <path>` (nothing is copied or
-#   downloaded). A model idle for 15 minutes is unloaded.
+#   downloaded), or one the owner fetched from the release's built-in
+#   catalogue with `cauldron inference models pull <name>` (only after a
+#   yes; the service itself downloads nothing). A model idle for 15 minutes
+#   is unloaded.
 # * A model whose estimated memory (file size + KV cache for its context + a
 #   fixed allowance) is over the budget (64 GiB unless the settings say
 #   otherwise) is refused, with the arithmetic.

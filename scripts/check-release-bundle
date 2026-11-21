@@ -9,6 +9,10 @@
 #     component, a link, or a device or fifo;
 #   - a file the installer needs is missing, or the inner SHA256SUMS does not
 #     match the files;
+#   - the local-inference services (libexec/cauldron-inference and
+#     libexec/cauldron-ripples) or their declarations are missing, or either
+#     binary's `--build-stamp` does not state the bundle's commit and dirty=0
+#     (`cauldron build inference|ripples` names the version by that line);
 #   - any binary (bin/*, libexec/*) is not a thin arm64 Mach-O, does not
 #     verify (`codesign --verify --strict`), is not ad-hoc signed, or carries
 #     another identifier than the installer expects;
@@ -49,10 +53,17 @@
 #     from the normal form build-release-bundle writes: every member owned
 #     by uid 0 / gid 0 / root / wheel, every mtime exactly BUNDLE's
 #     commit_time (the commit's own second, UTC), entries in byte order,
-#     modes 0755 for directories, the four binaries and `install` and 0644
-#     for every other file (so no setuid, setgid or group/other write), no
+#     modes 0755 for directories, the six binaries, `install` and the
+#     three helper scripts and 0644 for every other file (so no setuid,
+#     setgid or group/other write), no
 #     pax or GNU extension headers, and a gzip header with no name and no
 #     time;
+#   - a shipped account helper script (share/cauldron/scripts/threads/:
+#     add-account, claude-accounts, claude-login-browser) is missing, is not a
+#     bash script, or, run from the unpacked bundle (an installed layout,
+#     with a scratch HOME and fakes of security, cargo, claude and git first
+#     on PATH), does not refuse to run without a named account store, or
+#     reaches any of those fakes (a build, the keychain, Claude or git);
 # Prints one line per check and a closing verdict. Exit 0 clean, 1 a check
 # failed, 2 usage or a tool missing.
 set -euo pipefail
@@ -114,9 +125,14 @@ TMP="$(mktemp -d "${TMPBASE%/}/check-release-bundle.XXXXXX")"
 tar -xzf "${TARBALL}" -C "${TMP}"
 B="${TMP}/${BASE}"
 
+HELPERS=(add-account claude-accounts claude-login-browser)
 need=(bin/cauldron bin/tui libexec/threads libexec/cauldron-mcp share/cauldron/services/threads.toml
       share/cauldron/services/mcp.toml share/cauldron/mcp/agents.toml install BUNDLE SHA256SUMS LICENSE)
+for h in "${HELPERS[@]}"; do need+=("share/cauldron/scripts/threads/${h}"); done
 missing=()
+# The local-inference services and their declarations.
+need+=(libexec/cauldron-inference libexec/cauldron-ripples share/cauldron/services/inference.toml
+       share/cauldron/services/ripples.toml)
 for f in "${need[@]}"; do [[ -f "${B}/${f}" ]] || missing+=("${f}"); done
 if [[ ${#missing[@]} -eq 0 ]]; then pass "every file the installer needs is present"; else fail "missing: ${missing[*]}"; fi
 if (cd "${B}" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1); then pass "the inner SHA256SUMS matches every file"; else fail "the inner SHA256SUMS does not match"; fi
@@ -137,7 +153,11 @@ raw = open(path, "rb").read(10)
 bad = []
 if raw[:2] != b"\x1f\x8b" or raw[3] & 0x08 or raw[4:8] != b"\0\0\0\0":
     bad.append("the gzip header carries a file name or a time")
-execs = {top + "/" + p for p in ("bin/cauldron", "bin/tui", "libexec/threads", "libexec/cauldron-mcp", "install")}
+execs = {top + "/" + p for p in ("bin/cauldron", "bin/tui", "libexec/threads", "libexec/cauldron-mcp", "install",
+                                  "share/cauldron/scripts/threads/add-account",
+                                  "share/cauldron/scripts/threads/claude-accounts",
+                                  "share/cauldron/scripts/threads/claude-login-browser")}
+execs |= {top + "/" + p for p in ("libexec/cauldron-inference", "libexec/cauldron-ripples")}
 names = []
 with tarfile.open(path, "r:gz") as t:
     for m in t:
@@ -170,10 +190,115 @@ else
     fail "BUNDLE has no commit_time, so the tarball's mtimes cannot be checked against the commit"
 fi
 
+# The account helper scripts (issue #30): bash scripts that, run from the
+# unpacked bundle (the same layout the installer lays down), refuse to run
+# without a named account store and reach no build, keychain, Claude or git.
+HFAKES="${TMP}/helper-fakes"; HHOME="${TMP}/helper-home"; HLOG="${TMP}/helper-forbidden.log"
+mkdir -p "${HFAKES}" "${HHOME}"; : >"${HLOG}"
+for c in security cargo claude git; do
+    printf '#!/bin/sh\necho "%s $*" >> "%s"\nexit 97\n' "${c}" "${HLOG}" >"${HFAKES}/${c}"; chmod 0755 "${HFAKES}/${c}"
+done
+for h in "${HELPERS[@]}"; do
+    f="${B}/share/cauldron/scripts/threads/${h}"
+    [[ -f "${f}" ]] || continue
+    if [[ "$(head -1 "${f}")" == '#!/usr/bin/env bash' ]]; then pass "share/cauldron/scripts/threads/${h}: a bash script"; else fail "share/cauldron/scripts/threads/${h}: not a bash script"; fi
+done
+for run in "add-account conformance-probe" "claude-accounts list"; do
+    h="${run%% *}"; f="${B}/share/cauldron/scripts/threads/${h}"
+    [[ -f "${f}" ]] || continue
+    # ${run#* } is the helper's arguments, split on purpose.
+    hout="$(cd "${HHOME}" && env -i HOME="${HHOME}" USER=nobody PATH="${HFAKES}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin" \
+        /bin/bash "${f}" ${run#* } 2>&1)" && hrc=0 || hrc=$?
+    if [[ ${hrc} -ne 0 ]] && grep -q 'CLAUDE_ACCOUNTS_HOME' <<<"${hout}" && [[ ! -s "${HLOG}" ]]; then
+        pass "share/cauldron/scripts/threads/${h}, run installed: refuses without a named account store, and reaches no build, keychain, claude or git"
+    else
+        fail "share/cauldron/scripts/threads/${h}, run installed (rc ${hrc}): $(head -c 300 <<<"${hout}") $(cat "${HLOG}")"
+    fi
+done
+
+# Every shipped script runs every python ISOLATED (`-I`: neither the current
+# directory nor the script's is on sys.path, no user site-packages, no
+# PYTHON* variables), so a module planted where it is started is never
+# imported; and keeps only the absolute entries of PATH, so no program is
+# found in that directory. Checked on the text: a python run with arguments
+# that do not start with -I fails, through any spelling (python, python3,
+# python3.x, a path to one, or a variable naming one).
+iso_out="$(python3 -I - "${B}" <<'PYSCAN'
+import os, re, sys
+root = sys.argv[1]
+call = re.compile(r'''(?:^|[\s|;&(`'"])((?:[\w./${}-]*/)?python[0-9.]*|"?\$\{?PY[0-9]?\}?"?)\s+(\S+)''')
+for d, _, files in os.walk(root):
+    for f in sorted(files):
+        p = os.path.join(d, f)
+        with open(p, "rb") as fh:
+            if fh.read(2) != b"#!":
+                continue
+        rel = os.path.relpath(p, root)
+        text = open(p, encoding="utf-8", errors="replace").read().splitlines()
+        bad = []
+        has_path_rule = False
+        for n, line in enumerate(text, 1):
+            t = line.strip()
+            if t.startswith("#"):
+                continue
+            if t.startswith('PATH="${_safe_path:-'):
+                has_path_rule = True
+            for m in call.finditer(line):
+                arg = m.group(2).strip("'\"")
+                # A run: options (or `-`, the program on stdin) or a .py file
+                # follow. Prose and lists of paths ("no python3 at ...") do not.
+                runs = arg.startswith("-") or re.search(r"\.py\b", arg)
+                if runs and not arg.startswith("-I"):
+                    bad.append(f"{rel}:{n}: {t[:120]}")
+        for b in bad:
+            print("NOISO " + b)
+        print(("PATHOK " if has_path_rule else "NOPATH ") + rel)
+PYSCAN
+)"
+noiso="$(grep '^NOISO ' <<<"${iso_out}" | sed 's/^NOISO //' || true)"
+if [[ -z "${noiso}" ]]; then pass "every python every shipped script runs is isolated (-I)"; else fail "a shipped script runs python without -I (a module planted where it is started would be imported): ${noiso}"; fi
+nopath="$(grep '^NOPATH ' <<<"${iso_out}" | sed 's/^NOPATH //' | tr '\n' ' ' || true)"
+if [[ -z "${nopath// /}" ]]; then pass "every shipped script keeps only the absolute entries of PATH ($(grep -c '^PATHOK ' <<<"${iso_out}") scripts)"; else fail "a shipped script looks programs up through a PATH that may name its working directory: ${nopath}"; fi
+
+# Every place a shipped binary starts a helper script names its working
+# directory and scrubs its environment (`threads::helpers::harden` in the
+# daemon, `tui::pool::action::helper_command` in the terminal interface).
+# Checked on the source of the bundle's commit, where it is in this clone:
+# each `Command::new(` in those files that is not an absolute literal path
+# must reach `harden(` or `.current_dir(` within twelve lines, and each
+# `Command::from(` must wrap `helper_command(`.
+SPAWN_FILES=(services/threads/src/login.rs apps/tui/src/pool/mod.rs apps/tui/src/pool/cli.rs)
+if [[ -n "${commit:-}" ]] && git -C "${SELF_DIR}" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+    spawn_bad=""
+    for sf in "${SPAWN_FILES[@]}"; do
+        src="$(git -C "${SELF_DIR}" show "${commit}:${sf}" 2>/dev/null)" || { spawn_bad+=" ${sf}: not in the commit;"; continue; }
+        spawn_bad+="$(awk -v f="${sf}" '
+            { line[NR] = $0 }
+            END {
+                for (i = 1; i <= NR; i++) {
+                    l = line[i]
+                    if (l ~ /^[ \t]*\/\//) continue
+                    if (l ~ /Command::new\(/ && l !~ /Command::new\("\//) {
+                        ok = 0
+                        for (j = i; j <= i + 12 && j <= NR; j++) if (line[j] ~ /harden\(|\.current_dir\(/) ok = 1
+                        if (!ok) printf " %s:%d: a helper spawn with no working directory;", f, i
+                    }
+                    if (l ~ /Command::from\(/ && l !~ /helper_command\(/) printf " %s:%d: a spawn not built by helper_command;", f, i
+                }
+            }' <<<"${src}")"
+    done
+    if [[ -z "${spawn_bad}" ]]; then pass "every helper spawn in the daemon and the terminal interface names its working directory (${SPAWN_FILES[*]} at ${commit:0:12}…)"; else fail "helper spawns without a working directory:${spawn_bad}"; fi
+else
+    echo "  note  the bundle's commit is not in this clone: the helper spawns are not checked on its source"
+fi
+
 # Binaries: thin arm64 Mach-O, verifies, ad-hoc, expected identifier, and
 # each states the bundle's commit.
 expect_id() { case "$1" in libexec/threads) echo com.harness.threads ;; *) basename "$1" ;; esac; }
-for rel in bin/cauldron bin/tui libexec/threads libexec/cauldron-mcp; do
+# Every binary of the bundle; the last two are the local-inference services.
+BINS=(bin/cauldron bin/tui libexec/threads libexec/cauldron-mcp)
+BINS+=(libexec/cauldron-inference libexec/cauldron-ripples)
+for rel in "${BINS[@]}"; do
     f="${B}/${rel}"
     [[ -f "${f}" ]] || continue
     head8="$(od -An -tx1 -N8 "${f}" | tr -d ' \n')"
@@ -195,6 +320,13 @@ if [[ -f "${B}/bin/cauldron" ]]; then
     st="$("${B}/bin/cauldron" --build-stamp 2>/dev/null || true)"
     if grep -q "commit=${commit}" <<<"${st}" && grep -q 'dirty=0' <<<"${st}"; then pass "bin/cauldron states commit ${commit:0:12}… and dirty=0"; else fail "bin/cauldron --build-stamp: ${st}"; fi
 fi
+# The local-inference services state the same commit: `cauldron build
+# inference|ripples` (the --artifact path) names the version by it.
+for rel in libexec/cauldron-inference libexec/cauldron-ripples; do
+    [[ -f "${B}/${rel}" ]] || continue
+    st="$("${B}/${rel}" --build-stamp 2>/dev/null || true)"
+    if grep -q "commit=${commit} " <<<"${st}" && grep -q 'dirty=0' <<<"${st}"; then pass "${rel} states commit ${commit:0:12}… and dirty=0"; else fail "${rel} --build-stamp: ${st}"; fi
+done
 
 # The byte scan. The forbidden literals come from the environment of the
 # person running this, at run time.
@@ -281,11 +413,11 @@ while IFS=$'\t' read -r verdict rel why; do
     esac
 done <<<"${scan_out}"
 if [[ ${scan_rc} -eq 0 ]]; then
-    pass "byte scan of ${scanned} files: no home directory, /Users/ or repository path anywhere, and no user name, personal pattern (${npat} patterns), build path or path another user could create in the 4 binaries, and no host name or git user.email anywhere"
+    pass "byte scan of ${scanned} files: no home directory, /Users/ or repository path anywhere, and no user name, personal pattern (${npat} patterns), build path or path another user could create in the ${#BINS[@]} binaries, and no host name or git user.email anywhere"
 fi
 
 # Libraries: each binary links only what the system ships.
-for rel in bin/cauldron bin/tui libexec/threads libexec/cauldron-mcp; do
+for rel in "${BINS[@]}"; do
     [[ -f "${B}/${rel}" ]] || continue
     libs="$(otool -L "${B}/${rel}" 2>/dev/null | sed -n '2,$p' | awk '{print $1}')"
     odd="$(grep -vE '^(/usr/lib/|/System/Library/)' <<<"${libs}" || true)"
@@ -304,7 +436,8 @@ deny=()
 while IFS= read -r f; do [[ -n "${f}" && -d "${f}" ]] && deny+=(--deny "${f}"); done <<<"${CAULDRON_RELEASE_FORBID:-}"
 if [[ -x /usr/bin/sandbox-exec ]]; then
     for run in "bin/cauldron --help" "bin/cauldron --build-stamp" "bin/tui --build-stamp" \
-               "libexec/threads --build-stamp" "libexec/threads --self-check" "libexec/cauldron-mcp --build-stamp"; do
+               "libexec/threads --build-stamp" "libexec/threads --self-check" "libexec/cauldron-mcp --build-stamp" \
+               "libexec/cauldron-inference --build-stamp" "libexec/cauldron-ripples --build-stamp"; do
         rel="${run%% *}"; arg="${run#* }"
         [[ -f "${B}/${rel}" ]] || continue
         if out="$("${SELF_DIR}/probe-creatable-paths" ${deny[@]+"${deny[@]}"} -- "${B}/${rel}" "${arg}" 2>&1)"; then

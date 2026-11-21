@@ -24,10 +24,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-/// The oldest build accepted. Every flag passed is checked in `--help`
-/// besides; this floor turns away builds far older than the one this
-/// service was written against (12110).
-pub const MIN_BUILD: u64 = 6000;
+pub use inference_registry::runtime::{locate, parse_build, MIN_BUILD};
 
 /// Flags passed on every load; a build that lacks one is refused.
 pub const REQUIRED_FLAGS: &[&str] =
@@ -61,22 +58,6 @@ impl Runtime {
     pub fn has(&self, flag: &str) -> bool {
         self.flags.contains(flag)
     }
-}
-
-/// The binary the settings mean: `configured`, else the first
-/// `llama-server` on `PATH`.
-pub fn locate(configured: Option<&Path>) -> Result<PathBuf, String> {
-    if let Some(p) = configured {
-        return if p.is_file() { Ok(p.to_path_buf()) } else { Err(format!("`llama_server` in the settings names {}, which is not a file", p.display())) };
-    }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for d in std::env::split_paths(&path) {
-        let c = d.join("llama-server");
-        if c.is_file() {
-            return Ok(c);
-        }
-    }
-    Err("`llama-server` is not on PATH. Install llama.cpp (on macOS: `brew install llama.cpp`), or set `llama_server = \"/absolute/path\"` in the inference settings (data/<env>/inference/config.toml); then try again".into())
 }
 
 /// Run `bin arg` and answer what it printed (stdout and stderr together),
@@ -121,19 +102,6 @@ fn ask(bin: &Path, arg: &str) -> Result<String, String> {
     Ok(format!("{}\n{}", t_out.join().unwrap_or_default(), t_err.join().unwrap_or_default()))
 }
 
-/// The build number in `--version`'s output.
-pub fn parse_build(text: &str) -> Option<(u64, String)> {
-    let line = text.lines().find(|l| l.trim_start().starts_with("version:"))?.trim().to_string();
-    let digits = |s: &str| -> Option<u64> { s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok() };
-    if let Some(i) = line.find("build ") {
-        return digits(&line[i + 6..]).map(|b| (b, line.clone()));
-    }
-    // The older form: `version: 4589 (<short commit>)`.
-    let rest = line.trim_start_matches("version:").trim();
-    let b = digits(rest)?;
-    rest[b.to_string().len()..].trim_start().starts_with('(').then_some((b, line.clone()))
-}
-
 /// Every flag `--help` lists (each word of a line that starts with `-`).
 pub fn parse_flags(help: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -163,7 +131,7 @@ pub fn check(configured: Option<&Path>) -> Result<Runtime, String> {
         return Err(format!("{} --version printed no build number this service can read ({:?}); it needs a llama.cpp build {MIN_BUILD} or later", path.display(), v.trim().chars().take(200).collect::<String>()));
     };
     if build < MIN_BUILD {
-        return Err(format!("{} is llama.cpp build {build} ({version}); this service needs build {MIN_BUILD} or later. Update it (`brew upgrade llama.cpp`), then try again", path.display()));
+        return Err(format!("{} is llama.cpp build {build} ({version}); this service needs build {MIN_BUILD} or later. Update it (on macOS, `brew upgrade llama.cpp`), then try again", path.display()));
     }
     let help = ask(&path, "--help")?;
     let flags = parse_flags(&help);

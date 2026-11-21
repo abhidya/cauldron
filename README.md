@@ -33,8 +33,9 @@ release](#what-is-in-this-release) has the details.
   and read it today, from a shell and from Claude Code (see [From install to
   a working session](#from-install-to-a-working-session)). From 0.1.10 a
   ripple turns one dump into records when you ask (`cauldron ripples run`),
-  and from 0.1.12 on its own, for a cauldron whose owner turned that on at
-  a terminal (`cauldron ripples on`; off by default).
+  and from 0.1.12 on its own, for a cauldron whose owner turned that on
+  (`cauldron ripples on`; off by default; see [Who may act for the
+  owner](#who-may-act-for-the-owner)).
 - **The surface is your view into the cauldron.** You dump ideas, feedback
   and half-formed thoughts into it. You collect text, pastes and references in the
   **bucket** and **dump** it onto the surface. Every dump is recorded in the
@@ -158,6 +159,21 @@ your dumps into records:
   (`soup_claim`, `cauldron soup claim`); `import-corpus` brings an older
   corpus's clusters in with their claims; and `soup_changes` can wait for
   the next change ([Clusters and claims](#clusters-and-claims)).
+- 0.1.17 (unreleased): every tool answers when called as the consumer's
+  interface table writes it (`soup_link {from, kind, to}`); an MCP server
+  for one cauldron, pinned with `cauldron mcp stdio --cauldron` and written
+  out by `cauldron mcp config`; a wrong edge or citation fixed on the record
+  itself (`soup_unlink`, `soup_cite`, and `cauldron soup link | unlink |
+  cite`); who may act for the owner: granting, approving and turning
+  automatic ripples on stay the owner's acts at a terminal by default, and
+  the owner can let agents do them (`cauldron owner-acts`), each act
+  recorded with who did it ([Who may act for the
+  owner](#who-may-act-for-the-owner)); local inference on a prebuilt
+  install: the bundle carries the `inference` and `ripples` services,
+  `cauldron inference models pull` fetches one of the two measured models
+  when you ask, and `cauldron inference status` says what is still missing
+  ([Local inference](#local-inference)); and two fixes, to reads of a quiet
+  threads store and to the plugin launcher in a subdirectory.
 
 cauldron has three parts:
 
@@ -227,18 +243,19 @@ root, and its `threads` keeps the bundle's ad-hoc signature.
 
 From 0.1.15, each release on GitHub carries two files: the bundle
 `cauldron-<version>-aarch64-apple-darwin.tar.gz` (the `cauldron` command, the
-terminal UI, the `threads` daemon, the `mcp` service, their declarations and
-the installer) and `SHA256SUMS`, its checksum. Download both with `curl`,
-check the checksum, unpack, and install (the commands are for 0.1.16;
+terminal UI, the `threads` daemon, the `mcp` service, from 0.1.17 the
+`inference` and `ripples` services, their declarations and the installer)
+and `SHA256SUMS`, its checksum. Download both with `curl`,
+check the checksum, unpack, and install (the commands are for 0.1.17;
 change the version for another release):
 
 ```sh
 mkdir cauldron-download && cd cauldron-download
-curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.16/cauldron-0.1.16-aarch64-apple-darwin.tar.gz
-curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.16/SHA256SUMS
+curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.17/cauldron-0.1.17-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/broomstick-ai/cauldron/releases/download/v0.1.17/SHA256SUMS
 shasum -a 256 -c SHA256SUMS
-tar -xzf cauldron-0.1.16-aarch64-apple-darwin.tar.gz
-cauldron-0.1.16-aarch64-apple-darwin/install --prebuilt cauldron-0.1.16-aarch64-apple-darwin.tar.gz
+tar -xzf cauldron-0.1.17-aarch64-apple-darwin.tar.gz
+cauldron-0.1.17-aarch64-apple-darwin/install --prebuilt cauldron-0.1.17-aarch64-apple-darwin.tar.gz
 ```
 
 `shasum -a 256 -c SHA256SUMS` must print `OK` for the tarball. The installer
@@ -256,7 +273,9 @@ bundle that fails any of these is not installed. A download is cut off past
 it the tarball. It needs no cargo, git or compiler. It places the
 bundle in `~/.cauldron/share/cauldron/releases/<version>-<commit>/`, installs
 `threads` and `mcp` from it as versions of their own (`cauldron build
-<service> --artifact <image>`), and then does exactly what the from-source
+<service> --artifact <image>`), keeps the `inference` and `ripples` images
+there unpinned and unstarted (see [Local inference](#local-inference)), and
+then does exactly what the from-source
 install does below: makes `prod`, pins the services, puts the supervisor under
 launchd, and prints the same closing lines. `--dry-run` checks a local tarball
 and prints the plan without installing anything. To upgrade, run the new
@@ -367,8 +386,10 @@ started from the Dock, Finder or an IDE, whose `PATH` is the system's, finds
 it too. Whichever source names it, the launcher runs only a regular file
 (not a symlink) owned by you or root that group and others cannot write,
 in directories owned by you or root that group and others cannot write
-either. It does not take one from the project directory Claude Code starts
-it in: a file there is refused whichever source names it (`$CAULDRON_BIN`,
+either. It does not take one from the project Claude Code starts it in
+(the directory it starts in, `$CLAUDE_PROJECT_DIR`, and every directory
+above them, short of your home directory, that holds a `.git` or a
+`.mcp.json`): a file there is refused whichever source names it (`$CAULDRON_BIN`,
 the install marker, `$CAULDRON_HOME`), and the `PATH` step skips empty
 and relative entries (`.`, or a leading, trailing or doubled `:`), entries
 inside the project, and entries others can write to. When it finds none,
@@ -542,14 +563,16 @@ below for why.
    (Or skip this step: on the first run the curator proposes regions for you
    to approve.)
 5. **Open the cauldron to Claude Code**, yourself, at a terminal (an agent
-   cannot do this):
+   cannot do this unless you let it: [Who may act for the
+   owner](#who-may-act-for-the-owner)):
 
    ```sh
    cauldron mcp grant kb --env prod --project ~/code/proj
    ```
 
    Every cauldron is closed to Claude Code until you grant it. `--project`
-   makes `kb` the default for sessions working in `~/code/proj`.
+   makes `kb` the default for sessions working in `~/code/proj`; it does not
+   limit access (any of your sessions can still reach `kb` by naming it).
 6. **Install the plugin** inside Claude Code:
 
    ```text
@@ -610,14 +633,25 @@ A grant opens the cauldron to the Claude Code sessions you run on this
 machine, whichever directory they work in: any of them can name it.
 `--project` only tells a session which cauldron a directory means when the
 session does not name one; it does not limit which sessions can reach the
-cauldron. `grant` refuses to run without an interactive terminal, so an
-agent cannot open a cauldron for itself, and no MCP tool can grant or
-revoke. `--scopes read` opens a cauldron read-only. While the service holds
+cauldron. `grant` refuses to run without an interactive terminal unless you
+opened `grant` to agents ([Who may act for the
+owner](#who-may-act-for-the-owner)), so by default an agent cannot open a
+cauldron for itself; no MCP tool can grant or revoke. `--scopes read` opens a cauldron read-only. While the service holds
 a granted cauldron it is the soup's one writer: `cauldron soup import` is
 sent to it, and `cauldron soup recover` is refused.
 
+**A server for one cauldron.** `cauldron mcp config --cauldron kb --env
+prod` prints a `.mcp.json` entry for a project: a server `cauldron-kb` that
+runs `cauldron mcp stdio --env prod --cauldron kb`. That bridge is pinned to
+`kb`. Every call reaches `kb`, and a call naming another cauldron is refused
+as `cauldron_pinned`. Add one entry per cauldron to reach several at once.
+The plugin README has the details
+([One server per cauldron](claude-code/cauldron/README.md#one-server-per-cauldron)).
+
 **From a shell.** `cauldron soup import | regions | region | nodes | search
-| get` write records into a soup and read them back (`cauldron soup help`).
+| get` write records into a soup and read them back (`cauldron soup help`);
+`cauldron soup link | unlink | cite` add or remove one edge, or one
+citation, of records it holds.
 The records follow the published schema in
 [`schema/soup/workspace-v6/`](schema/soup/workspace-v6/README.md), whose
 README also says how to change a node (supersede it), what the import checks
@@ -655,6 +689,137 @@ grant first (a revoked cauldron has to be granted again). A project's `.cauldron
 updated; run `cauldron link notes --env prod --replace` there.
 
 The plugin's [README](claude-code/cauldron/README.md) has the details.
+
+### Who may act for the owner
+
+New in 0.1.17 ([#25](https://github.com/broomstick-ai/cauldron/issues/25)).
+Three acts belong to a cauldron's owner:
+
+| act | commands (and tools) |
+|---|---|
+| `grant` | `cauldron mcp grant`: open a cauldron to the Claude Code sessions you run |
+| `approve` | `cauldron soup approve`, `cauldron ripples approve \| reject` (and taking either back); the MCP tools `soup_approve` and `soup_reject` |
+| `ripples` | `cauldron ripples on`: automatic processing, and the model spend it starts |
+
+**What the gate is for.** By default each runs only with its input and
+output on an interactive terminal: a command run at a terminal is taken to
+be the owner's, and an agent, a script or a ripple is refused (the refusal
+names the command for you to run, and how you would let agents run it). That keeps three things
+from happening without you deciding: an agent approving the records a
+ripple wrote, so that model output reads as reviewed; an agent opening a
+cauldron to every Claude Code session, or widening its scopes; and
+automatic model spend and unattended writes starting.
+
+**What the gate is not.** It stops an agent that follows the rules from
+acting for you by accident. It is not a security boundary against a process
+that means to get around it: anything running as your user can give a
+command a terminal (`script(1)` does, in one line) or read your files (the
+`mcp` service's approval key among them, which its `DECIDE` verb takes as a
+decision made at a terminal). The boundary is your user account, as it
+always was. So `by: "tty"` means "run with a terminal attached", not "a
+person". What the `mcp` service can check, it does: a decision claimed as
+an agent's is taken only where your persisted setting opens `approve`, and
+how a choice was set (`how`) is recorded by the command that set it, never
+taken from an argument.
+
+**What it costs, and the choice.** An agent you told to set up or run
+Cauldron has to stop and hand you a command; a review queue only a person
+can drain piles up; and a session with no terminal (CI, a server, a
+scheduled job) cannot do these steps at all. So the gate is a setting,
+`owner_acts`, that you choose. `terminal` is the default and changes
+nothing: with nothing chosen (an upgraded root included) every act behaves
+as in 0.1.16. `open` lets all three run without a terminal; a list
+(`grant`, `approve`, `ripples`) opens only those.
+
+**What `open` gives up.** With `approve` open, an agent can approve what a
+ripple wrote, so a record can read as reviewed without a person having read
+it. With `grant` open, an agent can open a cauldron to every Claude Code
+session of yours. With `ripples` open, an agent can start automatic model
+spend and writes. Choose it when you want your agents to do these for you.
+
+**Three ways to choose.**
+
+```sh
+# at a terminal: the root's choice, for every cauldron of every environment
+cauldron owner-acts open
+cauldron owner-acts open --only approve
+# one cauldron's own choice wins over the root's, both ways
+cauldron owner-acts terminal --cauldron kb --env prod
+cauldron owner-acts unset --cauldron kb --env prod     # back to the root's
+cauldron owner-acts show --env prod                    # what is in effect, per act, and from where
+```
+
+- **The command**, `cauldron owner-acts open | terminal [--only
+  grant,approve,ripples] [--cauldron C] [--env E]`. At a terminal it just
+  applies. Without one, opening is refused unless the variable below is set
+  in its environment (and opens each act it would open); closing runs from
+  anywhere.
+- **The environment variable**, `CAULDRON_OWNER_ACTS=open` (or a comma
+  list of acts) in the environment of the `cauldron` command that acts: put
+  it in your shell profile, in your user settings for Claude Code (`env` in
+  `~/.claude/settings.json`, never a project's `.claude/settings.json`,
+  which a cloned repository could carry), in CI or on a server. It opens
+  `grant` and `ripples` for that command, whatever the setting says, and it
+  lets `cauldron owner-acts open` record a choice without a terminal.
+  Approving and rejecting are carried out by the `mcp` service, which takes
+  an agent's decision only where the persisted setting opens `approve`: the
+  variable alone does not, and the command says so before it sends
+  anything (record it once: `CAULDRON_OWNER_ACTS=approve cauldron owner-acts
+  open --only approve`). Anything
+  that can set its own environment, an agent told to included, can turn it
+  on. That is the point: you decide whether your agents may act for you.
+  It means "the command I ran may act", and nothing else reads it: `cauldron
+  start` and the supervisor remove it from every service they start, and
+  the `mcp` service decides `soup_approve` / `soup_reject` from the
+  persisted choice alone, so the variable in your shell never opens the
+  door to sessions. To let sessions approve through the door, record the
+  choice (`cauldron owner-acts open --only approve`).
+- **The installer**, `scripts/install --owner-acts open|terminal`, for a
+  headless install (it runs `cauldron install --owner-acts …`, the only
+  command that records `how: install`).
+
+Each choice is kept in `~/.cauldron/owner-acts.json` (owner-only) with when
+it was set and how (`tty`: run with a terminal attached, `env`: under the
+variable, or `install`), recorded by the command itself; a cauldron's own choice is
+bound to the cauldron's id, so a cauldron removed and made again under the
+name does not carry it. A development or check root is not special: its
+commands carry the variable, and its sessions follow its persisted choice.
+
+**What is not an owner act.** `soup_link`, `soup_unlink` and `soup_cite`
+(and `cauldron soup link | unlink | cite`) are ordinary writes, open to any
+grant with `write`, whatever `owner_acts` says, and none of them can set or
+clear a review flag, its `by`, or a ripple's provenance. `soup_cite` also
+leaves alone the `dump` citation of a record a ripple wrote, the one the
+review queue groups it by (`dump-cite-is-provenance`). A server pinned with
+`cauldron mcp stdio --cauldron` refuses `soup_approve` and `soup_reject`
+naming another cauldron, as it refuses every tool, and `cauldron mcp
+config` never writes `CAULDRON_OWNER_ACTS` into a project's `.mcp.json`
+(there is no flag for it). `cauldron inference models pull` asks you to
+type `yes` at a terminal, or takes `--yes`: that is your consent to one
+download, not an owner act, so `owner_acts` neither opens nor closes it.
+
+**Seeing who did what.** Every act records who did it: `by: "tty"` (run
+with a terminal attached) or `by: "agent"` (run without one, allowed by your
+choice) in the
+command's answer, in the grant row (`cauldron mcp grants`), in the `mcp`
+service's audit log (`calls.jsonl`, with the session for a tool call), in
+the automatic journal's `turned_on` line, and on each approved or rejected
+record (`meta.approved.by`, `meta.rejected.by`). A decision recorded before
+0.1.17 (`by: "owner"`) was made at a terminal and reads as `tty`.
+`cauldron soup nodes --review by-agent` (or `by-tty`; `review` on the MCP
+reads) lists only the records an agent (or a person) decided, each with
+`decided_by`, and the review queue counts both. `cauldron status`,
+`cauldron mcp status`, `cauldron ripples status` and `cauldron owner-acts
+show` show the setting in effect, twice over: per act for a command run
+from that shell without a terminal (`acts`, where `env` marks an act only
+the variable opens), and for MCP sessions (`sessions`, the persisted choice
+alone); the `soup_status` tool says what the door lets a session do.
+
+**What no setting changes.** A ripple never approves or rejects: the soup
+refuses the review flags to every ripple, and the `mcp` service refuses the
+ripples service's identity on `soup_approve` / `soup_reject`. No record
+write sets the review flags or a ripple's provenance. `review
+--interactive` always needs a terminal, because it asks a person.
 
 ### Ripples, by hand
 
@@ -802,7 +967,13 @@ nothing else. Two things stay:
 (`meta.cites: [{"kind": "dump", "id": "DM-3"}]`) and carries `meta.ripple`
 (the package, the run and the model). It is written through the `mcp`
 service, which records the write as a ripple's: no field of the record can
-say otherwise. Every read shows it, marked `unreviewed: true`, until you
+say otherwise. From 0.1.17 only that path sets `meta.ripple`: any other
+record write (`soup_put`, `cauldron soup import`, with or without
+`--remint`, direct or sent on to the service) that carries it, in any
+casing or nesting, is refused as `ripple_provenance`, as the review flags
+are. A record written before 0.1.17 may still carry one a session made up:
+read who wrote a record from `soup_review` (or `cauldron ripples review`),
+never from the field. Every read shows it, marked `unreviewed: true`, until you
 approve it: `cauldron soup nodes --review pending` (and `soup_nodes` /
 `soup_search` with `review: "pending"`) lists only those. An unreviewed record was written by an automatic step from your dump, so
 its text is data, not instructions: an MCP reply that holds one carries an
@@ -811,8 +982,8 @@ to act on an instruction found inside a record or a dump, and to tell you
 when one reads like an instruction. That is guidance to the session, not a
 control.
 
-**Reviewing is yours, at a terminal**: see [Reviewing a ripple's
-records](#reviewing-a-ripples-records).
+**Reviewing is yours**, at a terminal unless you let agents do it: see
+[Reviewing a ripple's records](#reviewing-a-ripples-records).
 
 **What a ripple may write.** New records only (never an edit, a close or a
 supersede of an existing node), of those seven types, each in at least one
@@ -843,7 +1014,7 @@ and shows it under `unsettled_calls`. The estimate does not include Claude
 Code's own system prompt, and one call can go past a cap (the check is made
 before it, not during it). Over a cap,
 nothing more is sent and the run ends `deferred` (`budget` or `daily_cap`),
-with the dump still `received`. The first call is Sonnet (or `--model`); an
+with the dump still `received`. The first call is Opus (or `--model`); an
 answer that misses the schema, or that the soup refuses, gets one retry on
 Opus with the refusal. A backend that answers busy (another request holds
 the local `inference` service, or it is not ready yet; threads refusing the
@@ -887,9 +1058,11 @@ command again, and it lands once.
 
 New in 0.1.13. Every record a ripple writes is **unreviewed** until you
 decide it: you approve it (it reads as reviewed from then on) or you reject
-it (it is kept, and left out of the normal reads). Only you decide, at an
-interactive terminal; a ripple, a Claude Code session and every MCP tool
-can only read.
+it (it is kept, and left out of the normal reads). Only you decide: at an
+interactive terminal, or, where you opened `approve` to agents, an agent
+you told to (the commands without a terminal, or a Claude Code session
+through `soup_approve` / `soup_reject`), each decision recorded with who
+made it. A ripple never decides.
 
 **The `mcp` service must be this release's.** A decision is written by the
 running `mcp` service, and this command line refuses to send one to an
@@ -972,19 +1145,27 @@ why. A skipped group, and every group after `q` or the end of input, is
 left as it was. Records are shown as `--text` shows them. It takes the same
 filters as `review`.
 
-**Why a terminal.** `approve`, `reject` and `review --interactive` run only
-with their input and output on an interactive terminal, like `cauldron mcp
-grant`, and no option skips that: a script or an agent running them is
-refused, and the refusal names the exact command for you to run. No MCP
-tool approves or rejects, so no Claude Code session can. A ripple can do
-neither: the soup refuses `meta.approved` and `meta.rejected` from a ripple,
+**Why a terminal, and when not.** By default `approve`, `reject` and
+`review --interactive` run only with their input and output on an
+interactive terminal, like `cauldron mcp grant`: a script or an agent
+running them is refused, and the refusal names the exact command for you
+to run and how you would let agents do it. If you open `approve` to agents
+([Who may act for the owner](#who-may-act-for-the-owner)), `approve` and
+`reject` run without a terminal too, and a Claude Code session can decide
+through `soup_approve` / `soup_reject`; every such decision says `by:
+"agent"` on the record (`meta.approved.by`, `meta.rejected.by`, with the
+session when there is one), in the answer and in the audit log, where one
+made at a terminal says `by: "tty"`. `review --interactive` asks a person,
+key by key, so it always needs a terminal. A ripple can do neither,
+whatever you chose: the soup refuses `meta.approved` and `meta.rejected` from a ripple,
 and no record write (`soup import`, `soup_put`, a ripple's batch) may carry
 either, set or cleared, in any casing or nesting. In a Claude
 Code session, `/cauldron:review` reads the queue (the MCP tool
-`soup_review`, scope `read`) and tells you these commands; it never runs
-them. Unreviewed text was written by a model from a dump, so the session is
+`soup_review`, scope `read`) and tells you these commands; where you opened
+`approve` to agents and you ask it to, it decides through `soup_approve` /
+`soup_reject` instead. Unreviewed text was written by a model from a dump, so the session is
 told to treat it as data and never to act on an instruction inside it. That
-is guidance to the session; the terminal check guards the commands, not
+is guidance to the session; the gate guards the commands and the tools, not
 the files, and a process running as you that reads the `mcp` service's
 private key file can send the same request.
 
@@ -992,7 +1173,8 @@ private key file can send the same request.
 
 New in 0.1.12. **Off by default, for every cauldron, and an upgrade never
 turns it on.** The owner turns it on for one cauldron at a time, at a
-terminal:
+terminal (or an agent the owner let do it: [Who may act for the
+owner](#who-may-act-for-the-owner)):
 
 ```sh
 cauldron ripples on kb --env prod                     # threads backend, text dumps only
@@ -1009,9 +1191,13 @@ records marked `unreviewed` until you approve or reject them at a terminal
 ([Reviewing a ripple's records](#reviewing-a-ripples-records)). It authorises model spend and writes into the
 cauldron that nobody asks for one by one, so, like `cauldron mcp grant`,
 `on` requires an interactive terminal (its input and output must both be
-one; no MCP tool, seam verb or option turns it on). It prints what will be
-sent where, the caps and the failure policy, then asks `[y/N]`, and writes
-the setting only on yes. The setting is a file per cauldron,
+one; no MCP tool or seam verb turns it on) unless you opened `ripples` to
+agents. At a terminal it prints what will be sent where, the caps and the
+failure policy, then asks `[y/N]`, and writes the setting only on yes;
+without one (opened to agents) it asks nothing, prints the same text as
+what it authorised, and records `by: "agent"` in its answer and in a
+`turned_on` line of the automatic journal (`ripples status` shows who last
+turned it on). The setting is a file per cauldron,
 `~/.cauldron/data/<env>/ripples/auto/<cauldron>.json` (owner-only, written
 whole and renamed into place); no file means off.
 
@@ -1060,8 +1246,16 @@ whole and renamed into place); no file means off.
   machine's Claude login (see [What leaves this machine](#ripples-by-hand)
   above): the dump's text, scrubbed, with the cauldron's regions, to
   Anthropic; threads keeps a copy of each call's prompt and answer in its
-  own store. Sonnet first, one Opus retry when the answer is refused, or
-  `--model`.
+  own store. Opus first, one Opus retry when the answer is refused, or
+  `--model`. A cauldron turned on before 0.1.17 without `--model` was
+  turned on when the default was Sonnet; it runs on Opus now, which costs
+  more per call (about twice the per-token price at Anthropic's API rates,
+  and more of a subscription's usage limits). It is not moved silently:
+  `cauldron ripples status` shows `default_changed` for it (what it was,
+  what it is, the cost, and the command that keeps Sonnet, `cauldron
+  ripples on <cauldron> --model sonnet`), and its first automatic run
+  after the upgrade writes one `default_model_changed` line to the
+  automatic journal. A cauldron turned on with `--model` keeps that model.
 - *local* (`--backend local`): the `inference` service on this machine,
   over loopback; nothing leaves the machine. The text is scrubbed too,
   unless `on` was given `--no-scrub-local`.
@@ -1141,7 +1335,7 @@ write its records, and writes nothing more (an answer already received is
 discarded and the dump stays `received`). Stopping the `ripples` service
 stops it for every cauldron.
 
-**Who can turn it on.** The terminal check guards the command, not the
+**Who can turn it on.** The owner acts' gate guards the command, not the
 file: anyone who can write the data root can write a setting file (and a
 binding that matches the cauldron, which is computable from its
 `cauldron.toml`), just as they can write `grants.json`. The setting keeps a
@@ -1394,7 +1588,18 @@ many clusters. Regions are the soup's own unit: a region holds nodes (each
 node sits in its regions) and regions nest. A cluster holds no node and does
 not nest; it groups regions, the way an area of your work spans several
 topics. A claim is a statement about the surface. It is not a lease on work:
-it holds nothing, assigns nothing to anyone, and never expires.
+it holds nothing, assigns nothing to anyone, and never expires. What does
+hold a region is a ripple's region lock, taken and let go by the ripple
+itself ([Region locks](#region-locks)); no session takes one.
+
+A cluster's `boundary` is for whoever reads the surface: you, a session
+choosing where a piece of work belongs, the curator proposing a claim. No
+machine reads its wording (a region's boundary, by contrast, is what each
+`in_region` note is meant to quote, and what a ripple's region scoring
+reads), so it is not checked beyond its length. Make a **parent region**
+(`narrows`) when the nodes themselves belong together under a wider topic;
+make a **cluster** when you want a named view across regions that stay
+separate, or that already sit under different parents.
 
 Clusters live in the soup's second pool, `cauldron`, on their own published
 schema, `cauldron@1` ([`schema/soup/cauldron-v1/`](schema/soup/cauldron-v1/README.md)):
@@ -1447,7 +1652,9 @@ at once, as any write into it is ([Region locks](#region-locks)).
 clusters that claim the region under `clusters`. `cauldron soup nodes --type
 cluster` lists the clusters, each with the regions it claims. `cauldron soup
 get CL-1` answers the cluster with its `claims`. `cauldron soup search`
-matches cluster handles and boundaries too. `soup_status` counts them.
+matches cluster handles and boundaries too. `soup_status` reports them
+separately, under `clusters` with `cluster_schema: "cauldron@1"`; its
+`total` and `counts` are the workspace records only, as through 0.1.15.
 `cauldron soup changes` (and `soup_changes`) reports a new cluster as
 `create`, a claim as `link` and a release as `unlink`, on the same cursor as
 every other write. `unlink` is new in this release, and the set of `op`
@@ -1483,16 +1690,20 @@ refused if it holds one.
 
 ### Local inference
 
-New in 0.1.11. It has run against two real models (Qwen3.6-35B-A3B at Q8_0
-and gpt-oss-120b at MXFP4, llama-server build 12110), but not yet through a
-whole ripple.
+New in 0.1.11; from 0.1.17 the prebuilt bundle carries it, and `cauldron
+inference models pull` fetches a model for you when you ask. It has run
+whole dump ripples and the fixture evaluation on two real models
+(Qwen3.6-35B-A3B at Q8_0 and gpt-oss-120b at MXFP4, llama-server build
+12110).
 
 The `inference` service runs a language model **on this machine**, with
 llama.cpp's `llama-server`, for work where a smaller model is good enough
 and nothing should leave the machine: summaries, curation, and turning a
 dump into records (the dump ripple's `--backend local`). It is **not** for
 writing code, settling a design question, or anything an agent acts on with tools:
-it never offers a model tools, and nothing in cauldron gives it any.
+in this release it offers a model no tools, and nothing in cauldron gives it
+any. (Threads on a local model, where the model reads and edits files, are
+planned for a later release.)
 
 **What it needs, and what it never does.** llama.cpp is not bundled:
 install it yourself (on macOS, `brew install llama.cpp`), and the service
@@ -1502,20 +1713,71 @@ one named by `llama_server = "/absolute/path"` in
 it first checks that binary with `--version` and `--help` (a build number
 of at least 6000, and every flag it passes), and refuses a missing or older
 one with what to do. That check proves the version and the flags, not where
-the binary came from. Nothing is downloaded,
-ever: you place a `.gguf` model file on this machine yourself, and the
-model runs with `--offline`.
+the binary came from. Nothing is downloaded unless you run `cauldron
+inference models pull` and say yes (below): otherwise you place a `.gguf`
+model file on this machine yourself. Either way the model runs with
+`--offline`.
+
+**From install to a local ripple.** Every step is yours; the installer
+installs the `inference` and `ripples` services but pins and starts
+neither. On a prebuilt install `cauldron --env prod build <service>`
+installs the image the release shipped (no cargo); from source it compiles
+it.
 
 ```sh
-brew install llama.cpp                                              # yourself, once
+brew install llama.cpp                                              # llama-server, build 6000 or later (tested: 12110)
+cauldron inference status --env prod                                # says what is still missing, and how to get it
 cauldron --env prod build inference                                 # the service: off unless you start it
 cauldron --env prod pin inference <the version label it printed>
 cauldron --env prod start inference
-cauldron inference models add qwen /Volumes/models/qwen.gguf --env prod   # record it: path, identity, sha256
-cauldron inference models list --env prod                           # each with its memory estimate
-cauldron inference status --env prod                                # loaded or not, memory, idle time, pid, crashes
+cauldron inference models pull qwen --env prod                      # 34.37 GiB, Apache-2.0: shows where it goes, asks first
+#   or a file you already have:
+#   cauldron inference models add qwen ~/models/Qwen3.6-35B-A3B-Q8_0.gguf --env prod
+cauldron --env prod build ripples                                   # then pin and start it the same way
+cauldron --env prod pin ripples <the version label it printed>
+cauldron --env prod start ripples
+cauldron mcp grant kb --env prod --project <dir>                    # yourself, at a terminal (mcp runs from install)
 cauldron ripples run DM-3 --env prod --cauldron kb --backend local  # a dump ripple, on this machine
+cauldron inference status --env prod                                # loaded or not, memory, idle time, pid, crashes
 ```
+
+`cauldron inference status` lists, under `missing`, each thing still in
+the way, with what to do: the service not installed or not started, no
+usable `llama-server` (none on `PATH`, or a build older than 6000: install
+or upgrade llama.cpp with Homebrew), no registered model (`models pull` or
+`models add`), a model whose memory estimate is over the budget, and a
+budget larger than the Mac's memory.
+
+**Getting a model: `models pull`.** `cauldron inference models pull <name>
+[--yes] --env <env>` fetches one model from a catalogue built into this
+release, and nothing else. The catalogue (`cauldron inference models pull
+--list`) holds exactly the two models this release was measured with, each
+from llama.cpp's own publisher repository on Hugging Face, pinned at a fixed
+revision, with its size and sha256:
+
+| name | file | size | licence | registered with |
+|---|---|---|---|---|
+| `qwen` (`qwen3.6-35b-a3b-q8`) | `ggml-org/Qwen3.6-35B-A3B-GGUF`, `Qwen3.6-35B-A3B-Q8_0.gguf` | 34.37 GiB | Apache-2.0 | context 65,536; about 36 GiB resident; a 64 GB Mac or larger |
+| `gpt-oss` (`gpt-oss-120b-mxfp4`) | `ggml-org/gpt-oss-120b-GGUF`, `gpt-oss-120b-MXFP4.gguf` | 59.03 GiB | Apache-2.0 | context 32,768; about 60 GiB resident; a 96 GB Mac or larger |
+
+Before it fetches anything it prints the size, the licence, where the file
+goes (`~/.cauldron/models/<id>/`, shared by the root's environments and
+never inside a project), the free disk there and the memory estimate
+against the budget, and asks you to type `yes` (or takes `--yes`); away
+from a terminal and without `--yes` it refuses. That yes is consent to one
+download, not an owner act: `owner_acts` and `CAULDRON_OWNER_ACTS` do not
+open or close it. It downloads over HTTPS
+only, with macOS's own `curl`, from `huggingface.co`, which redirects the
+file to its file store `us.aws.cdn.hf.co`; that redirect is the only one
+followed, and it says so. Any other host is refused. The bytes go to a
+private partial file beside the destination; if the transfer stops (a lost
+connection, Ctrl-C), running the same command again resumes it where it
+stopped. Nothing is registered until the whole file is there and its size
+and sha256 are the catalogue's; then it is renamed into place and
+registered as `models add` would. A file whose sha256 is wrong is not
+registered and not deleted: it is set aside as `.<file>.mismatch` and the
+command says where. The file is never run. At the 3.7 MB/s measured here,
+Qwen takes under three hours.
 
 **Registering a model copies nothing.** `cauldron inference models add
 <name> <path> [--context <tokens>]` reads the file once for its sha256 (a
@@ -1657,15 +1919,24 @@ This is an early release. These are known:
 - **The prebuilt binaries are for Apple silicon only, and are not
   notarised.** They are ad-hoc signed (see [Install](#install)). On an Intel
   Mac, build from source. The prebuilt `threads` keeps the bundle's ad-hoc
-  signature: `HARNESS_SIGN_SCRIPT` is not used on that path. In a prebuilt
-  install, the account board's "make this the machine's login" action
-  (`tui pool`, key `s`) runs no helper by default. The `claude-accounts`
-  script it needs ships only in the source tree, so the action refuses, runs
-  nothing, and says how to point `TUI_POOL_ACCOUNTS_TOOL` at a clone's copy.
-  The board's other actions go to the threads daemon and work. In every
-  build, that helper runs only from an absolute path to a regular file you
-  own that group and others cannot write, in directories owned by you or
-  root that nobody else can write. Anything else is refused.
+  signature: `HARNESS_SIGN_SCRIPT` is not used on that path.
+- **The account helper scripts are installed with cauldron (from 0.1.17).**
+  `add-account`, `claude-accounts` and `claude-login-browser` ship in the
+  bundle and are laid down by `scripts/install` (prebuilt or from source;
+  an upgrade with `--replace-running` replaces them) at
+  `<root>/share/cauldron/scripts/threads/`, every directory and script
+  0755 and yours. Logging an account in from the terminal UI (the threads
+  daemon runs `add-account`), rotation (`claude-accounts rotate`) and the
+  account board's "make this the machine's login" action (`tui pool`, key
+  `s`, which runs `claude-accounts set-live-login`) use that copy, which runs
+  the installed `threads`, never `cargo`, against the environment's threads
+  store. The daemon and the terminal UI run a helper only from an absolute
+  path to a regular file you own that group and others cannot write, in
+  directories owned by you or root that nobody else can write; anything else
+  is refused, and a missing one is refused naming the install that lays it
+  down. `TUI_POOL_ACCOUNTS_TOOL` still names another copy, checked the same
+  way. Run by hand, an installed copy needs the store named
+  (`CLAUDE_ACCOUNTS_HOME=<root>/data/<env>/threads/store`).
 - **A dump is removed from a shell only.** `cauldron soup dump-remove
   <DM-n> --env <env> --cauldron <cauldron> --yes` erases one dump's content
   from the cauldron's directory and leaves a tombstone; it is refused while
@@ -1675,12 +1946,13 @@ This is an early release. These are known:
   shows the other token sources, endpoints and templates greyed out, and
   refuses to act on them. The one local provider is llama.cpp's
   `llama-server`, through the `inference` service.
-- **Local inference has not run a whole ripple on a real model.** Real
-  models have answered through the `inference` service, but `--backend
-  local` and the evaluation have run only against a stand-in. A local run
-  never falls back to Claude, and the evaluation reads fixture
-  dumps from text files and does not measure recall or memory use. See
-  [Local inference](#local-inference).
+- **Local inference runs the dump ripple only.** Whole ripples and the
+  fixture evaluation have run on two real models; threads on a local model
+  are planned for a later release. A local run never falls back to Claude,
+  and the evaluation reads fixture dumps from text files and does not
+  measure recall or memory use. `models pull` offers only the two measured
+  models, which need a Mac with 64 GB of memory or more. See [Local
+  inference](#local-inference).
 - **Parts of the UI read sample files, not the daemon.** These are the Status
   Mesh, Soup and Bus views and some Config views. The Threads tab, Status →
   Tokens and the threads face (`cauldron tui --chat`) are wired to the live

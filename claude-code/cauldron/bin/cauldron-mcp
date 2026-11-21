@@ -25,14 +25,17 @@
 # The project directory is not trusted: a cloned repository can carry a file
 # named `cauldron`. So a candidate from ANY source ($CAULDRON_BIN, the file
 # the install marker names, $CAULDRON_HOME/bin/cauldron, PATH) is refused
-# when its resolved path is inside the current directory (where Claude Code
-# starts an MCP server: the project) or inside $CLAUDE_PROJECT_DIR; and the
-# PATH step also ignores empty and relative entries (`.`, or a leading,
-# trailing or doubled `:`, which mean the current directory), entries inside
-# the current directory or the project, and entries in a directory others
-# can write to. The current directory and $CLAUDE_PROJECT_DIR count as a
-# project unless they are / or $HOME itself. Anything skipped is named on
-# stderr.
+# when its resolved path is inside the project, which is each of: the
+# current directory (where Claude Code starts an MCP server);
+# $CLAUDE_PROJECT_DIR (the project root Claude Code sets for an MCP server);
+# and every directory above either of them, up to but not including $HOME,
+# that holds a `.git` or a `.mcp.json` (so a session started in a
+# subdirectory, with or without $CLAUDE_PROJECT_DIR, still refuses a file in
+# its repository). None of these counts when it is / or $HOME itself, or
+# above $HOME. The PATH step also ignores empty and relative entries (`.`, or
+# a leading, trailing or doubled `:`, which mean the current directory),
+# entries inside the project, and entries in a directory others can write
+# to. Anything skipped is named on stderr.
 #
 # When no candidate qualifies, this answers the MCP handshake itself rather
 # than failing silently: `initialize` gets a server with no tools whose
@@ -52,13 +55,32 @@ HERE=$(pwd -P 2>/dev/null) || HERE=""
 # The directories a candidate may not come from (see above), physical paths.
 PROJECTS=""
 HOMEP=$(cd -P "${HOME:-/nonexistent}" 2>/dev/null && pwd -P) || HOMEP=""
-if [ -n "$HERE" ] && [ "$HERE" != / ] && [ "$HERE" != "$HOMEP" ]; then
-    PROJECTS=$HERE
-fi
+add_project() {
+    case "$1" in "" | / | "$HOMEP") return ;; esac
+    PROJECTS="$PROJECTS${PROJECTS:+
+}$1"
+}
+# roots_above <physical directory>: the directory and every directory above
+# it that holds a `.git` (a repository or a worktree) or a `.mcp.json` (a
+# Claude Code project) is a project root too, so a session started in a
+# subdirectory still refuses a candidate anywhere in its project. The walk
+# stops at $HOME and at anything above it: a home directory kept under git
+# (dotfiles) is not a project, and neither is /.
+roots_above() {
+    r_d=$1
+    while [ -n "$r_d" ] && [ "$r_d" != / ]; do
+        [ "$r_d" = "$HOMEP" ] && return
+        if [ -n "$HOMEP" ]; then case "$HOMEP/" in "$r_d"/*) return ;; esac; fi
+        if [ -e "$r_d/.git" ] || [ -e "$r_d/.mcp.json" ]; then add_project "$r_d"; fi
+        case "$r_d" in /*/*) r_d=${r_d%/*} ;; *) r_d=/ ;; esac
+    done
+}
+add_project "$HERE"
+roots_above "$HERE"
 if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
     pd=$(cd -P "$CLAUDE_PROJECT_DIR" 2>/dev/null && pwd -P) || pd=""
-    if [ -n "$pd" ] && [ "$pd" != / ] && [ "$pd" != "$HOMEP" ]; then PROJECTS="$PROJECTS${PROJECTS:+
-}$pd"; fi
+    add_project "$pd"
+    roots_above "$pd"
 fi
 
 # in_project <physical path>: 0 if it is inside one of PROJECTS.

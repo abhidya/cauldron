@@ -283,14 +283,14 @@ fn reviewable(name: &str) -> bool {
 /// `meta.approved`: the review flag. Described, never required.
 fn approved_schema() -> Value {
     json!({
-        "description": "The review flag. A record a ripple wrote reads as `unreviewed: true` until this is set (any value but false or null; the owner's `cauldron ripples approve` or `cauldron soup approve`, run at a terminal, writes {at, by}; no MCP tool sets it; a rejected record is not approved until its rejection is taken back). It is a flag: the soup refuses it to every ripple, so a ripple can never approve its own records. Leave it out when you write a record.",
+        "description": "The review flag. A record a ripple wrote reads as `unreviewed: true` until this is set (any value but false or null; written by the owner's approval, `cauldron ripples approve` or `cauldron soup approve`, as {at, by, session?}: `by: tty` when run with a terminal attached, `by: agent` without one or through the MCP tool soup_approve, which the owner's owner_acts setting must open; no record write sets it; a rejected record is not approved until its rejection is taken back). It is a flag: the soup refuses it to every ripple, so a ripple can never approve its own records. Leave it out when you write a record.",
     })
 }
 
 /// `meta.rejected`: the other review decision. Described, never required.
 fn rejected_schema() -> Value {
     json!({
-        "description": "The rejection flag. A record a ripple wrote that the owner rejected (`cauldron ripples reject`, run at a terminal, writes {at, by, reason?}; no MCP tool sets it) is kept, with its cite to the dump, and is left out of the listing reads (nodes, search, a region's members) unless they are asked to include rejected records; `soup_get` still answers it, marked `rejected: true`. A rejected record cannot be approved until the rejection is taken back (`--unreject`). It is a flag: the soup refuses it to every ripple. Leave it out when you write a record.",
+        "description": "The rejection flag. A record a ripple wrote that the owner rejected (written by `cauldron ripples reject` as {at, by, session?, reason?}: `by: tty` when run with a terminal attached, `by: agent` without one or through the MCP tool soup_reject, which the owner's owner_acts setting must open; no record write sets it) is kept, with its cite to the dump, and is left out of the listing reads (nodes, search, a region's members) unless they are asked to include rejected records; `soup_get` still answers it, marked `rejected: true`. A rejected record cannot be approved until the rejection is taken back (`--unreject`). It is a flag: the soup refuses it to every ripple. Leave it out when you write a record.",
     })
 }
 
@@ -627,6 +627,54 @@ mod tests {
             }
         }
         drift
+    }
+
+    /// `v` with every annotation keyword taken out: a `description`,
+    /// `title` or `$comment` whose value is a string. (A property NAMED one
+    /// of those has an object for its value and stays.)
+    fn validation_only(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .filter(|(k, x)| !(matches!(k.as_str(), "description" | "title" | "$comment") && x.is_string()))
+                    .map(|(k, x)| (k.clone(), validation_only(x)))
+                    .collect(),
+            ),
+            Value::Array(a) => Value::Array(a.iter().map(validation_only).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// **Every VALIDATION keyword of both published schemas is as published
+    /// with 0.1.16.** The published files may change their words
+    /// (`description`, `title`, `$comment`), never what they accept: each
+    /// `.json` of `schema/soup/workspace-v6/` and `schema/soup/cauldron-v1/`,
+    /// with those keys taken out, equals the same file of 0.1.16 taken out
+    /// the same way (`schema_validation_0_1_16.json`, made from the 0.1.16
+    /// release's files), and the file set is the same. This replaces holding
+    /// the files byte for byte.
+    #[test]
+    fn validation_keywords_are_as_published_with_0_1_16() {
+        let published: std::collections::BTreeMap<String, Value> = serde_json::from_str(include_str!("schema_validation_0_1_16.json")).unwrap();
+        let mut now: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+        for (p, _) in publications() {
+            let dir = root().join(p.dir);
+            let sub = p.dir.trim_start_matches("schema/soup/");
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                if name.ends_with(".json") {
+                    let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.join(&name)).unwrap()).unwrap();
+                    now.insert(format!("{sub}/{name}"), validation_only(&v));
+                }
+            }
+        }
+        assert_eq!(now.keys().collect::<Vec<_>>(), published.keys().collect::<Vec<_>>(), "the published file set changed");
+        let changed: Vec<&String> = now.iter().filter(|(k, v)| published.get(*k) != Some(*v)).map(|(k, _)| k).collect();
+        assert!(changed.is_empty(), "a validation keyword changed from 0.1.16 in: {changed:?}");
+        // And the comparison sees a change: one keyword moved is caught.
+        let mut moved = published["workspace-v6/node.task.schema.json"].clone();
+        moved["properties"]["handle"]["maxLength"] = json!(1);
+        assert_ne!(validation_only(&moved), published["workspace-v6/node.task.schema.json"]);
     }
 
     /// The drift test, for both published grammars.

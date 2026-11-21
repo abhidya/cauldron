@@ -542,13 +542,14 @@ impl LoginSessions {
         account: &str,
         opts: LoginOptions,
     ) -> Result<Begun> {
-        if !script.exists() {
-            return Err(Error::Config(format!(
-                "the account login script is not at {} — the login flow drives that script \
-                 rather than reimplementing its credential guards, so it cannot run without it",
-                script.display()
-            )));
-        }
+        // Missing, or a file someone else could have replaced: refused
+        // before anything is spawned (`crate::helpers::check`).
+        crate::helpers::check(script, "the account login script").map_err(|why| {
+            Error::Config(format!(
+                "{why} (the login flow drives that script rather than reimplementing its credential guards, so it \
+                 cannot run without it)"
+            ))
+        })?;
         // ── AN IN-FLIGHT LOGIN IS SUPERSEDED, NOT A REFUSAL ──────────────────
         //
         // This used to return *"a login for X is already in progress — complete
@@ -600,6 +601,10 @@ impl LoginSessions {
         };
 
         let mut cmd = tokio::process::Command::new(script);
+        // From the threads home, never the daemon's own directory, with no
+        // variable that would make the script or its python load a file the
+        // caller chose (`crate::helpers::harden`).
+        crate::helpers::harden(&mut cmd, threads_home);
         cmd.arg("--login").arg(account).arg("--no-browser");
         if let Some(email) = &opts.email {
             cmd.arg("--email").arg(email);
@@ -607,8 +612,12 @@ impl LoginSessions {
         if opts.force {
             cmd.arg("--force").arg("--allow-same-account");
         }
-        cmd.current_dir(threads_home)
-            .env("THREADS_HOME", threads_home)
+        if let Some(bin) = crate::helpers::threads_bin() {
+            // The registry step runs THIS daemon's own `threads`, never a
+            // build from a source tree (`crate::helpers`).
+            cmd.env(crate::helpers::THREADS_BIN_VAR, bin);
+        }
+        cmd.env("THREADS_HOME", threads_home)
             // The slot `add-account` signs in is `<this home>/accounts/<label>`,
             // which is the slot the guard snapshotted and will check (R12.5
             // inspect B2: a home not handed on is a login nobody checks).
@@ -1032,13 +1041,9 @@ pub async fn rotate(
     dry_run: bool,
     mut on_progress: impl FnMut(&str, String),
 ) -> Result<(bool, serde_json::Value, String)> {
-    if !script.exists() {
-        return Err(Error::Config(format!(
-            "the accounts script is not at {} — rotation drives that script rather than \
-             reimplementing its keychain handling",
-            script.display()
-        )));
-    }
+    crate::helpers::check(script, "the accounts script").map_err(|why| {
+        Error::Config(format!("{why} (rotation drives that script rather than reimplementing its keychain handling)"))
+    })?;
     // The PRIVATE log for this pass. `claude-accounts` reads
     // `CLAUDE_ACCOUNTS_LOG` as a seam and appends there instead of to the
     // shared `accounts/rotation.log`, which is what makes these lines
@@ -1056,12 +1061,18 @@ pub async fn rotate(
         .map_err(|e| Error::Config(format!("creating {}: {e}", log.display())))?;
 
     let mut cmd = tokio::process::Command::new(script);
+    crate::helpers::harden(&mut cmd, threads_home);
     cmd.arg("rotate").arg("--json");
     if dry_run {
         cmd.arg("--dry-run");
     }
-    cmd.current_dir(threads_home)
-        .env("THREADS_HOME", threads_home)
+    if let Some(bin) = crate::helpers::threads_bin() {
+        cmd.env(crate::helpers::THREADS_BIN_VAR, bin);
+    }
+    cmd.env("THREADS_HOME", threads_home)
+        // The store is named, not derived from where the script sits: an
+        // installed copy has no store beside it.
+        .env("CLAUDE_ACCOUNTS_HOME", threads_home)
         .env("CLAUDE_ACCOUNTS_LOG", &log)
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
         .env_remove("ANTHROPIC_API_KEY")

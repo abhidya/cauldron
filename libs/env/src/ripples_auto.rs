@@ -38,7 +38,11 @@
 //!   `cauldron ripples status` shows. Each line carries the binding's key
 //!   ([`Binding::key`]), and only lines of the setting's own binding count:
 //!   a cauldron made again under an old name starts with a clean queue.
-//!   Ids, codes, counts and times only, never text.
+//!   Ids, codes, counts and times only, never text. `cauldron ripples on`
+//!   appends a `turned_on` line ([`turned_on_line`]) saying who turned it
+//!   on (`by`: `tty`, a person at a terminal, or `agent`, allowed by the
+//!   owner's `owner_acts` choice); a reader of the dump lines skips it (it
+//!   names no dump), so an older service reads the journal as before.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -133,6 +137,12 @@ pub struct Settings {
     /// The model given at `on` (`--model`), if any.
     #[serde(default)]
     pub model: Option<String>,
+    /// The threads default model when it was turned on (`opus` from
+    /// 0.1.17). Absent from a setting written by 0.1.16 or earlier, whose
+    /// default was `sonnet`: such a setting with no `model` of its own runs
+    /// on the new default, and says so ([`old_default`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     /// Session-transcript dumps too (`--include-sessions`); text dumps only
     /// otherwise.
     #[serde(default)]
@@ -164,6 +174,39 @@ impl Settings {
         let Some(b) = &self.bound_to else { return false };
         bound == b.key().as_str() || (b.id.is_some() && b.created_at.is_some() && bound == b.legacy_key().as_str())
     }
+}
+
+/// The threads default model a setting turned on before 0.1.17 consented
+/// to.
+pub const OLD_DEFAULT_MODEL: &str = "sonnet";
+
+/// The threads default model now.
+pub const DEFAULT_MODEL: &str = "opus";
+
+/// **Was `s` turned on under the old default, with no model of its own?**
+/// Then its automatic runs move from `sonnet` to `opus` with this release,
+/// and the status views and its first run after the upgrade say so. A
+/// setting that recorded an explicit model keeps it; a local one is not
+/// concerned.
+pub fn old_default(s: &Settings) -> bool {
+    s.backend != "local" && s.model.is_none() && s.default_model.is_none()
+}
+
+/// What changed for such a setting, and what to do to keep Sonnet.
+pub fn default_change(s: &Settings, env: &str) -> Value {
+    json!({
+        "was": OLD_DEFAULT_MODEL,
+        "now": DEFAULT_MODEL,
+        "note": format!(
+            "automatic processing was turned on for `{c}` when the default model was {OLD_DEFAULT_MODEL}, and no --model was \
+             given, so since 0.1.17 its automatic runs use {DEFAULT_MODEL}. Opus costs more than Sonnet: about twice as much \
+             per token at Anthropic's API prices when this was written, and through a Claude subscription it uses more of the \
+             account's usage limits per call",
+            c = s.cauldron
+        ),
+        "keep_sonnet": format!("cauldron ripples on {} --model {OLD_DEFAULT_MODEL} --env {env}", s.cauldron),
+        "keep_opus": format!("cauldron ripples on {} --model {DEFAULT_MODEL} --env {env}", s.cauldron),
+    })
 }
 
 /// **A setting as it stands now**: the stored setting, and, when it does not
@@ -408,6 +451,18 @@ pub fn append(data_root: &Path, line: &Value) -> std::io::Result<()> {
     f.sync_all()
 }
 
+/// The `turned_on` line `cauldron ripples on` appends: who turned `s` on,
+/// when, and the backend and `since` it authorised.
+pub fn turned_on_line(s: &Settings, by: &str, at: &str) -> Value {
+    json!({"at": at, "event": "turned_on", "cauldron": s.cauldron, "bound": s.bound_key(), "by": by,
+           "backend": s.backend, "since_dump": s.since_dump, "include_sessions": s.include_sessions})
+}
+
+/// The last `turned_on` line of `s`'s own binding, if any.
+pub fn last_turned_on<'a>(lines: &'a [Value], s: &Settings) -> Option<&'a Value> {
+    lines.iter().rev().find(|l| l["event"] == "turned_on" && l["cauldron"] == s.cauldron.as_str() && s.owns_line(&l["bound"]))
+}
+
 /// Every line of the automatic journal (one that does not parse is skipped).
 pub fn read(data_root: &Path) -> Vec<Value> {
     std::fs::read_to_string(journal_path(data_root)).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
@@ -620,6 +675,10 @@ pub fn queue(entry: &Entry, env: &str, received: Option<&[Value]>, states: &BTre
     if received.is_none() {
         v["queue_unknown"] = json!("the cauldron's dumps could not be read, so `waiting` is not known");
     }
+    if old_default(s) {
+        v["model"] = json!(DEFAULT_MODEL);
+        v["default_changed"] = default_change(s, env);
+    }
     v
 }
 
@@ -769,12 +828,32 @@ mod tests {
             since_dump: since,
             backend: "threads".into(),
             model: None,
+            default_model: Some(DEFAULT_MODEL.into()),
             include_sessions: sessions,
             scrub_local: true,
             changed_at: "2026-01-01T00:00:00.000Z".into(),
             off_at: None,
             bound_to: Some(Binding { env: "dev".into(), id: None, created_at: Some("2026-01-01T00:00:00Z".into()), dir_ino: Some(7) }),
         }
+    }
+
+    #[test]
+    fn a_setting_turned_on_under_the_old_default_says_it_moved_and_an_explicit_model_stays() {
+        let mut old = setting(0, false);
+        old.default_model = None;
+        assert!(old_default(&old));
+        let d = default_change(&old, "dev");
+        assert_eq!((d["was"].as_str(), d["now"].as_str()), (Some("sonnet"), Some("opus")));
+        assert!(d["note"].as_str().unwrap().contains("costs more") && d["keep_sonnet"].as_str().unwrap().contains("--model sonnet"));
+        let pinned = Settings { model: Some("sonnet".into()), ..old.clone() };
+        assert!(!old_default(&pinned), "an explicit model is kept");
+        assert!(!old_default(&Settings { backend: "local".into(), ..old.clone() }));
+        assert!(!old_default(&setting(0, false)), "turned on under this release");
+        // A 0.1.16 file (no `default_model` key) reads as the old default.
+        let mut v = serde_json::to_value(&old).unwrap();
+        v.as_object_mut().unwrap().remove("default_model");
+        let back: Settings = serde_json::from_value(v).unwrap();
+        assert!(old_default(&back));
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {

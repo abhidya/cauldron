@@ -7,7 +7,9 @@
 //! with its own arguments, refuse a path that is not a regular file owned by
 //! the user or root (a symlink, a group-writable file, a file in a directory
 //! others can write, a file in the project directory from any source, a PATH
-//! entry that is empty, relative or inside the project), and, with
+//! entry that is empty, relative or inside the project; the project being
+//! the current directory, $CLAUDE_PROJECT_DIR, and every directory above
+//! them, short of $HOME, holding a `.git` or a `.mcp.json`), and, with
 //! nothing found, answer the MCP handshake itself with a tool-less server
 //! whose instructions say how to install, printing nothing but JSON-RPC on
 //! stdout.
@@ -394,4 +396,118 @@ fn a_session_in_home_still_finds_the_default_install() {
     let h = home.to_str().unwrap();
     let (_, out, err) = run_in(Some(&home), &[("HOME", h), ("CLAUDE_PROJECT_DIR", h)], &[], "");
     assert_eq!(out, "default mcp stdio\n", "{err}");
+}
+
+/// **Started in a subdirectory of a project, with no project directory
+/// given**: the project root is found by walking up to a directory that
+/// holds a `.git` (a repository's directory, or a worktree's file) or a
+/// `.mcp.json`, and a candidate anywhere under it is refused from every
+/// source, an absolute PATH entry included. The same when Claude Code's
+/// $CLAUDE_PROJECT_DIR is itself a subdirectory (the session started
+/// there). Controls: with no marker above, nothing says the directory is a
+/// project, so the entry is run as before; and a directory above the
+/// project that is not one is not refused.
+#[test]
+fn a_session_in_a_subdirectory_refuses_a_candidate_anywhere_in_its_repository() {
+    let s = Scratch::new("subdir");
+    let home = s.0.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let h = home.to_str().unwrap();
+    let proj = s.0.join("proj");
+    let deep = proj.join("sub/deeper");
+    std::fs::create_dir_all(&deep).unwrap();
+    fake(&proj.join("bin/cauldron"), "PROJECT");
+    fake(&s.0.join("safe/cauldron"), "safe");
+    let path = format!("{}:{}:/usr/bin:/bin", proj.join("bin").display(), s.0.join("safe").display());
+    let bin = proj.join("bin/cauldron");
+
+    // No marker anywhere above: the launcher cannot know, and runs the entry.
+    let (_, out, _) = run_in(Some(&deep), &[("HOME", h), ("PATH", &path)], &[], "");
+    assert_eq!(out, "PROJECT mcp stdio\n");
+
+    for marker in ["git-dir", "git-file", "mcp-json"] {
+        match marker {
+            "git-dir" => std::fs::create_dir(proj.join(".git")).unwrap(),
+            "git-file" => std::fs::write(proj.join(".git"), "gitdir: elsewhere\n").unwrap(),
+            _ => std::fs::write(proj.join(".mcp.json"), "{}\n").unwrap(),
+        }
+        // A PATH entry in the repository, started two levels down.
+        let (rc, out, err) = run_in(Some(&deep), &[("HOME", h), ("PATH", &path)], &[], "");
+        assert_eq!((rc, out.as_str()), (0, "safe mcp stdio\n"), "{marker}: {err}");
+        assert!(err.contains(&format!("ignored the PATH entry {}", proj.join("bin").display())) && err.contains("inside the project"), "{marker}: {err}");
+        // CAULDRON_BIN naming the project's file.
+        let (_, out, err) = run_in(Some(&deep), &[("HOME", h), ("PATH", &path), ("CAULDRON_BIN", bin.to_str().unwrap())], &[], "");
+        assert_eq!(out, "safe mcp stdio\n", "{marker}: {err}");
+        assert!(err.contains("skipped CAULDRON_BIN") && err.contains("inside the project directory"), "{marker}: {err}");
+        // CLAUDE_PROJECT_DIR is the subdirectory the session started in,
+        // and the server runs somewhere else entirely.
+        let elsewhere = s.0.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let (_, out, err) = run_in(Some(&elsewhere), &[("HOME", h), ("PATH", &path), ("CLAUDE_PROJECT_DIR", proj.join("sub").to_str().unwrap())], &[], "");
+        assert_eq!(out, "safe mcp stdio\n", "{marker}: {err}");
+        // Nothing of the project runs when it is all there is.
+        let only = format!("{}:/usr/bin:/bin", proj.join("bin").display());
+        let (_, out, _) = run_in(Some(&deep), &[("HOME", h), ("PATH", &only)], &[], LIST);
+        assert!(answered_tool_less(&out), "{marker}: {out}");
+        let _ = std::fs::remove_dir(proj.join(".git"));
+        let _ = std::fs::remove_file(proj.join(".git"));
+        let _ = std::fs::remove_file(proj.join(".mcp.json"));
+    }
+
+    // A directory above the project with no marker is not the project: a
+    // sibling of the project beside it is run.
+    std::fs::create_dir(proj.join(".git")).unwrap();
+    fake(&s.0.join("sibling/cauldron"), "sibling");
+    let sib = format!("{}:/usr/bin:/bin", s.0.join("sibling").display());
+    let (_, out, err) = run_in(Some(&deep), &[("HOME", h), ("PATH", &sib)], &[], "");
+    assert_eq!(out, "sibling mcp stdio\n", "{err}");
+}
+
+/// A home directory kept under git (dotfiles) is not a project: the walk up
+/// stops at $HOME, so a session in a project under it, or in a plain
+/// directory under it, still runs the default install; a project of its
+/// own under it is still refused.
+#[test]
+fn a_home_under_git_is_not_a_project() {
+    let s = Scratch::new("githome");
+    let home = s.0.join("home");
+    let h = home.to_str().unwrap();
+    std::fs::create_dir_all(home.join(".git")).unwrap();
+    fake(&home.join(".cauldron/bin/cauldron"), "default");
+    let plain = home.join("notes/today");
+    std::fs::create_dir_all(&plain).unwrap();
+    let (_, out, err) = run_in(Some(&plain), &[("HOME", h)], &[], "");
+    assert_eq!(out, "default mcp stdio\n", "{err}");
+    let proj = home.join("code/p");
+    std::fs::create_dir_all(proj.join(".git")).unwrap();
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    fake(&proj.join("bin/cauldron"), "PROJECT");
+    let (_, out, err) = run_in(Some(&proj.join("src")), &[("HOME", h)], &[], "");
+    assert_eq!(out, "default mcp stdio\n", "{err}");
+    let (_, out, err) = run_in(Some(&proj.join("src")), &[("HOME", h), ("CAULDRON_BIN", proj.join("bin/cauldron").to_str().unwrap())], &[], "");
+    assert_eq!(out, "default mcp stdio\n", "{err}");
+    assert!(err.contains("inside the project directory"), "{err}");
+}
+
+/// A candidate under ANY ancestor directory others can write is refused,
+/// however far above it that directory is, and from every source.
+#[test]
+fn a_candidate_below_a_directory_others_can_write_is_refused_at_any_depth() {
+    let s = Scratch::new("wwdeep");
+    let home = s.0.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let h = home.to_str().unwrap();
+    let open = s.0.join("open");
+    let bin = open.join("a/b/c/cauldron");
+    fake(&bin, "DEEP");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let (_, out, err) = run(&[("HOME", h), ("CAULDRON_BIN", bin.to_str().unwrap())], &[], LIST);
+    assert!(answered_tool_less(&out), "{out}");
+    assert!(err.contains("writable by group or others"), "{err}");
+    let pe = format!("{}:/usr/bin:/bin", open.join("a/b/c").display());
+    let (_, out, _) = run(&[("HOME", h), ("PATH", &pe)], &[], LIST);
+    assert!(answered_tool_less(&out), "{out}");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (_, out, _) = run(&[("HOME", h), ("CAULDRON_BIN", bin.to_str().unwrap())], &[], "");
+    assert_eq!(out, "DEEP mcp stdio\n");
 }

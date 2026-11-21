@@ -114,8 +114,7 @@ async fn perform_unmasked(h: &client::Handle, a: &Action) -> Outcome {
 async fn run_captured(argv: &[String]) -> Result<(bool, String, String), String> {
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        tokio::process::Command::new(&argv[0])
-            .args(&argv[1..])
+        tokio::process::Command::from(action::helper_command(argv))
             .stdin(std::process::Stdio::null())
             .output(),
     )

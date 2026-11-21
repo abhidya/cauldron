@@ -54,6 +54,10 @@ pub struct Line {
     pub reason: Option<String>,
     /// Only on a dump that landed: its id (never its text).
     pub dump: Option<String>,
+    /// Only on an owner act (a review decision): who did it, `tty` (a
+    /// person at a terminal) or `agent` (allowed by the owner's
+    /// `owner_acts` choice).
+    pub by: Option<String>,
 }
 
 impl Audit {
@@ -99,6 +103,9 @@ impl Audit {
         }
         if let Some(d) = l.dump {
             v["dump"] = json!(d);
+        }
+        if let Some(b) = l.by {
+            v["by"] = json!(b);
         }
         // The whole line, newline included, goes to the file in ONE write
         // (`O_APPEND`): a reader never sees part of a line. (`writeln!` on a

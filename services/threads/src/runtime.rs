@@ -15528,7 +15528,9 @@ impl ThreadManager {
         });
     }
 
-    /// Where `scripts/add-account` lives, relative to the data dir.
+    /// The `add-account` script the login flow runs: the copy installed with
+    /// cauldron (`<cauldron root>/share/cauldron/scripts/threads/add-account`),
+    /// else `<data dir>/scripts/add-account` ([`crate::helpers::locate`]).
     ///
     /// The login flow DRIVES that script rather than reimplementing it: its
     /// credential guards (it refuses when `CLAUDE_CODE_OAUTH_TOKEN` is set,
@@ -15536,7 +15538,13 @@ impl ThreadManager {
     /// its distinct-account verdicts and its conformance vectors are all
     /// load-bearing, and none of them are restated in Rust.
     pub fn add_account_script(&self) -> std::path::PathBuf {
-        self.data_dir.join("scripts").join("add-account")
+        crate::helpers::locate(&self.data_dir, "add-account")
+    }
+
+    /// The `claude-accounts` script rotation runs, found as
+    /// [`ThreadManager::add_account_script`] is.
+    pub fn claude_accounts_script(&self) -> std::path::PathBuf {
+        crate::helpers::locate(&self.data_dir, "claude-accounts")
     }
 
     /// The daemon's data dir. Exposed so WS arms that answer questions about

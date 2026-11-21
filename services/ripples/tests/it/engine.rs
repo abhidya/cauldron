@@ -24,7 +24,7 @@ fn e1_a_text_dump_becomes_cited_unreviewed_records_and_the_dump_is_processed() {
     assert_eq!(out["usage"]["input_tokens"], 9000);
     assert_eq!(out["usage"]["output_tokens"], 700);
     assert_eq!(out["input_total"], 9010);
-    assert_eq!((out["calls"].clone(), out["models"].clone(), out["backend"].clone()), (json!(1), json!(["sonnet"]), json!("scripted")));
+    assert_eq!((out["calls"].clone(), out["models"].clone(), out["backend"].clone()), (json!(1), json!(["opus"]), json!("scripted")));
     let events: Vec<String> = s.journal().iter().map(|l| l["event"].as_str().unwrap().to_string()).collect();
     assert_eq!(events, ["started", "read", "call", "scrubbed", "called", "done"]);
     let called = &s.journal()[4];
@@ -80,10 +80,10 @@ fn e3_a_refused_answer_gets_one_opus_retry_with_the_refusal() {
     let script = s.script("e3", json!([{"output": bad, "usage": usage(4000, 100)}, {"output": ideas(1), "usage": usage(4500, 120)}]));
     let out = engine::run(&engine(&s, &door, &script, Caps::default()), &ask(&id));
     assert_eq!(out["outcome"], "processed", "{out}");
-    assert_eq!((out["calls"].clone(), out["models"].clone()), (json!(2), json!(["sonnet", "opus"])));
+    assert_eq!((out["calls"].clone(), out["models"].clone()), (json!(2), json!(["opus", "opus"])));
     assert_eq!(out["usage"]["input_tokens"], 8500);
     let c = calls(&script);
-    assert_eq!(c[1]["model"], "opus");
+    assert_eq!((c[0]["model"].clone(), c[1]["model"].clone()), (json!("opus"), json!("opus")), "Opus first and on the retry, by default");
     assert!(c[1]["prompt"].as_str().unwrap().contains("Your previous answer was refused") && c[1]["prompt"].as_str().unwrap().contains("R-9"));
     assert!(s.journal().iter().any(|l| l["event"] == "refused"));
 
@@ -552,4 +552,21 @@ fn e14_concurrent_runs_cannot_both_take_the_last_slot() {
     });
     assert_eq!((a, b), (Ok(()), Err("full")));
     assert_eq!(cauldron_ripples::journal::spent(&cauldron_ripples::journal::read(&path), "r"), (1, 10));
+}
+
+#[test]
+fn e3b_opus_is_the_default_and_model_still_overrides_the_first_call() {
+    assert_eq!((engine::FIRST_MODEL, engine::RETRY_MODEL), ("opus", "opus"));
+    let s = Scratch::new("e3b");
+    let door = Door::start(&s);
+    let id = door.dump("a note about caching");
+    let bad = json!({"records": [{"label": "n1", "type": "idea", "state": "idea", "handle": "x", "regions": ["R-9"]}]});
+    let script = s.script("e3b", json!([{"output": bad, "usage": usage(4000, 100)}, {"output": ideas(1), "usage": usage(4500, 120)}]));
+    let mut a = ask(&id);
+    a.model = Some("sonnet".into());
+    let out = engine::run(&engine(&s, &door, &script, Caps::default()), &a);
+    assert_eq!(out["outcome"], "processed", "{out}");
+    assert_eq!(out["models"], json!(["sonnet", "opus"]), "--model sets the first call; the retry is Opus");
+    let started = s.journal().into_iter().find(|l| l["event"] == "started").unwrap();
+    assert_eq!(started["model"], "sonnet");
 }

@@ -21,6 +21,10 @@
 //!   directory and session (a caller's own `_ctx` replaced); the door secret
 //!   never appears on its stdout or stderr; a service stopped mid-session
 //!   turns the next call into `service_down`.
+//! - **B5** one server per cauldron: `cauldron mcp config --cauldron <name>`
+//!   prints a `.mcp.json` entry whose bridge is pinned to that cauldron, and
+//!   that bridge refuses every call naming another (`cauldron_pinned`),
+//!   before anything reaches the service.
 //! - **D1** dumps: the bridge finds a session's transcript in a fixture
 //!   Claude Code store (a scratch `CLAUDE_CONFIG_DIR`, never the real one)
 //!   by id, or this session's by `$CLAUDE_CODE_SESSION_ID`, and the stored
@@ -218,9 +222,16 @@ impl Service {
 
     /// `bin` (a `cauldron-mcp`) started as `cauldron start mcp` starts it.
     fn start_bin(s: &Scratch, bin: &Path) -> Service {
+        Service::start_bin_with(s, bin, &[])
+    }
+
+    /// [`Service::start_bin`] with `vars` added to its environment (what a
+    /// service started by hand, not by the supervisor, might carry).
+    fn start_bin_with(s: &Scratch, bin: &Path, vars: &[(&str, &str)]) -> Service {
         let log = std::fs::File::create(s.0.join(format!("service-{}.log", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()))).unwrap();
         let bin = bin.to_path_buf();
         let child = Command::new(&bin)
+            .envs(vars.iter().copied())
             .env("CAULDRON_SERVICE", "mcp")
             .env("CAULDRON_ENV", "dev")
             .env("CAULDRON_HOME", s.root())
@@ -1273,7 +1284,7 @@ fn rv1_ripples_approve_and_reject_at_a_terminal() {
     // No terminal: refused before anything is sent, with the command.
     let o = s.run(&["ripples", "reject", "--dump", "DM-1", "--env", "dev", "--cauldron", "kb", "--reason", "not mine"], &pids);
     assert_ne!(o.rc, 0);
-    assert!(o.err.contains("REFUSED: rejecting a ripple's records is the owner's act at a terminal") && o.err.contains("no option skips this"), "{}", o.err);
+    assert!(o.err.contains("REFUSED: rejecting a ripple's records is the owner's act at a terminal") && o.err.contains("unless the owner has let agents") && o.err.contains("cauldron owner-acts open"), "{}", o.err);
     assert!(o.err.contains("cauldron ripples reject --dump DM-1 --env dev --cauldron kb --reason 'not mine'"), "{}", o.err);
     let o = s.run(&["ripples", "approve", "--run", "run-b", "--env", "dev", "--cauldron", "kb"], &pids);
     assert!(o.err.contains("cannot approve records by itself") && o.err.contains("cauldron ripples approve --run run-b --env dev --cauldron kb"), "{}", o.err);
@@ -1374,7 +1385,7 @@ fn rv2_the_interactive_pass() {
     assert!(t.contains("Done: 2 group(s) decided, 1 skipped; 1 record(s) still wait"), "{t}");
     let get = |id: &str| -> Value { s.run(&["soup", "get", id, "--env", "dev", "--cauldron", "kb"], &pids).json()["records"][0].clone() };
     assert_eq!(get(&c[0])["unreviewed"], json!(true), "skipped");
-    assert_eq!(get(&b[0])["meta"]["approved"]["by"], json!("owner"));
+    assert_eq!(get(&b[0])["meta"]["approved"]["by"], json!("tty"));
     let r = get(&b[1]);
     assert_eq!((r["rejected"].clone(), r["meta"]["rejected"]["reason"].clone()), (json!(true), json!("dup")), "{r}");
     for id in &a {
@@ -1649,7 +1660,7 @@ fn rv4_the_real_older_mcp_service_rejects_nothing_and_says_why() {
 /// whenever the workspace version is not this constant, so every release
 /// bump makes someone check rv3 and rv4 against the new relation and move
 /// it.
-const OLDER_SERVICE_TESTS_CHECKED_AT: &str = "0.1.16";
+const OLDER_SERVICE_TESTS_CHECKED_AT: &str = "0.1.17";
 
 #[test]
 fn rv0_the_older_service_tests_were_checked_against_the_workspace_version() {
@@ -1722,6 +1733,80 @@ fn w3_no_record_write_sets_a_review_flag() {
     let r = svc.call(&s, "soup_link", json!({"cauldron": "kb", "links": [{"from": "R-1", "kind": "ref", "to": "R-2", "meta": {"rejected": true}}]}));
     assert_eq!(r["isError"], json!(true), "{r}");
     svc.stop();
+}
+
+/// **No record write sets `meta.ripple`** (issue #23, item 2.10): `soup
+/// import` direct (with and without `--remint`, and `--dry-run`), `soup
+/// import` while the service holds the soup (it would be forwarded) and
+/// `soup_put` each refuse a record carrying ripple provenance in any
+/// casing or nesting, as `ripple_provenance`, and write nothing; only the
+/// door, on a ripple's batch, stamps it.
+#[test]
+fn w3b_no_record_write_sets_ripple_provenance() {
+    let s = Scratch::new("w3b", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let fake = json!({"package": "dump", "version": "v1", "run": "made-up", "model": "opus"});
+    let rec = |key: &str, v: Value| -> Value {
+        let mut r = task("t", "a record that claims a ripple wrote it");
+        r[key] = v;
+        r
+    };
+    let variants = [
+        ("meta", json!({"ripple": fake})),
+        ("meta", json!({"Ripple": fake})),
+        ("meta", json!({"ripple": null})),
+        ("meta", json!({"meta": {"ripple": fake}})),
+        ("Meta", json!({"ripple": fake})),
+        ("meta.ripple", fake.clone()),
+        ("ripple", fake.clone()),
+    ];
+    let before = s.node_count("kb");
+    for (k, m) in &variants {
+        let file = s.write("prov.json", &json!([rec(k, m.clone())]));
+        for extra in [&[][..], &["--dry-run"][..], &["--remint"][..], &["--remint", "--dry-run"][..]] {
+            let o = s.import("kb", &file, extra, &[]);
+            assert_ne!(o.rc, 0, "{k} {m} {extra:?}: {}", o.out);
+            assert!(o.err.contains("refused: ripple_provenance"), "{k} {m} {extra:?}: {}", o.err);
+        }
+    }
+    assert_eq!(s.node_count("kb"), before, "nothing landed directly");
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let r = svc.call(&s, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "Opens the writer")]}));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    let before = s.node_count("kb");
+    for (k, m) in &variants {
+        let o = s.import("kb", &s.write("prov.json", &json!([rec(k, m.clone())])), &["--remint"], &pids);
+        assert_ne!(o.rc, 0, "{k} {m}: {}", o.out);
+        assert!(o.err.contains("refused: ripple_provenance"), "{k} {m}: {}", o.err);
+        let r = svc.call(&s, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [rec(k, m.clone())]}));
+        let refused = &r["structuredContent"]["refused"];
+        assert_eq!((refused["code"].clone(), refused["detail"]["refused"].clone()), (json!("usage"), json!("ripple_provenance")), "{k} {m}: {r}");
+    }
+    assert_eq!(s.node_count("kb"), before, "nothing landed through the service");
+    svc.stop();
+}
+
+/// **`soup import` writes back what a read shows** (issue #23, item 2.4):
+/// the keys a read adds are dropped and named in `ignored`, direct and
+/// dry.
+#[test]
+fn w3c_soup_import_drops_what_a_read_adds_and_says_so() {
+    let s = Scratch::new("w3c", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let mut r = task("t", "a record as a read showed it");
+    r["superseded_by"] = json!(["T-9"]);
+    r["unreviewed"] = json!(true);
+    r["rejected"] = json!(true);
+    let file = s.write("back.json", &json!([r]));
+    for extra in [&["--remint", "--dry-run"][..], &["--remint"][..]] {
+        let o = s.import("kb", &file, extra, &[]);
+        assert_eq!(o.rc, 0, "{extra:?}: {} {}", o.out, o.err);
+        let doc: Value = serde_json::from_str(&o.out).unwrap();
+        let keys: Vec<&str> = doc["ignored"].as_array().unwrap().iter().map(|v| v["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, ["superseded_by", "unreviewed", "rejected"], "{extra:?}: {doc}");
+    }
 }
 
 /// Every character [`soup_door::review::hidden`] names, found in `text`
@@ -2100,4 +2185,706 @@ fn f3_a_corpus_import_is_sent_to_the_service_that_holds_the_soup() {
     assert_eq!((d["refusal"].clone(), d["forwarded_to"]["pid"].clone()), (json!("batch-already-landed"), json!(svc.pid())), "{d}");
     assert_eq!(s.node_count("kb"), before + 7);
     svc.stop();
+}
+
+// --------------------------------------------------------------------- B5
+
+/// **One server per cauldron.** `cauldron mcp config --cauldron kb` prints
+/// a `.mcp.json` entry (and nothing else on stdout) whose command is this
+/// cauldron by its absolute path and whose args pin the bridge to `kb`;
+/// that entry, run as written, is a server for `kb` alone: a call naming no
+/// cauldron reaches `kb` from any directory, a call naming `kb` too, and a
+/// call naming another granted cauldron is refused as `cauldron_pinned`
+/// and never reaches the service (a write lands nothing), whatever
+/// `$CAULDRON_CAULDRON` says; with the service down the pin still answers
+/// first. Without `--cauldron`, `$CAULDRON_CAULDRON` only chooses a
+/// default: a call may name another cauldron. The verb refuses no
+/// `--cauldron` and a cauldron the environment does not have, and names the
+/// grant command for one not granted.
+#[test]
+fn b5_a_server_pinned_to_one_cauldron_refuses_every_other() {
+    let s = Scratch::new("b5", &["kb", "other", "ungranted"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    assert_eq!(s.import("other", &s.write("example2.json", &json!(example())), &[], &[]).rc, 0);
+    s.grant("kb");
+    soup_door::grants::grant(&s.env(), "other", &Scope::ALL, &[], "tty").unwrap();
+
+    // The entry.
+    let o = s.run(&["mcp", "config", "--cauldron", "kb", "--env", "dev"], &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let entry = o.json();
+    let server = &entry["mcpServers"]["cauldron-kb"];
+    assert_eq!(server["command"], json!(CAULDRON), "{entry}");
+    let args: Vec<String> = server["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect();
+    assert_eq!(args, ["mcp", "stdio", "--env", "dev", "--cauldron", "kb"], "{entry}");
+    assert_eq!(entry["mcpServers"].as_object().unwrap().len(), 1, "{entry}");
+    assert!(o.err.contains("cauldron_pinned") && !o.err.contains("not granted"), "{}", o.err);
+    // Its refusals, and the note for a cauldron not granted.
+    let o = s.run(&["mcp", "config", "--env", "dev"], &[]);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("--cauldron"), "{}", o.err);
+    let o = s.run(&["mcp", "config", "--cauldron", "nope", "--env", "dev"], &[]);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("no cauldron `nope`") && o.out.is_empty(), "{}", o.err);
+    let o = s.run(&["mcp", "config", "--cauldron", "ungranted", "--env", "dev"], &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert!(o.err.contains("not granted") && o.err.contains("cauldron mcp grant ungranted"), "{}", o.err);
+
+    // The entry, run as written, from a directory outside every project,
+    // with $CAULDRON_CAULDRON naming the other cauldron.
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let pinned: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+    let mut b = Bridge::start_bare(&s, &s.0.join("work"), &pinned, &[("CAULDRON_CAULDRON", "other")], &pids);
+    let i = init(&mut b);
+    assert!(i["result"]["instructions"].as_str().unwrap().contains("pinned to cauldron `kb`"), "{i}");
+    let st = b.call(1, "soup_status", json!({}));
+    assert_eq!(st["structuredContent"]["cauldron"], "kb", "{st}");
+    let st = b.call(2, "soup_status", json!({"cauldron": "kb"}));
+    assert_eq!(st["structuredContent"]["cauldron"], "kb", "{st}");
+    let before = (s.node_count("kb"), s.node_count("other"), s.calls().len());
+    for (n, (tool, args)) in [
+        ("soup_status", json!({"cauldron": "other"})),
+        ("soup_search", json!({"cauldron": "other", "query": "import"})),
+        ("soup_put", json!({"cauldron": "other", "remint": true, "records": [task("t", "Must not land")]})),
+        ("soup_link", json!({"cauldron": " other ", "from": "DEC-1", "kind": "ref", "to": "T-1"})),
+        ("soup_dump_session", json!({"cauldron": "other"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (code, msg) = refused(&b.call(10 + n as u64, tool, args));
+        assert_eq!(code, "cauldron_pinned", "{tool}: {msg}");
+        assert!(msg.contains("`kb`") && msg.contains("`other`") && msg.contains("Nothing was read or written"), "{msg}");
+    }
+    assert_eq!((s.node_count("kb"), s.node_count("other"), s.calls().len()), before, "nothing reached the service");
+    // A write naming no cauldron lands in kb.
+    let put = b.call(20, "soup_put", json!({"remint": true, "records": [task("t", "Pinned write")]}));
+    assert_eq!(put["structuredContent"]["cauldron"], "kb", "{put}");
+    assert_eq!(s.node_count("kb"), before.0 + 1);
+    b.finish();
+
+    // Not pinned: $CAULDRON_CAULDRON is a default, and a call may name another.
+    let mut b = Bridge::start(&s, &s.0.join("work"), &[], &[("CAULDRON_CAULDRON", "kb")], &pids);
+    init(&mut b);
+    let st = b.call(1, "soup_status", json!({}));
+    assert_eq!(st["structuredContent"]["cauldron"], "kb", "{st}");
+    let st = b.call(2, "soup_status", json!({"cauldron": "other"}));
+    assert_eq!(st["structuredContent"]["cauldron"], "other", "{st}");
+    b.finish();
+    svc.stop();
+
+    // With the service down the pin still answers first.
+    let mut b = Bridge::start_bare(&s, &s.0.join("work"), &pinned, &[], &[]);
+    init(&mut b);
+    let (code, _) = refused(&b.call(1, "soup_status", json!({"cauldron": "other"})));
+    assert_eq!(code, "cauldron_pinned");
+    let (code, _) = refused(&b.call(2, "soup_status", json!({})));
+    assert_eq!(code, "service_down");
+    let (rc, _, err) = b.finish();
+    assert_eq!(rc, 0, "{err}");
+}
+
+/// `cauldron soup link | unlink | cite` while the `mcp` service holds the
+/// soup: each is sent to it as `soup_link`, `soup_unlink`, `soup_cite`,
+/// lands through it (`forwarded_to`), and is audited as the CLI's; a
+/// refusal comes back with its reasons and exit 1.
+#[test]
+fn k3_link_unlink_and_cite_are_sent_to_the_service_that_holds_the_soup() {
+    let s = Scratch::new("k3", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let r = svc.call(&s, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [task("t", "Opens the writer")]}));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert!(!lock_free(&s, "kb"), "the service holds the soup");
+    let kb = ["--env", "dev", "--cauldron", "kb"];
+    let soup = |args: &[&str]| {
+        let mut a = vec!["soup"];
+        a.extend_from_slice(args);
+        a.extend_from_slice(&kb);
+        s.run(&a, &pids)
+    };
+    for (args, want, tool) in [
+        (vec!["link", "T-1", "ref", "M-1"], "linked", "soup_link"),
+        (vec!["unlink", "T-1", "ref", "M-1"], "unlinked", "soup_unlink"),
+        (vec!["cite", "T-1", "--add", r#"{"kind":"url","url":"https://example.com/t"}"#], "cited", "soup_cite"),
+        (vec!["cite", "T-1", "--remove", "0"], "uncited", "soup_cite"),
+    ] {
+        let o = soup(&args);
+        assert_eq!(o.rc, 0, "{args:?}: {}\n{}", o.out, o.err);
+        assert_eq!(o.json()["outcome"], want, "{}", o.out);
+        assert_eq!(o.json()["forwarded_to"]["pid"], json!(svc.pid()), "{}", o.out);
+        assert!(s.calls().iter().any(|l| l["tool"] == tool && l["outcome"] == want && l["client"] == "cli"), "{tool}: {:?}", s.calls());
+    }
+    let o = soup(&["unlink", "T-1", "in_region", "R-2"]);
+    assert_eq!(o.rc, 1, "{}\n{}", o.out, o.err);
+    assert_eq!(o.json()["links"][0]["refused"]["reason"], "required-edge", "{}", o.out);
+    svc.stop();
+}
+
+// ------------------------------------------------------------- owner acts
+
+impl Scratch {
+    /// [`Scratch::run`] with `vars` set on the child (no terminal).
+    fn run_with(&self, args: &[&str], pids: &[u32], vars: &[(&str, &str)]) -> Out {
+        let mut c = self.command(args, pids);
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        let o = c.stdin(Stdio::null()).output().expect("spawn cauldron");
+        Out { rc: o.status.code().unwrap_or(-1), out: String::from_utf8_lossy(&o.stdout).into_owned(), err: String::from_utf8_lossy(&o.stderr).into_owned() }
+    }
+    /// The grant row of `c`, if any.
+    fn grant_row(&self, c: &str) -> Option<Value> {
+        let g: Value = serde_json::from_str(&std::fs::read_to_string(self.mcp_dir().join("grants.json")).ok()?).ok()?;
+        g["grants"].as_array()?.iter().find(|x| x["cauldron"] == c).cloned()
+    }
+    /// One record, read back.
+    fn record(&self, id: &str) -> Value {
+        let o = self.run(&["soup", "get", id, "--env", "dev", "--cauldron", "kb"], &[]);
+        o.json()["records"][0].clone()
+    }
+    /// One line to the running service's seam, answered.
+    fn seam_line(&self, line: &str) -> String {
+        let t: Value = serde_json::from_str(&std::fs::read_to_string(self.data().join("seams.json")).unwrap()).unwrap();
+        let addr: SocketAddr = t["seams"]["mcp"]["addr"].as_str().unwrap().parse().unwrap();
+        let mut c = TcpStream::connect(addr).unwrap();
+        writeln!(c, "{line}").unwrap();
+        let mut answer = String::new();
+        BufReader::new(c).read_line(&mut answer).unwrap();
+        answer.trim().to_string()
+    }
+    fn key(&self, f: &str) -> String {
+        std::fs::read_to_string(self.mcp_dir().join(f)).unwrap().trim().to_string()
+    }
+    /// The owner-acts setting file, if any.
+    fn owner_acts_file(&self) -> Option<Value> {
+        serde_json::from_str(&std::fs::read_to_string(self.root().join("owner-acts.json")).ok()?).ok()
+    }
+}
+
+impl Service {
+    /// One `tools/call` straight to the door with this `_ctx`.
+    fn call_as(&self, s: &Scratch, tool: &str, mut args: Value, client: &str, session: Option<&str>) -> Value {
+        let mut ctx = json!({"client": client, "cwd": s.project().display().to_string()});
+        if let Some(id) = session {
+            ctx["session_id"] = json!(id);
+        }
+        args["_ctx"] = ctx;
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}}).to_string();
+        let mut c = TcpStream::connect(self.door).unwrap();
+        write!(
+            c,
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.door.port(),
+            s.secret(),
+            body.len()
+        )
+        .unwrap();
+        let mut raw = String::new();
+        c.read_to_string(&mut raw).unwrap();
+        let v: Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+        v["result"].clone()
+    }
+}
+
+/// A tool call's structured answer, or its refusal's code.
+fn answer_of(r: &Value) -> Value {
+    r.get("structuredContent").cloned().unwrap_or_else(|| r.clone())
+}
+
+fn refusal_code(r: &Value) -> String {
+    r["structuredContent"]["refused"]["code"].as_str().map(str::to_string).unwrap_or_else(|| r.to_string())
+}
+
+const OPEN: (&str, &str) = ("CAULDRON_OWNER_ACTS", "open");
+
+/// **OA1: every owner act is refused without a terminal by default, and the
+/// variable allows it, recorded `by: "agent"` everywhere.** With nothing
+/// chosen, `mcp grant`, `soup approve`, `ripples approve | reject` and
+/// `ripples on` each refuse without a terminal, name the command and how the
+/// owner allows it, and write nothing. With `CAULDRON_OWNER_ACTS=open` each
+/// runs: the grant row, the decided records, the answers, the audit log and
+/// the automatic journal say `agent`; `ripples on` asks nothing and prints
+/// what it authorised. A variable naming one act opens only that one; one
+/// that does not parse opens nothing and says so.
+#[test]
+fn oa1_each_act_needs_a_terminal_by_default_and_the_variable_opens_it() {
+    let s = Scratch::new("oa1", &["kb", "other"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y")]);
+    let b = crate::ripples::ripple_write(&s.soup("kb"), "run-b", "DM-2", "sonnet", &[("idea", "three", "z")]);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let acts: Vec<Vec<&str>> = vec![
+        vec!["mcp", "grant", "other", "--env", "dev"],
+        vec!["soup", "approve", a[0].as_str(), "--env", "dev", "--cauldron", "kb"],
+        vec!["ripples", "approve", a[1].as_str(), "--env", "dev", "--cauldron", "kb"],
+        vec!["ripples", "reject", "--dump", "DM-2", "--env", "dev", "--cauldron", "kb"],
+        vec!["ripples", "on", "kb", "--env", "dev"],
+    ];
+    for args in &acts {
+        let o = s.run(args, &pids);
+        assert_ne!(o.rc, 0, "{args:?}: {}", o.out);
+        assert!(o.err.contains("REFUSED:") && o.err.contains("owner's act at a terminal") && o.err.contains("unless the owner has let agents"), "{args:?}: {}", o.err);
+        assert!(o.err.contains("cauldron owner-acts open --only") && o.err.contains("CAULDRON_OWNER_ACTS="), "{args:?}: {}", o.err);
+    }
+    assert!(s.grant_row("other").is_none(), "nothing granted");
+    assert_eq!(s.queue(&[])["counts"]["unreviewed"], 3, "nothing decided");
+    assert!(!s.data().join("ripples/auto/kb.json").exists(), "nothing turned on");
+    // One act open: only that one.
+    let o = s.run_with(&acts[0], &pids, &[("CAULDRON_OWNER_ACTS", "approve")]);
+    assert_ne!(o.rc, 0, "grant is not opened by `approve`: {}", o.out);
+    // A value that does not parse opens nothing and says why.
+    let o = s.run_with(&acts[1], &pids, &[("CAULDRON_OWNER_ACTS", "yes")]);
+    assert!(o.rc != 0 && o.err.contains("CAULDRON_OWNER_ACTS=yes") && o.err.contains("it opens nothing"), "{}", o.err);
+    // The variable: each runs, as an agent.
+    let o = s.run_with(&acts[0], &pids, &[OPEN]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!(o.json()["by"], "agent");
+    assert_eq!(s.grant_row("other").unwrap()["by"], "agent");
+    // Approving and rejecting are carried out by the mcp service, which
+    // takes an agent's decision only where the persisted setting opens
+    // `approve`: the variable alone is refused before anything is sent, and
+    // an `ADECIDE` sent straight to the service is refused there too.
+    for args in &acts[1..4] {
+        let o = s.run_with(args, &pids, &[OPEN]);
+        assert!(o.rc != 0 && o.err.contains("which takes an agent's decision only where the owner's persisted owner_acts setting opens `approve`") && o.err.contains("Nothing was sent"), "{args:?}: {}", o.err);
+    }
+    let line = s.seam_line(&format!("ADECIDE {} {}", s.key("approve.secret"), json!({"cauldron": "kb", "action": "approve", "ids": [a[0]]})));
+    assert!(line.contains("\"owner_act_closed\"") && line.contains("persisted owner_acts setting"), "{line}");
+    assert_eq!(s.queue(&[])["counts"]["unreviewed"], 3, "nothing decided");
+    let o = s.run_with(&["owner-acts", "open", "--only", "approve"], &[], &[OPEN]);
+    assert_eq!((o.rc, o.json()["how"].clone()), (0, json!("env")), "{}", o.err);
+    let o = s.run_with(&acts[1], &pids, &[OPEN]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!((o.json()["by"].clone(), o.json()["approved"].clone()), (json!("agent"), json!([a[0]])), "{}", o.out);
+    let o = s.run_with(&acts[2], &pids, &[("CAULDRON_OWNER_ACTS", "approve")]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert!(o.err.contains("by: agent"), "{}", o.err);
+    let o = s.run_with(&acts[3], &pids, &[OPEN]);
+    assert_eq!((o.rc, o.json()["rejected"].clone()), (0, json!([b[0]])), "{}", o.err);
+    for id in [&a[0], &a[1]] {
+        assert_eq!(s.record(id)["meta"]["approved"]["by"], "agent", "{id}");
+    }
+    assert_eq!(s.record(&b[0])["meta"]["rejected"]["by"], "agent");
+    let audit = s.calls();
+    for t in ["soup_approve", "soup_reject"] {
+        assert!(audit.iter().any(|l| l["tool"] == t && l["client"] == "cli" && l["by"] == "agent"), "{t}: {audit:?}");
+    }
+    let o = s.run_with(&acts[4], &pids, &[OPEN]);
+    assert_eq!(o.rc, 0, "{}{}", o.out, o.err);
+    assert!(o.out.contains("No terminal: no question asked") && !o.out.contains("[y/N]"), "{}", o.out);
+    let v = printed_json(&o.out);
+    assert_eq!((v["outcome"].clone(), v["by"].clone()), (json!("on"), json!("agent")), "{v}");
+    assert!(v["authorised"]["what"].as_str().unwrap().contains("What is sent where"), "{v}");
+    let journal = std::fs::read_to_string(s.data().join("ripples/auto.jsonl")).unwrap();
+    let on: Value = journal.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|l| l["event"] == "turned_on").expect("a turned_on line");
+    assert_eq!((on["by"].clone(), on["cauldron"].clone()), (json!("agent"), json!("kb")), "{on}");
+    // The status views show who turned it on and the effective setting.
+    let o = s.run(&["ripples", "status", "--env", "dev", "--cauldron", "kb"], &pids);
+    let st = o.json();
+    let kb = st["owner_acts"]["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap().clone();
+    assert_eq!((kb["turned_on_by"]["by"].clone(), kb["setting"].clone()), (json!("agent"), json!("approve")), "{st}");
+    svc.stop();
+}
+
+/// **OA2: `owner-acts open` persists the choice; a cauldron's own choice
+/// wins both ways; `--only` opens only what it lists; `unset` hands the
+/// cauldron back to the root.** Opening without a terminal and without the
+/// variable is refused, nothing written; closing runs anywhere. Every
+/// choice records when and how it was set, and `show`, `mcp status`,
+/// `ripples status` and `status` say what is in effect and from where.
+#[test]
+fn oa2_the_setting_persists_and_a_cauldrons_choice_wins_both_ways() {
+    let s = Scratch::new("oa2", &["kb", "k2"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    assert_eq!(s.import("k2", &s.write("example2.json", &json!(example())), &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y"), ("idea", "three", "z")]);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let approve = |id: &str| s.run(&["soup", "approve", id, "--env", "dev", "--cauldron", "kb"], &pids);
+    // No setting is `terminal`.
+    let v = s.run(&["owner-acts", "show", "--env", "dev"], &[]).json();
+    assert_eq!(v["summary"]["root"], "terminal");
+    assert!(v["cauldrons"].as_array().unwrap().iter().all(|c| c["setting"] == "terminal"), "{v}");
+    // Opening needs a terminal or the variable.
+    let o = s.run(&["owner-acts", "open"], &[]);
+    assert!(o.rc != 0 && o.err.contains("REFUSED: letting agents act for the owner is the owner's choice") && o.err.contains("cauldron owner-acts open --only grant,approve,ripples"), "{}", o.err);
+    let o = s.run_with(&["owner-acts", "open"], &[], &[("CAULDRON_OWNER_ACTS", "approve")]);
+    assert!(o.rc != 0 && o.err.contains("it would open grant,ripples"), "the variable must open each act opened: {}", o.err);
+    assert!(s.owner_acts_file().is_none(), "nothing written");
+    // How a choice was set is the command's to record, never an argument's:
+    // `--how install` is refused, with the variable and at a terminal alike.
+    let o = s.run_with(&["owner-acts", "open", "--only", "approve", "--how", "install"], &[], &[("CAULDRON_OWNER_ACTS", "approve")]);
+    assert!(o.rc != 0 && o.err.contains("`--how` is not an option") && o.err.contains("cauldron install --owner-acts"), "{}", o.err);
+    let o = s.on_tty(&["owner-acts", "terminal", "--how=install"], &[], &[], None);
+    assert!(o.rc != 0 && o.out.contains("`--how` is not an option"), "{}", o.out);
+    assert!(s.owner_acts_file().is_none(), "nothing written");
+    // At a terminal, --only approve: approve opens, grant does not.
+    let o = s.on_tty(&["owner-acts", "open", "--only", "approve"], &[], &[], None);
+    assert_eq!(o.rc, 0, "{}", o.out);
+    let v = printed_json(&o.out);
+    assert_eq!((v["setting"].clone(), v["how"].clone(), v["scope"].clone()), (json!("approve"), json!("tty"), json!("root")), "{v}");
+    assert!(v["note"].as_str().unwrap().contains("approve or reject what a ripple wrote"), "{v}");
+    assert_eq!(s.owner_acts_file().unwrap()["root"]["how"], "tty");
+    let o = approve(&a[0]);
+    assert_eq!((o.rc, o.json()["by"].clone()), (0, json!("agent")), "{}", o.err);
+    let o = s.run(&["mcp", "grant", "k2", "--env", "dev"], &[]);
+    assert_ne!(o.rc, 0, "--only approve does not open grant: {}", o.out);
+    // The cauldron's own choice closes it for kb alone (closing needs no terminal).
+    let o = s.run(&["owner-acts", "terminal", "--cauldron", "kb", "--env", "dev"], &[]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    assert_eq!((o.json()["setting"].clone(), o.json()["how"].clone()), (json!("terminal"), json!("env")));
+    let o = approve(&a[1]);
+    assert!(o.rc != 0 && o.err.contains("owner's act at a terminal"), "kb's own choice wins: {}", o.err);
+    let v = s.run(&["owner-acts", "show", "--env", "dev"], &[]).json();
+    let by = |c: &str| v["cauldrons"].as_array().unwrap().iter().find(|x| x["cauldron"] == c).unwrap().clone();
+    assert_eq!((by("kb")["from"].clone(), by("kb")["acts"]["approve"].clone()), (json!("cauldron"), json!("terminal")), "{v}");
+    assert_eq!((by("k2")["from"].clone(), by("k2")["acts"]["approve"].clone()), (json!("root"), json!("root")), "{v}");
+    // The other way: root closed, kb opened, by the variable.
+    assert_eq!(s.run(&["owner-acts", "terminal"], &[]).rc, 0);
+    let o = s.run_with(&["owner-acts", "open", "--only", "approve", "--cauldron", "kb", "--env", "dev"], &[], &[("CAULDRON_OWNER_ACTS", "approve")]);
+    assert_eq!((o.rc, o.json()["how"].clone()), (0, json!("env")), "{}", o.err);
+    let o = approve(&a[1]);
+    assert_eq!((o.rc, o.json()["by"].clone()), (0, json!("agent")), "{}", o.err);
+    // The status views.
+    let m = s.run(&["mcp", "status", "--env", "dev"], &pids).json();
+    let row = m["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap().clone();
+    assert_eq!((row["owner_acts"]["setting"].clone(), row["owner_acts"]["from"].clone()), (json!("approve"), json!("cauldron")), "{m}");
+    assert_eq!(m["owner_acts"]["root"], "terminal", "{m}");
+    let st = s.run_with(&["status", "--json"], &[], &[("CAULDRON_ENV", "dev")]);
+    let st: Value = serde_json::from_str(&st.out).unwrap_or_else(|e| panic!("{e}: {} {}", st.out, st.err));
+    assert!(st["owner_acts"]["cauldrons"].as_array().unwrap().iter().any(|c| c["cauldron"] == "kb" && c["setting"] == "approve"), "{st}");
+    let txt = s.run_with(&["status"], &[], &[("CAULDRON_ENV", "dev")]);
+    assert!(txt.out.contains("owner acts: root terminal; open without a terminal: kb approve"), "{}", txt.out);
+    // unset: the root's applies again.
+    let o = s.run(&["owner-acts", "unset", "--cauldron", "kb", "--env", "dev"], &[]);
+    assert_eq!((o.rc, o.json()["outcome"].clone()), (0, json!("unset")), "{}", o.err);
+    assert_ne!(approve(&a[2]).rc, 0, "back to the root's `terminal`");
+    // --env without --cauldron is refused (the root's choice covers every environment).
+    assert_ne!(s.run(&["owner-acts", "open", "--env", "dev"], &[]).rc, 0);
+    // A cauldron with no choice of its own starts from the root's, and the
+    // answer names what it took over and that it stops following the root.
+    assert_eq!(s.on_tty(&["owner-acts", "open"], &[], &[], None).rc, 0);
+    let o = s.run_with(&["owner-acts", "open", "--only", "approve", "--cauldron", "k2", "--env", "dev"], &[], &[("CAULDRON_OWNER_ACTS", "approve")]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let v = o.json();
+    assert_eq!((v["setting"].clone(), v["copied_from_root"].clone()), (json!("open"), json!("grant,ripples")), "{v}");
+    assert!(v["copied_note"].as_str().unwrap().contains("no longer reaches it"), "{v}");
+    let o = s.run_with(&["owner-acts", "open", "--only", "approve", "--cauldron", "k2", "--env", "dev"], &[], &[("CAULDRON_OWNER_ACTS", "approve")]);
+    assert!(o.json().get("copied_from_root").is_none(), "its own choice now: nothing copied: {}", o.out);
+    svc.stop();
+}
+
+/// **OA3: who decided is on every record and the reads filter on it.** A
+/// decision at a terminal says `tty`, one under the open setting `agent`;
+/// `soup nodes --review by-tty | by-agent` keeps only those, each listed
+/// with `decided_by`, and the review queue counts both.
+#[test]
+fn oa3_by_is_recorded_on_each_record_and_the_reads_filter_on_it() {
+    let s = Scratch::new("oa3", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y"), ("idea", "three", "z")]);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let o = s.on_tty(&["soup", "approve", &a[0], "--env", "dev", "--cauldron", "kb"], &pids, &[], None);
+    assert_eq!(printed_json(&o.out)["by"], "tty", "{}", o.out);
+    // An agent's decision needs the persisted setting (the service checks it).
+    assert_eq!(s.run_with(&["owner-acts", "open", "--only", "approve"], &[], &[OPEN]).rc, 0);
+    let o = s.run_with(&["soup", "approve", &a[1], "--env", "dev", "--cauldron", "kb"], &pids, &[OPEN]);
+    assert_eq!(o.json()["by"], "agent", "{}", o.err);
+    assert_eq!((s.record(&a[0])["meta"]["approved"]["by"].clone(), s.record(&a[1])["meta"]["approved"]["by"].clone()), (json!("tty"), json!("agent")));
+    let list = |f: &str| -> Vec<(String, String)> {
+        let v = s.run(&["soup", "nodes", "--env", "dev", "--cauldron", "kb", "--review", f, "--limit", "100"], &[]).json();
+        v["nodes"].as_array().unwrap().iter().map(|n| (n["id"].as_str().unwrap().to_string(), n["decided_by"].as_str().unwrap_or("").to_string())).collect()
+    };
+    assert_eq!(list("by-tty"), vec![(a[0].clone(), "tty".to_string())]);
+    assert_eq!(list("by-agent"), vec![(a[1].clone(), "agent".to_string())]);
+    let o = s.run(&["soup", "nodes", "--env", "dev", "--cauldron", "kb", "--review", "by-someone"], &[]);
+    assert!(o.rc != 0 && o.err.contains("by-agent"), "{}", o.err);
+    let q = s.queue(&[]);
+    assert_eq!((q["counts"]["decided_by"]["tty"].clone(), q["counts"]["decided_by"]["agent"].clone()), (json!(1), json!(1)), "{q}");
+    // The same filter through the door.
+    let r = svc.call(&s, "soup_nodes", json!({"cauldron": "kb", "review": "by-agent"}));
+    let ids: Vec<Value> = answer_of(&r)["nodes"].as_array().unwrap().iter().map(|n| n["id"].clone()).collect();
+    assert_eq!(ids, vec![json!(a[1])], "{r}");
+    svc.stop();
+}
+
+/// **OA4: the MCP tools.** Closed (the default), `soup_approve` and
+/// `soup_reject` are refused `owner_act_closed`, nothing written. Opened by
+/// the owner's setting, they decide by ids, dump or run, `undo` takes a
+/// decision back, and each decision is recorded `by: "agent"` with the
+/// session, on the record, in the answer and in the audit. A ripple's
+/// identity is refused under every setting, and no record write sets a
+/// review flag whatever the setting.
+#[test]
+fn oa4_the_mcp_tools_are_refused_closed_and_decide_as_an_agent_when_open() {
+    let s = Scratch::new("oa4", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y")]);
+    let b = crate::ripples::ripple_write(&s.soup("kb"), "run-b", "DM-2", "sonnet", &[("idea", "three", "z")]);
+    s.grant("kb");
+    let svc = Service::start(&s);
+    let call = |tool: &str, args: Value| svc.call_as(&s, tool, args, "claude-code", Some("sess-1"));
+    // Closed.
+    for (tool, args) in [("soup_approve", json!({"cauldron": "kb", "ids": [a[0]]})), ("soup_reject", json!({"cauldron": "kb", "dump": "DM-2"}))] {
+        let r = call(tool, args);
+        assert_eq!(r["isError"], json!(true), "{tool}: {r}");
+        assert_eq!(refusal_code(&r), "owner_act_closed", "{tool}: {r}");
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("cauldron owner-acts open --only approve"), "{r}");
+    }
+    assert_eq!(s.queue(&[])["counts"]["unreviewed"], 3, "nothing written");
+    // A ripple's identity is refused, open or not.
+    let ripple = |s: &Scratch| svc.call_as(s, "soup_approve", json!({"cauldron": "kb", "ids": [a[0]]}), "ripples", None);
+    assert_eq!(refusal_code(&ripple(&s)), "ripple_refused");
+    // Open (the owner's persisted choice, made at a terminal).
+    assert_eq!(s.on_tty(&["owner-acts", "open", "--only", "approve"], &[], &[], None).rc, 0);
+    assert_eq!(refusal_code(&ripple(&s)), "ripple_refused", "a ripple never decides, whatever the setting");
+    let r = call("soup_approve", json!({"cauldron": "kb", "run": "run-a"}));
+    let v = answer_of(&r);
+    assert_eq!((v["by"].clone(), v["session"].clone(), v["approved"].as_array().map(Vec::len)), (json!("agent"), json!("sess-1"), Some(2)), "{r}");
+    let rec = s.record(&a[0]);
+    assert_eq!((rec["meta"]["approved"]["by"].clone(), rec["meta"]["approved"]["session"].clone()), (json!("agent"), json!("sess-1")), "{rec}");
+    let r = call("soup_reject", json!({"cauldron": "kb", "ids": [b[0]], "reason": "not useful"}));
+    assert_eq!(answer_of(&r)["rejected"], json!([b[0]]), "{r}");
+    assert_eq!(s.record(&b[0])["meta"]["rejected"]["reason"], "not useful");
+    let r = call("soup_approve", json!({"cauldron": "kb", "ids": [a[1]], "undo": true}));
+    assert_eq!(answer_of(&r)["unapproved"], json!([a[1]]), "{r}");
+    let r = call("soup_approve", json!({"cauldron": "kb", "ids": [a[1]], "dump": "DM-1"}));
+    assert_eq!(refusal_code(&r), "usage", "{r}");
+    let audit = s.calls();
+    for t in ["soup_approve", "soup_reject"] {
+        assert!(audit.iter().any(|l| l["tool"] == t && l["client"] == "claude-code" && l["session"] == "sess-1" && l["by"] == "agent"), "{t}: {audit:?}");
+    }
+    // No record write sets a review flag, open or not.
+    let mut t = task("t", "Approved by a write");
+    t["meta"] = json!({"approved": {"at": "2026-01-01T00:00:00Z", "by": "tty"}});
+    let r = svc.call(&s, "soup_put", json!({"cauldron": "kb", "remint": true, "records": [t]}));
+    assert_eq!(r["isError"], json!(true), "{r}");
+    // The ripples key never reaches a decision verb.
+    let line = s.seam_line(&format!("ADECIDE {} {}", s.key("ripples.secret"), json!({"cauldron": "kb", "action": "approve", "ids": [a[1]]})));
+    assert!(line.contains("\"unauthorized\""), "{line}");
+    svc.stop();
+}
+
+/// **OA4b: the variable never opens the door.** A service whose own
+/// environment carries `CAULDRON_OWNER_ACTS=approve` (started by hand; the
+/// supervisor removes it) still refuses `soup_approve` and `soup_reject`
+/// `owner_act_closed` while nothing is persisted, and `soup_status`,
+/// `mcp status` and `owner-acts show` (run with the variable too) say
+/// `terminal` for sessions while saying `env` for this command line. The
+/// persisted `owner-acts open --only approve` opens it, and every view says
+/// so for sessions.
+#[test]
+fn oa4b_the_variable_never_opens_the_door_and_the_views_say_so() {
+    let s = Scratch::new("oa4b", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x")]);
+    s.grant("kb");
+    let svc = Service::start_bin_with(&s, &service_bin(), &[("CAULDRON_OWNER_ACTS", "approve")]);
+    let pids = [svc.pid()];
+    let call = |tool: &str, args: Value| svc.call_as(&s, tool, args, "claude-code", Some("sess-1"));
+    for (tool, args) in [("soup_approve", json!({"cauldron": "kb", "ids": [a[0]]})), ("soup_reject", json!({"cauldron": "kb", "ids": [a[0]]}))] {
+        let r = call(tool, args);
+        assert_eq!(refusal_code(&r), "owner_act_closed", "{tool}: the service's own variable opened the door: {r}");
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("CAULDRON_OWNER_ACTS opens nothing here"), "{r}");
+    }
+    assert_eq!(s.queue(&[])["counts"]["unreviewed"], 1, "nothing written");
+    let st = answer_of(&call("soup_status", json!({"cauldron": "kb"})));
+    assert_eq!(st["owner_acts"]["approve"], "terminal", "{st}");
+    let var = [("CAULDRON_OWNER_ACTS", "approve")];
+    let m = s.run_with(&["mcp", "status", "--env", "dev"], &pids, &var).json();
+    let row = m["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap().clone();
+    assert_eq!((row["owner_acts"]["acts"]["approve"].clone(), row["owner_acts"]["sessions"]["approve"].clone()), (json!("env"), json!("terminal")), "{m}");
+    assert_eq!(m["owner_acts"]["sessions"]["approve"], "terminal", "{m}");
+    assert!(m["owner_acts"]["env_var"]["for"].as_str().unwrap().contains("never an MCP session"), "{m}");
+    let v = s.run_with(&["owner-acts", "show", "--env", "dev"], &[], &var).json();
+    let kb = v["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap().clone();
+    assert_eq!((kb["acts"]["approve"].clone(), kb["sessions"]["approve"].clone()), (json!("env"), json!("terminal")), "{v}");
+    // Persisted: open for sessions, and shown.
+    assert_eq!(s.on_tty(&["owner-acts", "open", "--only", "approve"], &[], &[], None).rc, 0);
+    let r = call("soup_approve", json!({"cauldron": "kb", "ids": [a[0]]}));
+    assert_eq!((answer_of(&r)["by"].clone(), answer_of(&r)["approved"].clone()), (json!("agent"), json!([a[0]])), "{r}");
+    let st = answer_of(&call("soup_status", json!({"cauldron": "kb"})));
+    assert_eq!((st["owner_acts"]["approve"].clone(), st["owner_acts"]["from"].clone()), (json!("open"), json!("root")), "{st}");
+    let m = s.run(&["mcp", "status", "--env", "dev"], &pids).json();
+    let row = m["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap().clone();
+    assert_eq!((row["owner_acts"]["acts"]["approve"].clone(), row["owner_acts"]["sessions"]["approve"].clone()), (json!("root"), json!("open")), "{m}");
+    assert_eq!(m["owner_acts"]["sessions"]["approve"], "open", "{m}");
+    let v = s.run(&["owner-acts", "show", "--env", "dev"], &[]).json();
+    let kb = v["cauldrons"].as_array().unwrap().iter().find(|c| c["cauldron"] == "kb").unwrap().clone();
+    assert_eq!(kb["sessions"]["approve"], "open", "{v}");
+    svc.stop();
+}
+
+/// **OA5: across releases, no request is misread.** A newer command line
+/// sends an agent's decision on a verb of its own (`ADECIDE`), so a service
+/// that does not know it (here the fake of a release before it) answers
+/// `ERR unknown request`, writes nothing, and the command names the
+/// upgrade. The reverse: an older command line's `DECIDE` and `APPROVE`
+/// (sent only after its terminal check) land on this service as `tty`, and
+/// `ADECIDE` as `agent`. A root from the release before (no owner-acts
+/// file) reads `terminal`, and a decision it recorded as `by: "owner"`
+/// reads as `tty`.
+#[test]
+fn oa5_older_and_newer_releases_never_misread_an_owner_act() {
+    // A newer command line, an older service.
+    let s = Scratch::new("oa5", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x")]);
+    s.grant("kb");
+    // Persisted, so this command line gets as far as sending its ADECIDE.
+    assert_eq!(s.run_with(&["owner-acts", "open", "--only", "approve"], &[], &[OPEN]).rc, 0);
+    let heard = old_mcp(&s, env!("CARGO_PKG_VERSION"));
+    let me = [std::process::id()];
+    let before = s.queue(&[]);
+    for args in [
+        vec!["soup", "approve", a[0].as_str(), "--env", "dev", "--cauldron", "kb"],
+        vec!["ripples", "reject", "--dump", "DM-1", "--env", "dev", "--cauldron", "kb"],
+    ] {
+        let o = s.run_with(&args, &me, &[OPEN]);
+        assert_ne!(o.rc, 0, "{args:?}: {}", o.out);
+        assert!(o.err.contains("does not know `ADECIDE`") && o.err.contains("It wrote nothing, and nothing was decided"), "{args:?}: {}", o.err);
+    }
+    let lines = heard.lock().unwrap().clone();
+    assert!(!lines.is_empty() && lines.iter().all(|l| l.starts_with("ADECIDE ")), "only the new verb was sent: {lines:?}");
+    assert_eq!(s.queue(&[])["counts"], before["counts"], "nothing was written");
+
+    // A root from the release before, and an older command line.
+    let s = Scratch::new("oa5b", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    let a = crate::ripples::ripple_write(&s.soup("kb"), "run-a", "DM-1", "sonnet", &[("idea", "one", "x"), ("idea", "two", "y"), ("idea", "three", "z"), ("idea", "four", "w")]);
+    owner_decided(&s.soup("kb"), &a[3]);
+    s.grant("kb");
+    assert!(s.owner_acts_file().is_none());
+    let v = s.run(&["owner-acts", "show", "--env", "dev"], &[]).json();
+    assert!(v["cauldrons"].as_array().unwrap().iter().all(|c| c["setting"] == "terminal" && c["from"] == "default"), "{v}");
+    let svc = Service::start(&s);
+    assert_ne!(s.run(&["soup", "approve", &a[0], "--env", "dev", "--cauldron", "kb"], &[svc.pid()]).rc, 0, "upgraded root: terminal");
+    let key = s.key("approve.secret");
+    let line = s.seam_line(&format!("DECIDE {key} {}", json!({"cauldron": "kb", "action": "approve", "ids": [a[0]], "from": "cauldron ripples approve"})));
+    assert!(line.contains("\"by\":\"tty\""), "{line}");
+    let line = s.seam_line(&format!("APPROVE {key} {}", json!({"cauldron": "kb", "ids": [a[1]]})));
+    assert!(line.contains("\"ok\":true"), "{line}");
+    // An agent's claim is checked against the persisted setting: refused
+    // under the upgraded root's `terminal`, taken once `approve` is open.
+    let line = s.seam_line(&format!("ADECIDE {key} {}", json!({"cauldron": "kb", "action": "approve", "ids": [a[2]]})));
+    assert!(line.contains("\"owner_act_closed\""), "an agent's claim under `terminal`: {line}");
+    assert_eq!(s.run_with(&["owner-acts", "open", "--only", "approve"], &[], &[OPEN]).rc, 0);
+    let line = s.seam_line(&format!("ADECIDE {key} {}", json!({"cauldron": "kb", "action": "approve", "ids": [a[2]]})));
+    assert!(line.contains("\"by\":\"agent\""), "{line}");
+    let line = s.seam_line(&format!("DECIDE {key} {}", json!({"cauldron": "kb", "action": "approve", "ids": [a[2]], "by": "agent"})));
+    assert!(line.contains("\"usage\""), "a key DECIDE does not read is refused, never ignored: {line}");
+    let by: Vec<Value> = a.iter().map(|id| s.record(id)["meta"]["approved"]["by"].clone()).collect();
+    assert_eq!(by, vec![json!("tty"), json!("tty"), json!("agent"), json!("owner")]);
+    let list = s.run(&["soup", "nodes", "--env", "dev", "--cauldron", "kb", "--review", "by-tty", "--limit", "100"], &[]).json();
+    let mut ids: Vec<String> = list["nodes"].as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap().to_string()).collect();
+    ids.sort();
+    let mut want = vec![a[0].clone(), a[1].clone(), a[3].clone()];
+    want.sort();
+    assert_eq!(ids, want, "a decision recorded as the owner's reads as tty");
+    svc.stop();
+}
+
+/// A decision as the release before this one wrote it (`by: "owner"`),
+/// straight into the soup.
+fn owner_decided(soup: &Path, id: &str) {
+    use spine::envelope::{Envelope, Initiator, Instrument, Mode, Provenance, ENVELOPE_FORMAT_VERSION};
+    let c = spine::Cauldron::open(soup, spine::config::SpineConfig::default()).unwrap();
+    let mut bindings = std::collections::BTreeMap::new();
+    bindings.insert("id".to_string(), json!(id));
+    bindings.insert("v".to_string(), json!({"at": "2026-01-01T00:00:00Z", "by": "owner"}));
+    let env = Envelope {
+        statement: "MATCH (n: ws/idea { id: $id })\nSET n.meta.approved = $v".into(),
+        bindings,
+        format_version: ENVELOPE_FORMAT_VERSION,
+        provenance: Provenance {
+            initiator: Initiator::Agent { thread: "owner".into(), dispatch: "cauldron ripples approve".into() },
+            instrument: Instrument { name: "test".into(), version: "0".into() },
+        },
+        mode: Mode::Commit,
+        idempotency_nonce: Some(format!("owner-{id}")),
+    };
+    assert!(matches!(c.submit(env).unwrap(), spine::Outcome::Committed { .. }));
+}
+
+/// **A pinned bridge and the owner-act tools.** With `approve` opened to
+/// agents for the whole root (so both cauldrons would take a decision), a
+/// bridge pinned to `kb` refuses `soup_approve` and `soup_reject` naming
+/// `other` as `cauldron_pinned`, before the service sees them: nothing is
+/// decided in `other` and nothing is audited, whatever `$CAULDRON_CAULDRON`
+/// says. The same tools naming no cauldron reach `kb` and decide as an
+/// agent there.
+#[test]
+fn b6_a_pinned_bridge_refuses_the_owner_act_tools_for_another_cauldron() {
+    let s = Scratch::new("b6", &["kb", "other"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    assert_eq!(s.import("other", &s.write("example2.json", &json!(example())), &[], &[]).rc, 0);
+    let k = crate::ripples::ripple_write(&s.soup("kb"), "run-k", "DM-1", "sonnet", &[("idea", "kept", "x")]);
+    let o = crate::ripples::ripple_write(&s.soup("other"), "run-o", "DM-1", "sonnet", &[("idea", "elsewhere", "y")]);
+    s.grant("kb");
+    soup_door::grants::grant(&s.env(), "other", &Scope::ALL, &[], "tty").unwrap();
+    assert_eq!(s.on_tty(&["owner-acts", "open", "--only", "approve"], &[], &[], None).rc, 0);
+    let svc = Service::start(&s);
+    let pids = [svc.pid()];
+    let mut b = Bridge::start_bare(&s, &s.0.join("work"), &["--env", "dev", "--cauldron", "kb"], &[("CAULDRON_CAULDRON", "other")], &pids);
+    init(&mut b);
+    let before = s.calls().len();
+    for (n, (tool, args)) in [
+        ("soup_approve", json!({"cauldron": "other", "ids": [o[0]]})),
+        ("soup_approve", json!({"cauldron": " other ", "dump": "DM-1"})),
+        ("soup_reject", json!({"cauldron": "other", "run": "run-o", "reason": "not here"})),
+        ("soup_reject", json!({"cauldron": "other", "ids": [o[0]], "undo": true})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (code, msg) = refused(&b.call(20 + n as u64, tool, args));
+        assert_eq!(code, "cauldron_pinned", "{tool}: {msg}");
+        assert!(msg.contains("Nothing was read or written"), "{msg}");
+    }
+    assert_eq!(s.calls().len(), before, "nothing reached the service");
+    let got = answer_of(&svc.call(&s, "soup_get", json!({"cauldron": "other", "ids": [o[0]]})));
+    let meta = &got["records"][0]["meta"];
+    assert!(meta.get("approved").is_none() && meta.get("rejected").is_none(), "`other` decided nothing: {got}");
+    // Naming no cauldron, the pinned bridge reaches `kb`, where the owner
+    // let agents decide.
+    let r = b.call(30, "soup_approve", json!({"ids": [k[0]]}));
+    let v = answer_of(&r);
+    assert_eq!((v["by"].clone(), v["approved"].clone()), (json!("agent"), json!([k[0]])), "{r}");
+    assert_eq!(s.record(&k[0])["meta"]["approved"]["by"], "agent");
+    b.finish();
+    svc.stop();
+}
+
+/// **`mcp config` opens nothing.** With every owner act opened (the
+/// owner's recorded choice, and `CAULDRON_OWNER_ACTS=open` in the shell
+/// that runs it), the printed `.mcp.json` entry is still only `command` and
+/// `args`: no `env` block, and nothing that names the variable, on stdout
+/// or stderr. The verb has no flag that would add one.
+#[test]
+fn b7_mcp_config_never_carries_owner_acts_into_a_project() {
+    let s = Scratch::new("b7", &["kb"]);
+    assert_eq!(s.import("kb", &s.write("example.json", &json!(example())), &[], &[]).rc, 0);
+    s.grant("kb");
+    let open = [("CAULDRON_OWNER_ACTS", "open")];
+    assert_eq!(s.run_with(&["owner-acts", "open"], &[], &open).rc, 0);
+    let o = s.run_with(&["mcp", "config", "--cauldron", "kb", "--env", "dev"], &[], &open);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let entry = o.json();
+    let server = entry["mcpServers"]["cauldron-kb"].as_object().unwrap();
+    let mut keys: Vec<&str> = server.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, ["args", "command"], "{entry}");
+    assert!(!o.out.contains("OWNER_ACTS") && !o.err.contains("OWNER_ACTS"), "{}\n{}", o.out, o.err);
+    let o = s.run_with(&["mcp", "config", "--cauldron", "kb", "--env", "dev", "--owner-acts", "open"], &[], &open);
+    assert_ne!(o.rc, 0, "no flag carries it: {}", o.out);
+    assert!(o.out.is_empty(), "{}", o.out);
 }

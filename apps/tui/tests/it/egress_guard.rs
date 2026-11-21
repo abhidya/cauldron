@@ -606,6 +606,14 @@ const SHIPPED_ALLOWED: &[(&str, &str, usize, &str, &str)] = &[
         "the ripples service's threads backend: a websocket HANDSHAKE over the TcpStream env::egress::connect_tcp already admitted; it dials nothing itself",
     ),
     (
+        "cli/src/inference_pull.rs",
+        concat!("/", "curl\""),
+        1,
+        "admit_external_api(",
+        "`cauldron inference models pull`: macOS's own curl, HTTPS only, no redirect followed, after the owner's yes and \
+         gated by admit_external_api (refused under isolation); it fetches only the built-in catalogue's files",
+    ),
+    (
         "services/mcp/src/http.rs",
         concat!("hyper", "::"),
         1,

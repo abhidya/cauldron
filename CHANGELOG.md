@@ -22,11 +22,472 @@ Planned, and not released yet. Ripples and the soup engine arrive in 0.2.0.
 
 - **Fix: threads daemon boot with an oversized write-ahead log.** The daemon
   will fold the log once at boot, before recovery, and its periodic fold will
-  first run at 30 seconds instead of 5 minutes. Through 0.1.16, a large log
+  first run at 30 seconds instead of 5 minutes. Through 0.1.17, a large log
   left from earlier runs can stall startup until the supervisor kills the daemon.
 - **Fix: re-login re-enables a disabled account.** A verified login will lift
-  the disable and trigger a fresh usage reading. Through 0.1.16, only an
+  the disable and trigger a fresh usage reading. Through 0.1.17, only an
   explicit enable clears it.
+
+## [0.1.17] — 2026-11-20
+
+The consumer interface of issue #1 holds as written. Every tool in the
+interface table of issue #10 can be called exactly as the table writes it.
+A Claude Code project can have an MCP server for one cauldron. A wrong edge
+or citation can be fixed on the record itself (issue #24). Three fixes left
+over from 0.1.16: reads of a quiet threads store, the plugin launcher
+started from a subdirectory, and the directory a private read left behind.
+Who may act for the owner becomes the owner's setting (issue #25). Local
+inference on a prebuilt install: the bundle now carries the `inference` and
+`ripples` services, and `cauldron inference models pull` fetches one of the
+two measured models when you ask for it. Account login, rotation and the
+account board's set-live work on a prebuilt install (issue #30). Ripples
+use Opus by default (issue #27). A record read with `soup_get` can be
+written back, and the confusions reported at 0.1.16 are fixed or documented
+(issue #23).
+
+### Added
+
+- **`soup_unlink {from, kind, to}`** (scope `write`, audited; also `{links:
+  [...]}`, as `soup_link`) and **`cauldron soup unlink <from> <kind> <to>`**
+  remove an edge between two records the soup holds, in one write, through
+  the store's existing edge removal. `soup_get` stops showing the edge, and
+  `soup_changes` lists the write as `unlink`. Removing an edge that is not
+  there answers `not-linked` and writes nothing. Each of these is refused
+  by name, and then nothing of the call is written:
+  - `required-edge`: a record's last `in_region` (or, for a record placed
+    by `rejected_by`, the edges and field that stand for it), or a
+    milestone's last `serves`;
+  - `supersedes-is-history`: a `supersedes` edge, except one from a record
+    to itself or one on a cycle of `supersedes` edges, which may be removed
+    (neither records a replacement, and each hides the records on it);
+  - `claims-is-soup-claim`: a cluster's claim, which `soup_claim` releases;
+  - `unknown-node` and `unknown-kind`;
+  - `region_locked`: a removal touching a region a ripple holds.
+- **`soup_cite {id, add | remove}`** (scope `write`, audited) and **`cauldron
+  soup cite <id> --add <json> | --remove <index-or-json>`** add or remove
+  one entry of a record's `meta.cites`, on a workspace record or a cluster.
+  An added citation is judged by the import's citation table (`bad-cite`).
+  A removal names the entry by index or by an object it matches; a match
+  of more than one entry is refused. The call writes `meta.cites` and no
+  other key, so the review flags and a ripple's provenance stay out of
+  reach. Adding a citation the record already has answers `already-cited`,
+  removing one that is not there answers `not-cited`, and neither writes.
+  On a record a ripple wrote, the `dump` citation that ties it to its dump
+  (what the review queue groups by, and what approving or rejecting by
+  `--dump` selects on) is neither added nor removed: refused
+  `dump-cite-is-provenance`, nothing written.
+- **`cauldron soup link <from> <kind> <to> [--note]`**: `soup_link` from a
+  shell (issue #23, item 2.2). `cauldron link help` now says that
+  `cauldron link` names a project's cauldron and does not connect records.
+  While the `mcp` service holds the soup, `soup link`, `unlink` and `cite`
+  are sent to it, as `soup claim` is.
+- **`soup_link {from, kind, to, note?}`**: one link given flat, as the
+  interface table writes it. `{links: [...]}` still lands several links in
+  one write. A call that gives both forms is refused as `usage`, and the
+  message names the keys that clash. A link refused for an unknown edge kind
+  now lists the kinds the grammar has (`refused.kinds`). It refuses a
+  `supersedes` edge (`supersedes-at-creation`: one is written only with the
+  new record that supersedes, through `soup_put` or an import) and a
+  `narrows` edge from a region to itself or closing a cycle (`edge-loop`).
+- **`soup_status` takes `max_chars`**, as every other read does, with the
+  same default, floor and ceiling.
+- **A refused record says what to do in two common cases** (`soup_put` and
+  `cauldron soup import`). A record whose id the soup already holds carries
+  a `hint`: the soup never writes over a record, so write the new version
+  under a new id with a `supersedes` edge to the old one. A batch-local
+  label sent without `remint` carries a hint that names `remint`.
+- **`cauldron mcp config --cauldron <name> [--env <env>]`** prints the
+  `.mcp.json` entry of an MCP server for that one cauldron, and nothing else
+  on stdout. The server is `cauldron-<name>`. It runs this `cauldron` by its
+  absolute path as `mcp stdio --env <env> --cauldron <name>`. The verb
+  refuses a cauldron the environment does not have. For a cauldron with no
+  grant it prints the grant command on stderr. It writes nothing and grants
+  nothing. The entry has no `env` block: it never carries
+  `CAULDRON_OWNER_ACTS` into a project's `.mcp.json`, and there is no flag
+  that would.
+- **`soup_approve` and `soup_reject`**, MCP tools (scope `write`): a Claude
+  Code session approves or rejects a ripple's records (by `ids`, `dump` or
+  `run`; `reason`; `undo`) where the owner opened `approve` to agents for
+  that cauldron, recorded `by: "agent"` with the session. Refused
+  `owner_act_closed`, nothing written, otherwise. The `mcp` service follows
+  the persisted choice alone: `CAULDRON_OWNER_ACTS` never reaches it.
+  `/cauldron:review` and the curator use them when the user asks and the
+  owner allowed it, and give the terminal commands when not. Granting and
+  turning ripples on stay command-line acts.
+- **`by` everywhere an act is recorded**: the command's answer, the grant
+  row, the `mcp` audit log (`calls.jsonl`), a `turned_on` line in the
+  automatic journal, and each decided record. Listed records carry
+  `decided_by`; the review filter takes `by-tty` and `by-agent` (`cauldron
+  soup nodes | search --review`, `review` on `soup_nodes` / `soup_search`);
+  the review queue counts decisions by who made them.
+- **The status views** (`cauldron status`, `cauldron mcp status`, `cauldron
+  ripples status`, `cauldron owner-acts show`) show the effective
+  owner_acts setting twice over: per act for a command run from that shell
+  without a terminal (`acts`, the variable marked `env`), and what MCP
+  sessions may do (`sessions`, the persisted setting alone). `soup_status`
+  carries the door's own answer (`owner_acts`). `ripples status` shows who
+  last turned automatic processing on.
+- **`ADECIDE`**, a new `mcp` seam verb: a decision made without a terminal
+  goes on it, so a service older than this release answers `ERR unknown
+  request` and writes nothing rather than recording an agent's decision as
+  one made at a terminal. The service takes it only where the persisted
+  owner_acts setting opens `approve` for the cauldron (`owner_act_closed`
+  otherwise). `DECIDE` is unchanged: an older command line's decisions land
+  as `tty`, which records that the command had a terminal attached and
+  cannot be checked by the service.
+- **The bundle carries `cauldron-inference` and `cauldron-ripples`**
+  (`libexec/`), with their declarations, built with the same flags, ad-hoc
+  signed (identifiers `cauldron-inference` and `cauldron-ripples`) and
+  listed in the bundle's checksums. The release gate checks them as it
+  checks every other binary (arm64, signature, identifier, the byte scan
+  for compiled-in paths, libraries, the runtime probe), and checks that
+  each states the bundle's commit with `dirty=0`.
+- **`cauldron --env <env> build <service>` from a release install**
+  installs the image the release shipped (`inference`, `ripples`, `mcp`,
+  ...), as `--artifact` would, with no cargo. It looks beside the binary
+  (`../libexec/`) and in the installed release
+  (`share/cauldron/releases/<version>-<commit>/libexec/`). A checkout build
+  still compiles.
+- **`cauldron inference models pull <name> [--yes]`** and `models pull
+  --list`. The catalogue built into this release holds exactly two models,
+  the ones this release was measured with: `qwen` (Qwen3.6-35B-A3B, Q8_0,
+  from `ggml-org/Qwen3.6-35B-A3B-GGUF`, 36,903,139,616 bytes) and `gpt-oss`
+  (gpt-oss-120b, MXFP4, from `ggml-org/gpt-oss-120b-GGUF`, 63,387,346,208
+  bytes). Both are Apache-2.0 and pinned at a fixed revision with their
+  sha256. Before anything is fetched it shows the size, licence, destination
+  (`<root>/models/<id>/`, never inside a project), free disk and memory
+  estimate, and asks for a typed `yes` (or `--yes`); away from a terminal
+  without `--yes` it refuses. HTTPS only, through macOS's `/usr/bin/curl`
+  (no `.curlrc`, no redirect followed by curl). The one redirect followed
+  is from `huggingface.co` to its file store `us.aws.cdn.hf.co`, and it is
+  named when it happens; any other host is refused. The transfer resumes
+  with range requests into a private partial file. The size and sha256 are
+  checked before the file is renamed into place and registered. A wrong
+  sha256 sets the file aside as `.<file>.mismatch`, deletes nothing and
+  registers nothing. The file is never run. The typed yes is consent to
+  the download, not an owner act: `owner_acts` neither opens nor closes it.
+- **`cauldron inference status` says what is missing**, under `missing`,
+  each item with what to do: the service not installed or not started, no
+  usable `llama-server` (none on `PATH`, or older than build 6000: install
+  or upgrade llama.cpp with Homebrew; tested with 12110), no registered
+  model, a model over the memory budget, and a budget larger than the Mac's
+  memory.
+
+### Changed
+
+- **A repeated `soup_link` writes nothing (issue #23, item 2.12).** Through
+  0.1.16 linking an edge the soup already held answered `linked` and took a
+  new change entry that pointed at nothing new (the spine kept one edge).
+  Now such a link is answered `already-linked`, its note stays as it was,
+  and when every link of the call is, nothing is written (`outcome:
+  "already-linked"`, `written: false`), as `soup_claim` answers
+  `already-claimed`. In a list, the new edges land in one write and the
+  held ones are named. `cauldron soup link` answers the same.
+- **`cauldron mcp stdio --cauldron <name>` pins the bridge to that
+  cauldron.** Through 0.1.16 the flag only chose the cauldron for a call
+  that named none, and a call naming another cauldron reached that one.
+  Now such a call is refused by the bridge as `cauldron_pinned` and never
+  reaches the service. This holds while the service is down too. The
+  bridge's `initialize` instructions say which cauldron it is pinned to.
+  The owner-act tools are no exception: a pinned bridge refuses
+  `soup_approve` and `soup_reject` naming another cauldron the same way.
+  `$CAULDRON_CAULDRON` is unchanged: it only chooses a default.
+- **The plugin launcher finds the project root from a subdirectory.**
+  Through 0.1.16 the launcher treated only its current directory and
+  `$CLAUDE_PROJECT_DIR` as the project. A session started in a subdirectory
+  with no `$CLAUDE_PROJECT_DIR` therefore still ran a `cauldron` from an
+  absolute `PATH` entry elsewhere in the repository. Now every directory
+  above either of them that holds a `.git` or a `.mcp.json` is part of the
+  project too, up to but not including `$HOME`. A candidate inside the
+  project is refused from every source. A home directory kept under git is
+  not a project.
+- **Who may act for the owner is the owner's setting** (issue #25).
+  `cauldron mcp grant`, `cauldron soup approve` (`--unapprove`), `cauldron
+  ripples approve | reject` (`--unapprove`, `--unreject`) and `cauldron
+  ripples on` were refused unless their input and output were an
+  interactive terminal, as a fixed rule. They now ask one shared decision:
+  a command run with a terminal attached may always do them (`by: "tty"`);
+  without a terminal, an act runs only when the owner opened it (`by:
+  "agent"`), and
+  is refused otherwise with the same words as before plus one sentence on
+  how the owner allows it. The default, `terminal`, changes nothing: a root
+  from 0.1.16, with no setting, behaves exactly as before. The terminal
+  check stops an agent that follows the rules; it is not a security
+  boundary against a process of the same user that fakes a terminal
+  (`script(1)` does) or reads the user's files, as the README's "Who may
+  act for the owner" now says: `by: "tty"` means "run with a terminal
+  attached", not "a person".
+- **The setting, `owner_acts`**, in `<root>/owner-acts.json` (owner-only):
+  one choice for the root and, optionally, one per cauldron that wins over
+  it both ways (bound to the cauldron's id, as its grant is). `terminal`,
+  `open`, or a list of the acts that are open (`grant`, `approve`,
+  `ripples`), each recorded with when and how it was set (`tty`, `env`,
+  `install`), by the command that set it: `cauldron owner-acts` takes no
+  `--how`, and only `cauldron install --owner-acts` records `install`.
+  Three ways to choose it: `cauldron owner-acts open | terminal
+  [--only grant,approve,ripples] [--cauldron C] [--env E]` (opening needs a
+  terminal or the variable; closing runs anywhere; `unset --cauldron C`
+  hands a cauldron back to the root's choice; `show` prints what is in
+  effect per cauldron and where it came from; a cauldron with no choice of
+  its own that is given one starts from the root's, and the answer names
+  what it took over as `copied_from_root`); the environment variable
+  `CAULDRON_OWNER_ACTS=open` (or a comma list) in the environment of the
+  `cauldron` command that acts, which opens `grant` and `ripples` for that
+  command and lets `cauldron owner-acts open` record a choice without a
+  terminal (anything that can set its own environment, an agent told to
+  included, can turn it on: the owner decides whether their agents may act
+  for them; the README names a shell profile or your user settings for
+  Claude Code, never a project's `.claude/settings.json`); and
+  `scripts/install --owner-acts open|terminal` for a headless install,
+  which passes it to `cauldron install`. The variable is read only by the
+  command that carries it: `cauldron start` and the supervisor remove it
+  from every service they start, and approving and rejecting, which the
+  `mcp` service carries out, need the persisted setting (the command says
+  so before it sends anything when only the variable opened `approve`).
+- **`cauldron ripples on`, allowed without a terminal**, asks nothing and
+  prints what it authorised.
+- **Every refusal of an owner act** names how the owner allows it; the
+  ones that said "no option skips this" no longer do (`review --interactive`
+  still needs a terminal, because it asks a person).
+- **A decided record says who decided**: `meta.approved` and
+  `meta.rejected` carry `by: "tty"` or `by: "agent"` (and the session, for
+  a decision made through the MCP door), where 0.1.16 wrote `by: "owner"`.
+  A decision recorded as `owner` was made at a terminal and reads as `tty`.
+- **`scripts/install --prebuilt`** verifies the two new images and their
+  declarations, as it verifies the others, and lays them down with the
+  bundle, but pins and starts neither. Both install paths end with the
+  commands that turn local inference on.
+- **The docs no longer say that local inference never downloads
+  anything.** Nothing is downloaded unless you run `models pull` and say
+  yes. The model still gets no tools in this release; threads on a local
+  model are planned for a later release. The README walks a prebuilt
+  install to its first local ripple.
+- **Ripples use Opus by default (issue #27).** The first call of a ripple on
+  the threads backend is now Opus (it was Sonnet); the one retry after a
+  refused answer stays Opus, `--model` (on `ripples run` and `ripples on`)
+  still chooses the first call's model, and a local run is unchanged (both
+  calls on its local model). `ripples eval`'s threads model follows the same
+  default (`--threads-model` still overrides). The command-line help, the
+  "what leaves this machine" text `ripples on` prints, and the README say
+  so. The caps are unchanged: a call's input-token estimate is the prompt's
+  characters divided by three whatever the model, so the per-dump and
+  per-day caps count the same; an Opus call costs more of your Claude
+  usage than a Sonnet one. A cauldron turned on under 0.1.16 or earlier
+  without `--model` consented to Sonnet: it runs on Opus now, and not
+  silently. `ripples status` shows `default_changed` for it (Sonnet to
+  Opus, the cost, and `cauldron ripples on <c> --model sonnet` to keep
+  Sonnet), and its first automatic run after the upgrade writes one
+  `default_model_changed` line to the automatic journal. A setting that
+  recorded a model keeps it, and `ripples on` now records the default it
+  was turned on under. This holds until ripples split graph writing
+  (a cheaper model) from reasoning over issues, contradictions and work
+  items (a stronger one).
+- **A record read with `soup_get` can be written back (issue #23, 2.4 and
+  2.6).** `soup_put` and `cauldron soup import` (direct, dry run, or sent on
+  to the service) drop the keys a read adds and never stores
+  (`superseded_by`, `unreviewed`, a top-level `rejected: true`, a cluster's
+  `claims` list) and name each one in the answer's new `ignored` list.
+  Through 0.1.16 each was refused (`undeclared_field`, or as a review
+  flag). The keys a write still refuses that a read can show (the review
+  flags `meta.approved` and `meta.rejected`, `meta.ripple`, and a held
+  `id`) are published, with the dropped ones and what a read may cut, as a
+  machine-readable list, `schema/soup/write-back.json`, so a client strips
+  them from the list instead of by hand. The list says how the review
+  flags are written instead: by the owner's decision at a terminal or,
+  where the owner opened approving to agents, through `soup_approve` /
+  `soup_reject`; never by a record write. `soup_link`'s tool schema now
+  carries the 1,000-character `maxLength` on `note` that `soup_claim`'s
+  already did.
+
+### Fixed
+
+- **A read of a threads store that no daemon holds open no longer reads
+  the file in place.** `threads cutover`, and the account inventory's read
+  of which accounts are disabled, opened such a store `immutable=1`, with
+  no lock. If a writer opened the store meanwhile and checkpointed its log,
+  pages changed under the read. The read could then fail with `database
+  disk image is malformed`, or return a wrong answer. A failed read of the
+  disabled accounts was taken as "none disabled". The store is now read the
+  way 0.1.16 reads a soup: through a private copy that is checked not to
+  have changed while it was taken. With a `-wal` present, it is read
+  through SQLite's locking, as before. The copy writes nothing beside the
+  store. If the store changes during 20 copies in a row, the read falls back
+  to `mode=ro`, which is correct but may leave `-wal` and `-shm` beside it.
+- **A read through a private copy leaves no directory behind.** Through
+  0.1.16, a read of a soup no daemon holds made a directory named
+  `spine-read-<uid>` in the temporary directory, kept it, and shared it
+  between every read of that user. Where the temporary directory is shared
+  (`/tmp`), another user could make that name first, which turned the
+  private copy off for the owner (the read then went through SQLite's
+  locking). Now each read makes its own directory under a new name that
+  cannot be guessed, mode 0700, holding a lock while the read lives, and
+  removes it before the read returns. What a process killed in the middle
+  of a read leaves is removed by the next process's first read. A threads
+  store's read (above) works the same way. A `spine-read-<uid>` directory
+  left by 0.1.16 is not removed automatically; it can be deleted by hand.
+- **No session can write `meta.ripple` (issue #23, 2.10).** Ripple
+  provenance is stamped by the door on a ripple's records only. Every other
+  record write (`soup_put`, `cauldron soup import` with or without
+  `--remint`, direct, dry run or forwarded to the service) now refuses a
+  record that carries it, in any casing, dotted, nested or as a top-level
+  `ripple`, as `usage` with `detail.refused: "ripple_provenance"`, the way
+  the owner's review flags are refused. Through 0.1.16 a session could land
+  a record carrying a made-up `meta.ripple`; it gave no power (authorship
+  is read from the writing transaction, and `soup_review` never listed
+  it), but a reader of the record could be misled. Records already stored
+  are not changed.
+- **Logging an account in from the terminal UI works on an install (issue
+  #30).** The threads daemon ran `add-account` (and, to rotate,
+  `claude-accounts`) from `<data dir>/scripts/`, which nothing installs, and
+  the scripts built `threads` with `cargo run` from a source tree they
+  assumed was three directories above them; on a prebuilt install the login
+  was refused before it started. Now the bundle ships `add-account`,
+  `claude-accounts` and `claude-login-browser`
+  (`share/cauldron/scripts/threads/`, covered by its `SHA256SUMS`), and
+  `scripts/install` lays them down at `<root>/share/cauldron/scripts/threads/`
+  on the prebuilt and the from-source path alike (every directory and
+  script 0755 and the user's; an upgrade with `--replace-running` replaces
+  them, the previous copy kept as `threads.prev`). The daemon finds them
+  there through the `CAULDRON_HOME` its supervisor sets (never a path
+  compiled in), falling back to `<data dir>/scripts/` for a development
+  home, and runs one only when it is yours and nothing on its path is
+  writable by group or others; a missing one is refused naming the command
+  that installs it. It tells the scripts which `threads` to run
+  (`CAULDRON_THREADS_BIN`, its own binary) and, for rotation as for login,
+  which store (`CLAUDE_ACCOUNTS_HOME`). An installed copy of a script never
+  runs `cargo`: it runs that `threads`, or the one the cauldron installed
+  beside it pins, and refuses to run without a named store; a copy in a
+  source checkout behaves as before.
+- **The account board's "make this the machine's login" works on a prebuilt
+  install (issue #30).** `tui pool`, key `s`, runs the installed
+  `claude-accounts` (`<root>/share/cauldron/scripts/threads/`, found beside
+  the running `tui` at run time; a release-bundle `tui` still compiles in no
+  helper path) with the environment's threads store, after the same
+  ownership and mode check as before. Through 0.1.16 a prebuilt terminal UI
+  had no helper and the action refused.
+- **The account helpers never load code from the directory they are
+  started in.** They piped the keychain secret into `python3 -c` with no
+  isolation, and the terminal UI started them from its own working
+  directory, so a `json.py` in a project the board was opened in was
+  imported with the secret on its stdin (the code was older; this release
+  ships it to every prebuilt install). Now every python a shipped script
+  runs is one interpreter at a fixed absolute path (`/opt/homebrew/bin`,
+  `/usr/local/bin`, or `/usr/bin` when the Command Line Tools are
+  installed), not writable by group or others, started with `-I` (no
+  current or script directory on its path, no user site-packages, no
+  `PYTHON*` variables). The helpers and `install` keep only the absolute
+  entries of `PATH` and drop `CDPATH`, `GLOBIGNORE`, `BASH_ENV` and `ENV`;
+  `claude-login-browser` runs `/usr/bin/open`. The threads daemon and the
+  terminal UI start a helper from a fixed directory (the threads store, or
+  `/`), never the caller's, with no `BASH_ENV`, `ENV`, `IFS`, `CDPATH`,
+  `PYTHON*`, exported bash function or dynamic-loader variable, and a
+  `PATH` of absolute entries.
+- **A service never inherits `CAULDRON_OWNER_ACTS`.** `cauldron start` and
+  the supervisor passed the caller's environment on, so a shell carrying it
+  opened the MCP door's `soup_approve` and `soup_reject` to every session
+  while `cauldron mcp status` said `terminal`. Now the variable is removed
+  from every service's environment, the door decides from the persisted
+  setting alone, and the views say what sessions may do apart from what the
+  shell may.
+- **No record can be hidden for good by a `supersedes` edge.** `soup_link`
+  accepted `supersedes`, a self-edge and a cycle included, and `soup_unlink`
+  refused to remove one, so a session with write scope could mark any
+  record superseded and no tool could undo it. Now `supersedes` is written
+  only with its new record, self-edges and cycles of `supersedes` and
+  `narrows` are refused on every write (`edge-loop`), and `soup_unlink`
+  removes a self-edge or an edge on a cycle that an earlier build let in.
+- **A change-feed `update` entry keeps its ids** when the record is written
+  again later (a second citation, an approval then a citation): the ids are
+  read from the write's own recorded changes.
+- `scripts/check-release-bundle` checks the shipped helper scripts: present,
+  mode 0755 in the tarball, bash, and, run from the unpacked bundle, refusing
+  to run without a named store and reaching no build, keychain, Claude or
+  git. It also fails a shipped script that runs python without `-I` or keeps
+  a relative `PATH` entry, and, on the source of the bundle's commit when the
+  clone has it, a helper spawn in the daemon or the terminal UI with no
+  working directory. `scripts/test-check-release-bundle` plants a helper
+  without its mode, helpers altered to behave as checkout copies, python run
+  without `-I` (each spelling) and a relative `PATH` entry, and the gate
+  fails each.
+
+### Documentation
+
+- `schema/soup/workspace-v6/README.md`, prose only (issue #23, item 2.1):
+  "A node is never edited in place" is now accurate. Imports and `soup_put`
+  only create nodes. Link, unlink, cite and the owner's review flags add to
+  or take from a node that exists. The paragraph on adding an edge now also
+  covers removing one. The plugin's copy is synced.
+- The published schema's descriptions of `meta.approved` and
+  `meta.rejected` say who writes them now (`by: tty` with a terminal
+  attached, `by: agent` without one or through `soup_approve` /
+  `soup_reject` where owner_acts opens it). Nothing a validator checks
+  changed: a spine test now holds every validation keyword of
+  `schema/soup/workspace-v6/` and `schema/soup/cauldron-v1/` (everything
+  but `description`, `title` and `$comment`) to the files published with
+  0.1.16, in place of holding the files byte for byte.
+- The workspace-v6 README says where the door is stricter than the
+  schemas: the review flags are declared (stored records carry them) and
+  refused on every write, an edge `note` of `null` is taken as no note, and
+  the `supersedes` and `edge-loop` rules above.
+- The plugin README has a new section, "Correcting a record".
+- The plugin README has a new section, "One server per cauldron". It covers
+  the project default, a pinned server and its `.mcp.json` entry, and
+  several cauldrons at once. The README has a short paragraph on the same.
+- The tool descriptions of `soup_link`, `soup_put` and `soup_status`, the
+  plugin README and the curator describe the forms above. The launcher's
+  header and both READMEs describe the project root.
+- Issue #23, the rest. 2.3: the quick start says a grant's `--project`
+  only sets a default and does not limit access, as the grant help already
+  did. 2.5: the workspace-v6 README opens with what changed around it since
+  0.1.10 (rejection, the note bound, region locks, clusters, the write-back
+  list, `meta.ripple`). 2.6: it says the door bounds a new edge note at
+  1,000 characters though the schemas do not. 2.7: a claim holds nothing,
+  and what holds a region is a ripple's region lock (README). 2.8: who reads a cluster's boundary (people and the
+  sessions choosing where work belongs; nothing in the soup), and when to
+  make a cluster rather than a parent region. 2.9: `soup_status` reports
+  clusters separately, and its `total` and `counts` are workspace records
+  only. 2.11: `--remint` rewrites an edge's `to` and `[[label]]` links in a
+  record's `body` only; a label in a handle, a boundary or a note is kept as
+  written. Of the workspace@6 and cauldron@1 schema files, only the two
+  descriptions above and the workspace@6 README changed. Items 2.1 and 2.2 (in-place edits by
+  links and claims, and a command-line `soup link`) are the workspace-v6
+  README change and `cauldron soup link` above; 2.12 (a repeated
+  `soup_link`) is under Changed.
+- README "Known limitations": the account helpers' install location, the
+  checks made before one runs, and how to run an installed copy by hand.
+
+### Unchanged, whatever the setting
+
+- A ripple never approves or rejects: the soup refuses the review flags to
+  every ripple, and the door refuses the ripples service's identity on the
+  review tools. No record write sets the review flags or a ripple's
+  provenance.
+- No root is special: there is no separate test root, and a development or
+  check root's commands carry `CAULDRON_OWNER_ACTS=open` like anyone's (its
+  services never see it, and its sessions follow its persisted choice). Test
+  binaries remove the variable at load, so `cargo test` always starts from
+  `terminal`.
+
+### Known limitations
+
+- **The pull catalogue fits large Macs only.** Qwen needs about 36 GiB
+  resident and gpt-oss about 60 GiB. A smaller model has not been measured,
+  so none is offered.
+- **The redirect allow-list is the one host observed when the catalogue was
+  made** (`us.aws.cdn.hf.co`). If the publisher serves the file from another
+  host, `models pull` refuses and says which host. `models add` still
+  registers a file fetched any other way.
+- A real account login, rotation and set-live action from a prebuilt
+  install have been exercised against fake scripts, a fake `threads` and a
+  stubbed installer only, never against a keychain or a Claude account.
+- The account helpers find `bash` 4.4 or newer through `PATH` (their first
+  line is `#!/usr/bin/env bash`; when that one is older they run again
+  under one from `/opt/homebrew/bin` or `/usr/local/bin`); the daemon and the terminal UI give them a `PATH` of
+  absolute entries only. They need a python 3 at one of the three fixed
+  places above.
+- The owner-act gate is a guard against an agent that follows the rules,
+  not a security boundary against a process running as the same user
+  (see "Who may act for the owner" in the README).
 
 ## [0.1.16] — 2026-11-18
 
@@ -1890,7 +2351,8 @@ The first public release.
   paths ship) and `scripts/check-no-personal-data.sh` (what the shipped files
   say).
 
-[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.16...HEAD
+[Unreleased]: https://github.com/broomstick-ai/cauldron/compare/v0.1.17...HEAD
+[0.1.17]: https://github.com/broomstick-ai/cauldron/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/broomstick-ai/cauldron/compare/v0.1.15...v0.1.16
 [0.1.15]: https://github.com/broomstick-ai/cauldron/compare/v0.1.14...v0.1.15
 [0.1.14]: https://github.com/broomstick-ai/cauldron/compare/v0.1.13...v0.1.14

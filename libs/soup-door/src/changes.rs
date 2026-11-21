@@ -268,6 +268,40 @@ fn payload_edges(soup: &Path, hash: &str, removed: bool) -> Result<Vec<(String, 
     Ok(out)
 }
 
+/// The nodes a landed write set a field of (or sealed), from its row's
+/// recorded payload: `(pool, node)`. Read here rather than from the pool's
+/// `updated_tx` column, which names only a node's LATEST write: a node
+/// changed again later (a second citation, an approval then a citation)
+/// would otherwise leave this write's entry with no ids.
+fn payload_set_nodes(soup: &Path, hash: &str) -> Result<Vec<(String, String)>, String> {
+    let conn = spine::offline::read_only_connection(&soup.join(spine::spine_db::SPINE_FILE)).map_err(|e| e.to_string())?;
+    let payload: String = conn
+        .query_row("SELECT payload FROM transactions WHERE hash = ?1 AND decided = 1", [hash], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let p: spine::delta::CompiledPayload = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut created: BTreeSet<(String, String)> = BTreeSet::new();
+    for part in &p.parts {
+        for d in &part.deltas {
+            let pool = part.pool.as_str().to_string();
+            match d {
+                spine::delta::Delta::CreateNode { id, .. } => {
+                    created.insert((pool, id.0.clone()));
+                }
+                spine::delta::Delta::SetField { node, .. } | spine::delta::Delta::Seal { node } => {
+                    let k = (pool, node.0.clone());
+                    if !out.contains(&k) {
+                        out.push(k);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out.retain(|k| !created.contains(k));
+    Ok(out)
+}
+
 /// A write that left no node and no standing edge of its own: `link` when
 /// it added edges (since removed), else `unlink` when it removed some.
 fn edge_op(soup: &Path, hash: &str) -> Result<Option<(&'static str, Vec<(String, String)>)>, String> {
@@ -299,14 +333,27 @@ fn change(soup: &Path, pools: &[std::path::PathBuf], r: &Row) -> Result<Value, S
             "SELECT n.id, n.node_type, f.value FROM nodes n LEFT JOIN node_fields f ON f.node_id = n.id AND f.field = 'handle'
              WHERE n.created_tx = ?1 ORDER BY n.rowid",
         )?);
-        updated.extend(node(
-            "SELECT n.id, n.node_type, f.value FROM nodes n LEFT JOIN node_fields f ON f.node_id = n.id AND f.field = 'handle'
-             WHERE n.updated_tx = ?1 AND n.created_tx != ?1 ORDER BY n.rowid",
-        )?);
         let mut stmt = conn.prepare("SELECT src FROM edges WHERE created_tx = ?1").map_err(|e| e.to_string())?;
         for src in stmt.query_map([&r.hash], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())? {
             edges += 1;
             linked.insert((pi, src.map_err(|e| e.to_string())?));
+        }
+    }
+    // The nodes it changed, from its own recorded deltas (every write it
+    // made, whatever wrote those nodes since).
+    if created.is_empty() && linked.is_empty() {
+        for (pool, id) in payload_set_nodes(soup, &r.hash)? {
+            let file = soup.join(format!("{pool}.db"));
+            let conn = spine::offline::read_only_connection(&file).map_err(|e| e.to_string())?;
+            let found = conn
+                .query_row(
+                    "SELECT n.node_type, f.value FROM nodes n LEFT JOIN node_fields f ON f.node_id = n.id AND f.field = 'handle' WHERE n.id = ?1",
+                    [&id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .ok();
+            let (ty, h) = found.unwrap_or_default();
+            updated.push(json!({"id": id, "type": ty, "handle": handle(h)}));
         }
     }
     let (op, ids): (&str, Vec<Value>) = if !created.is_empty() {

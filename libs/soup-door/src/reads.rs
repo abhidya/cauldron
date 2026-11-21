@@ -116,15 +116,34 @@ fn store(err: impl std::fmt::Display) -> Error {
     Error::new(Code::Store, err.to_string())
 }
 
-/// The review filter's two values.
-pub const REVIEW_VALUES: [&str; 2] = ["pending", "reviewed"];
+/// The review filter's values: `pending`, `reviewed`, and who decided
+/// (`by-tty`: approved or rejected by a person at a terminal; `by-agent`:
+/// by an agent the owner's `owner_acts` choice allowed).
+pub const REVIEW_VALUES: [&str; 4] = ["pending", "reviewed", "by-tty", "by-agent"];
 
-/// A review filter, checked: `pending` or `reviewed`.
+/// A review filter, checked.
 pub fn checked_review(v: &str) -> Result<String> {
     if REVIEW_VALUES.contains(&v) {
         return Ok(v.to_string());
     }
-    refuse!(Code::Usage, "the review filter is `pending` (only records a ripple wrote that nobody approved yet) or `reviewed` (every other record), not `{v}`")
+    refuse!(
+        Code::Usage,
+        "the review filter is `pending` (only records a ripple wrote that nobody approved yet), `reviewed` (every other \
+         record), `by-tty` (only records approved or rejected by a person at a terminal) or `by-agent` (only records \
+         approved or rejected by an agent the owner allowed), not `{v}`"
+    )
+}
+
+/// Who approved or rejected a record (`meta.approved.by`, else
+/// `meta.rejected.by`): `agent` when it says so, else `tty` (a decision
+/// written before decisions said who, `by: "owner"`, was made at a
+/// terminal: nothing else could make one). `None` for a record nobody
+/// decided.
+pub fn decided_by(fields: &BTreeMap<String, spine::pool::FieldValue>) -> Option<&'static str> {
+    let meta = fields.get("meta")?;
+    let flag = |k: &str| meta.value.get(k).filter(|a| !a.is_null() && **a != Value::Bool(false));
+    let d = flag("approved").or_else(|| flag("rejected"))?;
+    Some(if d.get("by").and_then(Value::as_str) == Some("agent") { "agent" } else { "tty" })
 }
 
 /// The hashes of the landed transactions a RIPPLE initiated, read from the
@@ -336,6 +355,8 @@ struct Entry {
     unreviewed: bool,
     /// The owner rejected it (`meta.rejected`).
     rejected: bool,
+    /// Who approved or rejected it ([`decided_by`]).
+    decided_by: Option<&'static str>,
 }
 
 /// Every node of the pool, newest first: by the commit that created it
@@ -370,6 +391,7 @@ fn catalog(c: &env::Cauldron, pool: &PoolName, snap: &spine::pool::Snapshot<'_>,
                 superseded_by,
                 unreviewed,
                 rejected,
+                decided_by: decided_by(&n.fields),
             });
         }
     }
@@ -398,6 +420,9 @@ fn stated(mut item: Value, n: &Entry) -> Value {
         if n.rejected {
             m.insert("rejected".into(), json!(true));
         }
+        if let Some(by) = n.decided_by {
+            m.insert("decided_by".into(), json!(by));
+        }
     }
     item
 }
@@ -407,6 +432,8 @@ fn reviewed_as(review: Option<&str>, n: &Entry) -> bool {
     match review {
         Some("pending") => n.unreviewed,
         Some("reviewed") => !n.unreviewed,
+        Some("by-tty") => n.decided_by == Some("tty"),
+        Some("by-agent") => n.decided_by == Some("agent"),
         _ => true,
     }
 }

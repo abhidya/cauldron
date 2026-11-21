@@ -91,6 +91,8 @@ mod mcp;
 mod mcp_door;
 // `cauldron mcp stdio`: the bridge Claude Code launches.
 mod mcp_bridge;
+// The owner acts' one gate (`env::owner_acts`), on the command line.
+mod owner_acts;
 // `cauldron ripples`: a dump into records, by hand or automatically, through the ripples service.
 mod ripples;
 // `cauldron ripples review`: the records a ripple wrote, waiting for review.
@@ -100,6 +102,8 @@ mod review_pass;
 // `cauldron inference`: local model files registered by hand, and the
 // `inference` service that runs them on demand.
 mod inference;
+// `cauldron inference models pull`: the built-in catalogue and the download.
+mod inference_pull;
 // `ensure_soup_cauldron` only; this release has no engine.
 mod engine;
 mod daemon;
@@ -148,9 +152,10 @@ const VERBS: &[(&str, &str)] = &[
     ("rename", "rename a cauldron of this environment (its soup, dumps and MCP grant follow)"),
     ("remove", "put a cauldron away in cauldrons/.removed/ (never deleted; a dry run without --yes)"),
     ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get | dump-remove | approve (`soup help`)"),
-    ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`)"),
+    ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`; an edge between records is `soup link`)"),
     ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
     ("ripples", "a dump into knowledge-graph records: run | status | eval | on | off | review | approve | reject (`ripples help`)"),
+    ("owner-acts", "who may act for the owner without a terminal: open | terminal | unset | show (`owner-acts help`)"),
     ("inference", "local models on this machine: models add | list | remove, status, unload (`inference help`)"),
 ];
 
@@ -186,8 +191,13 @@ cauldron — the Cauldron entry point
                                      write; settle an interrupted import; list
                                      regions; read and search nodes; keep text as a
                                      dump beside the soup, read dumps back, and remove
-                                     one; approve a ripple's records (at a terminal).
+                                     one; approve a ripple's records (at a terminal,
+                                     unless the owner opened it: `owner-acts`).
                                      JSON out, non-zero on refusal (`cauldron soup help`)
+    cauldron owner-acts open|terminal|unset|show [--only <acts>] [--cauldron <c>]
+                                     who may act for the owner without a terminal
+                                     (grant, approve, ripples on); default `terminal`
+                                     (`cauldron owner-acts help`)
     cauldron link <cauldron> --env <e> [--dir <path>] | --show
                                      write a .cauldron marker naming this project's
                                      environment and cauldron, so `cauldron soup` run
@@ -215,7 +225,9 @@ cauldron — the Cauldron entry point
                                      that no other environment pins; `<label>` is untouched
     cauldron build <service> --artifact <image> [--env-copy] [--json]
                                      install a prebuilt image (a release bundle's) as a
-                                     version, with no compiler; the image states its commit
+                                     version, with no compiler; the image states its commit.
+                                     A release build's bare `build <service>` installs the
+                                     image the release shipped (inference, ripples, mcp …)
     cauldron build --snapshot-declaration <service> <label> [--force]
                                      BACKFILL: copy the CURRENT declaration into an
                                      existing build dir as its `declaration.toml`
@@ -407,6 +419,7 @@ fn run() -> Result<i32> {
         Some("link") => link::verb_link(&argv[1..]),
         Some("mcp") => mcp::verb_mcp(&argv[1..]),
         Some("ripples") => ripples::verb_ripples(&argv[1..]),
+        Some("owner-acts") => owner_acts::verb_owner_acts(&argv[1..]),
         Some("inference") => inference::verb_inference(&argv[1..]),
         Some("create") => cauldrons::verb_create(&argv[1..]),
         Some("list") | Some("ls") => cauldrons::verb_list(&argv[1..]),
@@ -452,7 +465,9 @@ const CONTROL_VERBS: &[&str] =
     &["daemon", "install", "uninstall", "promote", "restart", "start", "stop", "down", "pin", "rollback", "env", "test",
       // `create` writes a cauldron; `soup import` writes its
       // soup, and the soup reads share the guard; `mcp` writes the grants.
-      "create", "rename", "remove", "soup", "mcp"];
+      "create", "rename", "remove", "soup", "mcp",
+      // `owner-acts` writes the root's owner_acts setting.
+      "owner-acts"];
 
 /// **REL-6a5: A DAEMON-CONTROL VERB IN AN ISOLATED PROCESS ACTS ONLY ON A
 /// SCRATCH ROOT.** Isolated (`env::egress::process_isolation`: the marker,
@@ -1296,6 +1311,8 @@ fn verb_status(args: &[String]) -> Result<i32> {
                 // Per cauldron, how many records a ripple wrote wait for
                 // the owner's review.
                 "review": review::waiting_all(&env, None),
+                // Who may act for the owner without a terminal.
+                "owner_acts": {"summary": owner_acts::summary(&env), "cauldrons": owner_acts::per_cauldron(&env)},
             }))?
         );
     } else {
@@ -1340,6 +1357,20 @@ fn verb_status(args: &[String]) -> Result<i32> {
         }
         for (svc, line, _) in &gates {
             println!("\n{svc}: {line}");
+        }
+        {
+            let oa = owner_acts::summary(&env);
+            let open: Vec<String> = owner_acts::per_cauldron(&env)
+                .iter()
+                .filter(|c| c["setting"] != "terminal")
+                .map(|c| format!("{} {}", c["cauldron"].as_str().unwrap_or("?"), c["setting"].as_str().unwrap_or("?")))
+                .collect();
+            let var = oa["env_var"]["opens"].as_str().map(|v| format!("; CAULDRON_OWNER_ACTS opens {v} for this process")).unwrap_or_default();
+            println!(
+                "\nowner acts: root {}{}{var} (`cauldron owner-acts show`)",
+                oa["root"].as_str().unwrap_or("?"),
+                if open.is_empty() { String::new() } else { format!("; open without a terminal: {}", open.join(", ")) },
+            );
         }
         for w in review::waiting_all(&env, None) {
             if let Some(cmd) = w["review"].as_str() {
@@ -1850,6 +1881,22 @@ fn verb_build(args: &[String]) -> Result<i32> {
         }
     }
     let mut decls = owned_targets(&env, &o.services, "build")?;
+    // A release-bundle cauldron has no source tree and no cargo: a bare
+    // `cauldron build <service>` of a service the bundle carries an image of
+    // (`libexec/<bin>`) installs THAT image, exactly as `--artifact` would.
+    let mut o = o;
+    if o.artifact.is_none() && o.services.len() == 1 && decls.len() == 1 {
+        if let Some(image) = bundled_image(&decls[0]) {
+            if !o.json {
+                println!(
+                    "cauldron: no source tree in a release build; installing the image this release shipped, {} \
+                     (as `--artifact` would)",
+                    image.display()
+                );
+            }
+            o.artifact = Some(image.display().to_string());
+        }
+    }
     if let Some(image) = &o.artifact {
         // ONE named service, and its build source becomes the image: no
         // cargo, the commit read off the bytes. Everything else in the
@@ -1895,6 +1942,37 @@ fn verb_build(args: &[String]) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// **THE IMAGE OF `d` THAT THIS RELEASE BUNDLE SHIPPED**, for a bare
+/// `cauldron build <service>` in a release-bundle binary (which has no source
+/// tree to compile). Only for a declaration whose build is a cargo source
+/// with no `workspace` of its own (the shipped `inference`, `ripples`, `mcp`
+/// and so on): one that names a workspace or an artifact means what it says.
+/// Looked for, in order, at `<this binary's dir>/../libexec/<bin>` (run from
+/// the unpacked bundle, or from the copy the installer keeps at
+/// `<root>/share/cauldron/releases/<version>-<commit>/`) and at
+/// `<root>/share/cauldron/releases/<this version>-<this commit>/libexec/<bin>`
+/// (the installed `<root>/bin/cauldron`). The image still states its own
+/// commit, which names the version; nothing here trusts the file name.
+/// A checkout build never looks: it compiles.
+#[cfg(cauldron_release_bundle)]
+fn bundled_image(d: &decl::Declaration) -> Option<PathBuf> {
+    let b = d.build.as_ref()?;
+    if b.artifact.is_some() || b.workspace.is_some() || b.package.is_none() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let beside = exe.parent()?.parent()?.join("libexec").join(&b.bin);
+    let short: String = SELF_COMMIT.chars().take(12).collect();
+    let installed = decl::release_share_dir(&format!("releases/{}-{short}/libexec", env!("CARGO_PKG_VERSION"))).join(&b.bin);
+    [beside, installed].into_iter().find(|p| p.is_file())
+}
+
+#[cfg(not(cauldron_release_bundle))]
+fn bundled_image(_d: &decl::Declaration) -> Option<PathBuf> {
+    None
 }
 
 /// **`cauldron build --json`'s stdout: the build records, as a JSON array.**
@@ -3363,6 +3441,11 @@ fn launch_hosted(env: &Environment, l: &Launchable) -> Result<Seam> {
     for (k, v) in &d.env {
         cmd.env(k, expand_hosted(&expand(v, &data_dir), &launch.addr));
     }
+    // CAULDRON_OWNER_ACTS means "the command the owner ran may act": it is read
+    // only by that command, never inherited by a service (not from the shell that
+    // started this, nor from a declaration). The mcp service decides MCP approve
+    // and reject from the persisted owner_acts setting alone.
+    cmd.env_remove(env::owner_acts::VAR);
     use std::os::unix::process::CommandExt;
     // ITS OWN PROCESS GROUP, and this is what makes everything else possible.
     // The child is therefore NOT in launchd's job, so launchd restarting the
@@ -4780,6 +4863,11 @@ fn start_one(env: &Environment, l: &Launchable) -> Result<Seam> {
     for (k, v) in &d.env {
         cmd.env(k, v);
     }
+    // CAULDRON_OWNER_ACTS means "the command the owner ran may act": it is read
+    // only by that command, never inherited by a service (not from the shell that
+    // started this, nor from a declaration). The mcp service decides MCP approve
+    // and reject from the persisted owner_acts setting alone.
+    cmd.env_remove(env::owner_acts::VAR);
     // Its own process group, so it outlives this shell and a Ctrl-C here does
     // not reach it. Stable std API; no unsafe, no libc.
     use std::os::unix::process::CommandExt;

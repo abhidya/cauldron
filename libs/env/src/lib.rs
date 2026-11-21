@@ -60,6 +60,8 @@ pub mod hold;
 pub mod hosting;
 pub mod identity;
 pub mod lock;
+// Who may act for the owner: the one decision every owner act asks.
+pub mod owner_acts;
 pub mod paths;
 pub mod private;
 // The region locks a writer holds while it prepares a write (a ripple).

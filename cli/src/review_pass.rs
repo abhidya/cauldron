@@ -118,7 +118,8 @@ fn decide(e: &env::Environment, cauldron: &str, yes: &[String], no: &[String], r
     if let (Some(r), false) = (reason, no.is_empty()) {
         body["reason"] = json!(r);
     }
-    let v: Value = crate::review::send(e, cauldron, body)?;
+    // The interactive pass needs a terminal by nature: a person decides.
+    let v: Value = crate::review::send(e, cauldron, body, env::owner_acts::By::Tty)?;
     if v["ok"] == json!(true) {
         let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
         let mut said = Vec::new();
@@ -172,9 +173,10 @@ pub(crate) fn interactive(a: &crate::review::Args) -> Result<i32> {
     if !crate::review::at_terminal() {
         bail!(
             "REFUSED: deciding a ripple's records is the owner's act at a terminal. `cauldron ripples review --interactive` \
-             runs only with its input and output on an interactive terminal, so an agent, a ripple or a script cannot \
-             approve or reject records by itself, and no option skips this. Nothing was written. `cauldron ripples review` \
-             (without --interactive) lists the queue from anywhere. Ask the user to run, in a terminal on this machine:\n    \
+             runs only with its input and output on an interactive terminal (it asks a person, key by key), so an agent, \
+             a ripple or a script cannot approve or reject records with it, and no option skips this. Nothing was written. \
+             `cauldron ripples review` (without --interactive) lists the queue from anywhere; where the owner opened \
+             `approve` to agents (`cauldron owner-acts help`), `cauldron ripples approve | reject` run without a terminal. Ask the user to run, in a terminal on this machine:\n    \
              {command}"
         );
     }

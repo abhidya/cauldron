@@ -99,9 +99,78 @@ fn directory_is_safe(dir: &Path, uid: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Variables a helper this crate's callers run (the account helpers) never
+/// inherits: each one makes a shell source a file, a lookup start somewhere
+/// else, or an interpreter load code from a path the caller chose. The same
+/// list as the threads daemon's (`threads::helpers::SCRUBBED_VARS`).
+pub const HELPER_SCRUBBED_VARS: &[&str] = &[
+    "BASH_ENV", "ENV", "IFS", "CDPATH", "GLOBIGNORE", "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND",
+    "PERL5LIB", "PERL5OPT", "PERLLIB", "RUBYOPT", "RUBYLIB", "NODE_OPTIONS", "NODE_PATH",
+];
+/// Prefixes of variables a helper never inherits: exported bash functions,
+/// every `PYTHON*` setting, and dynamic-loader injection.
+pub const HELPER_SCRUBBED_PREFIXES: &[&str] = &["BASH_FUNC_", "PYTHON", "DYLD_", "LD_"];
+/// The PATH a helper gets when the caller's has no absolute entry.
+pub const HELPER_FALLBACK_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// Which of `names` a helper must not inherit.
+pub fn helper_scrubbed_names<I: IntoIterator<Item = std::ffi::OsString>>(names: I) -> Vec<std::ffi::OsString> {
+    names
+        .into_iter()
+        .filter(|n| {
+            let s = n.to_string_lossy();
+            HELPER_SCRUBBED_VARS.contains(&s.as_ref()) || HELPER_SCRUBBED_PREFIXES.iter().any(|p| s.starts_with(p))
+        })
+        .collect()
+}
+
+/// `path` with only its absolute entries (an empty entry or `.` would find a
+/// program in the helper's working directory); [`HELPER_FALLBACK_PATH`] when
+/// none is left.
+pub fn helper_path(path: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    let kept: Vec<PathBuf> = path
+        .map(|p| std::env::split_paths(p).filter(|d| d.is_absolute()).collect())
+        .unwrap_or_default();
+    if kept.is_empty() {
+        return HELPER_FALLBACK_PATH.into();
+    }
+    std::env::join_paths(kept).unwrap_or_else(|_| HELPER_FALLBACK_PATH.into())
+}
+
+/// **How a helper is started**: `program` with `args`, from `dir` (never
+/// the caller's working directory), with [`helper_scrubbed_names`] removed
+/// from this process's environment and a PATH of absolute entries only.
+pub fn helper_command(program: &std::ffi::OsStr, dir: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.current_dir(dir);
+    for name in helper_scrubbed_names(std::env::vars_os().map(|(k, _)| k)) {
+        cmd.env_remove(name);
+    }
+    cmd.env("PATH", helper_path(std::env::var_os("PATH").as_deref()));
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_helper_runs_from_its_directory_with_no_variable_that_loads_a_file() {
+        let names: Vec<std::ffi::OsString> =
+            ["PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "BASH_ENV", "ENV", "IFS", "BASH_FUNC_f%%", "DYLD_LIBRARY_PATH", "HOME", "PATH", "CLAUDE_ACCOUNTS_HOME"]
+                .iter()
+                .map(|s| s.into())
+                .collect();
+        let gone = helper_scrubbed_names(names);
+        assert_eq!(gone.len(), 8, "{gone:?}");
+        assert!(!gone.iter().any(|g| g == "HOME" || g == "PATH" || g == "CLAUDE_ACCOUNTS_HOME"));
+        assert_eq!(helper_path(Some(".::rel:/a/bin".as_ref())), "/a/bin");
+        assert_eq!(helper_path(Some(".".as_ref())), HELPER_FALLBACK_PATH);
+        let cmd = helper_command("/bin/true".as_ref(), Path::new("/"));
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+        let path = cmd.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v).unwrap();
+        assert!(std::env::split_paths(path).all(|d| d.is_absolute()));
+    }
     use std::os::unix::fs::PermissionsExt;
 
     struct Scratch(PathBuf);

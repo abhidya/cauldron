@@ -47,6 +47,10 @@ use serde_json::json;
 const USAGE: &str = "\
 cauldron link — name this project's cauldron, so `cauldron soup` finds it from here
 
+  This links a DIRECTORY to a cauldron. It does not connect two records: for an edge
+  between records use `cauldron soup link <from> <kind> <to>` (or `soup_link` from a
+  session), and `cauldron soup unlink` to remove one.
+
     cauldron link <cauldron> --env <env> [--dir <path>] [--replace]
         Write <path>/.cauldron (default: the current directory) naming the environment
         and the cauldron, after checking both exist. `cauldron soup ...` run in that

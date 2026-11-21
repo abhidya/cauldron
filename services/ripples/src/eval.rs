@@ -78,7 +78,7 @@ pub struct Spec {
     pub out: PathBuf,
     /// `threads` and/or `local`, in order.
     pub backends: Vec<String>,
-    /// The model of the threads runs (`sonnet` unless asked).
+    /// The model of the threads runs (`opus` unless asked).
     pub threads_model: String,
     /// The model of the local runs (`local:<name>`).
     pub local_model: Option<String>,

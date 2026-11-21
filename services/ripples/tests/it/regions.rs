@@ -49,23 +49,39 @@ fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
+/// Opens a scripted call's gate when dropped, so a test that fails while
+/// the call is held never leaves the run waiting for it.
+struct OpensOnDrop(std::path::PathBuf);
+
+impl Drop for OpensOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"");
+    }
+}
+
 fn events_of(s: &Scratch, run: &str) -> Vec<String> {
     s.journal().iter().filter(|l| l["run"] == run).map(|l| l["event"].as_str().unwrap().to_string()).collect()
 }
 
 /// **The curator writes elsewhere while the ripple thinks.** The run holds
 /// R-1 from before its call; during the call (the scripted backend holds it
-/// open) a session's write into R-2 lands at once, one into R-1 is refused
-/// `region_locked` at once naming the run, since and until, with a
-/// retry-after; the run then lands in R-1 and lets go in the same act, and
-/// the session's write into R-1 lands.
+/// open until the test opens its gate, so the call cannot end under the
+/// test on a loaded machine) a session's write into R-2 lands, one into R-1
+/// is refused `region_locked` naming the run, since and until, with a
+/// retry-after, and both answer while the call is still open (a refusal
+/// that waited for the lock would never answer); the run then lands in R-1
+/// and lets go in the same act, and the session's write into R-1 lands.
 #[test]
 fn rg1_a_curator_write_elsewhere_lands_during_a_running_ripple_and_one_into_its_region_is_refused() {
     let s = Scratch::new("rg1");
     let door = Door::start(&s);
     let id = door.dump(SCHEMA_TEXT);
-    let script = s.script("rg1", json!([{"output": answer_in("R-1", "a drift test for the schema"), "sleep_ms": 1500}]));
+    let gate = s.0.join("rg1.gate");
+    let script = s.script("rg1", json!([{"output": answer_in("R-1", "a drift test for the schema"), "until_exists": gate}]));
     let out = std::thread::scope(|sc| {
+        // Inside the scope: a failure here opens the gate before the scope
+        // waits for the run.
+        let _open = OpensOnDrop(gate.clone());
         let run = sc.spawn(|| {
             let ctx = engine(&s, &door, &script, Default::default());
             cauldron_ripples::engine::run(&ctx, &ask(&id))
@@ -74,10 +90,10 @@ fn rg1_a_curator_write_elsewhere_lands_during_a_running_ripple_and_one_into_its_
         let held = table(&s);
         assert_eq!(held.len(), 1, "{held:?}");
         assert_eq!((held[0]["region"].clone(), held[0]["mode"].clone(), held[0]["holder"]["dump"].clone()), (json!("R-1"), json!("write"), json!(id)));
-        let t0 = Instant::now();
         session_put(&door, "R-2", "an import idea").expect("another region takes the write at once");
         let (code, msg, detail) = session_put(&door, "R-1", "a schema idea").expect_err("the held region refuses");
-        assert!(t0.elapsed() < Duration::from_millis(1000), "refused at once, not after a wait: {:?}", t0.elapsed());
+        assert_eq!(table(&s).len(), 1, "answered while the call still holds R-1");
+        std::fs::write(&gate, b"").unwrap();
         assert_eq!(code, "region_locked", "{msg}");
         assert!(msg.contains("region `R-1` is locked by a ripple") && msg.contains(&format!("dump {id}")), "{msg}");
         assert!(detail["retry_after_secs"].as_i64().unwrap() >= 1, "{detail}");
@@ -361,25 +377,37 @@ fn rg4_a_park_a_cap_or_a_failure_lets_the_lock_go() {
     assert!(calls(&script).is_empty());
 }
 
-/// **Renewed while the call is open.** With a time to live of 1 s and a
-/// call of 2.5 s, the lock is renewed and still refuses a session's write
-/// after 1.8 s; once the run lands it is let go.
+/// **Renewed while the call is open.** With a time to live of 1 s, the call
+/// is held open by the test's gate (never a guessed duration). Once the
+/// lock has been renewed (its `until` moved past where it started) and more
+/// than its time to live has passed since the call opened, it still refuses
+/// a session's write; then the gate opens, and once the run lands the lock
+/// is let go.
 #[test]
 fn rg5_the_lock_is_renewed_while_the_call_is_open() {
     let s = Scratch::new("rg5");
     let door = Door::start(&s);
     let id = door.dump(SCHEMA_TEXT);
-    let script = s.script("rg5", json!([{"output": answer_in("R-1", "after a long call"), "sleep_ms": 2500}]));
+    let gate = s.0.join("rg5.gate");
+    let script = s.script("rg5", json!([{"output": answer_in("R-1", "after a long call"), "until_exists": gate}]));
     let out = std::thread::scope(|sc| {
+        // Inside the scope: a failure here opens the gate before the scope
+        // waits for the run.
+        let _open = OpensOnDrop(gate.clone());
         let run = sc.spawn(|| {
             let mut ctx = engine(&s, &door, &script, Default::default());
             ctx.lock_ttl_secs = 1;
             cauldron_ripples::engine::run(&ctx, &ask(&id))
         });
         wait_for("the call is open", || calls(&script).len() == 1);
-        std::thread::sleep(Duration::from_millis(1800));
+        let opened = Instant::now();
+        let first = table(&s)[0]["until_ms"].clone();
+        wait_for("renewed, and past its first time to live", || {
+            opened.elapsed() > Duration::from_millis(1800) && table(&s).first().is_some_and(|r| r["until_ms"] != first)
+        });
         let (code, _, _) = session_put(&door, "R-1", "while the call is open").expect_err("still held");
         assert_eq!(code, "region_locked");
+        std::fs::write(&gate, b"").unwrap();
         run.join().unwrap()
     });
     assert_eq!(out["outcome"], "processed", "{out}");

@@ -96,6 +96,43 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] \
   exit 1
 fi
 
+# ── NOTHING IS FOUND THROUGH THE DIRECTORY THIS WAS STARTED FROM ─────────────
+# This may be started from anywhere, a cloned project included, so nothing it
+# runs may be looked up there:
+#   * PATH keeps only its absolute entries (an empty entry or `.` would find a
+#     planted `security`, `claude` or `git` in the current directory);
+#   * CDPATH, GLOBIGNORE and BASH_ENV/ENV are dropped, so no `cd` lands
+#     elsewhere and no child bash sources a file first;
+#   * every python runs as `py`: one interpreter at a fixed absolute path, not
+#     writable by group or others, started with -I (isolated: neither the
+#     current directory nor the script's directory is on sys.path, no user
+#     site-packages, no PYTHON* variables). A `json.py` planted where this was
+#     started is never imported, and the keychain secret piped into python
+#     reaches only the standard library.
+IFS=: read -r -a _path_entries <<<"${PATH:-}" || true
+_safe_path=""
+for _d in "${_path_entries[@]+"${_path_entries[@]}"}"; do
+  case "$_d" in /*) _safe_path="${_safe_path:+$_safe_path:}$_d" ;; esac
+done
+PATH="${_safe_path:-/usr/bin:/bin:/usr/sbin:/sbin}"; export PATH
+unset _path_entries _safe_path _d CDPATH GLOBIGNORE BASH_ENV ENV
+PY3=""
+for _py in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  [ -f "$_py" ] && [ -x "$_py" ] || continue
+  # /usr/bin/python3 is a stub until the Command Line Tools are installed, and
+  # the stub opens an install dialog: use it only when they are.
+  [ "$_py" != /usr/bin/python3 ] || /usr/bin/xcode-select -p >/dev/null 2>&1 || continue
+  case "$(/usr/bin/stat -Lf '%Lp' "$_py" 2>/dev/null)" in
+    ''|*[2367]|*[2367]?) continue ;;   # unreadable, or writable by group or others
+  esac
+  PY3="$_py"; break
+done
+unset _py
+py() {
+  [ -n "$PY3" ] || { printf '%s: no python3 at /opt/homebrew/bin, /usr/local/bin or /usr/bin\n' "${0##*/}" >&2; return 127; }
+  "$PY3" -I "$@"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")")" && pwd)"
 THREADS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # REPO_ROOT follows the PHYSICAL scripts dir (`cd -P`/`pwd -P`): under cauldron
@@ -105,6 +142,21 @@ THREADS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # repository" on every board sign-in). THREADS_DIR stays the invoking home on
 # purpose: it is the data dir (threads.db, accounts) the caller meant.
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/../../.." && pwd -P)"
+# WHERE THIS COPY RUNS FROM (issue #30). In a source checkout's layout (the
+# physical scripts dir is <repo>/services/threads/scripts) it may look for a
+# threads build there and build one with cargo, as it always has. Anywhere
+# else it is an INSTALLED copy (<cauldron root>/share/cauldron/scripts/threads/):
+# it never builds, it runs the `threads` it is given (CAULDRON_THREADS_BIN, which
+# the daemon sets to itself) or the one cauldron pins, and it needs its store
+# named (CLAUDE_ACCOUNTS_HOME, which the daemon and the terminal UI pass).
+IN_CHECKOUT=0
+case "$(cd -P "$SCRIPT_DIR" && pwd -P)" in
+  */services/threads/scripts) IN_CHECKOUT=1 ;;
+esac
+INSTALLED_ROOT=""
+case "$(cd -P "$SCRIPT_DIR" && pwd -P)" in
+  */share/cauldron/scripts/threads) INSTALLED_ROOT="$(cd -P "$SCRIPT_DIR/../../../.." && pwd -P)" ;;
+esac
 # CLAUDE_ACCOUNTS_HOME (R5.S4, HOLDS R23): the threads home whose `accounts/`
 # is the store, named EXPLICITLY instead of derived from where this file sits.
 # A copy installed elsewhere (cauldron's version store) has no store beside
@@ -218,13 +270,16 @@ cauldron_threads_image() {
   local cbin
   if [ "$TEST_MODE" = "1" ]; then
     cbin="$(seam CLAUDE_ACCOUNTS_CAULDRON_BIN)"
+  elif [ -n "$INSTALLED_ROOT" ] && [ -x "$INSTALLED_ROOT/bin/cauldron" ]; then
+    # An installed copy asks the cauldron installed beside it.
+    cbin="$INSTALLED_ROOT/bin/cauldron"
   else
     cbin="$(command -v cauldron 2>/dev/null || true)"
     [ -n "$cbin" ] || { [ -x "$HOME/.cauldron/bin/cauldron" ] && cbin="$HOME/.cauldron/bin/cauldron"; }
   fi
   [ -n "$cbin" ] && [ -x "$cbin" ] || return 0
   local img
-  img="$("$cbin" status --json threads 2>/dev/null | python3 -c '
+  img="$("$cbin" status --json threads 2>/dev/null | py -c '
 import json, os, sys
 try:
     d = json.load(sys.stdin)
@@ -248,23 +303,40 @@ for s in d.get("services") or []:
 }
 
 # The `threads` binary, in this order (Q-23-sync4-1):
+#   0. CAULDRON_THREADS_BIN, when it is an absolute path to an executable: the
+#      daemon running this script sets it to its own binary (issue #30);
 #   1. the build cauldron runs/pins for this environment — the one the daemon
 #      actually serves, so rename/delete act through the same code it runs;
 #   2. $CARGO_TARGET_DIR/{release,debug}/threads — where every build on this
 #      machine goes (the shared target dirs live OUTSIDE the repo);
 #   3. $REPO_ROOT/target/{release,debug}/threads — the legacy in-repo location.
+# 2 and 3 only in a source checkout's layout.
 # Prefer something already built (a launchd job may have no cargo at all).
 threads_cli() {
   local override; override="$(seam CLAUDE_ACCOUNTS_THREADS_BIN)"
   if [ -n "$override" ]; then printf '%s' "$override"; return; fi
+  case "${CAULDRON_THREADS_BIN:-}" in
+    /*) if [ -f "$CAULDRON_THREADS_BIN" ] && [ -x "$CAULDRON_THREADS_BIN" ]; then printf '%s' "$CAULDRON_THREADS_BIN"; return; fi ;;
+  esac
   local b
   b="$(cauldron_threads_image)"
   [ -n "$b" ] && { printf '%s' "$b"; return; }
+  [ "$IN_CHECKOUT" = 1 ] || { printf ''; return; }
   for b in ${CARGO_TARGET_DIR:+"$CARGO_TARGET_DIR/release/threads" "$CARGO_TARGET_DIR/debug/threads"} \
            "$REPO_ROOT/target/release/threads" "$REPO_ROOT/target/debug/threads"; do
     [ -x "$b" ] && { printf '%s' "$b"; return; }
   done
   printf ''
+}
+
+# What to do when no threads binary is found: build one (a checkout), or
+# have cauldron run one (an installed copy).
+build_hint() {
+  if [ "$IN_CHECKOUT" = 1 ]; then
+    printf '%s' "cargo build -p threads --manifest-path $REPO_ROOT/Cargo.toml"
+  else
+    printf '%s' "${INSTALLED_ROOT:-<cauldron root>}/bin/cauldron status threads   (it must run or pin a threads version; reinstall with --replace-running if not)"
+  fi
 }
 
 # The cargo fallback's build-dir guard (same shape as 2619cd57). With
@@ -309,10 +381,13 @@ health_json() {
   if [ -n "$bin" ]; then
     THREADS_HOME="$THREADS_DIR" "$bin" accounts health --json 2>/dev/null
   else
+    # No build is ever made from an installed copy.
+    [ "$IN_CHECKOUT" = 1 ] || return 1
     cargo_target_ok || return 1
-    PATH="$HOME/.cargo/bin:$PATH" THREADS_HOME="$THREADS_DIR" \
+    # From the checkout, so no `.cargo/config.toml` of the caller's directory applies.
+    ( cd "$REPO_ROOT" && PATH="$HOME/.cargo/bin:$PATH" THREADS_HOME="$THREADS_DIR" \
       cargo run --quiet --manifest-path "$REPO_ROOT/Cargo.toml" \
-      -p threads --bin threads -- accounts health --json 2>/dev/null
+      -p threads --bin threads -- accounts health --json 2>/dev/null )
   fi
 }
 
@@ -353,7 +428,7 @@ kc_mdat() {
 fingerprint() {
   local f="$1"
   [ -f "$f" ] || { printf ''; return 0; }
-  python3 - "$f" <<'PY' 2>/dev/null || true
+  py - "$f" <<'PY' 2>/dev/null || true
 import hashlib, json, sys
 h = lambda v: hashlib.sha256(v.encode()).hexdigest()[:8] if isinstance(v, str) else "-"
 try:
@@ -470,7 +545,7 @@ trusted_email() {
   fi
   local res
   res="$(security find-generic-password -a "$acct" -w -s "$svc" 2>/dev/null \
-    | python3 -c "$PROFILE_PY" "$url" 2>/dev/null)"
+    | py -c "$PROFILE_PY" "$url" 2>/dev/null)"
   case "$res" in
     ok$'\t'*) printf '%s' "$res"; return 0 ;;
     unreadable$'\t'*) printf '%s' "$res"; return 1 ;;
@@ -640,7 +715,7 @@ recheck_flags() {  # recheck_flags <label>
 # refusal against a temp dir; outside test mode this function is never called.
 real_home() {
   local h; h="$(seam CLAUDE_ACCOUNTS_REAL_HOME)"
-  [ -n "$h" ] || h="$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)"
+  [ -n "$h" ] || h="$(py -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)"
   printf '%s' "$h"
 }
 # R12.10 (R12.5 inspect-2 N4-N6) hardens all three checks:
@@ -719,7 +794,7 @@ label_for_email() {  # label_for_email <normalised email>
 slot_days_left() {  # slot_days_left <keychain service> [--with-expiry]
   local svc="$1" acct="${USER:-claude-code-user}" want_exp="${2:-}"
   security find-generic-password -a "$acct" -s "$svc" >/dev/null 2>&1 || return 0
-  security find-generic-password -a "$acct" -w -s "$svc" 2>/dev/null | python3 -c '
+  security find-generic-password -a "$acct" -w -s "$svc" 2>/dev/null | py -c '
 import json, sys, time
 want_exp = len(sys.argv) > 1 and sys.argv[1] == "--with-expiry"
 try:
@@ -759,7 +834,7 @@ read_login_hint() { local f; f="$(login_hint_file "$1")"; [ -f "$f" ] && head -1
 slot_email_from_config() {
   local f="$ACCOUNTS_DIR/$1/.claude.json"
   [ -f "$f" ] || { printf ''; return 0; }
-  python3 - "$f" <<'PY' 2>/dev/null || true
+  py - "$f" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -1210,7 +1285,7 @@ cmd_prune() {
 
 # ── list / status ────────────────────────────────────────────────────────────
 
-# The renderer, as a program in a variable. It CANNOT be a `python3 - <<PY`
+# The renderer, as a program in a variable. It CANNOT be a `py - <<PY`
 # heredoc: a heredoc redirects stdin, so it would collide with the JSON we pipe
 # in and python would try to execute the JSON as source. (That exact collision
 # is a live bug in add-account's post-login auth summary; fixed there too.)
@@ -1308,20 +1383,20 @@ for i, s in enumerate(slots, 1):
 PY
 
 render_list() {  # render_list <json> [--numbered]
-  printf '%s' "$1" | python3 -c "$RENDER_PY" "${2:-}" "$ACCOUNTS_DIR"
+  printf '%s' "$1" | py -c "$RENDER_PY" "${2:-}" "$ACCOUNTS_DIR"
 }
 
 # The labels the renderer printed, in the SAME order and with the SAME
 # filtering, so a menu number always names the row the operator is looking at.
 list_labels() {  # list_labels <json>
-  printf '%s' "$1" | python3 -c \
+  printf '%s' "$1" | py -c \
     'import json,sys; [print(s["label"]) for s in json.load(sys.stdin).get("slots",[]) if not s.get("folds_into")]'
 }
 
 cmd_list() {
   local json; json="$(health_json)"
   [ -n "$json" ] || die "could not read the account inventory (\`threads accounts health --json\` produced nothing).
-  Build the crate first:  cargo build -p threads --manifest-path $REPO_ROOT/Cargo.toml"
+  Build the crate first:  $(build_hint)"
   say ""
   say "  Claude accounts on this machine"
   say ""
@@ -1556,10 +1631,10 @@ read_facts() {
   done
   while IFS=$'\x1f' read -r k v; do
     [ -n "${k:-}" ] && F["$k"]="${v:-}"
-  done < <(printf '%s' "$json" | python3 -c "$FACTS_PY" "$label")
+  done < <(printf '%s' "$json" | py -c "$FACTS_PY" "$label")
   [ -n "${F[target_found]}" ] || die "could not read the account inventory
   (\`threads accounts health --json\` produced nothing usable). Build the crate:
-      cargo build -p threads --manifest-path $REPO_ROOT/Cargo.toml"
+      $(build_hint)"
 }
 
 valid_label() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_-]{1,64}$'; }
@@ -2030,7 +2105,7 @@ cmd_rename() {
   valid_label "$new" || die "invalid name ${new@Q}: use [A-Za-z0-9_-], max 64 chars"
   local bin; bin="$(threads_cli)"
   [ -n "$bin" ] || die "the threads binary is not built. Run:
-  cargo build -p threads --manifest-path $REPO_ROOT/Cargo.toml"
+  $(build_hint)"
   say ""
   THREADS_HOME="$THREADS_DIR" "$bin" accounts rename "$old" "$new" || return $?
   # The login hint lives inside the slot dir, so it moved with it. Nothing else
@@ -2103,7 +2178,7 @@ cmd_delete() {
 
   local bin; bin="$(threads_cli)"
   [ -n "$bin" ] || die "the threads binary is not built. Run:
-  cargo build -p threads --manifest-path $REPO_ROOT/Cargo.toml"
+  $(build_hint)"
   local -a args=(accounts delete "$label")
   [ "$force" -eq 0 ] || args+=(--force)
   say ""
@@ -2254,7 +2329,7 @@ print(json.dumps({
     "orphan_stores": [s for s in sys.argv[2].splitlines() if s.strip()],
 }, indent=2))
 PY
-  printf '%s' "$rows" | python3 -c "$emit_py" "$threshold" "$orphans"
+  printf '%s' "$rows" | py -c "$emit_py" "$threshold" "$orphans"
 }
 
 # ── rotate ───────────────────────────────────────────────────────────────────
@@ -2336,7 +2411,7 @@ for s in d.get("slots", []):
     ]))
 PY
   local plan
-  plan="$(printf '%s' "$json" | python3 -c "$plan_py")"
+  plan="$(printf '%s' "$json" | py -c "$plan_py")"
 
   local n_rotated=0 n_skip=0 n_manual=0
   local -a manual_slots=() results=()
@@ -2450,7 +2525,7 @@ for line in sys.stdin.read().splitlines():
                  "note": note})
 print(json.dumps({"at": sys.argv[1], "live_login": sys.argv[2], "slots": rows}, indent=2))
 PY
-    printf '%s\n' "${results[@]+"${results[@]}"}" | python3 -c "$out_py" "$stamp" "$live_note"
+    printf '%s\n' "${results[@]+"${results[@]}"}" | py -c "$out_py" "$stamp" "$live_note"
     return 0
   fi
 
@@ -2548,7 +2623,7 @@ EOF
 cmd_menu() {
   local json; json="$(health_json)"
   [ -n "$json" ] || die "could not read the account inventory (\`threads accounts health --json\` produced nothing).
-  Build the crate first:  cargo build -p threads --manifest-path $REPO_ROOT/Cargo.toml"
+  Build the crate first:  $(build_hint)"
 
   say ""
   say "  ════════════════════════════════════════════════════════════════"
@@ -2764,6 +2839,16 @@ main() {
   case "${1:-}" in
     logout|signout|sign-out|--logout) refuse_logout ;;
   esac
+  # An installed copy has no store beside it: the store must be named.
+  if [ "$IN_CHECKOUT" = 0 ] && [ -z "${CLAUDE_ACCOUNTS_HOME:-}" ] \
+     && ! { [ "$TEST_MODE" = "1" ] && [ -n "${CLAUDE_ACCOUNTS_STATE_DIR:-}" ]; }; then
+    case "${1:-}" in
+      help|-h|--help) ;;
+      *) die "this copy runs from $SCRIPT_DIR, which is not a source checkout, so the account store
+  must be named: set CLAUDE_ACCOUNTS_HOME to the threads store (<cauldron root>/data/<env>/threads/store).
+  The daemon and the terminal UI pass it." ;;
+    esac
+  fi
   assert_safe_env
   case "${1:-}" in
     "")            cmd_menu ;;

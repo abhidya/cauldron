@@ -180,7 +180,7 @@ async fn interactive(url: &str) -> anyhow::Result<()> {
                         Outcome::NeedsTerminal(argv) => {
                             paused.store(true, Ordering::SeqCst);
                             term_shell::restore();
-                            let st = std::process::Command::new(&argv[0]).args(&argv[1..]).status();
+                            let st = crate::pool::action::helper_command(&argv).status();
                             term = term_shell::enter_with(&claims)?;
                             term.clear()?;
                             paused.store(false, Ordering::SeqCst);

@@ -62,6 +62,10 @@ i = 0
 while i < len(args):
     if args[i] == "--member":
         edits.setdefault(args[i + 1], []).append((args[i + 2].encode(), args[i + 3].encode())); i += 4
+    elif args[i] == "--text":
+        # --text <rel> <old> <new>: the first <old> of a non-binary member
+        # replaced by <new>, not re-signed (a script, a declaration).
+        meta.setdefault("--text", []).append((args[i + 1], args[i + 2].encode(), args[i + 3].encode())); i += 4
     elif args[i] == "--append":
         # --append <rel> <text>: text appended to a non-binary member.
         meta.setdefault("--append", []).append((args[i + 1], args[i + 2].encode())); i += 3
@@ -76,7 +80,8 @@ src = tarfile.open(good, "r:gz")
 members = src.getmembers()
 data = {m.name: src.extractfile(m).read() for m in members if m.isfile()}
 ids = {"bin/tui": "tui", "bin/cauldron": "cauldron", "libexec/threads": "com.harness.threads",
-       "libexec/cauldron-mcp": "cauldron-mcp"}
+       "libexec/cauldron-mcp": "cauldron-mcp", "libexec/cauldron-inference": "cauldron-inference",
+       "libexec/cauldron-ripples": "cauldron-ripples"}
 top = name + "/"
 for rel, reps in edits.items():
     if not reps:
@@ -93,6 +98,10 @@ for rel, reps in edits.items():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     data[full] = open(tmp, "rb").read()
     os.remove(tmp)
+for rel, old, new in meta.pop("--text", []):
+    assert data[top + rel].count(old) >= 1, "plant: %r not in %s" % (old, rel)
+    data[top + rel] = data[top + rel].replace(old, new, 1)
+    edits.setdefault(rel, [])
 for rel, text in meta.pop("--append", []):
     data[top + rel] = data[top + rel] + text
     edits.setdefault(rel, [])
@@ -145,6 +154,12 @@ expect_fail shared-path "bin/cauldron: contains a path in a location another use
 # 3. A relative helper path, resolved against wherever the binary runs.
 plant relative-path --member libexec/cauldron-mcp CAULDRON_ISOLATED " ./helper-planted"
 expect_fail relative-path "libexec/cauldron-mcp: contains a path in a location another user could create (./helper-planted"
+# 3b. The same in each local-inference service, which the gate checks like
+#     every other binary of the bundle.
+plant inference-tmp --member libexec/cauldron-inference CAULDRON_ISOLATED /private/tmp/h-in
+expect_fail inference-tmp "libexec/cauldron-inference: contains a path in a location another user could create (/private/tmp/h-in"
+plant ripples-relative --member libexec/cauldron-ripples CAULDRON_ISOLATED " ./helper-ripples"
+expect_fail ripples-relative "libexec/cauldron-ripples: contains a path in a location another user could create (./helper-ripples"
 # 4. The build's own scratch directory, wherever it was: a literal the
 #    builder passes (here a made-up root outside every shared location).
 plant build-root --member bin/tui TUI_POOL_ACCOUNTS_TOOL /opt/rb-x/cauldron-src
@@ -188,7 +203,28 @@ expect_fail setuid "bin/cauldron has mode 4755, not 755"
 plant unsorted --reverse
 expect_fail unsorted "the entries are not in byte order"
 
-# 7. The runtime probe, on a planted file in the shared temporary directory.
+# 7. The account helper scripts (issue #30): one shipped without its
+#    executable mode, and one that, run installed, behaves as a checkout copy
+#    (it no longer asks for a named store, and would look for a build).
+plant helper-mode --meta share/cauldron/scripts/threads/claude-accounts mode 0o644
+expect_fail helper-mode "share/cauldron/scripts/threads/claude-accounts has mode 644, not 755"
+plant helper-checkout --text share/cauldron/scripts/threads/claude-accounts $'IN_CHECKOUT=0\n' $'IN_CHECKOUT=1\n'
+expect_fail helper-checkout "share/cauldron/scripts/threads/claude-accounts, run installed"
+plant helper-aa-checkout --text share/cauldron/scripts/threads/add-account $'IN_CHECKOUT=0\n' $'IN_CHECKOUT=1\n'
+expect_fail helper-aa-checkout "share/cauldron/scripts/threads/add-account, run installed"
+# 7b. A helper that runs python without isolation (a module planted where it
+#     is started would be imported), in each spelling, and one whose PATH
+#     keeps a relative entry.
+plant helper-py-c --text share/cauldron/scripts/threads/claude-accounts $'"$PY3" -I "$@"' $'python3 -c "$@"'
+expect_fail helper-py-c "a shipped script runs python without -I"
+plant helper-py-stdin --text share/cauldron/scripts/threads/add-account $'"$PY3" -I "$@"' $'"$PY3" - "$@"'
+expect_fail helper-py-stdin "a shipped script runs python without -I"
+plant install-py --append install $'/usr/bin/python3 -c "import json"\n'
+expect_fail install-py "a shipped script runs python without -I"
+plant browser-path --text share/cauldron/scripts/threads/claude-login-browser 'PATH="${_safe_path:-' 'PATH=".:${_safe_path:-'
+expect_fail browser-path "a shipped script looks programs up through a PATH that may name its working directory"
+
+# 8. The runtime probe, on a planted file in the shared temporary directory.
 mkdir -p "${PLANTED_TMP}" && printf 'planted\n' >"${PLANTED_TMP}/helper"
 if ! "${SELF_DIR}/probe-creatable-paths" -- /bin/cat "${PLANTED_TMP}/helper" >/dev/null 2>&1; then
     held "probe: a command that reads a planted file under /private/tmp is killed"

@@ -1,6 +1,7 @@
 //! Records a ripple wrote: every read shows them marked `unreviewed: true`,
-//! `review` filters on that, only the owner's command line approves them
-//! (the `APPROVE` seam verb with the approval key; no MCP tool, no ripple),
+//! `review` filters on that, only the owner's side approves them (the seam
+//! verbs with the approval key, or the review tools where the owner opened
+//! `approve`; never a ripple),
 //! and a store with no ripple record reads exactly as before.
 
 use serde_json::{json, Value};
@@ -89,10 +90,10 @@ fn rv1_a_ripple_record_is_shown_marked_filtered_and_approved_by_the_owner_side()
     let (code, _, _) = refused(&svc.call("soup_nodes", json!({"cauldron": "kb", "review": "maybe"}), &c));
     assert_eq!(code, "usage");
 
-    // No MCP session can approve: there is no such tool.
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "soup_approve", "arguments": {"cauldron": "kb", "ids": [id], "_ctx": c}}});
-    let no_tool: Value = serde_json::from_str(&svc.post(&body.to_string(), &[]).body).unwrap();
-    assert_eq!(no_tool["error"]["message"], json!("unknown tool: soup_approve"), "{no_tool}");
+    // No MCP session can approve unless the owner opened it (the default
+    // keeps it at a terminal): the tool refuses and writes nothing.
+    let (code, _, _) = refused(&svc.call("soup_approve", json!({"cauldron": "kb", "ids": [id]}), &c));
+    assert_eq!(code, "owner_act_closed");
     assert_eq!(ok(&svc.call("soup_get", json!({"cauldron": "kb", "ids": [id]}), &c))["records"][0]["unreviewed"], json!(true));
     // Nor a write that sets the flag on the ripple's record.
     let put = svc.call(
@@ -125,7 +126,7 @@ fn rv1_a_ripple_record_is_shown_marked_filtered_and_approved_by_the_owner_side()
     assert_eq!(a["skipped"].as_array().unwrap().len(), 2, "{a}");
     let got = ok(&svc.call("soup_get", json!({"cauldron": "kb", "ids": [id]}), &c));
     assert!(got["records"][0].get("unreviewed").is_none(), "{got}");
-    assert_eq!(got["records"][0]["meta"]["approved"]["by"], json!("owner"));
+    assert_eq!(got["records"][0]["meta"]["approved"]["by"], json!("tty"));
     let p = ok(&svc.call("soup_nodes", json!({"cauldron": "kb", "review": "pending"}), &c));
     assert_eq!(p["total"], 0);
     let again = approve(&owner, json!({"cauldron": "kb", "ids": [id]}));
@@ -215,7 +216,7 @@ fn rv2_bulk_approve_and_reject_through_the_owners_verb() {
     let rec = get(&a[0]);
     assert_eq!(rec["rejected"], json!(true), "{rec}");
     assert!(rec.get("unreviewed").is_none(), "{rec}");
-    assert_eq!(rec["meta"]["rejected"]["by"], json!("owner"));
+    assert_eq!(rec["meta"]["rejected"]["by"], json!("tty"));
     assert_eq!(rec["meta"]["rejected"]["reason"], json!("not mine at all"), "one line");
     assert!(rec["meta"]["cites"].as_array().unwrap().iter().any(|x| x["kind"] == "dump" && x["id"] == "DM-1"), "{rec}");
     // Out of the listing reads, counted; listed when asked for.
@@ -315,9 +316,8 @@ fn rv2_bulk_approve_and_reject_through_the_owners_verb() {
         assert_eq!(code, "usage", "{put}");
         assert!(msg.contains(&format!("meta.{k}")), "{msg}");
     }
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "soup_reject", "arguments": {"cauldron": "kb", "dump": "DM-2", "_ctx": c}}});
-    let no_tool: Value = serde_json::from_str(&svc.post(&body.to_string(), &[]).body).unwrap();
-    assert_eq!(no_tool["error"]["message"], json!("unknown tool: soup_reject"), "{no_tool}");
+    let (code, _, _) = refused(&svc.call("soup_reject", json!({"cauldron": "kb", "dump": "DM-2"}), &c));
+    assert_eq!(code, "owner_act_closed", "closed by default");
 }
 
 /// **`soup_review`**, read-only: the same queue as the library (and the
@@ -372,9 +372,13 @@ fn rv3_soup_review_shows_the_queue_and_decides_nothing() {
     assert!(msg.contains("under 2000"), "{msg}");
     let (code, _, _) = refused(&svc.call("soup_review", json!({"cauldron": "kb", "since": "soon"}), &c));
     assert_eq!(code, "usage");
-    // Nothing a session can call decides a record.
-    for name in ["soup_approve", "soup_reject", "soup_unreject", "soup_unapprove"] {
+    // A session decides only through the two review tools (scope `write`,
+    // refused unless the owner opened `approve`; rv6), never through a read.
+    for name in ["soup_unreject", "soup_unapprove"] {
         assert!(soup_door::catalogue::find(name).is_none(), "{name}");
+    }
+    for name in ["soup_approve", "soup_reject"] {
+        assert_eq!(soup_door::catalogue::find(name).unwrap().needs, soup_door::catalogue::Needs::Scope(Scope::Write), "{name}");
     }
     assert_eq!(soup_door::catalogue::find("soup_review").unwrap().needs, soup_door::catalogue::Needs::Scope(Scope::Read));
     assert_eq!(ok(&svc.call("soup_review", json!({"cauldron": "kb"}), &c))["counts"]["unreviewed"], 3);
@@ -431,7 +435,7 @@ fn rv4_approve_is_the_earlier_body_only_and_decide_names_its_act() {
     let v = line("DECIDE", json!({"cauldron": "kb", "action": "approve_and_reject", "approve": [a[0]], "reject": [a[1], a[2]], "reason": "dup", "all_or_nothing": true}));
     assert_eq!((v["ok"].clone(), v["outcome"].clone(), v["approved"].clone()), (json!(true), json!("decided"), json!([a[0]])), "{v}");
     assert_eq!(v["rejected"].as_array().unwrap().len(), 2, "{v}");
-    assert_eq!((get(&a[0])["meta"]["approved"]["by"].clone(), get(&a[1])["meta"]["rejected"]["reason"].clone()), (json!("owner"), json!("dup")));
+    assert_eq!((get(&a[0])["meta"]["approved"]["by"].clone(), get(&a[1])["meta"]["rejected"]["reason"].clone()), (json!("tty"), json!("dup")));
     let mixed: Vec<Value> = s.calls().into_iter().filter(|l| l["tool"] == "soup_approve_and_reject").collect();
     assert_eq!(mixed.len(), 1, "one audited act");
     assert_eq!((mixed[0]["counts"]["approved"].clone(), mixed[0]["counts"]["rejected"].clone()), (json!(1), json!(2)), "{}", mixed[0]);
@@ -514,4 +518,279 @@ fn rv5_paging_by_a_cursor_skips_nothing_when_records_are_decided_between_pages()
     // A cursor at a decided record still pages from where it was.
     let o = soup_door::review::QueueOpts { after: Some(all[0].clone()), ..Default::default() };
     assert_eq!(soup_door::review::queue(&t, &o).unwrap()["shown"], json!(0), "all decided");
+}
+
+/// **The door's review tools follow the owner's `owner_acts` choice.**
+/// `soup_approve` / `soup_reject` are refused `owner_act_closed` by default
+/// (nothing written), and still refused when the service's own environment
+/// carries `CAULDRON_OWNER_ACTS` (that variable belongs to the CLI command
+/// that carries it, never to a service); allowed when the owner's persisted
+/// choice opens `approve` for the cauldron (a cauldron's own `terminal`
+/// closes it again);
+/// each decision is written `by: "agent"` with the session. A ripple's
+/// identity is refused under every setting.
+#[test]
+fn rv6_the_review_tools_follow_owner_acts_and_never_serve_a_ripple() {
+    use env::owner_acts::{Act, Choice, How, Setting};
+    let s = Scratch::new("rv6", &["kb"]);
+    s.import("kb", &example());
+    let ids: Vec<String> = (0..4).map(|i| ripple_idea(&s, "kb", &format!("idea number {i}"))).collect();
+    s.grant("kb", &[Scope::Read, Scope::Write], &[]);
+    let mut c = ctx(&s.project("p"));
+    c["session_id"] = json!("sess-9");
+    let ripple = json!({"client": "ripples", "cwd": s.project("p").display().to_string()});
+
+    // Closed: the default.
+    let svc = Service::start(&s);
+    let (code, msg, _) = refused(&svc.call("soup_approve", json!({"cauldron": "kb", "ids": [ids[0]]}), &c));
+    assert_eq!(code, "owner_act_closed", "{msg}");
+    assert!(msg.contains("cauldron owner-acts open --only approve"), "{msg}");
+    assert_eq!(refused(&svc.call("soup_reject", json!({"cauldron": "kb", "ids": [ids[0]]}), &ripple)).0, "ripple_refused");
+    drop(svc);
+
+    // The service's own environment opens nothing.
+    let svc = Service::start_with(&s, &[("CAULDRON_OWNER_ACTS", "approve")]);
+    let (code, msg, _) = refused(&svc.call("soup_approve", json!({"cauldron": "kb", "ids": [ids[0]]}), &c));
+    assert_eq!(code, "owner_act_closed", "the service's variable opened the door: {msg}");
+    assert!(msg.contains("CAULDRON_OWNER_ACTS opens nothing here"), "{msg}");
+    drop(svc);
+
+    // The persisted choice opens it; a cauldron's own `terminal` closes it.
+    let mut set = Setting::default();
+    set.set_root(Choice::new(&[Act::Approve], How::Tty));
+    env::owner_acts::store(&s.root(), &set).unwrap();
+    let svc = Service::start(&s);
+    let v = ok(&svc.call("soup_approve", json!({"cauldron": "kb", "ids": [ids[0]]}), &c));
+    assert_eq!((v["by"].clone(), v["session"].clone(), v["approved"].clone()), (json!("agent"), json!("sess-9"), json!([ids[0]])), "{v}");
+    assert_eq!(refused(&svc.call("soup_approve", json!({"cauldron": "kb", "ids": [ids[1]]}), &ripple)).0, "ripple_refused", "open, and still never a ripple");
+    let v = ok(&svc.call("soup_reject", json!({"cauldron": "kb", "ids": [ids[1]], "reason": "off topic"}), &c));
+    assert_eq!((v["by"].clone(), v["rejected"].clone()), (json!("agent"), json!([ids[1]])), "{v}");
+    let id = s.target("kb").cauldron.id();
+    set.set_cauldron("dev", "kb", id, Choice::new(&[], How::Tty));
+    env::owner_acts::store(&s.root(), &set).unwrap();
+    assert_eq!(refused(&svc.call("soup_approve", json!({"cauldron": "kb", "ids": [ids[2]]}), &c)).0, "owner_act_closed", "read on every call");
+    let got = reads::get(&s.target("kb"), &[ids[0].clone(), ids[1].clone()], &ReadOpts::default()).unwrap();
+    assert_eq!(got["records"][0]["meta"]["approved"]["by"], json!("agent"), "{got}");
+    assert_eq!(got["records"][1]["meta"]["rejected"]["session"], json!("sess-9"), "{got}");
+    let audit = s.calls();
+    assert!(audit.iter().any(|l| l["tool"] == "soup_reject" && l["by"] == "agent" && l["session"] == "sess-9"), "{audit:?}");
+}
+
+/// The published write-back list (`schema/soup/write-back.json`).
+fn write_back() -> Value {
+    serde_json::from_str(include_str!("../../../../schema/soup/write-back.json")).unwrap()
+}
+
+/// `record` with the write-back list's `refused` keys taken out the way a
+/// client would, from the list alone (a dotted `meta.<k>` from `meta`), and
+/// its `id` replaced by `label` (to land under `remint`).
+fn strip_refused(record: &Value, label: &str) -> Value {
+    let mut r = record.clone();
+    for k in write_back()["refused"].as_array().unwrap() {
+        let key = k["key"].as_str().unwrap();
+        match key.strip_prefix("meta.") {
+            Some(inner) => {
+                if let Some(m) = r.get_mut("meta").and_then(Value::as_object_mut) {
+                    m.remove(inner);
+                }
+            }
+            None => {
+                r.as_object_mut().unwrap().remove(key);
+            }
+        }
+    }
+    r["id"] = json!(label);
+    r
+}
+
+/// **Writing back what you read** (issue #23, items 2.4 and 2.6). Records
+/// read with `soup_get` (a superseded record, a ripple's unreviewed record,
+/// a rejected one, a cluster with its claims) land again through
+/// `soup_put` with only the published list's `refused` keys taken out and
+/// a new label: the keys a read adds are dropped and named in `ignored`,
+/// and what stays refused is refused by name. A `soup_link` note's bound
+/// is in the tool's own schema.
+#[test]
+fn wb1_a_record_read_with_soup_get_is_written_back_from_the_published_list() {
+    let s = Scratch::new("wb1", &["kb"]);
+    s.import("kb", &example());
+    let rejected = ripple_batch(&s, "kb", "run-a", "DM-1", &["an idea the owner turned down"]);
+    let pending = ripple_batch(&s, "kb", "run-b", "DM-2", &["an idea nobody reviewed yet"]);
+    s.grant("kb", &[Scope::Read, Scope::Write], &[]);
+    let svc = Service::start(&s);
+    let c = ctx(&s.project("p"));
+    let owner = std::fs::read_to_string(s.mcp_dir().join("approve.secret")).unwrap().trim().to_string();
+    let r: Value = serde_json::from_str(&seam_say(svc.seam, &format!("DECIDE {owner} {}", json!({"cauldron": "kb", "dump": "DM-1", "action": "reject"})))).unwrap();
+    assert_eq!(r["outcome"], json!("rejected"), "{r}");
+    let boundary = "Inside: everything that gets a release to the people who use it, end to end.";
+    let put = ok(&svc.call(
+        "soup_put",
+        json!({"cauldron": "kb", "remint": true, "records": [
+            {"id": "old", "type": "idea", "state": "idea", "handle": "the old idea", "edges": [{"kind": "in_region", "to": "R-1"}]},
+            {"id": "new", "type": "idea", "state": "idea", "handle": "the new idea",
+             "edges": [{"kind": "in_region", "to": "R-1"}, {"kind": "supersedes", "to": "old", "note": "all of it"}]},
+            {"id": "k", "type": "cluster", "handle": "the release", "boundary": boundary, "edges": [{"kind": "claims", "to": "R-1"}]}]}),
+        &c,
+    ));
+    let (old, cl) = (put["id_map"]["old"].as_str().unwrap().to_string(), put["id_map"]["k"].as_str().unwrap().to_string());
+    let read = ok(&svc.call("soup_get", json!({"cauldron": "kb", "ids": [old, rejected[0], pending[0], cl]}), &c));
+    let recs = read["records"].as_array().unwrap().clone();
+    assert_eq!(recs.len(), 4, "{read}");
+    let by_id = |id: &str| recs.iter().find(|r| r["id"] == id).unwrap().clone();
+    assert!(by_id(&old)["superseded_by"].is_array() && by_id(&rejected[0])["rejected"] == json!(true), "{read}");
+    assert!(by_id(&pending[0])["unreviewed"] == json!(true) && by_id(&cl)["claims"].is_array(), "{read}");
+
+    // As read, with only a new label: what stays refused is refused by name.
+    let relabel = |r: &Value, l: &str| -> Value {
+        let mut r = r.clone();
+        r["id"] = json!(l);
+        r
+    };
+    let (code, msg, detail) = refused(&svc.call("soup_put", json!({"cauldron": "kb", "remint": true, "dry_run": true, "records": [relabel(&by_id(&pending[0]), "p")]}), &c));
+    assert_eq!((code.as_str(), detail["refused"].as_str()), ("usage", Some("ripple_provenance")), "{msg}");
+    let (code, msg, _) = refused(&svc.call("soup_put", json!({"cauldron": "kb", "remint": true, "dry_run": true, "records": [relabel(&by_id(&rejected[0]), "r")]}), &c));
+    assert!(code == "usage" && msg.contains("are the owner's"), "{msg}");
+
+    // From the published list alone: lands, and says what it dropped.
+    let back: Vec<Value> = recs.iter().map(|r| strip_refused(r, &format!("rt-{}", r["id"].as_str().unwrap()))).collect();
+    let mut copies = json!(null);
+    for dry in [true, false] {
+        let landed = ok(&svc.call("soup_put", json!({"cauldron": "kb", "remint": true, "dry_run": dry, "allow_duplicate": true, "records": back}), &c));
+        let mut ignored: Vec<String> = landed["ignored"].as_array().unwrap().iter().map(|v| format!("{}:{}", v["record"].as_str().unwrap(), v["key"].as_str().unwrap())).collect();
+        ignored.sort();
+        let mut want = vec![
+            format!("rt-{old}:superseded_by"),
+            format!("rt-{}:rejected", rejected[0]),
+            format!("rt-{}:unreviewed", pending[0]),
+            format!("rt-{cl}:claims"),
+        ];
+        want.sort();
+        assert_eq!(ignored, want, "dry_run {dry}: {landed}");
+        assert!(landed["ignored_why"].as_str().unwrap().contains("write-back.json"));
+        assert_eq!(landed["id_map"].as_object().unwrap().len(), 4, "dry_run {dry}: {landed}");
+        copies = landed["id_map"].clone();
+    }
+    // Nothing a read adds was stored: the copies are a session's records,
+    // neither rejected nor unreviewed nor superseded, and the copied
+    // cluster's claims are its edges.
+    let ids: Vec<Value> = copies.as_object().unwrap().values().cloned().collect();
+    let after = ok(&svc.call("soup_get", json!({"cauldron": "kb", "ids": ids}), &c));
+    for r in after["records"].as_array().unwrap() {
+        assert!(r.get("rejected").is_none() && r.get("unreviewed").is_none() && r.get("superseded_by").is_none(), "{r}");
+        assert!(r["meta"].get("ripple").is_none() && r["meta"].get("rejected").is_none(), "{r}");
+        if r["type"] == "cluster" {
+            assert_eq!(r["claims"].as_array().unwrap().len(), 1, "{r}");
+        }
+    }
+
+    // 2.6: the link tool's schema bounds a note, as soup_claim's does.
+    let link = soup_door::catalogue::find("soup_link").unwrap().def().input_schema;
+    assert_eq!(link["properties"]["links"]["items"]["properties"]["note"]["maxLength"], json!(soup_door::notes::EDGE_NOTE_MAX));
+    svc.stop();
+}
+
+/// **No session writes `meta.ripple`** (issue #23, item 2.10): `soup_put`
+/// refuses it, as `ripple_provenance`, landed or dry, with or without
+/// `remint` or `partial`, in every casing and nesting and as a top-level
+/// `ripple`; nothing lands. The ripple path still stamps it.
+#[test]
+fn wb2_no_session_writes_ripple_provenance() {
+    let s = Scratch::new("wb2", &["kb"]);
+    s.import("kb", &example());
+    s.grant("kb", &[Scope::Read, Scope::Write], &[]);
+    let svc = Service::start(&s);
+    let c = ctx(&s.project("p"));
+    let fake = json!({"package": "dump", "version": "v1", "run": "made-up", "model": "opus"});
+    let variants = [
+        ("meta", json!({"ripple": fake})),
+        ("meta", json!({"Ripple": fake})),
+        ("meta", json!({"RIPPLE": null})),
+        ("meta", json!({"ripple": {}})),
+        ("meta", json!({"meta": {"ripple": fake}})),
+        ("meta", json!({"meta.ripple": fake})),
+        ("Meta", json!({"ripple": fake})),
+        ("meta.ripple", fake.clone()),
+        ("Meta.Ripple", fake.clone()),
+        ("ripple", fake.clone()),
+    ];
+    let before = s.node_count("kb");
+    for (k, m) in &variants {
+        let mut rec = json!({"id": "C-2", "type": "idea", "state": "idea", "handle": "a session's own", "edges": [{"kind": "in_region", "to": "R-1"}]});
+        rec[*k] = m.clone();
+        for flags in [json!({}), json!({"dry_run": true}), json!({"remint": true}), json!({"remint": true, "partial": true}), json!({"remint": true, "dry_run": true})] {
+            let mut args = json!({"cauldron": "kb", "records": [rec]});
+            for (f, v) in flags.as_object().unwrap() {
+                args[f] = v.clone();
+            }
+            let (code, msg, detail) = refused(&svc.call("soup_put", args, &c));
+            assert_eq!((code.as_str(), detail["refused"].as_str()), ("usage", Some("ripple_provenance")), "{k} {m} {flags}: {msg}");
+            assert!(msg.contains("refused: ripple_provenance") && msg.contains("Nothing was written"), "{msg}");
+        }
+    }
+    assert_eq!(s.node_count("kb"), before, "nothing landed");
+    // A key that only looks like it is no provenance.
+    let fine = ok(&svc.call(
+        "soup_put",
+        json!({"cauldron": "kb", "remint": true, "dry_run": true, "records": [{"id": "x", "type": "idea", "state": "idea", "handle": "about ripples",
+            "body": "meta.ripple in the text", "edges": [{"kind": "in_region", "to": "R-1"}]}]}),
+        &c,
+    ));
+    assert_eq!(fine["outcome"], json!("validated"), "{fine}");
+    svc.stop();
+}
+
+/// **Write-back of records an agent decided, and a citation on them.** With
+/// `approve` opened to agents (the service's own environment), one ripple
+/// record is approved and one rejected through `soup_approve` /
+/// `soup_reject` (`by: "agent"`, with the session). `soup_cite` adds and
+/// removes a citation on each and leaves the decision and `meta.ripple` as
+/// they were. Read with `soup_get` and written back as read, each is
+/// refused by name (the agent's decision is a review flag like a person's,
+/// and `meta.ripple` is provenance); stripped from the published list
+/// alone, both land, with only the rejected one's top-level `rejected`
+/// named as ignored, and the copies carry no decision and no provenance.
+#[test]
+fn wb3_records_an_agent_decided_write_back_and_take_a_citation_like_any_other() {
+    let s = Scratch::new("wb3", &["kb"]);
+    s.import("kb", &example());
+    let ids = ripple_batch(&s, "kb", "run-a", "DM-1", &["one idea an agent approved", "one idea an agent rejected"]);
+    s.grant("kb", &[Scope::Read, Scope::Write], &[]);
+    let mut set = env::owner_acts::Setting::default();
+    set.set_root(env::owner_acts::Choice::new(&[env::owner_acts::Act::Approve], env::owner_acts::How::Tty));
+    env::owner_acts::store(&s.root(), &set).unwrap();
+    let svc = Service::start(&s);
+    let mut c = ctx(&s.project("p"));
+    c["session_id"] = json!("sess-3");
+    ok(&svc.call("soup_approve", json!({"cauldron": "kb", "ids": [ids[0]]}), &c));
+    ok(&svc.call("soup_reject", json!({"cauldron": "kb", "ids": [ids[1]], "reason": "not this"}), &c));
+    let get = |id: &str| ok(&svc.call("soup_get", json!({"cauldron": "kb", "ids": [id]}), &c))["records"][0].clone();
+    let trail = |r: &Value| json!([r["meta"]["approved"], r["meta"]["rejected"], r["meta"]["ripple"]]);
+    let before: Vec<Value> = ids.iter().map(|id| trail(&get(id))).collect();
+    assert_eq!(before[0][0]["by"], "agent", "{before:?}");
+    assert_eq!(before[1][1]["session"], "sess-3", "{before:?}");
+    for id in &ids {
+        let u = json!({"kind": "url", "url": "https://example.com/why"});
+        ok(&svc.call("soup_cite", json!({"cauldron": "kb", "id": id, "add": u}), &c));
+        ok(&svc.call("soup_cite", json!({"cauldron": "kb", "id": id, "remove": u}), &c));
+    }
+    let recs: Vec<Value> = ids.iter().map(|id| get(id)).collect();
+    assert_eq!(recs.iter().map(trail).collect::<Vec<_>>(), before, "a citation moved no decision and no provenance");
+
+    for (r, l) in recs.iter().zip(["a", "b"]) {
+        let mut as_read = r.clone();
+        as_read["id"] = json!(l);
+        let (code, msg, _) = refused(&svc.call("soup_put", json!({"cauldron": "kb", "remint": true, "dry_run": true, "records": [as_read]}), &c));
+        assert_eq!(code, "usage", "{msg}");
+        assert!(msg.contains("meta.approved") || msg.contains("meta.rejected") || msg.contains("ripple"), "{msg}");
+    }
+    let back: Vec<Value> = recs.iter().zip(["a", "b"]).map(|(r, l)| strip_refused(r, l)).collect();
+    let landed = ok(&svc.call("soup_put", json!({"cauldron": "kb", "remint": true, "records": back}), &c));
+    let ignored: Vec<String> = landed["ignored"].as_array().unwrap().iter().map(|v| format!("{}:{}", v["record"].as_str().unwrap(), v["key"].as_str().unwrap())).collect();
+    assert_eq!(ignored, ["b:rejected"], "{landed}");
+    for l in ["a", "b"] {
+        let copy = get(landed["id_map"][l].as_str().unwrap());
+        assert_eq!(trail(&copy), json!([null, null, null]), "{copy}");
+        assert!(copy.get("rejected").is_none() && copy.get("unreviewed").is_none(), "{copy}");
+    }
+    svc.stop();
 }

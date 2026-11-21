@@ -195,7 +195,10 @@ fn at2_an_automatic_runs_tokens_are_the_turns_totals() {
 /// **A park at admission is a deferral, held for every cauldron.** threads
 /// parks the first calls (every account over its usage threshold), then
 /// takes calls again. Five dumps: while it parks, one withdrawn call per
-/// wait (the wait growing), never one per dump; each park is `deferred`
+/// wait (the wait growing), never one per dump, read from the journal's
+/// own times (each call after a park starts at or after that park's
+/// `retry_after`, and the second park's wait is longer than the first's),
+/// never from how long the test slept; each park is `deferred`
 /// with reason `threads_parked` and cause `threshold`, never a failed
 /// attempt, and charged nothing; once threads takes calls, all five are
 /// processed, each in one call.
@@ -221,9 +224,6 @@ fn at3_a_park_at_admission_is_a_deferral_with_one_call_per_wait() {
     let svc = start(&s, &door, &f, 1500);
     let ids: Vec<String> = (0..5).map(|i| door.dump(&format!("note {i} about the cache key"))).collect();
     wait_for("the first park", 20, || auto_lines(&s).iter().any(|l| l["event"] == "outcome"));
-    let parked_at = Instant::now();
-    std::thread::sleep(Duration::from_millis(900));
-    assert_eq!(f.sends(), 1, "while held, no other dump is sent: {}", svc.log());
     let first = auto_lines(&s).into_iter().find(|l| l["event"] == "outcome").unwrap();
     assert_eq!((first["class"].clone(), first["reason"].clone(), first["park"].clone()), (json!("deferred"), json!("threads_parked"), json!("threshold")), "{first}");
     assert!(first["message"].as_str().unwrap().contains("usage threshold") && !first["message"].as_str().unwrap().contains("an-account"), "{first}");
@@ -238,12 +238,24 @@ fn at3_a_park_at_admission_is_a_deferral_with_one_call_per_wait() {
     assert_eq!(q["retrying"], json!([]), "a park is not a failed attempt: {st}");
 
     wait_for("all five processed", 60, || ids.iter().all(|d| s.dump_state(d)["state"] == "processed"));
-    let held_for = parked_at.elapsed();
     assert_eq!(f.sends(), parks + 5, "one call per wait while parked, then one per dump");
-    assert!(held_for >= Duration::from_millis(1500 + 6000 - 1000), "the second wait is longer: {held_for:?}");
     let outs: Vec<Value> = auto_lines(&s).into_iter().filter(|l| l["event"] == "outcome").collect();
     let deferred: Vec<&Value> = outs.iter().filter(|l| l["class"] == "deferred").collect();
     assert_eq!(deferred.len(), parks, "{outs:?}");
+    // While held, nothing is sent: every attempt after a park starts at or
+    // after its `retry_after` (RFC 3339 in UTC with milliseconds, so the
+    // strings order as the instants do).
+    let all = auto_lines(&s);
+    for park in &deferred {
+        let (at, until) = (park["at"].as_str().unwrap(), park["retry_after"].as_str().unwrap());
+        let early: Vec<&Value> = all.iter().filter(|l| l["event"] == "attempt" && l["at"].as_str().unwrap() > at && l["at"].as_str().unwrap() < until).collect();
+        assert!(early.is_empty(), "sent while held (park at {at}, held until {until}): {early:?}");
+    }
+    let wait = |l: &Value| {
+        let t = |k: &str| chrono::DateTime::parse_from_rfc3339(l[k].as_str().unwrap()).unwrap();
+        t("retry_after") - t("at")
+    };
+    assert!(wait(deferred[1]) > wait(deferred[0]), "the second wait is longer: {:?} then {:?}", wait(deferred[0]), wait(deferred[1]));
     assert!(outs.iter().all(|l| l["failed_attempts"] == json!(0)), "no park counts as a failed attempt: {outs:?}");
     // The parks were charged nothing and are not calls against the caps.
     let lines = s.journal();
@@ -261,6 +273,11 @@ fn at3_a_park_at_admission_is_a_deferral_with_one_call_per_wait() {
 /// the cause, the next attempt, the dump that set it) and marks both
 /// cauldrons held. When it is over, `kb`, served less recently, is tried
 /// first and processed, though `aa` still has a due dump and keeps parking.
+/// The hold lasts 5 s, so `STATUS` (asked as soon as the park's outcome is
+/// in the journal) is read while it holds even on a loaded machine; the
+/// test proves that from the journal (the read came before the hold's
+/// `retry_after`) instead of assuming it, and waits for kb's outcome, not a
+/// time.
 #[test]
 fn at4_the_hold_is_shown_and_the_cauldron_served_least_recently_goes_first() {
     let s = Scratch::new("at4");
@@ -279,14 +296,16 @@ fn at4_the_hold_is_shown_and_the_cauldron_served_least_recently_goes_first() {
         }
     });
     let f = fake_gen(None, gen, Mode::Current);
-    let svc = start(&s, &door, &f, 800);
+    let svc = start(&s, &door, &f, 5000);
     let a1 = door.dump_in("aa", "a note in aa");
     wait_for("aa parked", 20, || auto_lines(&s).iter().any(|l| l["event"] == "outcome" && l["cauldron"] == "aa"));
     let kb1 = door.dump("a note in kb, behind the hold");
     let k = Service::key(&s);
     let st = svc.say(&format!("STATUS {k} {}", json!({})));
+    let asked = cauldron_ripples::auto::now();
     let hold = &st["automatic"]["threads_hold"];
     let first = auto_lines(&s).into_iter().find(|l| l["event"] == "outcome").unwrap();
+    assert!(asked.as_str() < first["retry_after"].as_str().unwrap(), "STATUS was answered inside the hold ({asked} before {})", first["retry_after"]);
     if hold["state"] == "holding" {
         assert_eq!((hold["park"].clone(), hold["reason"].clone(), hold["set_by"]["cauldron"].clone(), hold["set_by"]["dump"].clone()), (json!("threshold"), json!("threads_parked"), json!("aa"), json!(a1.clone())), "{st}");
         assert_eq!((hold["since"].clone(), hold["next_attempt"].clone()), (first["at"].clone(), first["retry_after"].clone()), "{st}");
@@ -294,7 +313,7 @@ fn at4_the_hold_is_shown_and_the_cauldron_served_least_recently_goes_first() {
         assert_eq!(row("aa")["held"]["by"], "threads_hold", "{st}");
         assert_eq!(row("kb")["held"]["dumps"], json!([kb1.clone()]), "{st}");
     } else {
-        panic!("the hold was over before STATUS was asked (a slow machine): {st}");
+        panic!("STATUS was answered inside the hold, yet did not show it: {st}");
     }
     // After the hold, kb goes first, though aa's dump is due again.
     let t = Instant::now();

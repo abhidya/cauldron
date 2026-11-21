@@ -2152,3 +2152,77 @@ fn rv1_unreviewed_records_are_marked_and_filtered_by_the_cli() {
     assert_ne!(bad.rc, 0);
     assert!(bad.err.contains("pending"), "{}", bad.err);
 }
+
+// ------------------------------------------------------- link, unlink, cite
+
+fn edges_in(s: &Scratch, id: &str) -> Vec<(String, String)> {
+    let g = get(s, "kb", &[id]).json();
+    g["records"][0]["edges"].as_array().unwrap().iter().map(|e| (e["kind"].as_str().unwrap().to_string(), e["to"].as_str().unwrap().to_string())).collect()
+}
+
+/// `cauldron soup link | unlink | cite`, written directly (issue #24, and
+/// #23's missing CLI twin of `soup_link`): an edge added and removed (`get`
+/// stops showing it, `changes` lists an `unlink`), a repeat `not-linked`
+/// with nothing written, a record's last `in_region` and a `supersedes`
+/// refused with their reasons on stdout and exit 1, a citation added and
+/// removed by index and by match with every other meta key kept, a bad one
+/// refused; and `cauldron link help` points at `soup link`.
+#[test]
+fn s19_link_unlink_and_cite_from_a_shell() {
+    let s = scratch("s19", &["kb"]);
+    assert_eq!(import(&s, "kb", &write_json(&s, "ex.json", &example()), &[]).rc, 0);
+    let kb = ["--env", "dev", "--cauldron", "kb"];
+    let soup = |args: &[&str]| {
+        let mut a = vec!["soup"];
+        a.extend_from_slice(args);
+        a.extend_from_slice(&kb);
+        run(&s, &a)
+    };
+    let since = soup(&["changes"]).json()["cursor"].as_str().unwrap().to_string();
+    let o = soup(&["link", "T-1", "ref", "M-1", "--note", "evidence"]);
+    assert_eq!(o.rc, 0, "{}\n{}", o.out, o.err);
+    assert_eq!(o.json()["outcome"], "linked", "{}", o.out);
+    assert!(edges_in(&s, "T-1").contains(&("ref".into(), "M-1".into())));
+    let o = soup(&["unlink", "T-1", "ref", "M-1"]);
+    assert_eq!((o.rc, o.json()["outcome"].clone()), (0, json!("unlinked")), "{}\n{}", o.out, o.err);
+    assert!(!edges_in(&s, "T-1").contains(&("ref".into(), "M-1".into())), "get no longer shows it");
+    let ops: Vec<String> = soup(&["changes", "--since", &since]).json()["changes"].as_array().unwrap().iter().map(|c| c["op"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ops, ["link", "unlink"]);
+    let o = soup(&["unlink", "T-1", "ref", "M-1"]);
+    assert_eq!((o.rc, o.json()["outcome"].clone(), o.json()["written"].clone()), (0, json!("not-linked"), json!(false)), "{}", o.out);
+    // Refused by name.
+    let o = soup(&["unlink", "T-1", "in_region", "R-2"]);
+    assert_eq!(o.rc, 1, "{}\n{}", o.out, o.err);
+    assert_eq!(o.json()["links"][0]["refused"]["reason"], "required-edge", "{}", o.out);
+    assert!(o.err.contains("links_refused"), "{}", o.err);
+    assert!(edges_in(&s, "T-1").contains(&("in_region".into(), "R-2".into())));
+    let o = soup(&["unlink", "CL-1", "claims", "R-1"]);
+    assert_eq!(o.rc, 1);
+    assert_eq!(o.json()["links"][0]["refused"]["reason"], "claims-is-soup-claim", "{}", o.out);
+    let o = soup(&["link", "T-1", "ref"]);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("takes a record, an edge kind and a record"), "{}", o.err);
+    // Citations.
+    let o = soup(&["cite", "DEC-1", "--add", r#"{"kind":"url","url":"https://example.com/d"}"#]);
+    assert_eq!((o.rc, o.json()["outcome"].clone()), (0, json!("cited")), "{}\n{}", o.out, o.err);
+    let o = soup(&["cite", "DEC-1", "--add", r#"{"kind":"file","path":"src/lib.rs","line":3}"#]);
+    assert_eq!(o.rc, 0, "{}", o.err);
+    let meta = get(&s, "kb", &["DEC-1"]).json()["records"][0]["meta"].clone();
+    assert_eq!(meta["cites"].as_array().unwrap().len(), 2, "{meta}");
+    assert_eq!(meta["kind"], "pattern", "{meta}");
+    let o = soup(&["cite", "DEC-1", "--add", r#"{"kind":"file"}"#]);
+    assert_ne!(o.rc, 0);
+    assert!(o.err.contains("bad-cite"), "{}", o.err);
+    let o = soup(&["cite", "DEC-1", "--remove", r#"{"kind":"file"}"#]);
+    assert_eq!((o.rc, o.json()["outcome"].clone()), (0, json!("uncited")), "{}\n{}", o.out, o.err);
+    let o = soup(&["cite", "DEC-1", "--remove", "0"]);
+    assert_eq!((o.rc, o.json()["removed"]["url"].clone()), (0, json!("https://example.com/d")), "{}", o.out);
+    let o = soup(&["cite", "DEC-1", "--remove", "0"]);
+    assert_ne!(o.rc, 0, "past the end: {}", o.out);
+    let meta = get(&s, "kb", &["DEC-1"]).json()["records"][0]["meta"].clone();
+    assert_eq!(meta["cites"], json!([]), "{meta}");
+    assert_eq!(meta["kind"], "pattern");
+    // The two `link`s told apart.
+    let o = run(&s, &["link", "help"]);
+    assert!(o.out.contains("cauldron soup link") && o.out.contains("does not connect two records"), "{}", o.out);
+}

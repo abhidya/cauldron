@@ -37,10 +37,19 @@
 #          with them beside themselves (`../share/cauldron/`), compile in no
 #          source-tree path for it, and run no helper from the source tree
 #          (the terminal board's account action has no default helper).
+#   3b. The same build, same flags, of the two LOCAL-INFERENCE services:
+#      `cauldron-inference` and `cauldron-ripples` (libexec/). They are
+#      opt-in: scripts/install lays them down with the bundle and pins and
+#      starts neither; `cauldron --env <env> build inference|ripples` installs
+#      the bundle's image as a version, with no cargo.
 #   4. The bundle directory `cauldron-<version>-aarch64-apple-darwin/`:
 #        bin/cauldron  bin/tui  libexec/threads  libexec/cauldron-mcp
+#        libexec/cauldron-inference  libexec/cauldron-ripples
 #        share/cauldron/services/*.toml   (the shipped service declarations)
 #        share/cauldron/mcp/              (the shipped MCP tool declarations)
+#        share/cauldron/scripts/threads/  (the account helper scripts the
+#          threads daemon and the terminal UI run: add-account,
+#          claude-accounts, claude-login-browser; 0755)
 #        install  README.md  LICENSE  NOTICE  BUNDLE  SHA256SUMS
 #      Every binary is AD-HOC code-signed (`codesign --force --sign -
 #      --identifier <id>`; `threads` keeps the identifier its own signer
@@ -49,8 +58,8 @@
 #   5. One tarball `<out-dir>/cauldron-<version>-aarch64-apple-darwin.tar.gz`
 #      and `<out-dir>/SHA256SUMS` for it. Its metadata says nothing about the
 #      builder: ustar format, entries in byte order, every owner uid 0 / gid
-#      0 / root / wheel, every mode 0755 (directories, binaries, `install`)
-#      or 0644 (everything else) whatever the builder's umask, every mtime
+#      0 / root / wheel, every mode 0755 (directories, binaries, `install`,
+#      the helper scripts) or 0644 (everything else) whatever the builder's umask, every mtime
 #      the commit's own time in UTC (BUNDLE records it as commit_time), no
 #      extended attributes, gzip without a name or time.
 #
@@ -224,17 +233,39 @@ say "building cauldron, tui, threads and cauldron-mcp (release) in ${SRC}"
             -p cauldron --bin cauldron -p tui --bin tui -p threads --bin threads -p cauldron-mcp --bin cauldron-mcp
 )
 
+# 3b. The local-inference services (see the header): the same environment
+# and flags, so the same remaps and the same `--cfg` reach them.
+say "building cauldron-inference and cauldron-ripples (release) in ${SRC}"
+(
+    cd "${SRC}"
+    env -u RUSTFLAGS -u CARGO_BUILD_RUSTFLAGS -u RUSTDOCFLAGS -u CARGO_BUILD_TARGET \
+        -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
+        CARGO_ENCODED_RUSTFLAGS="${FLAGS}" \
+        CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=none CARGO_INCREMENTAL=0 \
+        SOURCE_DATE_EPOCH="${COMMIT_TIME}" \
+        INFERENCE_BUILD_COMMIT_PIN="${STAMP_COMMIT}" RIPPLES_BUILD_COMMIT_PIN="${STAMP_COMMIT}" \
+        cargo build --release --locked --target-dir "${TARGET_DIR}" \
+            -p cauldron-inference --bin cauldron-inference -p cauldron-ripples --bin cauldron-ripples
+)
+
 STAGE="${SCRATCH}/stage"
 B="${STAGE}/${NAME}"
-mkdir -p "${B}/bin" "${B}/libexec" "${B}/share/cauldron/services" "${B}/share/cauldron/mcp"
+mkdir -p "${B}/bin" "${B}/libexec" "${B}/share/cauldron/services" "${B}/share/cauldron/mcp" "${B}/share/cauldron/scripts/threads"
+# The account helper scripts (issue #30), installed by scripts/install at
+# <root>/share/cauldron/scripts/threads/.
+HELPERS=(add-account claude-accounts claude-login-browser)
 # Copied by content (cat), so no file flag or extended attribute travels.
 place() { cat "$1" >"$2"; chmod 0755 "$2"; }
 place "${TARGET_DIR}/release/cauldron" "${B}/bin/cauldron"
 place "${TARGET_DIR}/release/tui" "${B}/bin/tui"
 place "${TARGET_DIR}/release/threads" "${B}/libexec/threads"
 place "${TARGET_DIR}/release/cauldron-mcp" "${B}/libexec/cauldron-mcp"
+# 3b's local-inference services.
+place "${TARGET_DIR}/release/cauldron-inference" "${B}/libexec/cauldron-inference"
+place "${TARGET_DIR}/release/cauldron-ripples" "${B}/libexec/cauldron-ripples"
 for f in "${SRC}"/services/*.toml; do cat "${f}" >"${B}/share/cauldron/services/$(basename "${f}")"; done
 for f in "${SRC}"/mcp/*; do [[ -f "${f}" ]] && cat "${f}" >"${B}/share/cauldron/mcp/$(basename "${f}")"; done
+for h in "${HELPERS[@]}"; do cat "${SRC}/services/threads/scripts/${h}" >"${B}/share/cauldron/scripts/threads/${h}"; done
 cat "${SRC}/scripts/install" >"${B}/install"; chmod 0755 "${B}/install"
 for f in README.md LICENSE NOTICE; do cat "${SRC}/${f}" >"${B}/${f}"; done
 
@@ -244,6 +275,8 @@ sign "${B}/bin/cauldron" cauldron
 sign "${B}/bin/tui" tui
 sign "${B}/libexec/threads" com.harness.threads
 sign "${B}/libexec/cauldron-mcp" cauldron-mcp
+sign "${B}/libexec/cauldron-inference" cauldron-inference
+sign "${B}/libexec/cauldron-ripples" cauldron-ripples
 
 printf 'name=cauldron\nversion=%s\ncommit=%s\ncommit_time=%s\ntarget=aarch64-apple-darwin\nsigned=adhoc\n' \
     "${VERSION}" "${STAMP_COMMIT}" "${COMMIT_TIME}" >"${B}/BUNDLE"
@@ -251,6 +284,8 @@ printf 'name=cauldron\nversion=%s\ncommit=%s\ncommit_time=%s\ntarget=aarch64-app
 find "${B}" -type d -exec chmod 0755 {} +
 find "${B}" -type f -exec chmod 0644 {} +
 chmod 0755 "${B}/bin/cauldron" "${B}/bin/tui" "${B}/libexec/threads" "${B}/libexec/cauldron-mcp" "${B}/install"
+chmod 0755 "${B}/libexec/cauldron-inference" "${B}/libexec/cauldron-ripples"
+for h in "${HELPERS[@]}"; do chmod 0755 "${B}/share/cauldron/scripts/threads/${h}"; done
 (cd "${B}" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "${f}"; done) >"${STAGE}/inner-sums"
 mv "${STAGE}/inner-sums" "${B}/SHA256SUMS"
 

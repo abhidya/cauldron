@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # scripts/install — build cauldron (release) and install it for THE CURRENT USER.
 #
-#   scripts/install [--dry-run] [--env <name>] [--from <dir>] [--replace-running]
-#   scripts/install --prebuilt <tarball-or-url> [--sha256 <sum>] [--dry-run] [--env <name>] [--replace-running]
+#   scripts/install [--dry-run] [--env <name>] [--from <dir>] [--replace-running] [--owner-acts open|terminal]
+#   scripts/install --prebuilt <tarball-or-url> [--sha256 <sum>] [--dry-run] [--env <name>] [--replace-running] [--owner-acts open|terminal]
+#
+# --owner-acts open|terminal (for a headless install): step 5's `cauldron
+# install --owner-acts <value>` records the root's owner_acts choice after
+# the install, as set by it (`how: install`; `open`: grant, approve and
+# ripples on may run without a terminal;
+# `terminal`: they may not, the default). Without the flag the setting is left
+# as it is. See `cauldron owner-acts help`.
 #
 # THE PREBUILT PATH (`--prebuilt`): installs from a release bundle,
 # `cauldron-<version>-aarch64-apple-darwin.tar.gz` (scripts/build-release-bundle),
@@ -30,7 +37,8 @@
 #      <root>/share/cauldron/mcp/ (the previous ones kept as `.prev`), where
 #      a release binary at <root>/bin/cauldron reads them, as the last write
 #      before step 5, so a run that stops earlier leaves the installed
-#      binary on the declarations it came with.
+#      binary on the declarations it came with. Its account helper scripts
+#      go to <root>/share/cauldron/scripts/threads/ (step 5 below).
 #   4b/4c. `cauldron build threads|mcp --json --env-copy --artifact
 #      <release>/libexec/<image>` in place of the cargo builds: a NEW version
 #      `<commit>-release+<env>` whose commit is read off the image. The
@@ -154,7 +162,13 @@
 #      an env.toml that pins threads but no longer matches the marker (an
 #      older install stopped after its threads pin, before clearing it) is
 #      cleared, and mcp is added as for any existing environment.
-#   5. Runs `cauldron --env <name> install`: copies the binary to
+#   5. Lays down the account helper scripts the threads daemon and the
+#      terminal UI run (add-account, claude-accounts, claude-login-browser)
+#      at <root>/share/cauldron/scripts/threads/, from the bundle or from
+#      this checkout's services/threads/scripts/, every directory and script
+#      0755 and yours (the previous copy kept as threads.prev); an upgrade
+#      (`--replace-running`) replaces them. Then runs
+#      `cauldron --env <name> install`: copies the binary to
 #      <root>/bin/cauldron (and `tui` beside it), writes
 #      ~/Library/LaunchAgents/<label>.plist, and bootstraps it into this user's
 #      gui/<uid> domain, verifying that launchd actually loaded it.
@@ -189,6 +203,19 @@
 # script itself aborted (an internal error, e.g. an unset variable); 129 / 130
 # / 143 stopped by SIGHUP / SIGINT / SIGTERM; else the failing step's own code.
 set -euo pipefail
+
+# ── NOTHING IS FOUND THROUGH THE DIRECTORY THIS WAS STARTED FROM ─────────────
+# PATH keeps only its absolute entries (an empty entry or `.` would find a
+# planted program in the current directory), and CDPATH, GLOBIGNORE and
+# BASH_ENV/ENV are dropped, so no `cd` lands elsewhere and no child bash
+# sources a file first.
+IFS=: read -r -a _path_entries <<<"${PATH:-}" || true
+_safe_path=""
+for _d in "${_path_entries[@]+"${_path_entries[@]}"}"; do
+  case "$_d" in /*) _safe_path="${_safe_path:+$_safe_path:}$_d" ;; esac
+done
+PATH="${_safe_path:-/usr/bin:/bin:/usr/sbin:/sbin}"; export PATH
+unset _path_entries _safe_path _d CDPATH GLOBIGNORE BASH_ENV ENV
 
 # ── the EXIT trap (REL-4.S5e) ───────────────────────────────────────────────
 # ONE trap for the whole run. It removes what this run made and has not
@@ -234,6 +261,7 @@ FROM=""
 REPLACE_RUNNING=0
 PREBUILT=""
 PB_SHA=""
+OWNER_ACTS=""
 
 usage() { sed -n '2,5p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 while [[ $# -gt 0 ]]; do
@@ -248,6 +276,8 @@ while [[ $# -gt 0 ]]; do
         --prebuilt=*) PREBUILT="${1#--prebuilt=}" ;;
         --sha256) [[ $# -ge 2 ]] || usage; PB_SHA="$2"; shift ;;
         --sha256=*) PB_SHA="${1#--sha256=}" ;;
+        --owner-acts) [[ $# -ge 2 ]] || usage; OWNER_ACTS="$2"; shift ;;
+        --owner-acts=*) OWNER_ACTS="${1#--owner-acts=}" ;;
         -h|--help) usage ;;
         *) echo "install: unknown argument '$1'" >&2; usage ;;
     esac
@@ -255,6 +285,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 say()  { printf 'install: %s\n' "$*"; }
+if [[ -n "${OWNER_ACTS}" && "${OWNER_ACTS}" != open && "${OWNER_ACTS}" != terminal ]]; then
+    printf 'install: REFUSED: --owner-acts is `open` or `terminal`, not `%s`.\n' "${OWNER_ACTS}" >&2; exit 2
+fi
 if [[ -n "${PREBUILT}" && -n "${FROM}" ]]; then
     printf 'install: REFUSED: --prebuilt and --from are two different sources of binaries; give one.\n' >&2; exit 2
 fi
@@ -301,6 +334,17 @@ name_only_note() {
     say ""
     say "grants:   an MCP grant names its cauldron only by name, so every call to it is refused:"
     while IFS= read -r line; do say "            ${line#cauldron: WARNING: }"; done <<<"${w}"
+}
+# local_inference_note: the closing lines on the local-inference services,
+# which this script never pins or starts.
+local_inference_note() {
+    local c="${ROOT}/bin/cauldron" from="from this checkout (cargo)"
+    [[ -z "${PREBUILT}" ]] || from="from the bundle's image (no cargo)"
+    say ""
+    say "local:    local inference (the inference and ripples services) is installed OFF: nothing pinned, nothing started."
+    say "          To use it: ${c} --env ${ENV_NAME} build inference   (and ripples; ${from})"
+    say "            then ${c} --env ${ENV_NAME} pin inference <the version it printed>, and start inference;"
+    say "            then ${c} inference status --env ${ENV_NAME}, which says what is still missing (llama-server, a model)."
 }
 bridge_note() {
     say ""
@@ -762,7 +806,9 @@ pb_fetch_and_verify() {
     PB_DIR="${PB_STAGE}/x/${PB_TOP}"
     local f missing=""
     for f in bin/cauldron bin/tui libexec/threads libexec/cauldron-mcp share/cauldron/services/threads.toml \
-             share/cauldron/services/mcp.toml share/cauldron/mcp/agents.toml BUNDLE SHA256SUMS; do
+             share/cauldron/services/mcp.toml share/cauldron/mcp/agents.toml share/cauldron/scripts/threads/add-account \
+             share/cauldron/scripts/threads/claude-accounts share/cauldron/scripts/threads/claude-login-browser \
+             BUNDLE SHA256SUMS; do
         [[ -f "${PB_DIR}/${f}" && ! -L "${PB_DIR}/${f}" ]] || missing="${missing} ${f}"
     done
     [[ -z "${missing}" ]] || pb_refuse "the bundle lacks:${missing}."
@@ -782,6 +828,18 @@ pb_fetch_and_verify() {
     done
     say "contents   version ${PB_VERSION}, commit ${PB_COMMIT:0:12}; every file matches the bundle's SHA256SUMS"
     say "signatures bin/cauldron, bin/tui, libexec/threads, libexec/cauldron-mcp: arm64, ad-hoc signed, verified"
+    # The local-inference services: laid down with the bundle and checked the
+    # same way; this script pins and starts neither (they are opt-in).
+    for rel in libexec/cauldron-inference:cauldron-inference libexec/cauldron-ripples:cauldron-ripples \
+               share/cauldron/services/inference.toml: share/cauldron/services/ripples.toml:; do
+        id="${rel#*:}"; rel="${rel%%:*}"
+        [[ -f "${PB_DIR}/${rel}" && ! -L "${PB_DIR}/${rel}" ]] || pb_refuse "the bundle lacks: ${rel}."
+        [[ -n "${id}" ]] || continue
+        pb_macho_arm64 "${PB_DIR}/${rel}" || pb_refuse "${rel} in the bundle is not an arm64 executable."
+        pb_signed "${PB_DIR}/${rel}" "${id}" \
+            || pb_refuse "${rel} in the bundle does not carry a valid ad-hoc signature as ${id} (\`codesign --verify --strict\` fails, or another identifier): it was changed after it was signed."
+    done
+    say "signatures libexec/cauldron-inference, libexec/cauldron-ripples: arm64, ad-hoc signed, verified (local inference: laid down, not pinned, not started)"
     return 0
 }
 if [[ -n "${PREBUILT}" ]]; then
@@ -1189,16 +1247,62 @@ place_declarations() {
         run mv "${ROOT}/share/cauldron/.${d}.new.$$" "${ROOT}/share/cauldron/${d}"
     done
 }
+# place_helpers (both paths): the account helper scripts the threads daemon
+# (an account's login, rotation) and the terminal UI (the account board's
+# set-live action) run, at ${ROOT}/share/cauldron/scripts/threads/, from the
+# bundle (prebuilt) or this checkout (from source): add-account,
+# claude-accounts and claude-login-browser. The directory is replaced whole,
+# the previous one kept as threads.prev. Every directory from share/ down and
+# every script is 0755 and owned by the user running this, which is what the
+# daemon and the terminal UI check before they run one (owned by you, nothing
+# writable by group or others). Neither ever runs a copy from a source tree
+# or a path compiled into it.
+HELPERS="add-account claude-accounts claude-login-browser"
+place_helpers() {
+    local src d="${ROOT}/share/cauldron/scripts" n h
+    if [[ -n "${PREBUILT}" ]]; then src="${REL_DIR}/share/cauldron/scripts/threads"; else src="${REPO}/services/threads/scripts"; fi
+    n="${d}/.threads.new.$$"
+    run mkdir -p "${d}"
+    run chmod 0755 "${ROOT}/share" "${ROOT}/share/cauldron" "${d}"
+    run rm -rf "${n}"
+    run mkdir "${n}"
+    for h in ${HELPERS}; do
+        run cp "${src}/${h}" "${n}/${h}"
+        run chmod 0755 "${n}/${h}"
+    done
+    run chmod 0755 "${n}"
+    if [[ -d "${d}/threads" ]]; then
+        run rm -rf "${d}/threads.prev"
+        run mv "${d}/threads" "${d}/threads.prev"
+    fi
+    run mv "${n}" "${d}/threads"
+}
 step "5. supervisor (launchd job)"
 if [[ -n "${PREBUILT}" && ${DRY} -eq 0 ]]; then
     place_declarations
     say "placed the bundle's declarations at ${ROOT}/share/cauldron/{services,mcp} (the previous ones kept as .prev)"
 fi
+if [[ ${DRY} -eq 0 ]]; then
+    place_helpers
+    say "placed the account helpers (${HELPERS// /, }) at ${ROOT}/share/cauldron/scripts/threads/ (the previous ones kept as threads.prev)"
+else
+    say "would place the account helpers (${HELPERS// /, }) at ${ROOT}/share/cauldron/scripts/threads/, from $( [[ -n "${PREBUILT}" ]] && echo the bundle || echo "${REPO}/services/threads/scripts" )"
+fi
 # `cauldron install` has the same running-job guard (REL-4.S3c), so the
 # operator's --replace-running is passed through to it.
 INSTALL_ARGS=(install)
 if [[ ${REPLACE_RUNNING} -eq 1 ]]; then INSTALL_ARGS+=(--replace-running); fi
-run "${CAULDRON}" --env "${ENV_NAME}" "${INSTALL_ARGS[@]}"
+# --owner-acts: the owner chose it on this command line, and `cauldron
+# install --owner-acts` records it after the install as set by the install
+# (`how: install`): the code path says so, no argument does. Opening without
+# a terminal needs the variable in the command's own environment, which
+# this sets for that one command only.
+if [[ -n "${OWNER_ACTS}" ]]; then INSTALL_ARGS+=(--owner-acts "${OWNER_ACTS}"); fi
+if [[ "${OWNER_ACTS}" == open ]]; then
+    run env CAULDRON_OWNER_ACTS=open "${CAULDRON}" --env "${ENV_NAME}" "${INSTALL_ARGS[@]}"
+else
+    run "${CAULDRON}" --env "${ENV_NAME}" "${INSTALL_ARGS[@]}"
+fi
 write_install_marker
 
 if [[ ${DRY} -eq 1 ]]; then
@@ -1209,6 +1313,7 @@ if [[ ${DRY} -eq 1 ]]; then
         say "(no built cauldron at ${CAULDRON} yet, so the label and paths it would resolve are not shown)"
     fi
     old_mcp_note
+    local_inference_note
     bridge_note
     say "DRY RUN complete: nothing was built, written or loaded."
     FINISHED=1
@@ -1239,5 +1344,6 @@ if [[ "$(command -v cauldron 2>/dev/null || true)" != "${ROOT}/bin/cauldron" ]];
     say "            echo 'export PATH=\"${ROOT}/bin:\$PATH\"' >> ~/.zshrc"
     say "          and open a new terminal (for bash, use ~/.bash_profile)."
 fi
+local_inference_note
 bridge_note
 FINISHED=1

@@ -94,7 +94,7 @@ fn rp1_ripples_without_its_service() {
     assert!(out.is_empty(), "{out}");
     assert!(
         err.contains("REFUSED: approving a ripple's records is the owner's act at a terminal")
-            && err.contains("no option skips this")
+            && err.contains("unless the owner has let agents") && err.contains("cauldron owner-acts open")
             && err.contains("cauldron soup approve C-1 C-2 --env dev --cauldron kb"),
         "{err}"
     );
@@ -229,7 +229,7 @@ fn rp2_on_off_and_the_queue() {
     let (rc, out, err) = run(&s, &["ripples", "on", "kb", "--env", "dev", "--include-sessions"]);
     assert_ne!(rc, 0);
     assert!(out.is_empty(), "{out}");
-    assert!(err.contains("owner's act at a terminal") && err.contains("no option skips this") && err.contains("cauldron ripples on kb --env dev --include-sessions"), "{err}");
+    assert!(err.contains("owner's act at a terminal") && err.contains("unless the owner has let agents") && err.contains("cauldron owner-acts open") && err.contains("cauldron ripples on kb --env dev --include-sessions"), "{err}");
     let setting = s.join("root/data/dev/ripples/auto/kb.json");
     assert!(!setting.exists());
     // Checked before the terminal.

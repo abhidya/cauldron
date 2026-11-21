@@ -1,13 +1,15 @@
-//! **`cauldron mcp grant | revoke | grants | status | stdio`**: which
+//! **`cauldron mcp grant | revoke | grants | status | stdio | config`**: which
 //! cauldrons the owner has opened to the MCP door, the `mcp` service that
 //! serves them, and the stdio bridge Claude Code launches
 //! (`crate::mcp_bridge`).
 //!
 //! Every cauldron is closed to the MCP door until it is granted. A grant is
-//! the owner's act at a terminal: `grant` runs only when its standard input
-//! and standard output are both an interactive terminal, and there is no
-//! flag that skips that, so an agent (whose shell has no terminal) that reads
-//! a refusal naming the command cannot simply run it. Revoking and listing
+//! the owner's act: `grant` runs when its standard input and standard output
+//! are both an interactive terminal, or without one only where the owner
+//! opened `grant` to agents (`env::owner_acts`, through
+//! `crate::owner_acts::act`), so an agent (whose shell has no terminal) that
+//! reads a refusal naming the command cannot simply run it unless the owner
+//! said it may. Revoking and listing
 //! need no terminal. The store and its rules are `soup_door::grants`.
 //!
 //! The environment is the usual one: `--env` (or a leading `cauldron
@@ -15,7 +17,6 @@
 //! it. The stdio bridge is the exception: it does not read `$ENV`
 //! (`crate::mcp_bridge`).
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -34,8 +35,10 @@ cauldron mcp — which cauldrons are open to the MCP door
         --project does not limit which sessions can reach it. A cauldron that is already
         granted takes the new scopes and keeps its projects, adding these.
         Refused for a cauldron that does not exist or has no soup. A grant is the owner's
-        act at a terminal: it runs only with its input and output on an interactive
-        terminal, and is refused (naming the command to run) anywhere else.
+        act: it runs with its input and output on an interactive terminal, or without one
+        only where the owner opened `grant` to agents (`cauldron owner-acts help`), and is
+        refused (naming the command to run) anywhere else. The grant row and the answer
+        say who granted (`by`: `tty` or `agent`).
     cauldron mcp revoke <cauldron> [--env <env>] [--project <dir>]
         Close the cauldron to the MCP door; with --project, only unbind that directory.
     cauldron mcp grants [--env <env>]
@@ -60,7 +63,10 @@ cauldron mcp — which cauldrons are open to the MCP door
         message per line, on stdin and stdout, relayed to the service with the door secret.
         It adds the session's context to every tool call (working directory, the session
         id when Claude Code passes CLAUDE_CODE_SESSION_ID, and --cauldron or
-        $CAULDRON_CAULDRON), replacing any `_ctx` a caller put in the arguments. With the
+        $CAULDRON_CAULDRON), replacing any `_ctx` a caller put in the arguments. With
+        --cauldron it is pinned to that cauldron: a call whose `cauldron` argument names
+        another is refused as `cauldron_pinned` and never relayed ($CAULDRON_CAULDRON
+        only chooses a default). With the
         service down it still answers `initialize` and `tools/list`, and every tool call
         is refused as `service_down`, naming the command that starts it. Its environment
         is --env, else $CAULDRON_ENV, else prod: it does not read $ENV. When that
@@ -69,6 +75,17 @@ cauldron mcp — which cauldrons are open to the MCP door
         service is another version than this cauldron, its `initialize` instructions and
         a line on stderr say so with the commands that upgrade it, and a refusal of a tool
         or an argument the service does not know says the same.
+    cauldron mcp config --cauldron <name> [--env <env>]
+        The `.mcp.json` entry of an MCP server for that one cauldron, on stdout:
+        `cauldron-<name>`, running this cauldron by its absolute path as
+        `mcp stdio --env <env> --cauldron <name>`. Put it in a project's .mcp.json. A server
+        started with --cauldron is pinned: every call reaches that cauldron, and a call
+        naming another is refused as `cauldron_pinned`. Writes and grants nothing; the
+        environment is --env, else $CAULDRON_ENV, else prod (not $ENV). The entry has no
+        `env` block: it never carries CAULDRON_OWNER_ACTS (or any variable), whatever this
+        shell has. Who may act for the owner is chosen with `cauldron owner-acts`, never by
+        a project's .mcp.json, and the MCP review tools follow that choice, not a variable
+        in a session's server.
     cauldron mcp help
 
   Every cauldron is closed until granted. Grants live in <root>/data/<env>/mcp/grants.json
@@ -91,12 +108,13 @@ pub(crate) fn verb_mcp(args: &[String]) -> Result<i32> {
         Some("grants") => list(&args[1..]),
         Some("status") => status(&args[1..]),
         Some("stdio") => crate::mcp_bridge::stdio(&args[1..]),
+        Some("config") => config(&args[1..]),
         None => {
             eprint!("{USAGE}");
             Ok(2)
         }
         Some(other) => {
-            eprintln!("cauldron mcp: no verb `{other}` (grant | revoke | grants | status | stdio | help)");
+            eprintln!("cauldron mcp: no verb `{other}` (grant | revoke | grants | status | stdio | config | help)");
             Ok(2)
         }
     }
@@ -172,16 +190,19 @@ fn grant(args: &[String]) -> Result<i32> {
     let projects = a.projects.iter().map(|p| grants::canonical_project(p)).collect::<soup_door::Result<Vec<_>>>()?;
     grants::require_cauldron(&e, cauldron)?;
     // Checked last, so the command the refusal names is one that would work.
-    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-        bail!(
+    let allowed = crate::owner_acts::act(
+        env::owner_acts::Act::Grant,
+        &e,
+        cauldron,
+        &format!(
             "REFUSED: a grant is the owner's act at a terminal. `cauldron mcp grant` runs only with its input and \
-             output on an interactive terminal, so an agent or a script cannot open a cauldron to the MCP door by \
-             itself, and no option skips this. Nothing was granted. Ask the user to run, in a terminal on this \
-             machine:\n    {}",
+             output on an interactive terminal, unless the owner has let agents grant (owner_acts), so an agent or a \
+             script cannot open a cauldron to the MCP door by itself. Nothing was granted. Ask the user to run, in a \
+             terminal on this machine:\n    {}",
             grants::grant_command(&e.name, cauldron, &scopes, &projects)
-        );
-    }
-    let (g, created) = grants::grant(&e, cauldron, &scopes, &projects, "tty")?;
+        ),
+    )?;
+    let (g, created) = grants::grant(&e, cauldron, &scopes, &projects, allowed.by().as_str())?;
     let defaults = if g.projects.is_empty() {
         "No --project was given, so a session reaches it only by naming it.".to_string()
     } else {
@@ -193,6 +214,7 @@ fn grant(args: &[String]) -> Result<i32> {
         "{}",
         serde_json::to_string_pretty(&json!({
             "outcome": if created { "granted" } else { "updated" },
+            "by": allowed.by().as_str(),
             "env": e.name,
             "grant": g,
             "store": grants::store_path(&e).display().to_string(),
@@ -206,6 +228,70 @@ fn grant(args: &[String]) -> Result<i32> {
             ),
         }))?
     );
+    Ok(0)
+}
+
+// ------------------------------------------------------------------- config
+
+/// The name of the MCP server `cauldron mcp config` writes for `cauldron`.
+pub(crate) fn server_name(cauldron: &str) -> String {
+    format!("cauldron-{cauldron}")
+}
+
+/// `cauldron mcp config --cauldron <name> [--env <env>]`: the `.mcp.json`
+/// entry of a server pinned to that one cauldron, on stdout and nothing
+/// else (so it can be written to a file as it is); notes go to stderr. The
+/// command is this `cauldron`'s absolute path, so the server starts whatever
+/// PATH Claude Code has. The environment is the bridge's rule (`--env`, else
+/// `$CAULDRON_ENV`, else `prod`; never `$ENV`), and the entry names it
+/// outright. Writes nothing, and grants nothing: an ungranted cauldron's
+/// note names the owner's `cauldron mcp grant` command.
+fn config(args: &[String]) -> Result<i32> {
+    let a = parse("config", args, &["--env", "--cauldron"])?;
+    if let Some(p) = a.pos.first() {
+        bail!("`cauldron mcp config` takes no arguments (got `{p}`); name the cauldron with --cauldron <name>");
+    }
+    let Some(cauldron) = a.cauldron.as_deref().map(str::trim).filter(|c| !c.is_empty()) else {
+        bail!("`cauldron mcp config` needs --cauldron <name>: the one cauldron the server is pinned to");
+    };
+    let name = a
+        .env
+        .clone()
+        .or_else(|| std::env::var("CAULDRON_ENV").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| "prod".to_string());
+    let e = environment(Some(&name))?;
+    if e.find_cauldron(cauldron)?.is_none() {
+        bail!("REFUSED: environment `{}` has no cauldron `{cauldron}` (`cauldron --env {} list`). Nothing was printed.", e.name, e.name);
+    }
+    let me = std::env::current_exe().context("finding this cauldron's own path")?;
+    if !me.is_absolute() {
+        bail!("this cauldron's own path is not absolute ({}); run it by its absolute path", me.display());
+    }
+    // The entry is the command and its arguments, and never an `env` block:
+    // a project's `.mcp.json` is shared (often committed), and the owner's
+    // choice of who may act for them is made with `cauldron owner-acts`,
+    // never carried in by a variable here (the `mcp` service, which decides
+    // the review tools, would not read it from a session's server anyway).
+    let doc = json!({"mcpServers": {server_name(cauldron): {
+        "command": me.display().to_string(),
+        "args": ["mcp", "stdio", "--env", e.name, "--cauldron", cauldron],
+    }}});
+    println!("{}", serde_json::to_string_pretty(&doc)?);
+    eprintln!(
+        "cauldron mcp config: the `{}` server above serves cauldron `{cauldron}` of environment `{}` only: a call naming \
+         another cauldron is refused (`cauldron_pinned`). Put it in the project's .mcp.json (merge it into `mcpServers` \
+         if the file has one already).",
+        server_name(cauldron),
+        e.name
+    );
+    match Grants::load(&e)?.get(cauldron) {
+        Some(_) => {}
+        None => eprintln!(
+            "cauldron mcp config: `{cauldron}` is not granted yet, so every call will be refused as `not_granted` until \
+             you run, at a terminal:\n    {}",
+            grants::grant_command(&e.name, cauldron, &Scope::ALL, &[])
+        ),
+    }
     Ok(0)
 }
 
@@ -358,6 +444,8 @@ fn status(args: &[String]) -> Result<i32> {
             // The regions a writer holds now: a write into one is refused
             // `region_locked` until it is let go or expires.
             "region_locks": env::region_locks::view_of(&c),
+            // Who may act for the owner on it without a terminal.
+            "owner_acts": crate::owner_acts::of_cauldron(&e, &c),
         });
         if let Some(w) = crate::review::waiting(&e, &c) {
             row["unreviewed"] = w["unreviewed"].clone();
@@ -378,6 +466,7 @@ fn status(args: &[String]) -> Result<i32> {
             "service": service,
             "open": open,
             "open_dumps": open_dumps,
+            "owner_acts": crate::owner_acts::summary(&e),
             "cauldrons": cauldrons,
             "note": "`writer_lock_says` is the text the last holder wrote into <soup>/writer.lock (and `dumps_lock_says` \
                      into <cauldron>/dumps/writer.lock); the lock itself, not the text, says who holds it now, and \

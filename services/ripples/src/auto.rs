@@ -367,6 +367,16 @@ fn run_one(state: &State, s: &Settings, dump: &str, states: &std::collections::B
             }
             // Nothing runs while a call an earlier run left may still be spending.
             engine::settle(&state.ctx);
+            // A setting turned on under the old default (sonnet) with no
+            // model of its own runs on the new one: its first run after the
+            // upgrade says so, once, in the journal `ripples status` reads.
+            if ra::old_default(s) && !ra::read(&data_root).iter().any(|l| l["event"] == "default_model_changed" && s.owns_line(&l["bound"])) {
+                let change = ra::default_change(s, &state.ctx.env.name);
+                tracing::warn!(cauldron = %s.cauldron, note = %change["note"], "the default model of automatic runs changed");
+                if !line("default_model_changed", change) {
+                    return journal_down(&run);
+                }
+            }
             if !line("attempt", json!({"n": failed_before + 1, "run": run, "retry_after_if_cut": later(retry_wait(failed_before + 1))})) {
                 return journal_down(&run);
             }

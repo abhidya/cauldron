@@ -3,7 +3,9 @@
 //!
 //! `models add|list|remove` read and write the environment's registry
 //! (`data/<env>/inference/models.json`, owner-only) directly: registering a
-//! model needs no running service, copies nothing and downloads nothing. It
+//! model needs no running service, copies nothing and downloads nothing
+//! (`models pull`, in `inference_pull`, is the one verb that downloads, and
+//! only from its built-in catalogue, after a yes). It
 //! records the file's path, its identity (real path, device, inode, size,
 //! modification and change times) and sha256, and the few header facts the
 //! memory estimate uses; `verify` reads the file again. `status` and `unload` ask the
@@ -36,6 +38,16 @@ cauldron inference — local models, on demand, on this machine
         is read once) are recorded in data/<env>/inference/models.json. --context sets
         the context size it is served with (default: the settings' `context`, 65536).
         Prints the memory estimate against the budget.
+    cauldron inference models pull <name> [--yes] [--env <env>]
+        Download one model from this release's catalogue (`--list`), and register it. Nothing
+        is downloaded unless you run this and say yes (at a terminal, or with --yes). It
+        shows the size, the licence and where the file goes (<root>/models/<id>/), the free
+        disk and the memory estimate first. HTTPS only, from the publisher named in the
+        catalogue; a stopped download resumes when you run the same command again; the file
+        is registered only after its size and sha256 are the catalogue's, and never run.
+    cauldron inference models pull --list
+        The catalogue: each model's name, publisher repository, file, size, sha256, licence
+        and memory notes.
     cauldron inference models list [--env <env>]
         Every registered model, with its memory estimate against the budget and whether
         its file's identity is still the one recorded (nothing is read).
@@ -75,8 +87,9 @@ pub(crate) fn verb_inference(args: &[String]) -> Result<i32> {
             Some("list") | Some("ls") => list(&args[2..]),
             Some("remove") | Some("rm") => remove(&args[2..]),
             Some("verify") => verify(&args[2..]),
+            Some("pull") => crate::inference_pull::pull(&args[2..]),
             other => {
-                eprintln!("cauldron inference models: {} (add | list | remove | verify)", other.map_or("a verb is needed".to_string(), |o| format!("no verb `{o}`")));
+                eprintln!("cauldron inference models: {} (add | pull | list | remove | verify)", other.map_or("a verb is needed".to_string(), |o| format!("no verb `{o}`")));
                 Ok(2)
             }
         },
@@ -131,13 +144,13 @@ fn print(v: &Value) -> Result<()> {
     Ok(())
 }
 
-fn estimate_json(m: &inference_registry::Model, c: &Config) -> Value {
+pub(crate) fn estimate_json(m: &inference_registry::Model, c: &Config) -> Value {
     let e = memory::estimate(m.size_bytes, &m.facts, m.context_under(c), c.memory_budget_bytes);
     json!({"total": memory::gib(e.total_bytes), "fits": e.fits, "how": e.how})
 }
 
 /// A line every few GiB while a large file is hashed.
-fn progress_lines() {
+pub(crate) fn progress_lines() {
     inference_registry::report_hash_progress(|n| eprintln!("cauldron inference: … {} read", memory::gib(n)));
 }
 
@@ -260,29 +273,127 @@ fn ask(e: &Environment, addr: SocketAddr, verb: &str, args: &Value) -> Result<Va
     serde_json::from_str(line.trim()).with_context(|| format!("the inference service answered `{}`", line.trim()))
 }
 
-fn start_hint(e: &str) -> String {
-    format!("Start it: `cauldron --env {e} build inference`, then `cauldron --env {e} pin inference <the version it printed>`, then `cauldron --env {e} start inference`.")
+/// Is `service` pinned in this environment's env.toml? (Read as text: a
+/// `[services.<name>]` table.)
+fn pinned(e: &Environment, service: &str) -> bool {
+    std::fs::read_to_string(e.data_root.join("env.toml"))
+        .is_ok_and(|t| t.lines().any(|l| l.trim() == format!("[services.{service}]")))
+}
+
+/// This Mac's memory, from `sysctl hw.memsize`.
+fn machine_memory() -> Option<u64> {
+    let o = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).stdin(std::process::Stdio::null()).output().ok()?;
+    String::from_utf8_lossy(&o.stdout).trim().parse().ok()
+}
+
+/// The `llama-server` this CLI would find (the settings' or PATH's) and its
+/// build, or why there is none usable. Run with `--version` only. The
+/// service checks again, on its own PATH, before every load.
+fn runtime_here(cfg: &Config) -> std::result::Result<(PathBuf, u64), String> {
+    use inference_registry::runtime::{locate, parse_build, MIN_BUILD};
+    let p = locate(cfg.llama_server.as_deref())?;
+    let o = std::process::Command::new(&p).arg("--version").stdin(std::process::Stdio::null()).output().map_err(|e| format!("{} --version could not be run: {e}", p.display()))?;
+    let text = format!("{}\n{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    match parse_build(&text) {
+        Some((b, _)) if b >= MIN_BUILD => Ok((p, b)),
+        Some((b, _)) => Err(format!("{} is llama.cpp build {b}; build {MIN_BUILD} or later is needed. Update it (on macOS, `brew upgrade llama.cpp`)", p.display())),
+        None => Err(format!("{} --version states no build number; llama.cpp build {MIN_BUILD} or later is needed", p.display())),
+    }
+}
+
+/// **What is still missing before a local model can answer**, in plain
+/// sentences, each with what to do: the service, `llama-server`, a model,
+/// and the memory budget. `live` is the running service's own STATUS.
+fn missing(e: &Environment, cfg: &Config, reg: &Registry, live: Option<&Value>) -> Vec<String> {
+    use inference_registry::runtime::{HOW_TO_GET, MIN_BUILD, TESTED_BUILD};
+    let env = &e.name;
+    let mut out = vec![];
+    match live {
+        None if pinned(e, SERVICE) => out.push(format!("The inference service is pinned but not running: `cauldron --env {env} start inference`.")),
+        None => out.push(format!(
+            "The inference service is not installed in `{env}`: `cauldron --env {env} build inference` (a release install uses the image it shipped; no cargo), then `cauldron --env {env} pin inference <the version it printed>`, then `cauldron --env {env} start inference`."
+        )),
+        Some(_) => {}
+    }
+    let rt_problem = match live.map(|v| &v["runtime"]) {
+        Some(r) if r["checked"] == json!(true) && r["ok"] == json!(false) => Some(r["problem"].as_str().unwrap_or("the runtime check failed").to_string()),
+        Some(r) if r["checked"] == json!(true) => None,
+        _ => runtime_here(cfg).err(),
+    };
+    if let Some(p) = rt_problem {
+        out.push(format!("No usable llama-server: {p}. {HOW_TO_GET} (build {MIN_BUILD} or later; this release was tested with build {TESTED_BUILD})."));
+    }
+    if reg.models.is_empty() {
+        out.push(format!(
+            "No model is registered in `{env}`: `cauldron inference models pull qwen --env {env}` downloads the catalogue's Qwen (34.37 GiB; it asks first; `models pull --list` shows the catalogue), or `cauldron inference models add <name> <file.gguf> --env {env}` registers a file you already have."
+        ));
+    }
+    let budget = cfg.memory_budget_bytes;
+    for m in &reg.models {
+        let est = memory::estimate(m.size_bytes, &m.facts, m.context_under(cfg), budget);
+        if !est.fits {
+            out.push(format!(
+                "`{}` would be refused: {}. Register it again with a smaller `--context`, or raise `memory_budget_gib` in {}.",
+                m.name,
+                est.how,
+                inference_registry::dir(&e.data_root).join(inference_registry::CONFIG_FILE).display()
+            ));
+        }
+    }
+    if let Some(mem) = machine_memory() {
+        if budget > mem {
+            out.push(format!(
+                "The memory budget ({}) is more than this Mac has ({}): a model that fits the budget may still not fit in memory. Lower `memory_budget_gib` in {}.",
+                memory::gib(budget),
+                memory::gib(mem),
+                inference_registry::dir(&e.data_root).join(inference_registry::CONFIG_FILE).display()
+            ));
+        }
+    }
+    out
+}
+
+fn say_missing(m: &[String]) {
+    if m.is_empty() {
+        eprintln!("cauldron inference: nothing is missing: a request that names a registered model loads it.");
+    }
+    for line in m {
+        eprintln!("cauldron inference: missing: {line}");
+    }
 }
 
 fn status(args: &[String]) -> Result<i32> {
     let a = parse("status", args, &["--env"])?;
     let e = crate::mcp::environment(a.env.as_deref())?;
+    let reg = Registry::load(&e.data_root)?;
+    let cfg = Config::load(&e.data_root)?;
     match find(&e) {
         Ok(addr) => {
-            let v = ask(&e, addr, "STATUS", &json!({}))?;
+            let mut v = ask(&e, addr, "STATUS", &json!({}))?;
+            let m = missing(&e, &cfg, &reg, Some(&v));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("missing".into(), json!(m));
+            }
             print(&v)?;
+            say_missing(&m);
             Ok(if v["ok"] == json!(true) { 0 } else { 1 })
         }
         Err(why) => {
-            let reg = Registry::load(&e.data_root)?;
-            let cfg = Config::load(&e.data_root)?;
+            let m = missing(&e, &cfg, &reg, None);
+            let rt = match runtime_here(&cfg) {
+                Ok((p, b)) => json!({"path": p, "build": b, "ok": true}),
+                Err(p) => json!({"ok": false, "problem": p}),
+            };
             print(&json!({
                 "ok": true,
                 "service": {"running": false, "why": why},
                 "registered": reg.models.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+                "runtime_on_this_path": rt,
                 "settings": {"memory_budget": memory::gib(cfg.memory_budget_bytes), "idle_seconds": cfg.idle_seconds, "context": cfg.context, "llama_server": cfg.llama_server},
+                "missing": m,
             }))?;
-            eprintln!("cauldron inference: {why}. {}", start_hint(&e.name));
+            eprintln!("cauldron inference: {why}.");
+            say_missing(&m);
             Ok(0)
         }
     }

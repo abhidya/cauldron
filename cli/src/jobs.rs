@@ -719,6 +719,11 @@ fn command(env: &Environment, l: &crate::Launchable, args: &[String]) -> Result<
     for (k, v) in &d.env {
         cmd.env(k, crate::expand(v, &data_dir));
     }
+    // CAULDRON_OWNER_ACTS means "the command the owner ran may act": it is read
+    // only by that command, never inherited by a service (not from the shell that
+    // started this, nor from a declaration). The mcp service decides MCP approve
+    // and reject from the persisted owner_acts setting alone.
+    cmd.env_remove(env::owner_acts::VAR);
     Ok((cmd, data_dir))
 }
 

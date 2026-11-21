@@ -6,10 +6,10 @@
 //! running, as must `mcp` and `threads`) and follows it to its outcome;
 //! `status` shows the service, the run in progress, the last runs and
 //! the spend and automatic processing per cauldron; `on` (the owner's act,
-//! at a terminal) turns automatic processing on for one cauldron, from now
+//! at a terminal unless the owner opened it, `env::owner_acts`) turns automatic processing on for one cauldron, from now
 //! on, and `off` (from anywhere) turns it off. `review` lists the records a ripple wrote
 //! that wait for review, and the owner approves or rejects them with `approve` and
-//! `reject`, at a terminal (`crate::review`).
+//! `reject`, at a terminal or where the owner opened it (`crate::review`).
 //!
 //! The service is found through the environment's seam table (its `ripples`
 //! row must be live); `RUN` and `STATUS` carry the run key the service
@@ -26,7 +26,6 @@ use env::seams::{self, SeamState, Table};
 use env::Environment;
 use env::ripples_auto as ra;
 use serde_json::{json, Value};
-use std::io::IsTerminal;
 
 const SERVICE: &str = "ripples";
 
@@ -44,7 +43,7 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand or automa
         services/ripples/package/dump/v1/prompt.md, filled in). The answer must meet the
         package's schema; its records land through the `mcp` service as new records, each
         citing the dump and marked `unreviewed` until the owner approves them, and the dump
-        moves from `received` to `processed`. One call on Sonnet (or --model), and one retry
+        moves from `received` to `processed`. One call on Opus (or --model), and one retry
         on Opus when the answer is refused. Caps, counted from the run journal before every
         call: per dump, across every run of it, 3 calls and 200000 input tokens; per
         cauldron per UTC day, 1500000 input tokens or 30 dumps. A call is charged when it
@@ -122,9 +121,12 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand or automa
         call, caps, journal and `unreviewed` marking). Only dumps received AFTER this moment
         are taken; older ones only by hand (`run`). Text dumps only, unless
         --include-sessions (session transcripts too: their text view). It authorises
-        automatic model spend and automatic writes, so it requires an interactive terminal,
-        like `cauldron mcp grant`: it prints what will be sent where and the caps, asks
-        [y/N], and writes the setting only on yes. The setting belongs to that cauldron,
+        automatic model spend and automatic writes, so it is the owner's act, like `cauldron
+        mcp grant`: at an interactive terminal it prints what will be sent where and the
+        caps, asks [y/N], and writes the setting only on yes. Without a terminal it is
+        refused unless the owner opened `ripples` to agents (`cauldron owner-acts help`);
+        then it asks nothing, prints what it authorised, and records `by: agent` in its
+        answer and in the automatic journal (`turned_on`). The setting belongs to that cauldron,
         never to its name: `cauldron remove` and `cauldron rename` turn it off, and a
         setting left behind or copied from another cauldron or environment is void (runs
         nothing; `status` says why).
@@ -177,13 +179,13 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand or automa
     cauldron ripples approve (--dump <DM-n> | --run <run> | <id>...) --env <env> --cauldron <name> [--unapprove]
         Approve a ripple's records: every record it names (all the records a ripple wrote
         citing that dump, or written by that run, or the ids) that reads as `unreviewed`
-        gets `meta.approved: {at, by: \"owner\"}` and reads as reviewed from then on. With
+        gets `meta.approved: {at, by}` and reads as reviewed from then on. With
         --unapprove, each approved one reads as unreviewed again. A rejected record is not
         approved: take the rejection back first (`reject ... --unreject`).
     cauldron ripples reject (--dump <DM-n> | --run <run> | <id>...) --env <env> --cauldron <name>
                             [--reason <text>] [--unreject]
         Reject a ripple's records: each named record that reads as `unreviewed` gets
-        `meta.rejected: {at, by: \"owner\", reason}` (the reason: one line, at most 500
+        `meta.rejected: {at, by, reason}` (the reason: one line, at most 500
         characters). A rejected record is kept, never deleted: `soup get` (and `soup_get`)
         still answers it, marked `rejected: true`, with its cite to the dump and the
         decision; `soup nodes`, `soup search` and a region's members (and the MCP reads)
@@ -191,9 +193,11 @@ cauldron ripples — turn a dump into knowledge-graph records, by hand or automa
         `include_rejected`); the review queue no longer lists it. An approved record is not
         rejected: take the approval back first (--unapprove). With --unreject, each rejected
         one reads as unreviewed again.
-        Both are the owner's acts: they run only with their input and output on an
-        interactive terminal, and no option skips that; no MCP tool approves or rejects, and
-        a ripple never can. Each is one write, through the running `mcp` service, audited
+        Both are the owner's acts: they run with their input and output on an interactive
+        terminal (`by: \"tty\"`), or without one only where the owner opened `approve` to
+        agents (`cauldron owner-acts help`; `by: \"agent\"`, sent on the `ADECIDE` verb);
+        the MCP tools `soup_approve` and `soup_reject` do the same there, and a ripple
+        never can. Each is one write, through the running `mcp` service, audited
         in its calls.jsonl (the counts, never the text or the reason). Asking again for a
         state a record is already in changes nothing: it is listed in `skipped`, with why.
         The running `mcp` service must be this release's or later: an older one (left
@@ -469,6 +473,7 @@ fn status(args: &[String]) -> Result<i32> {
             let mut v = ask(&e, addr, "STATUS", &req)?;
             if v["ok"] == json!(true) && a.run.is_none() {
                 v["review"] = review_view(&e, a.cauldron.as_deref());
+                v["owner_acts"] = owner_acts_view(&e, a.cauldron.as_deref());
             }
             print(&v)?;
             say_review(&v);
@@ -514,6 +519,7 @@ fn status(args: &[String]) -> Result<i32> {
                 "evaluations_ledger": eval_path.display().to_string(),
                 "automatic": automatic_offline(&e, a.cauldron.as_deref()),
                 "review": review_view(&e, a.cauldron.as_deref()),
+                "owner_acts": owner_acts_view(&e, a.cauldron.as_deref()),
                 // Held regions are rows in each soup: shown with the service
                 // stopped too (a lock whose holder stopped expires).
                 "region_locks": env::region_locks::env_view(&e, a.cauldron.as_deref()),
@@ -523,6 +529,27 @@ fn status(args: &[String]) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+/// Who may act for the owner, per cauldron (`env::owner_acts`), and who
+/// last turned automatic processing on for each cauldron that has a
+/// setting (`turned_on_by`, from the automatic journal).
+fn owner_acts_view(e: &Environment, cauldron: Option<&str>) -> Value {
+    let lines = ra::read(&e.data_root);
+    let settings = ra::all(e);
+    let list: Vec<Value> = crate::owner_acts::per_cauldron(e)
+        .into_iter()
+        .filter(|v| cauldron.is_none_or(|c| v["cauldron"] == c))
+        .map(|mut v| {
+            if let Some(x) = settings.iter().find(|x| v["cauldron"] == x.name.as_str()) {
+                if let Some(l) = ra::last_turned_on(&lines, &x.settings) {
+                    v["turned_on_by"] = json!({"by": l["by"], "at": l["at"]});
+                }
+            }
+            v
+        })
+        .collect();
+    json!({"summary": crate::owner_acts::summary(e), "cauldrons": list})
 }
 
 /// The review queue per cauldron (`crate::review::waiting`): how many
@@ -608,7 +635,7 @@ fn what_it_means(s: &ra::Settings, env_name: &str, service: &str) -> String {
     } else {
         format!(
             "goes through the `threads` service, on this machine's Claude login, to Anthropic as one bare completion with no tools, no MCP server and no settings, plugins, hooks or CLAUDE.md, on `{}` (one retry on `opus` when the answer is refused). The text is scrubbed first: credential-shaped text is replaced by `<redacted:kind>`. The scrubber reduces the risk and is not a guarantee. threads keeps a copy of each call's prompt and answer in its own store.",
-            s.model.as_deref().unwrap_or("sonnet")
+            s.model.as_deref().unwrap_or("opus")
         )
     };
     format!(
@@ -663,14 +690,17 @@ fn turn_on(args: &[String]) -> Result<i32> {
         cmd.push_str(" --no-scrub-local");
     }
     // Checked last, so the command the refusal names is one that would work.
-    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-        bail!(
+    let allowed = crate::owner_acts::act(
+        env::owner_acts::Act::Ripples,
+        &e,
+        &cauldron,
+        &format!(
             "REFUSED: turning automatic processing on is the owner's act at a terminal: it authorises model spend and \
              writes into the cauldron with no further command. `cauldron ripples on` requires an interactive terminal \
-             (its input and output), shows what it means there and asks for a yes, and no option skips this. \
-             Nothing was changed. Ask the user to run, in a terminal on this machine:\n    {cmd}"
-        );
-    }
+             (its input and output), shows what it means there and asks for a yes, unless the owner has let agents turn \
+             it on (owner_acts). Nothing was changed. Ask the user to run, in a terminal on this machine:\n    {cmd}"
+        ),
+    )?;
     // The cauldron's id, given now if it has none yet: the setting is bound
     // to it.
     soup_door::grants::adopt(&e, &c)?;
@@ -690,6 +720,7 @@ fn turn_on(args: &[String]) -> Result<i32> {
         since_dump,
         backend,
         model: a.model.clone(),
+        default_model: Some(ra::DEFAULT_MODEL.into()),
         include_sessions: a.include_sessions,
         scrub_local: !a.no_scrub_local,
         changed_at: now,
@@ -706,15 +737,21 @@ fn turn_on(args: &[String]) -> Result<i32> {
         text.push_str(&format!("\nThe cauldron must be granted to the MCP door with read, write and dump for this to run: `cauldron mcp grant {cauldron} --env {}`.", e.name));
     }
     // What it means first; then the owner's yes, at the terminal; only then
-    // is anything written.
+    // is anything written. Without a terminal (the owner let agents turn it
+    // on) there is nobody to ask: what it means is printed all the same, as
+    // what was authorised.
     println!("{text}\n");
-    print!("Turn automatic processing on for cauldron `{cauldron}`? [y/N] ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        println!("cauldron ripples: not turned on; nothing was changed.");
-        return Ok(1);
+    if allowed == env::owner_acts::Allowed::Terminal {
+        print!("Turn automatic processing on for cauldron `{cauldron}`? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("cauldron ripples: not turned on; nothing was changed.");
+            return Ok(1);
+        }
+    } else {
+        println!("No terminal: no question asked. The owner allowed this ({}); the above is what it authorises.", allowed.said());
     }
     // Already on for this cauldron, and the setting not changed meanwhile:
     // the same `since` (read again, after the wait at the prompt).
@@ -723,12 +760,20 @@ fn turn_on(args: &[String]) -> Result<i32> {
         _ => s,
     };
     ra::store(&e.data_root, &s)?;
-    print(&json!({
+    // Who turned it on, in the automatic journal.
+    let by = allowed.by().as_str();
+    ra::append(&e.data_root, &ra::turned_on_line(&s, by, &s.changed_at))?;
+    let mut doc = json!({
         "outcome": if kept { "updated" } else { "on" },
+        "by": by,
         "env": e.name,
         "setting": s,
         "store": ra::path(&e.data_root, &cauldron).display().to_string(),
-    }))?;
+    });
+    if allowed != env::owner_acts::Allowed::Terminal {
+        doc["authorised"] = json!({"allowed_by": allowed.said(), "what": text});
+    }
+    print(&doc)?;
     println!(
         "Automatic processing is ON for cauldron `{cauldron}` in environment `{}`, for dumps received after DM-{} (from {}). Turn it off, from anywhere: cauldron ripples off {cauldron} --env {}",
         e.name, s.since_dump, s.since_at, e.name

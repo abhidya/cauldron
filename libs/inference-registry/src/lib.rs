@@ -23,6 +23,7 @@
 
 pub mod gguf;
 pub mod memory;
+pub mod runtime;
 
 use std::path::{Path, PathBuf};
 
@@ -449,6 +450,45 @@ impl Registry {
             mtime: file.mtime,
             sha256,
             file: Some(file),
+            added_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            context,
+            facts,
+        })
+    }
+
+    /// **Register a file whose sha256 was just read** by [`hash_identified`]
+    /// (`hashed` is the identity it read it under), without reading it
+    /// again: the file at `path` must still be that file (device, inode,
+    /// size and modification time; a rename between the two changes only
+    /// its path and change time, which are recorded as they are now).
+    /// `cauldron inference models pull` hashes the download under its
+    /// private temporary name, compares the sha256 with the catalogue's,
+    /// renames it into place and registers it with this.
+    pub fn describe_verified(name: &str, path: &Path, context: Option<u32>, sha256: &str, hashed: &FileId) -> Result<Model> {
+        if !name_ok(name) {
+            bail!("`{name}` is not a model name: a lower-case letter or digit, then up to 63 of those, `.`, `_` or `-`");
+        }
+        if !path.is_absolute() {
+            bail!("give the model file's absolute path, not `{}`", path.display());
+        }
+        if let Some(c) = context {
+            check_context(c)?;
+        }
+        let now = FileId::now(path)?;
+        if (now.dev, now.ino, now.size, now.mtime, now.mtime_nsec) != (hashed.dev, hashed.ino, hashed.size, hashed.mtime, hashed.mtime_nsec) {
+            bail!("{} is no longer the file whose sha256 was read ({}); nothing was recorded", path.display(), now.differences(hashed).join(", "));
+        }
+        if now.real_path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+            bail!("{} is not a `.gguf` file; llama-server loads GGUF model files", now.real_path.display());
+        }
+        let facts = gguf::facts(&now.real_path)?;
+        Ok(Model {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+            size_bytes: now.size,
+            mtime: now.mtime,
+            sha256: sha256.to_string(),
+            file: Some(now),
             added_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             context,
             facts,

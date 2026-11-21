@@ -16,6 +16,10 @@
 //!   unapprove, reject, unreject, or approve some and reject others at
 //!   once), answered only to a line carrying the approval key, which only
 //!   the owner's commands at a terminal read (`crate::approve`);
+//! - `ADECIDE`: the same decision, sent by the owner's command line without
+//!   a terminal where the owner's `owner_acts` choice opens `approve`, and
+//!   recorded as an agent's (`by: "agent"`); a verb of its own so that an
+//!   older service refuses it instead of recording it as a person's;
 //! - `APPROVE`: the earlier command line's approval by id (`{cauldron, ids,
 //!   unapprove?}` and nothing else), kept for a command line older than
 //!   `DECIDE`, with the same key.
@@ -68,6 +72,7 @@ impl Service for McpSeam {
         Verb::new("RCHECK", McpSeam::v_rcheck),
         Verb::new("APPROVE", McpSeam::v_approve),
         Verb::new("DECIDE", McpSeam::v_decide),
+        Verb::new("ADECIDE", McpSeam::v_adecide),
         Verb::new("RDUMPS", McpSeam::v_rdumps),
         Verb::new("RNOTE", McpSeam::v_rnote),
         Verb::new("RFAIL", McpSeam::v_rfail),
@@ -166,6 +171,11 @@ impl McpSeam {
 
     fn v_decide(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
         c.line(&crate::approve::answer_decide(&self.state, &self.approve, rest))?;
+        Ok(())
+    }
+
+    fn v_adecide(&self, c: &mut Conn<'_>, rest: &str) -> Result<()> {
+        c.line(&crate::approve::answer_adecide(&self.state, &self.approve, rest))?;
         Ok(())
     }
 }

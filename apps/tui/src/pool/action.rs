@@ -97,34 +97,84 @@ pub fn accounts_tool() -> Option<PathBuf> {
     default_accounts_tool()
 }
 
-/// **A RELEASE-BUNDLE `tui` HAS NO DEFAULT HELPER.** It was compiled in a
-/// scratch directory that does not exist on the machine it runs on, and a
+/// Where the helper is installed, relative to the cauldron root (the
+/// directory above this binary's `bin/`): `scripts/install` lays it down there
+/// on the prebuilt and the from-source path alike.
+pub const INSTALLED_HELPER: &str = "share/cauldron/scripts/threads/claude-accounts";
+
+/// **THE INSTALLED HELPER** (issue #30): `<root>/share/cauldron/scripts/threads/claude-accounts`,
+/// where `<root>` is the directory above the one this executable sits in,
+/// every link resolved (the installed `tui` is `<root>/bin/tui`). Read at run
+/// time, never compiled in; `None` when there is no file there. It is still
+/// only run when [`local_refusal`] admits it.
+pub fn installed_accounts_tool() -> Option<PathBuf> {
+    installed_tool_for(&std::env::current_exe().ok()?)
+}
+
+/// [`installed_accounts_tool`] for the executable `exe`.
+pub fn installed_tool_for(exe: &std::path::Path) -> Option<PathBuf> {
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let p = exe.parent()?.parent()?.join(INSTALLED_HELPER);
+    p.is_file().then_some(p)
+}
+
+/// **A RELEASE-BUNDLE `tui` COMPILES IN NO HELPER PATH.** It was compiled in
+/// a scratch directory that does not exist on the machine it runs on, and a
 /// path compiled from it (`/private/tmp/...` on the build machine) is one any
-/// local user could create. So no source-tree path is compiled in at all,
-/// and the account action runs only a `TUI_POOL_ACCOUNTS_TOOL` the user
-/// names, which [`local_refusal`] checks like any other.
+/// local user could create. Its default is the helper installed beside it
+/// ([`installed_accounts_tool`]), or none.
 #[cfg(cauldron_release_bundle)]
 pub fn default_accounts_tool() -> Option<PathBuf> {
-    None
+    installed_accounts_tool()
 }
 
-/// A `tui` built from a checkout runs that checkout's
-/// `services/threads/scripts/claude-accounts` (the script derives its account
-/// store from where it sits, so a copy elsewhere would read another store).
-/// DEPTH-DEPENDENT: this crate lives two directories down. It is still only
-/// run when [`local_refusal`] admits it: owned by you, in directories only
-/// you or root can write, so a checkout built in a shared directory is
-/// refused rather than trusted.
+/// A `tui` built from a checkout runs the installed helper when it is
+/// installed ([`installed_accounts_tool`]), else that checkout's
+/// `services/threads/scripts/claude-accounts`. DEPTH-DEPENDENT: this crate
+/// lives two directories down. Either is only run when [`local_refusal`]
+/// admits it: owned by you, in directories only you or root can write, so a
+/// checkout built in a shared directory is refused rather than trusted.
 #[cfg(not(cauldron_release_bundle))]
 pub fn default_accounts_tool() -> Option<PathBuf> {
-    Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../services/threads/scripts/claude-accounts"))
+    installed_accounts_tool()
+        .or_else(|| Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../services/threads/scripts/claude-accounts")))
 }
 
-/// What a release-bundle `tui` says when no helper is named.
-pub const NO_HELPER_IN_THIS_BUILD: &str = "set-live-login needs the claude-accounts helper, which a prebuilt \
-     install does not include (it reads its account store from the repository it sits in). To use this action, \
-     clone the repository and start the board with TUI_POOL_ACCOUNTS_TOOL set to the clone's \
-     services/threads/scripts/claude-accounts (a file you own, in directories only you or root can write to).";
+/// The threads store the helper is told to use (`CLAUDE_ACCOUNTS_HOME`): the
+/// environment's `<data root>/threads/store`, the daemon's `THREADS_HOME` as
+/// the shipped declaration sets it. `None` when the environment does not
+/// resolve or the store is not there (an installed helper then refuses,
+/// saying the store must be named).
+pub fn accounts_store() -> Option<PathBuf> {
+    let env = env::Environment::resolve().ok()?;
+    let store = env.service_data("threads").ok()?.join("store");
+    store.is_dir().then_some(store)
+}
+
+/// The environment a helper run gets on top of this process's: the store.
+pub fn helper_env() -> Vec<(&'static str, PathBuf)> {
+    accounts_store().map(|s| vec![("CLAUDE_ACCOUNTS_HOME", s)]).unwrap_or_default()
+}
+
+/// **How the helper is started** (the preflight and the terminal switch
+/// alike): `argv` from the accounts store (or `/` when there is none), never
+/// the directory `tui` was started from, so nothing planted in a project the
+/// board was opened in is found; with no variable that would make the script
+/// or its python load a file the caller chose, and a PATH of absolute entries
+/// only (`env::trust::helper_command`); plus [`helper_env`].
+pub fn helper_command(argv: &[String]) -> std::process::Command {
+    let dir = accounts_store().unwrap_or_else(|| PathBuf::from("/"));
+    let mut cmd = env::trust::helper_command(argv[0].as_ref(), &dir);
+    cmd.args(&argv[1..]).envs(helper_env());
+    cmd
+}
+
+/// What `tui` says when there is no helper to run.
+pub const NO_HELPER_IN_THIS_BUILD: &str = "set-live-login needs the claude-accounts helper, which is installed \
+     with cauldron at <cauldron root>/share/cauldron/scripts/threads/claude-accounts and is not there. Install or \
+     upgrade with the release bundle's `install --prebuilt <tarball> --replace-running` or `scripts/install \
+     --replace-running` (a clone), or start the board with TUI_POOL_ACCOUNTS_TOOL naming a copy (a file you own, \
+     in directories only you or root can write to).";
 
 /// **REL-6a5: AN ISOLATED PROCESS NEVER RUNS THE REAL `claude-accounts`.**
 /// `set-live-login` switches the machine's Claude login, so under isolation

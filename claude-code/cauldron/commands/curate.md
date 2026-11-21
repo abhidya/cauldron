@@ -26,7 +26,8 @@ unknown or ungranted cauldron.
   not for that scope) or `no_cauldron_for_project` (no cauldron was named and
   no grant names this directory as its project). Show the user the refusal and
   the `cauldron mcp grant …` command it names (they run it at a terminal; you
-  cannot), and stop.
+  run it only if the user asks and the owner opened `grant` to agents), and
+  stop.
 - `service_down`: the `mcp` service is not running. Tell the user the start
   command the refusal names, and offer the CLI route below instead.
 - If the user named an environment and `soup_status` reports another, say so

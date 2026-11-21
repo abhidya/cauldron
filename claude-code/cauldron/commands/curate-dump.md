@@ -22,7 +22,8 @@ door serves, the cauldron, `resolved_from` and the grant's `scopes`.
   writing records needs `write`. If `scopes` lacks one, or the answer is
   `not_granted` or `no_cauldron_for_project`, show the user the refusal and
   the `cauldron mcp grant …` command it names (they run it at a terminal; you
-  cannot), and stop.
+  run it only if the user asks and the owner opened `grant` to agents), and
+  stop.
 - `service_down`: the `mcp` service is not running. Show the start command
   the refusal names and stop. (Without the service, the curator can still
   read the dump with `cauldron soup dump-get <id> --view text` and land

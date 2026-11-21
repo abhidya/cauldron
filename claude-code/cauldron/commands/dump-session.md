@@ -28,7 +28,7 @@ calling.
 
 Refusals: `not_granted` or `no_cauldron_for_project` (show the refusal and
 the `cauldron mcp grant …` command it names; the user runs it at a terminal,
-you cannot), `service_down` (show the start command it names),
+and you run it only if the user asks and the owner opened `grant` to agents), `service_down` (show the start command it names),
 `session_unknown` (no transcript of that id on this machine; say so),
 `transcript_unreadable` (show the reason), `transcript_link` (a link was
 found where the transcript is looked for, and nothing was read; show the

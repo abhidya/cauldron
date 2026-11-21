@@ -10,6 +10,35 @@ soup will accept.
 
 Version: `workspace@6`.
 
+**Since 0.1.10, see also.** The grammar and the schema files here have not
+changed since 0.1.10, on purpose; the soup's door has grown rules around
+them, described in the repository's root `README.md` and `CHANGELOG.md`:
+
+- the owner's rejection, `meta.rejected` (`cauldron ripples reject`), and
+  the reads that leave rejected records out (`rejected_hidden`, and
+  `include_rejected` to list them);
+- an edge's `note` is at most 1,000 characters at the door (0.1.16), though
+  the schemas put no bound on it (below, under the record shape);
+- region locks: a write into a region a ripple holds is refused
+  `region_locked` (0.1.14);
+- clusters, which claim regions, on their own grammar (kind `cauldron`,
+  version 1), published in the sibling directory with its own README
+  (0.1.16);
+- writing back a record you read: `../write-back.json` lists, per key, what
+  a write drops (keys a read adds) and what it refuses (0.1.17);
+- `meta.ripple` is refused on every write but a ripple's own
+  (`ripple_provenance`, 0.1.17);
+- the review flags `meta.approved` and `meta.rejected` are declared in the
+  schemas because stored records carry them, and refused on every record
+  write (`usage`): only the owner's approval and rejection set them. A
+  validator built from the schemas alone passes them; leave them out;
+- an edge whose `note` is `null` is taken as an edge with no note, though
+  the schemas want a string where the key is present: leave the key out
+  rather than send `null` (0.1.17 documents this; nothing changed);
+- a `supersedes` edge is written only with the new node that supersedes,
+  and a `supersedes` or `narrows` edge from a node to itself, or one closing
+  a cycle, is refused on every write (`edge-loop`, 0.1.17).
+
 ## Files
 
 | file | what it is |
@@ -62,7 +91,11 @@ The schemas describe one node **at mint**, as a JSON (or YAML) object:
   `{kind, to, note?}` plus the kind's declared fields (only `shows` declares
   any). `note` is optional free text on every edge that carries no declared
   fields; a `shows` edge carries its `cite` and `why` and no `note` (the soup
-  stores one or the other on an edge). Inverses are never written:
+  stores one or the other on an edge). The schemas put no bound on `note`,
+  but the soup's door takes a NEW note of at most 1,000 characters, on every
+  write path (a record's edge, `soup_link`, `soup_claim`): a longer one
+  refuses the write. A validator built from these schemas alone will pass a
+  longer note; check the bound yourself. Inverses are never written:
   `blocked_by`, `superseded_by` and the like do not exist; the soup computes the
   inbound side.
 - `to` is an id in the same pool, or `<ID>@<pool>` for a node in another pool,
@@ -279,14 +312,29 @@ makes a node the human's.
 ripples run`, from 0.1.10) writes new records only, each citing its dump
 (`{"kind": "dump", "id": "DM-<n>"}`) and carrying `meta.ripple: {package,
 version, run, model}`, which the MCP door sets and a batch cannot change.
-Who wrote a record is read from the transaction that wrote it, not from any
-field. Such a record is unreviewed until its `meta.approved` is set (any
-value but `false` or `null`; the owner's `cauldron soup approve`, run at a
-terminal, writes `{at, by}`, and no MCP tool sets it); the reads mark it `unreviewed: true`,
+From 0.1.17 no other write sets it: a record that carries `meta.ripple`, in
+any casing or nesting, is refused at the door as `ripple_provenance` on
+every write path but a ripple's (`soup_put`, `cauldron soup import`,
+`--remint` or not, dry run or not). A record written before 0.1.17 may
+carry one a session made up, so trust the field only on a record a ripple
+wrote: who wrote a record is read from the transaction that wrote it
+(`soup_review`), not from any field. Such a record is unreviewed until its
+`meta.approved` is set (any value but `false` or `null`; the owner's
+decision writes `{at, by, session?}`: `cauldron soup approve` or `cauldron
+ripples approve` at a terminal, `by: "tty"`, or, only where the owner
+opened approving to agents, those commands without one or the MCP tool
+`soup_approve`, `by: "agent"`); the reads mark it `unreviewed: true`,
 which is computed and is not a field (leave it out when you write the record
 again). `meta.approved` is a flag: the soup refuses it to every ripple, so a
 ripple can never approve its own records. Do not write `meta.approved` or
 `meta.ripple` yourself on a record you create.
+The same holds for `meta.rejected`, which a rejection writes (`{at, by,
+session?, reason?}`, `by` as above). The descriptions of `meta.approved` and
+`meta.rejected` in the generated schema files say the same. Their words may
+change from one release to the next; what they accept may not: a test in the
+spine crate holds every validation keyword of the published files (everything
+but `description`, `title` and `$comment`) to the files published with
+0.1.16.
 
 **Knowledge capture: patterns and cases.** There is no `pattern` or `case`
 type. Record a **pattern** (a lesson, a rule learned) as a `decision` (a call
@@ -448,11 +496,15 @@ note, `Outside:` clauses, `[[links]]` matching `ref` edges, retired `meta`
 keys, a node in a region and its ancestor, and the rest): a batch that breaks
 them can validate and land. Keeping them is the writer's job.
 
-**Changing a node.** A node is never edited in place, and an import only
-creates nodes. To change one, write a new node of the **same type** with a
-new id (a label, under `--remint`) that carries a `supersedes` edge to the
-old one, with a `note` naming the clauses it replaces, and carries forward the
-old node's `in_region` and other edges that still hold:
+**Changing a node.** Imports and `soup_put` only create nodes: a node's
+fields are never rewritten. A few writes add to, or take from, a node that
+exists: `soup_link` and `cauldron soup link` add an edge; `soup_unlink` and
+`cauldron soup unlink` remove one; `soup_cite` and `cauldron soup cite` add
+or remove one entry of `meta.cites`; and the owner's approve and reject set
+a review flag. To change what a node SAYS, write a new node of the **same
+type** with a new id (a label, under `--remint`) that carries a `supersedes`
+edge to the old one, with a `note` naming the clauses it replaces, and
+carries forward the old node's `in_region` and other edges that still hold:
 
 ```json
 {"id": "n1", "type": "decision", "state": "decided",
@@ -464,12 +516,22 @@ old node's `in_region` and other edges that still hold:
 `supersedes` across types is refused (`wrong_endpoint_type`). The old node
 keeps its text and reads as superseded (see the reads below).
 
-**Adding an edge to a node that exists.** Edges are written on the node they
-leave, when it is minted, so an import cannot add an outgoing edge to a node
-the soup already holds: supersede the node with a copy that carries its old
-edges plus the new one. An edge INTO an existing node needs nothing special:
-any new record can carry it. From a Claude Code session, the MCP tool
-`soup_link` adds an edge between two nodes the soup already holds.
+**Adding or removing an edge of a node that exists.** An import writes a
+node's outgoing edges when it mints the node, so it cannot add one to a node
+the soup already holds; an edge INTO an existing node needs nothing special,
+since any new record can carry it. `soup_link` (or `cauldron soup link
+<from> <kind> <to>`) adds an edge between two nodes the soup holds, and
+`soup_unlink` (or `cauldron soup unlink`) removes one, so a wrong edge does
+not stay readable on the old node; the change feed keeps both as `link` and
+`unlink`. A removal is refused for a node's last `in_region` (add the new one
+first), a milestone's last `serves`, and a `supersedes` edge, which is
+history (except one from a node to itself, or one on a cycle of `supersedes`
+edges: neither records a replacement, so either may be removed). `soup_link`
+never adds a `supersedes` edge (`supersedes-at-creation`): it is written
+only with the new node that supersedes. A `supersedes` or `narrows` edge
+from a node to itself, or one that would close a cycle of its kind, is
+refused on every write (`edge-loop`). A wrong or missing citation is fixed the same way, one entry at a
+time, with `soup_cite` (or `cauldron soup cite <id> --add | --remove`).
 
 **Edge order.** `get` answers a node's edges sorted by kind, then by target,
 not in the order they were written; compare records as sets of edges.
@@ -489,7 +551,11 @@ neither a record of the batch nor a node the soup holds (`unknown-target`).
 - Without `--remint`, ids are carried as written; an id the soup already holds
   refuses the whole import. With `--remint`, every id in the batch is a label:
   each record gets the next free id for its type, references and `[[links]]`
-  between batch records are rewritten, and the output's `id_map` gives old to
+  between batch records are rewritten (an edge's `to`, and a `[[label]]`
+  link in a record's `body`; nothing else: a label in a `handle`, a
+  region's `boundary` or an edge's `note`, linked or in plain words, is kept
+  as written, so name batch records from those fields only once they have
+  ids), and the output's `id_map` gives old to
   new when the batch landed (or, on a dry run, would land as it stands); a
   refused batch prints no `id_map`, since its ids were never taken. Under `--remint` a label may be any string without `@` or `#` that is
   not an id the soup already holds: such a label is refused
@@ -509,7 +575,11 @@ neither a record of the batch nor a node the soup holds (`unknown-target`).
   out of `nodes`, `search` and a region's members, each saying how many it
   left out (`superseded_hidden`); `--include-superseded` lists it too. `get`
   always answers it, adding `superseded_by: [ids]`. That key is read from the
-  edges, not stored: leave it out when writing the record again.
+  edges, not stored: a write drops it (and names it in its answer's
+  `ignored`), as it drops every key a read adds. `../write-back.json` lists
+  them, and the keys a write refuses that a read can show (the review flags,
+  `meta.ripple`, and the id itself), so a record read back needs no
+  hand-made strip list.
 
 ## Validating a record
 

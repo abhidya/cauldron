@@ -228,7 +228,10 @@ pub fn default_from_env(e: &env::Environment) -> anyhow::Result<Box<dyn Inferenc
 /// `{"output": …, "usage": {…}, "model": "…", "sleep_ms": n}` or `{"fail":
 /// "busy"|"parked"|"schema_unmet"|"unavailable"|"unsupported"|"failed", "message": "…", "cause": "…" (a park's),
 /// "usage": {…}, "sleep_ms": n}`; `"sent": true` on an entry reports a call
-/// handle (event `sent`) before it answers. No entry left is `failed`.
+/// handle (event `sent`) before it answers. `"until_exists": "<path>"` holds
+/// the call open until that file exists (a test's gate: it answers when the
+/// test says so, never after a guessed time; given up after 10 minutes). No
+/// entry left is `failed`.
 pub struct Scripted {
     path: PathBuf,
     next: Mutex<usize>,
@@ -273,6 +276,12 @@ impl Inference for Scripted {
         }
         if let Some(ms) = e["sleep_ms"].as_u64() {
             std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        if let Some(gate) = e["until_exists"].as_str() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            while !Path::new(gate).exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
         let usage: Usage = serde_json::from_value(e["usage"].clone()).unwrap_or_default();
         let message = e["message"].as_str().unwrap_or("scripted").to_string();
