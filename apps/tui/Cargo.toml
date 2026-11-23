@@ -144,6 +144,9 @@ projects = { path = "../../libs/projects" }
 # table), so the face and `cauldron start threads` cannot disagree about which
 # daemon is "the threads". See `src/cauldron_env.rs`.
 env = { path = "../../libs/env" }
+# The Cauldron tab reads the environment's real soups (`cauldron/livesoup.rs`)
+# through the same offline reads `cauldron soup` prints. Read-only.
+soup-door = { path = "../../libs/soup-door" }
 # REL-3.S2: the face's own `+` seeds `cauldron-build` exactly as the CLI's
 # `env create` does (`soup::demo::seed_env`). The soup crate's own tests
 # dev-depend on this crate; a dev-dependency cycle is allowed.
