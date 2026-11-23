@@ -1,0 +1,54 @@
+[
+ {
+  "id": "DEC-2",
+  "type": "decision",
+  "state": "decided",
+  "handle": "The next batch comes from shape-shared classes, not the wasm queue.",
+  "body": "Chosen in thread \"Clear the port queue\" after the request to relaunch the driver was declined under CON-1.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-4"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-2"
+   },
+   {
+    "kind": "ref",
+    "to": "CON-1",
+    "note": "made under"
+   }
+  ]
+ },
+ {
+  "id": "Q-1",
+  "type": "question",
+  "state": "open",
+  "handle": "Does the Acceleration Ninja action-2 dash match the original?",
+  "body": "Unanswered: no reference capture exists. Under CON-2 this is a playable-parity claim and needs one.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-4"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-1"
+   },
+   {
+    "kind": "ref",
+    "to": "CON-2",
+    "note": "governed by"
+   }
+  ]
+ }
+]
