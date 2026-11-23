@@ -1,0 +1,306 @@
+[
+ {
+  "id": "R-1",
+  "type": "region",
+  "handle": "TypeScript recreation",
+  "boundary": "Inside: the hand-written three.js game that ships to GitHub Pages, and each system transcribed from ROM evidence. Outside: compiled retail code and how it is verified."
+ },
+ {
+  "id": "R-2",
+  "type": "region",
+  "handle": "Matching decompilation",
+  "boundary": "Inside: compiling candidate C and diffing it against retail bytes until byte-identical, the loop that drives it, and its results. Outside: the compiler's own limits."
+ },
+ {
+  "id": "R-3",
+  "type": "region",
+  "handle": "Verification",
+  "boundary": "Inside: what counts as proven, the vocabulary for each kind of claim, and what counts as evidence. Outside: how any single function is matched."
+ },
+ {
+  "id": "R-4",
+  "type": "region",
+  "handle": "Compiler",
+  "boundary": "Inside: mwcc-rs, what it compiles and what it refuses, and how that bounds the port route. Outside: the C candidates themselves."
+ },
+ {
+  "id": "R-5",
+  "type": "region",
+  "handle": "Retired: wasm-unit pipeline",
+  "boundary": "Inside: the superseded wasm-unit port pipeline, its driver and its queue, kept for history. Outside: any active route."
+ },
+ {
+  "id": "CL-1",
+  "type": "cluster",
+  "handle": "TypeScript recreation",
+  "boundary": "Inside: the hand-written three.js game that ships to GitHub Pages, and each system transcribed from ROM evidence. Outside: compiled retail code and how it is verified.",
+  "edges": [
+   {
+    "kind": "claims",
+    "to": "R-1"
+   }
+  ]
+ },
+ {
+  "id": "CL-2",
+  "type": "cluster",
+  "handle": "Matching decompilation",
+  "boundary": "Inside: compiling candidate C and diffing it against retail bytes until byte-identical, the loop that drives it, and its results. Outside: the compiler's own limits.",
+  "edges": [
+   {
+    "kind": "claims",
+    "to": "R-2"
+   }
+  ]
+ },
+ {
+  "id": "CL-3",
+  "type": "cluster",
+  "handle": "Verification",
+  "boundary": "Inside: what counts as proven, the vocabulary for each kind of claim, and what counts as evidence. Outside: how any single function is matched.",
+  "edges": [
+   {
+    "kind": "claims",
+    "to": "R-3"
+   }
+  ]
+ },
+ {
+  "id": "CL-4",
+  "type": "cluster",
+  "handle": "Compiler",
+  "boundary": "Inside: mwcc-rs, what it compiles and what it refuses, and how that bounds the port route. Outside: the C candidates themselves.",
+  "edges": [
+   {
+    "kind": "claims",
+    "to": "R-4"
+   }
+  ]
+ },
+ {
+  "id": "CL-5",
+  "type": "cluster",
+  "handle": "Retired: wasm-unit pipeline",
+  "boundary": "Inside: the superseded wasm-unit port pipeline, its driver and its queue, kept for history. Outside: any active route.",
+  "edges": [
+   {
+    "kind": "claims",
+    "to": "R-5"
+   }
+  ]
+ },
+ {
+  "id": "DEC-1",
+  "type": "decision",
+  "state": "decided",
+  "handle": "The port route is matching decompilation.",
+  "body": "Chosen 2026-09-04, superseding the wasm-unit pipeline. Candidate C is compiled and diffed against retail bytes until byte-identical.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-1"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-2"
+   }
+  ]
+ },
+ {
+  "id": "CON-1",
+  "type": "constraint",
+  "state": "standing",
+  "handle": "Do not relaunch the wasm-unit driver.",
+  "body": "`finish-port --drive` is obsolete on this route and must not be relaunched. Its queue, compile-fix loop and assembly gate are retired with it.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-1"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-5"
+   },
+   {
+    "kind": "ref",
+    "to": "DEC-1",
+    "note": "follows from"
+   }
+  ]
+ },
+ {
+  "id": "CON-2",
+  "type": "constraint",
+  "state": "standing",
+  "handle": "Match, synthetic test and playable parity are separate claims.",
+  "body": "A recorded match, a passing synthetic test and a playable-parity result must never be reported as one another.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-1"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-3"
+   }
+  ]
+ },
+ {
+  "id": "D-1",
+  "type": "danger",
+  "state": "lurking",
+  "handle": "The matched-function count overstates progress.",
+  "body": "118 of the 405 matched functions are a single `blr`. True about the bytes, thin about the program.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-1"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-2"
+   },
+   {
+    "kind": "ref",
+    "to": "DEC-1",
+    "note": "qualifies"
+   }
+  ]
+ },
+ {
+  "id": "IS-1",
+  "type": "issue",
+  "state": "open",
+  "handle": "The compiler bounds the route.",
+  "body": "mwcc-rs compiles only 10.07 % of the game's instructions; 87.2 % is compiler-blocked.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-1"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-4"
+   },
+   {
+    "kind": "ref",
+    "to": "DEC-1",
+    "note": "blocks progress on"
+   }
+  ]
+ },
+ {
+  "id": "CON-3",
+  "type": "constraint",
+  "state": "standing",
+  "handle": "Only committed or re-derivable numbers are evidence.",
+  "body": "Every number is read from a committed artifact or re-derived by a named script. A machine-local number says so and is not treated as evidence.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-2"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-3"
+   }
+  ]
+ },
+ {
+  "id": "IS-2",
+  "type": "issue",
+  "state": "open",
+  "handle": "The wasm-unit queue numbers cannot be reproduced.",
+  "body": "They come from a machine-local, untracked state file and are not reproducible from a clone. Flagged by the verifier: not evidence.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-1"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-5"
+   },
+   {
+    "kind": "ref",
+    "to": "CON-3",
+    "note": "conflicts with"
+   }
+  ]
+ },
+ {
+  "id": "CON-4",
+  "type": "constraint",
+  "state": "standing",
+  "handle": "A match resting on a masked data relocation is unverified.",
+  "body": "Such verdicts are recorded `MATCH_UNVERIFIED` and are never written to `src-match/`.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-3"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-3"
+   },
+   {
+    "kind": "ref",
+    "to": "CON-2",
+    "note": "refines"
+   }
+  ]
+ },
+ {
+  "id": "T-1",
+  "type": "task",
+  "state": "ready",
+  "handle": "List the top 20 unmatched shape-shared classes and pick the next batch.",
+  "body": "Use the matching loop's `shapes` command. No model step is needed for this class.",
+  "meta": {
+   "cites": [
+    {
+     "kind": "dump",
+     "id": "DM-3"
+    }
+   ]
+  },
+  "edges": [
+   {
+    "kind": "in_region",
+    "to": "R-2"
+   }
+  ]
+ }
+]

@@ -1,0 +1,559 @@
+{
+ "clusters": [
+  {
+   "id": "CL-1",
+   "region": "R-1",
+   "name": "TypeScript recreation",
+   "x": 0.16,
+   "y": 0.32,
+   "r": 0.13
+  },
+  {
+   "id": "CL-2",
+   "region": "R-2",
+   "name": "Matching decompilation",
+   "x": 0.46,
+   "y": 0.4,
+   "r": 0.18
+  },
+  {
+   "id": "CL-3",
+   "region": "R-3",
+   "name": "Verification",
+   "x": 0.8,
+   "y": 0.27,
+   "r": 0.16
+  },
+  {
+   "id": "CL-4",
+   "region": "R-4",
+   "name": "Compiler",
+   "x": 0.27,
+   "y": 0.78,
+   "r": 0.12
+  },
+  {
+   "id": "CL-5",
+   "region": "R-5",
+   "name": "Retired: wasm-unit pipeline",
+   "x": 0.74,
+   "y": 0.79,
+   "r": 0.14
+  }
+ ],
+ "docs": [
+  {
+   "path": "README.md",
+   "drop": "CL-2",
+   "dx": -0.03,
+   "dy": -0.02
+  },
+  {
+   "path": "docs/verification-status.md",
+   "drop": "CL-3",
+   "dx": 0.0,
+   "dy": 0.0
+  },
+  {
+   "path": "docs/matching-loop.md",
+   "drop": "CL-2",
+   "dx": 0.05,
+   "dy": 0.06
+  }
+ ],
+ "ripple_replies": [
+  {
+   "dump": 1,
+   "records": [
+    "DEC-1",
+    "CON-1",
+    "CON-2",
+    "D-1",
+    "IS-1",
+    "IS-2"
+   ]
+  },
+  {
+   "dump": 2,
+   "records": [
+    "CON-3"
+   ]
+  },
+  {
+   "dump": 3,
+   "records": [
+    "CON-4",
+    "T-1"
+   ]
+  },
+  {
+   "dump": 4,
+   "records": [
+    "DEC-2",
+    "Q-1"
+   ]
+  }
+ ],
+ "dots": {
+  "DEC-1": [
+   0.4,
+   0.33
+  ],
+  "D-1": [
+   0.55,
+   0.5
+  ],
+  "T-1": [
+   0.38,
+   0.52
+  ],
+  "CON-1": [
+   0.68,
+   0.76
+  ],
+  "IS-2": [
+   0.8,
+   0.84
+  ],
+  "CON-2": [
+   0.76,
+   0.21
+  ],
+  "CON-3": [
+   0.86,
+   0.3
+  ],
+  "CON-4": [
+   0.77,
+   0.35
+  ],
+  "IS-1": [
+   0.27,
+   0.78
+  ],
+  "DEC-2": [
+   0.52,
+   0.28
+  ],
+  "Q-1": [
+   0.16,
+   0.32
+  ]
+ },
+ "members": [
+  [
+   "coordinator",
+   "assigning",
+   "idle"
+  ],
+  [
+   "@extract",
+   "writing records",
+   "good"
+  ],
+  [
+   "@link",
+   "linking",
+   "idle"
+  ],
+  [
+   "@verifier",
+   "1 objection",
+   "warn"
+  ]
+ ],
+ "posts": [
+  {
+   "from": "coordinator",
+   "to": "@all",
+   "text": "Three documents in. @extract, pull decisions, constraints and dangers. @link, connect them. @verifier, check each record against the others."
+  },
+  {
+   "from": "@extract",
+   "to": "@link",
+   "text": "Nine records. Two are about the retired wasm-unit pipeline: CON-1 and IS-2."
+  },
+  {
+   "from": "@link",
+   "to": "@verifier",
+   "text": "CON-1 follows from DEC-1. D-1 qualifies the 405 figure. IS-1 blocks DEC-1. CON-4 refines CON-2."
+  },
+  {
+   "from": "@verifier",
+   "to": "@link, you",
+   "warn": true,
+   "text": "IS-2 conflicts with CON-3. The queue numbers are machine-local, and CON-3 says machine-local numbers are not evidence. Keep IS-2 as an issue, or drop it?"
+  },
+  {
+   "from": "@verifier",
+   "to": "@all",
+   "after_reply": true,
+   "text": "Kept. IS-2 is flagged \"not evidence\"."
+  }
+ ],
+ "threads": [
+  {
+   "title": "Clear the port queue",
+   "query": "wasm-unit driver relaunch",
+   "reply": "I won't relaunch it. CON-1 says `finish-port --drive` is obsolete on the current route and must not be relaunched, and DEC-1 says the route is matching decompilation since 2026-09-04. The matching-route equivalent of clearing a queue is T-1: list the top 20 unmatched shape-shared classes and pick the next batch. Before I ask you, I'm having the checker confirm nothing in the soup forbids it.",
+   "after_allow": "It failed. The loop needs the retail ISO and looks for it at D:/GotYaForce/Gotcha Force.iso, which is not on this machine, so I can't list shapes here. T-1 stays open until the ISO path is set. One more thing I can't judge myself:",
+   "after_parity": "Understood. I won't record a parity claim. I'll leave it as an open question for the next session.",
+   "cards": {
+    "permission": [
+     {
+      "version": "1.0",
+      "createSurface": {
+       "surfaceId": "permission_t1",
+       "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"
+      }
+     },
+     {
+      "version": "1.0",
+      "updateComponents": {
+       "surfaceId": "permission_t1",
+       "components": [
+        {
+         "id": "root",
+         "component": "Card",
+         "child": "col"
+        },
+        {
+         "id": "col",
+         "component": "Column",
+         "children": [
+          "kicker",
+          "title",
+          "cmd",
+          "note",
+          "div",
+          "btns"
+         ]
+        },
+        {
+         "id": "kicker",
+         "component": "Text",
+         "text": "Permission \u00b7 thread \"Clear the port queue\"",
+         "variant": "caption"
+        },
+        {
+         "id": "title",
+         "component": "Text",
+         "text": "Run the matching loop's shape listing?",
+         "variant": "h4"
+        },
+        {
+         "id": "cmd",
+         "component": "Code",
+         "@catalogId": "cauldron:demo/catalog",
+         "text": "python3 research/tools/matching-decomp/loop.py shapes --top 20"
+        },
+        {
+         "id": "note",
+         "component": "Text",
+         "text": "Read-only. Lists classes; changes no files.",
+         "variant": "caption"
+        },
+        {
+         "id": "div",
+         "component": "Divider",
+         "axis": "horizontal"
+        },
+        {
+         "id": "btns",
+         "component": "Row",
+         "justify": "end",
+         "children": [
+          "deny",
+          "always",
+          "once"
+         ]
+        },
+        {
+         "id": "deny",
+         "component": "Button",
+         "child": "deny_l",
+         "action": {
+          "event": {
+           "name": "permission_deny",
+           "context": {}
+          }
+         }
+        },
+        {
+         "id": "deny_l",
+         "component": "Text",
+         "text": "Deny",
+         "variant": "body"
+        },
+        {
+         "id": "always",
+         "component": "Button",
+         "child": "always_l",
+         "action": {
+          "event": {
+           "name": "permission_always",
+           "context": {}
+          }
+         }
+        },
+        {
+         "id": "always_l",
+         "component": "Text",
+         "text": "Always allow in this cluster",
+         "variant": "body"
+        },
+        {
+         "id": "once",
+         "component": "Button",
+         "child": "once_l",
+         "action": {
+          "event": {
+           "name": "permission_once",
+           "context": {}
+          }
+         },
+         "variant": "primary"
+        },
+        {
+         "id": "once_l",
+         "component": "Text",
+         "text": "Allow once",
+         "variant": "body"
+        }
+       ]
+      }
+     }
+    ],
+    "visual": [
+     {
+      "version": "1.0",
+      "createSurface": {
+       "surfaceId": "visual_ninja",
+       "catalogId": "https://a2ui.org/specification/v1_0/catalogs/basic/catalog.json"
+      }
+     },
+     {
+      "version": "1.0",
+      "updateComponents": {
+       "surfaceId": "visual_ninja",
+       "components": [
+        {
+         "id": "root",
+         "component": "Card",
+         "child": "col"
+        },
+        {
+         "id": "col",
+         "component": "Column",
+         "children": [
+          "kicker",
+          "title",
+          "panes",
+          "src",
+          "div",
+          "opts"
+         ]
+        },
+        {
+         "id": "kicker",
+         "component": "Text",
+         "text": "Visual check \u00b7 TypeScript recreation",
+         "variant": "caption"
+        },
+        {
+         "id": "title",
+         "component": "Text",
+         "text": "Acceleration Ninja, action-2 dash: does the motion look right?",
+         "variant": "h4"
+        },
+        {
+         "id": "panes",
+         "component": "Row",
+         "children": [
+          "left",
+          "right"
+         ]
+        },
+        {
+         "id": "left",
+         "component": "Card",
+         "child": "left_c"
+        },
+        {
+         "id": "left_c",
+         "component": "Column",
+         "children": [
+          "left_t",
+          "left_b"
+         ]
+        },
+        {
+         "id": "left_t",
+         "component": "Text",
+         "text": "Browser build",
+         "variant": "caption"
+        },
+        {
+         "id": "left_b",
+         "component": "Text",
+         "text": "No capture attached.",
+         "variant": "body"
+        },
+        {
+         "id": "right",
+         "component": "Card",
+         "child": "right_c"
+        },
+        {
+         "id": "right_c",
+         "component": "Column",
+         "children": [
+          "right_t",
+          "right_b"
+         ]
+        },
+        {
+         "id": "right_t",
+         "component": "Text",
+         "text": "Reference",
+         "variant": "caption"
+        },
+        {
+         "id": "right_b",
+         "component": "Text",
+         "text": "No reference capture supplied.",
+         "variant": "body"
+        },
+        {
+         "id": "src",
+         "component": "Text",
+         "text": "docs/acceleration-ninja-dash-motion.md says this change restores movement and does not establish parity.",
+         "variant": "caption"
+        },
+        {
+         "id": "div",
+         "component": "Divider",
+         "axis": "horizontal"
+        },
+        {
+         "id": "opts",
+         "component": "Row",
+         "children": [
+          "ok",
+          "short",
+          "fast",
+          "cant"
+         ]
+        },
+        {
+         "id": "ok",
+         "component": "Button",
+         "child": "ok_l",
+         "action": {
+          "event": {
+           "name": "parity_ok",
+           "context": {}
+          }
+         }
+        },
+        {
+         "id": "ok_l",
+         "component": "Text",
+         "text": "Looks right",
+         "variant": "body"
+        },
+        {
+         "id": "short",
+         "component": "Button",
+         "child": "short_l",
+         "action": {
+          "event": {
+           "name": "parity_short",
+           "context": {}
+          }
+         }
+        },
+        {
+         "id": "short_l",
+         "component": "Text",
+         "text": "Too short",
+         "variant": "body"
+        },
+        {
+         "id": "fast",
+         "component": "Button",
+         "child": "fast_l",
+         "action": {
+          "event": {
+           "name": "parity_fast",
+           "context": {}
+          }
+         }
+        },
+        {
+         "id": "fast_l",
+         "component": "Text",
+         "text": "Too fast",
+         "variant": "body"
+        },
+        {
+         "id": "cant",
+         "component": "Button",
+         "child": "cant_l",
+         "action": {
+          "event": {
+           "name": "parity_unknown",
+           "context": {}
+          }
+         }
+        },
+        {
+         "id": "cant_l",
+         "component": "Text",
+         "text": "Can't tell without a reference",
+         "variant": "body"
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "agents": [
+    {
+     "name": "planner",
+     "adapter": "Claude adapter",
+     "role": "plans and asks you"
+    },
+    {
+     "name": "checker",
+     "adapter": "Gemini adapter",
+     "role": "cross-checks against the soup"
+    }
+   ],
+   "peer": [
+    {
+     "from": "planner",
+     "to": "checker",
+     "text": "Proposed next step is T-1, a read-only listing of shape-shared classes. Does any standing constraint forbid it or change how results must be reported?"
+    },
+    {
+     "from": "checker",
+     "to": "planner",
+     "query": "MATCH_UNVERIFIED",
+     "text": "Nothing forbids it. One rule applies to whatever comes after: CON-4 says a match resting on a masked data relocation stays MATCH_UNVERIFIED and is never written to src-match/. The listing itself changes no files, so it is safe to ask the owner."
+    },
+    {
+     "from": "planner",
+     "to": "checker",
+     "text": "Agreed. I'll carry CON-4 into the batch plan and ask for permission now."
+    }
+   ],
+   "command": "python3 research/tools/matching-decomp/loop.py shapes --top 20"
+  },
+  {
+   "title": "Ninja dash status",
+   "query": "ninja dash",
+   "reply": "One open question, Q-1: parity for the action-2 dash is unconfirmed because there is no reference capture. It was raised in the thread \"Clear the port queue\"."
+  }
+ ]
+}
