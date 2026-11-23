@@ -2874,6 +2874,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shapewire",
+ "soup-door",
  "soup-seed",
  "tempfile",
  "term-shell",

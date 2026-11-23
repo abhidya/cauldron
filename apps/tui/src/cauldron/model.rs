@@ -739,6 +739,30 @@ impl Soup {
         let corpus = crate::cauldron::corpus::Corpus::build(Default::default(), &forest)?;
         Ok(Soup { forest, corpus, dash: Default::default(), messages: BTreeMap::new() })
     }
+
+    /// [`Soup::empty_rooted`] for an environment whose real soups were read
+    /// (`livesoup`): the one cluster named after the environment, then each
+    /// cauldron's root cluster with its soup's clusters under it, over a
+    /// corpus of those soups' regions and nodes. What the bridge skipped is
+    /// added to the stale notice.
+    pub fn empty_rooted_live(
+        env: &str,
+        created: Vec<(Option<String>, ClusterSpec)>,
+        whole: bool,
+        live: crate::cauldron::livesoup::Live,
+    ) -> anyhow::Result<Self> {
+        let mut specs = vec![ClusterSpec::bare("X-1", env)];
+        specs.extend(live.clusters);
+        let orphans = attach(&mut specs, created);
+        if whole {
+            specs = vec![ClusterSpec::whole(env, specs)];
+        }
+        let mut forest = Forest::from_specs(specs)?;
+        forest.take_orphans(orphans);
+        let corpus = crate::cauldron::corpus::Corpus::build(live.corpus, &forest)?;
+        forest.stale.extend(live.notes);
+        Ok(Soup { forest, corpus, dash: Default::default(), messages: BTreeMap::new() })
+    }
 }
 
 /// Put each made cluster under its parent, in the order they were made. A

@@ -164,7 +164,23 @@ pub fn load_soup_rooted(seeds: &Path, name: &str, dir: &Path, whole: bool) -> Re
     let created = CreatedClusters::new(dir).specs()?;
     let mut soup = match own_seed(dir, "clusters.json").or_else(|| seed_path(seeds, name)) {
         Some(p) => Soup::load_rooted(&p, created, whole.then_some(name))?,
-        None => Soup::empty_rooted(name, created, whole)?,
+        // No seed: the environment's real soups, if it has any
+        // (`livesoup`), else the one empty cluster. A bridged soup the
+        // tab's grammar refuses never stops the face opening: the empty
+        // soup is shown, and the refusal is said in the stale notice.
+        None => match crate::cauldron::livesoup::read(name, dir) {
+            Some(live) => {
+                match Soup::empty_rooted_live(name, created, whole, live) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let mut s = Soup::empty_rooted(name, CreatedClusters::new(dir).specs()?, whole)?;
+                        s.forest.stale.push(format!("this environment's soups are not shown: {e:#}"));
+                        s
+                    }
+                }
+            }
+            None => Soup::empty_rooted(name, created, whole)?,
+        },
     };
     // The token-source board a seed carries (`global.json`): the cauldron's
     // OWN seed's first, else a fixture's (REL-3.S2: never the repo's into
@@ -745,7 +761,14 @@ impl CreatedClusters {
 /// like C-2 ... Use an X"): `X-<n>`, one past the highest `X-` number among
 /// `keys`, which are every cluster's — the seed's and those made here.
 pub fn mint_id<'a>(keys: impl IntoIterator<Item = &'a str>) -> String {
-    let n = keys.into_iter().filter_map(|k| k.strip_prefix("X-")?.parse::<u32>().ok()).max().unwrap_or(0);
+    // An id at or above `livesoup::LIVE_BASE` is a real soup's cluster shown
+    // in the tab, never one made here, so it takes no part in minting.
+    let n = keys
+        .into_iter()
+        .filter_map(|k| k.strip_prefix("X-")?.parse::<u32>().ok())
+        .filter(|n| *n < crate::cauldron::livesoup::LIVE_BASE)
+        .max()
+        .unwrap_or(0);
     format!("X-{}", n + 1)
 }
 

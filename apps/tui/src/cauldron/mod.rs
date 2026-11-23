@@ -115,6 +115,7 @@ pub mod seeding;
 pub mod status;
 pub mod supervise;
 pub mod live;
+pub mod livesoup;
 pub mod threads;
 pub mod tickets;
 // V1.8: where a human action's value goes (env file, keychain, node).
