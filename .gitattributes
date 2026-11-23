@@ -37,6 +37,8 @@
 # The personal-data guard's literal patterns (REL-4.S7h): read by
 # scripts/check-no-personal-data.sh, never shipped.
 /scripts/personal-patterns.private export-ignore
+# Its self-test fixtures: known-bad and known-good lines, never shipped.
+/scripts/history-fixtures.private export-ignore
 
 # Operator-only tooling: prunes one machine's shared build targets against a
 # private keep-list (fails closed without it).
@@ -56,6 +58,11 @@
 /libs/projects/PROVENANCE.md export-ignore
 /libs/aui-wire/PROVENANCE.md export-ignore
 /libs/term-shell/PROVENANCE.md export-ignore
+
+# A maintainer-only probe that compares the spine's v6 grammar with the
+# private specification it was written from; it reads a repository the public
+# cannot have, so it is kept out of the published tree.
+/libs/spine/tests/grammar_v6_data_source.rs export-ignore
 
 # Operator-only proofs: each snapshots or restarts one machine's live services
 # and store (CUT-A-FIX3 F2).

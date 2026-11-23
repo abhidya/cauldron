@@ -1,0 +1,55 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  inference — LOCAL MODELS, ON DEMAND, ON LOOPBACK.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# One per environment. OFF unless started: the installer does not pin it
+# (a release bundle carries its image; `cauldron --env <env> build inference`
+# installs it with no cargo).
+# It supervises at most one `llama-server` child (llama.cpp, the binary on
+# PATH or `llama_server` in its settings; never bundled, never downloaded).
+#
+# * Nothing is loaded until a request names a model. A model is a `.gguf`
+#   file the owner placed on this machine and registered by name with
+#   `cauldron inference models add <name> <path>` (nothing is copied or
+#   downloaded), or one the owner fetched from the release's built-in
+#   catalogue with `cauldron inference models pull <name>` (only after a
+#   yes; the service itself downloads nothing). A model idle for 15 minutes
+#   is unloaded.
+# * A model whose estimated memory (file size + KV cache for its context + a
+#   fixed allowance) is over the budget (64 GiB unless the settings say
+#   otherwise) is refused, with the arithmetic.
+# * Loopback only: its seam and its child listen on 127.0.0.1; the child
+#   answers only a key minted for each load. No tools, ever.
+# * Its files live in `data/<env>/inference/`: `door.secret` (0600, minted at
+#   every start; ripples and `cauldron inference` read it), `models.json`
+#   (the registered models), `config.toml` (optional settings, by hand),
+#   `llama-server.log` (the child's output), `child.json` (the child's pid
+#   while one runs).
+
+name        = "inference"
+description = "Local inference: one llama-server child on loopback, loaded on demand with a registered model file, unloaded when idle, held to a memory budget. Off unless started. Registers its own seam."
+kind        = "daemon"
+
+# The HELLO handshake against this start's boot token.
+probe = "seam"
+
+# TERM: the service stops its child (TERM, then a kill after 10 s) before it
+# exits. A child is never left behind: it runs under a guard that stops it
+# when the service's end of a pipe closes, however the service ends.
+stop_signal = "TERM"
+# The child's 10 s, and room to spare, before cauldron escalates.
+stop_grace_secs = 20
+
+start_timeout_ms = 15000
+
+[build]
+# A cargo source in this repository.
+package = "cauldron-inference"
+bin     = "cauldron-inference"
+profile = "release"
+
+# Inherits cauldron's per-environment identity; nothing signs this image
+# with an identifier of its own.
+[permissions]
+responsibility = "inherit"
+identity = ""

@@ -1,0 +1,11 @@
+{
+  "id": "DEC-1",
+  "type": "decision",
+  "state": "decided",
+  "handle": "Corpus ids become batch labels, so every record gets a fresh id.",
+  "body": "Carried ids could collide with what the soup holds; see [[IS-2]].",
+  "in_region": [
+    "R-2"
+  ],
+  "cite": "notes#4"
+}

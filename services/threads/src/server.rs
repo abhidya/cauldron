@@ -232,6 +232,9 @@ pub(crate) async fn handle(
             // tell "said nothing" from "said no", and it is gone the moment this
             // deserializes. See `ThreadSettings::apply_creator_defaults`.
             settings.apply_creator_defaults(&raw_settings);
+            if let Some(c) = &settings.completion {
+                c.check().map_err(|e| Error::Config(format!("bad settings: {e}")))?;
+            }
             let thread_id = params
                 .get("thread_id")
                 .and_then(Value::as_str)
@@ -1611,7 +1614,7 @@ pub(crate) async fn handle(
                 false,
                 None,
             );
-            let script = manager.data_dir().join("scripts").join("claude-accounts");
+            let script = manager.claude_accounts_script();
             let outcome = crate::login::rotate(
                 &script,
                 manager.data_dir(),
@@ -2719,6 +2722,40 @@ mod command_promise_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// **A BARE COMPLETION'S BOUND IS CHECKED AT CREATION**: a bound of 0 or
+    /// above the ceiling refuses the create and makes no thread; a bound in
+    /// range is stored with the thread (and read back on `threads/list`),
+    /// and a thread that names none stores no `completion` key at all.
+    #[tokio::test]
+    async fn a_completion_thread_is_created_only_with_a_bound_in_range() {
+        crate::accounts::set_keychain_reader_for_test(Some(std::sync::Arc::new(|_: &str, _: &str| {
+            crate::accounts::CredentialFacts::default()
+        })));
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, _f) = tracked_threads(tmp.path()).await;
+        let mut settings = serde_json::to_value(a_thread(tmp.path())).unwrap();
+        assert!(settings.get("completion").is_none(), "{settings}");
+        let before = route_request(&m, "threads/list", json!({})).await.unwrap()["threads"].as_array().unwrap().len();
+        for bad in [0u64, crate::settings::Completion::MAX_OUTPUT_TOKENS as u64 + 1] {
+            settings["completion"] = json!({"max_output_tokens": bad});
+            let e = route_request(&m, "threads/create", json!({"settings": settings.clone()})).await.err().expect("refused");
+            assert!(e.to_string().contains("max_output_tokens"), "{e}");
+        }
+        settings["completion"] = json!({"max_output_tokens": 8000, "tools": "Bash"});
+        assert!(route_request(&m, "threads/create", json!({"settings": settings.clone()})).await.is_err(), "an unknown key is refused");
+        assert_eq!(route_request(&m, "threads/list", json!({})).await.unwrap()["threads"].as_array().unwrap().len(), before);
+        settings["completion"] = json!({"max_output_tokens": 8000});
+        let id = route_request(&m, "threads/create", json!({"settings": settings.clone()})).await.unwrap()["thread_id"].as_str().unwrap().to_string();
+        let plain = route_request(&m, "threads/create", json!({"settings": serde_json::to_value(a_thread(tmp.path())).unwrap()})).await.unwrap()["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let list = route_request(&m, "threads/list", json!({"limit": 1000})).await.unwrap();
+        let row = |want: &str| list["threads"].as_array().unwrap().iter().find(|t| t["thread_id"] == want).cloned().unwrap();
+        assert_eq!(row(&id)["settings"]["completion"], json!({"max_output_tokens": 8000}));
+        assert!(row(&plain)["settings"].get("completion").is_none());
     }
 
     /// **A THREAD CREATED WITH A NAME IS NAMED FROM BIRTH; A BLANK OR ABSENT

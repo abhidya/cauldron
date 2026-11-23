@@ -1,0 +1,12 @@
+{
+  "id": "C-1",
+  "type": "idea",
+  "state": "exploring",
+  "handle": "A directory of records could be watched and imported as it grows.",
+  "in_region": [
+    "R-2"
+  ],
+  "tags": [
+    "later"
+  ]
+}

@@ -1,0 +1,380 @@
+//! The door's limits: what is refused before any body is read, the cap on
+//! connections, the in-flight body budget, and the timeouts. Each test drives
+//! the real binary with raw sockets, so a refusal can be read back before a
+//! byte of the body is sent.
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+use crate::support::*;
+
+const LIST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+/// The service's resident memory, in KiB.
+fn rss_kib(pid: u32) -> u64 {
+    let out = std::process::Command::new("/bin/ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+}
+
+/// The service's established TCP connections on its door port.
+fn door_connections(pid: u32, port: u16) -> usize {
+    let out = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:ESTABLISHED", "-Fn"])
+        .output()
+        .unwrap();
+    let local = format!("127.0.0.1:{port}->");
+    String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.starts_with('n') && l[1..].starts_with(&local)).count()
+}
+
+/// Sample the service's memory every 20 ms until `stop`; the peak, in KiB.
+fn watch_rss(pid: u32, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<u64> {
+    let peak = Arc::new(AtomicU64::new(0));
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            peak.fetch_max(rss_kib(pid), Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        peak.load(Ordering::SeqCst)
+    })
+}
+
+/// A request head (no body) with these headers.
+fn head(door: SocketAddr, auth: Option<&str>, extra: &[(&str, &str)], len: Option<usize>) -> String {
+    let mut h = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\n",
+        door.port()
+    );
+    if let Some(a) = auth {
+        h.push_str(&format!("Authorization: {a}\r\n"));
+    }
+    for (k, v) in extra {
+        h.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if let Some(n) = len {
+        h.push_str(&format!("Content-Length: {n}\r\n"));
+    }
+    h.push_str("\r\n");
+    h
+}
+
+/// Send `head` alone and read the answer: the status and body, and how
+/// long it took. The body the head announces is never sent.
+fn head_only(door: SocketAddr, head: &str) -> (u16, String, Duration) {
+    let t = Instant::now();
+    let mut s = TcpStream::connect(door).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    s.write_all(head.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (h, b) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = h.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    (status, b.to_string(), t.elapsed())
+}
+
+#[test]
+fn l1_a_request_is_refused_from_its_head_before_any_body_is_read() {
+    let s = Scratch::new("l1", &["kb"]);
+    let svc = Service::start(&s);
+    let big = Some(1_000_000);
+    // No secret, a wrong one: 401 at once, though the body never comes.
+    for auth in [None, Some("Bearer 0000")] {
+        let (status, body, took) = head_only(svc.door, &head(svc.door, auth, &[], big));
+        assert_eq!(status, 401, "{auth:?}: {body}");
+        assert!(took < Duration::from_secs(2), "the refusal waited for the body: {took:?}");
+    }
+    // The secret, and a Host or an Origin a browser would send: 403 at once.
+    let (status, body, took) = head_only(svc.door, &head(svc.door, Some(&svc.bearer), &[("Origin", "http://evil.example")], big));
+    assert_eq!(status, 403, "{body}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    let h = head(svc.door, Some(&svc.bearer), &[], big).replace(&format!("Host: 127.0.0.1:{}", svc.door.port()), "Host: evil.example");
+    let (status, body, took) = head_only(svc.door, &h);
+    assert_eq!(status, 403, "{body}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    // The secret and a declared length over the limit: 413 `too_large`,
+    // naming the limit, at once.
+    let over = cauldron_mcp::http::BODY_LIMIT + 1;
+    let (status, body, took) = head_only(svc.door, &head(svc.door, Some(&svc.bearer), &[], Some(over)));
+    assert_eq!(status, 413, "{body}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["error"]["data"]["code"], "too_large", "{v}");
+    assert_eq!(v["error"]["data"]["limit_bytes"].as_u64(), Some(cauldron_mcp::http::BODY_LIMIT as u64));
+    assert!(v["error"]["message"].as_str().unwrap().contains("16 MiB"), "{v}");
+    // No declared length (a chunked body): 411, nothing read.
+    let h = head(svc.door, Some(&svc.bearer), &[("Transfer-Encoding", "chunked")], None);
+    let (status, body, _) = head_only(svc.door, &h);
+    assert_eq!(status, 411, "{body}");
+    // The door still answers.
+    assert_eq!(svc.post(LIST, &[]).status, 200);
+}
+
+#[test]
+fn l2_a_flood_of_unauthenticated_bodies_leaves_memory_bounded() {
+    let s = Scratch::new("l2", &["kb"]);
+    let svc = Service::start(&s);
+    let pid = svc.child.id();
+    let before = rss_kib(pid);
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = watch_rss(pid, stop.clone());
+    // The flood: 200 connections, no secret, each announcing
+    // 16,000,000 bytes and sending 15,000,000.
+    let door = svc.door;
+    let chunk = vec![b'a'; 1 << 20];
+    let flood: Vec<_> = (0..200)
+        .map(|_| {
+            let chunk = chunk.clone();
+            std::thread::spawn(move || {
+                let Ok(mut s) = TcpStream::connect_timeout(&door, Duration::from_secs(5)) else { return };
+                let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+                let h = head(door, None, &[], Some(16_000_000));
+                if s.write_all(h.as_bytes()).is_err() {
+                    return;
+                }
+                for _ in 0..15 {
+                    if s.write_all(&chunk).is_err() {
+                        return;
+                    }
+                }
+            })
+        })
+        .collect();
+    // A real call during the flood is answered.
+    let t = Instant::now();
+    let r = svc.post(LIST, &[]);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let during = t.elapsed();
+    for f in flood {
+        f.join().unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::SeqCst);
+    let peak = watcher.join().unwrap();
+    let after = rss_kib(pid);
+    eprintln!("l2: rss before {before} KiB, peak {peak} KiB, after {after} KiB; a call during the flood took {during:?}");
+    // Before the change this reached 3 GB. Bounded: 64 connections x 64 KiB
+    // read buffers, with room for the allocator.
+    assert!(peak < before + 64 * 1024, "the flood grew the service from {before} KiB to {peak} KiB");
+    assert_eq!(svc.post(LIST, &[]).status, 200);
+}
+
+#[test]
+fn l3_authenticated_bodies_in_flight_are_held_to_the_budget() {
+    let s = Scratch::new("l3", &["kb"]);
+    let svc = Service::start(&s);
+    let pid = svc.child.id();
+    let before = rss_kib(pid);
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = watch_rss(pid, stop.clone());
+    // 32 callers WITH the secret, each sending a full 16 MiB body (not
+    // JSON, so each is refused once read). Unbounded, that is 512 MiB held.
+    let door = svc.door;
+    let bearer = svc.bearer.clone();
+    let n = cauldron_mcp::http::BODY_LIMIT;
+    let statuses: Vec<_> = (0..32)
+        .map(|_| {
+            let bearer = bearer.clone();
+            std::thread::spawn(move || -> u16 {
+                let mut s = TcpStream::connect(door).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+                s.write_all(head(door, Some(&bearer), &[], Some(n)).as_bytes()).unwrap();
+                let chunk = vec![b'x'; 1 << 20];
+                for _ in 0..(n >> 20) {
+                    if s.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+                let mut raw = Vec::new();
+                let _ = s.read_to_end(&mut raw);
+                let t = String::from_utf8_lossy(&raw).into_owned();
+                t.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
+            })
+        })
+        .collect();
+    let statuses: Vec<u16> = statuses.into_iter().map(|t| t.join().unwrap()).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::SeqCst);
+    let peak = watcher.join().unwrap();
+    eprintln!("l3: rss before {before} KiB, peak {peak} KiB; statuses {statuses:?}");
+    // Every body was read and answered (parse error), or told the door was busy.
+    assert!(statuses.iter().all(|s| *s == 400 || *s == 503), "{statuses:?}");
+    assert!(statuses.iter().filter(|s| **s == 400).count() >= 4, "{statuses:?}");
+    // The budget is 64 MiB of bodies, each read into one buffer of its
+    // length; 32 MiB more for the read buffers and the allocator.
+    let budget_kib = (cauldron_mcp::http::INFLIGHT_BODY_BYTES / 1024) as u64;
+    assert!(peak < before + budget_kib + 32 * 1024, "authenticated bodies grew the service from {before} KiB to {peak} KiB");
+}
+
+#[test]
+fn l4_connections_are_capped_and_a_silent_one_is_closed_after_the_header_timeout() {
+    let s = Scratch::new("l4", &["kb"]);
+    let svc = Service::start(&s);
+    let pid = svc.child.id();
+    let cap = cauldron_mcp::http::MAX_CONNECTIONS;
+    // 150 connections that send nothing.
+    let idle: Vec<TcpStream> = (0..150).filter_map(|_| TcpStream::connect_timeout(&svc.door, Duration::from_secs(5)).ok()).collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let held = door_connections(pid, svc.door.port());
+    assert!(held <= cap, "the service holds {held} door connections; the cap is {cap}");
+    // Once the header timeout passes the silent ones are closed, and a
+    // real call is answered.
+    let t = Instant::now();
+    let r = svc.post(LIST, &[]);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let waited = t.elapsed();
+    assert!(waited < cauldron_mcp::http::HEADER_TIMEOUT * 3 + Duration::from_secs(5), "{waited:?}");
+    eprintln!("l4: held {held} of {} idle connections; a real call waited {waited:?}", idle.len());
+    // A connection that sends half a head is closed by the service.
+    let mut slow = TcpStream::connect(svc.door).unwrap();
+    slow.write_all(b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n").unwrap();
+    slow.set_read_timeout(Some(cauldron_mcp::http::HEADER_TIMEOUT * 4)).unwrap();
+    let t = Instant::now();
+    let mut buf = Vec::new();
+    let _ = slow.read_to_end(&mut buf);
+    assert!(t.elapsed() < cauldron_mcp::http::HEADER_TIMEOUT * 3, "a half head held its connection {:?}", t.elapsed());
+    drop(idle);
+}
+
+#[test]
+fn l5_a_body_that_stalls_is_answered_408_after_the_body_timeout() {
+    let s = Scratch::new("l5", &["kb"]);
+    let svc = Service::start(&s);
+    let mut c = TcpStream::connect(svc.door).unwrap();
+    c.set_read_timeout(Some(cauldron_mcp::http::BODY_TIMEOUT * 3)).unwrap();
+    c.write_all(head(svc.door, Some(&svc.bearer), &[], Some(100)).as_bytes()).unwrap();
+    c.write_all(b"{\"jsonrpc\"").unwrap();
+    let t = Instant::now();
+    let mut raw = Vec::new();
+    let _ = c.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+    assert!(t.elapsed() >= cauldron_mcp::http::BODY_TIMEOUT - Duration::from_millis(500), "{:?}", t.elapsed());
+}
+
+/// A client that sends calls and never reads the answers stops holding its
+/// connection once a write has made no progress for the write timeout: the
+/// service closes it, and only part of the answers were ever written.
+#[test]
+fn l6_a_client_that_stops_reading_is_closed_after_the_write_timeout() {
+    let s = Scratch::new("l6", &["kb"]);
+    let svc = Service::start(&s);
+    let n = 2000;
+    let mut one = head(svc.door, Some(&svc.bearer), &[], Some(LIST.len()));
+    one.push_str(LIST);
+    let c = TcpStream::connect(svc.door).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut w = c.try_clone().unwrap();
+    let all = one.repeat(n);
+    // Sent from another thread: the service stops reading once it cannot
+    // write, and then this write blocks until the connection is closed.
+    let sender = std::thread::spawn(move || {
+        let _ = w.write_all(all.as_bytes());
+    });
+    // Not a fixed wait: under load the service fills the buffers late, so
+    // wait (bounded) for its own word that it closed this connection.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !svc.log().contains("the client stopped reading its answer") {
+        assert!(Instant::now() < deadline, "the write timeout was never reached:\n{}", svc.log());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let mut c = c;
+    let mut raw = Vec::new();
+    let _ = c.read_to_end(&mut raw);
+    let answered = String::from_utf8_lossy(&raw).matches("HTTP/1.1 200").count();
+    assert!(answered > 0 && answered < n, "{answered} of {n} answers were written");
+    let _ = sender.join();
+    // The service still answers.
+    assert_eq!(svc.post(LIST, &[]).status, 200);
+}
+
+/// **The write timeout, reached for certain**: a client pipelines 600
+/// calls whose answers come to tens of MiB (a 50,000-character page of a
+/// large dump each, far more than loopback's buffers hold), every tenth one
+/// a `soup_dump`, and never reads. The service's write stalls, and once it
+/// has made no progress for `WRITE_TIMEOUT` the service says so in its log
+/// and closes the connection: the client gets fewer answers than it asked
+/// for, then the end of the stream. No write is left half-applied: the
+/// dumps that landed are exactly the first k of the ones sent, in order,
+/// each whole; none landed after the close; the next open of the store
+/// finds nothing to roll back or sweep. The service still answers.
+#[test]
+fn l7_an_unread_answer_closes_the_connection_after_the_write_timeout_and_leaves_no_write_half_applied() {
+    use soup_door::grants::Scope;
+    let s = Scratch::new("l7", &["kb"]);
+    let proj = s.project("p");
+    s.grant("kb", &Scope::ALL, &[&proj]);
+    let c = ctx(&proj);
+    let svc = Service::start(&s);
+    let big = "a line of a large dump, read back a page at a time\n".repeat(19_000);
+    assert_eq!(ok(&svc.call("soup_dump", serde_json::json!({"cauldron": "kb", "text": big}), &c))["dump_id"], "DM-1");
+
+    let n = 600;
+    let mut all = String::new();
+    let mut writes = vec![];
+    for i in 0..n {
+        let (tool, args) = if i % 10 == 5 {
+            let text = format!("pipelined write {i:04}");
+            writes.push(text.clone());
+            ("soup_dump", serde_json::json!({"cauldron": "kb", "text": text, "_ctx": c}))
+        } else {
+            ("soup_dump_get", serde_json::json!({"cauldron": "kb", "id": "DM-1", "max_chars": 50_000, "_ctx": c}))
+        };
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": i, "method": "tools/call", "params": {"name": tool, "arguments": args}}).to_string();
+        all.push_str(&head(svc.door, Some(&svc.bearer), &[], Some(body.len())));
+        all.push_str(&body);
+    }
+    let conn = TcpStream::connect(svc.door).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut w = conn.try_clone().unwrap();
+    let sender = std::thread::spawn(move || {
+        let _ = w.write_all(all.as_bytes());
+    });
+    // Never read until the service says it gave up on this client: its
+    // answers are produced slowly enough that a fixed wait could end before
+    // the buffers fill, so wait for the service's own word, with a bound.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let sent_at = Instant::now();
+    while !svc.log().contains("the client stopped reading its answer") {
+        assert!(Instant::now() < deadline, "the write timeout was never reached:\n{}", svc.log());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(sent_at.elapsed() >= cauldron_mcp::http::WRITE_TIMEOUT, "closed before the timeout could pass: {:?}", sent_at.elapsed());
+    let mut conn = conn;
+    let mut raw = Vec::new();
+    let t = Instant::now();
+    let _ = conn.read_to_end(&mut raw);
+    assert!(t.elapsed() < Duration::from_secs(25), "the connection was not closed");
+    let text = String::from_utf8_lossy(&raw);
+    let answered = text.matches("HTTP/1.1 200").count();
+    assert!(answered < n, "{answered} of {n} answers were written");
+    let _ = sender.join();
+
+    // The writes: the first k sent, in order, each whole, and no more.
+    let landed = soup_door::dumps::list(&s.target("kb").cauldron, &soup_door::dumps::ListOpts { limit: Some(1000), ..Default::default() }).unwrap();
+    let mut ids: Vec<String> = landed["dumps"].as_array().unwrap().iter().map(|d| d["id"].as_str().unwrap().to_string()).filter(|id| id != "DM-1").collect();
+    ids.reverse();
+    let k = ids.len();
+    assert!(k > 0 && k < writes.len(), "{k} of {} writes landed", writes.len());
+    for (j, id) in ids.iter().enumerate() {
+        let g = soup_door::dumps::get(&s.target("kb").cauldron, id, 0, 2000).unwrap();
+        assert_eq!(g["text"].as_str(), Some(writes[j].as_str()), "{id}: {g}");
+    }
+    let answered_writes = text.matches("\"dump_id\"").count();
+    eprintln!("l7: closed {:?} after sending; {answered} of {n} answers written; {k} of {} writes landed, {answered_writes} of them answered", sent_at.elapsed(), writes.len());
+    assert!(answered_writes <= k, "{answered_writes} write answers for {k} landed");
+    std::thread::sleep(Duration::from_secs(1));
+    let again = soup_door::dumps::list(&s.target("kb").cauldron, &soup_door::dumps::ListOpts { limit: Some(1000), ..Default::default() }).unwrap();
+    assert_eq!(again["total"], landed["total"], "a write landed after the close");
+
+    // The service still answers, and the store is at rest.
+    assert_eq!(svc.post(LIST, &[]).status, 200);
+    svc.stop();
+    let st = soup_door::dumps::Store::open(&s.target("kb").cauldron, "test").unwrap();
+    assert_eq!(st.recovered["interrupted"], "none", "{}", st.recovered);
+    assert_eq!(st.recovered["swept"], serde_json::json!({"incoming": 0, "blobs": 0}), "{}", st.recovered);
+}

@@ -354,7 +354,20 @@ fn up_to_the_missed_rollback(tag: &str) -> (Sandbox, u16, String, String, ::env:
     let (rc, out) = sb.cauldron(&["pin", "svc-a", &good]);
     assert_eq!(rc, 0, "{out}");
     sb.start_daemon();
-    wait_for("the good build up", first_up(), || sb.up("svc-a", port));
+    // On a timeout here, say what the holder said: a load-sensitive failure
+    // of this wait was seen once, and its log was gone with the sandbox.
+    let budget = first_up();
+    let t0 = Instant::now();
+    while sb.up("svc-a", port).is_none() {
+        assert!(
+            t0.elapsed() <= budget,
+            "timed out after {budget:?} waiting for: the good build up (port {port}; listening: {}; seam pid: {:?})\nthe holder's log:\n{}",
+            listening(port),
+            sb.pid_of("svc-a"),
+            sb.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     wait_for("the good build recorded good", BUDGET, || (sb.good("svc-a").first() == Some(&good)).then_some(()));
 
     let bad = sb.build_script("svc-a", &dying_fake(DIES_AFTER));

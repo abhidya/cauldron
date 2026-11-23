@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cauldron": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/cauldron-mcp",
+      "args": []
+    }
+  }
+}

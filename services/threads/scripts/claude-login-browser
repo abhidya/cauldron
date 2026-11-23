@@ -26,6 +26,19 @@
 # and map them to people via each profile's Preferences file.
 set -euo pipefail
 
+# ── NOTHING IS FOUND THROUGH THE DIRECTORY THIS WAS STARTED FROM ─────────────
+# PATH keeps only its absolute entries (an empty entry or `.` would find a
+# planted program in the current directory), and CDPATH, GLOBIGNORE and
+# BASH_ENV/ENV are dropped, so no `cd` lands elsewhere and no child bash
+# sources a file first.
+IFS=: read -r -a _path_entries <<<"${PATH:-}" || true
+_safe_path=""
+for _d in "${_path_entries[@]+"${_path_entries[@]}"}"; do
+  case "$_d" in /*) _safe_path="${_safe_path:+$_safe_path:}$_d" ;; esac
+done
+PATH="${_safe_path:-/usr/bin:/bin:/usr/sbin:/sbin}"; export PATH
+unset _path_entries _safe_path _d CDPATH GLOBIGNORE BASH_ENV ENV
+
 [ $# -ge 1 ] || { echo "usage: claude-login-browser <url>" >&2; exit 2; }
 URL="$1"
 
@@ -47,25 +60,25 @@ chrome_app() {
 
 if [ -n "${CLAUDE_LOGIN_CHROME_PROFILE:-}" ]; then
   if app="$(chrome_app)"; then
-    exec open -na "$app" --args \
+    exec /usr/bin/open -na "$app" --args \
       --profile-directory="$CLAUDE_LOGIN_CHROME_PROFILE" \
       --new-window "$URL"
   fi
   echo "claude-login-browser: Chrome not found; falling back to the default browser." >&2
   echo "  The page will open wherever your system default sends it — check which" >&2
   echo "  account is signed in there before authorizing." >&2
-  exec open "$URL"
+  exec /usr/bin/open "$URL"
 fi
 
 if [ -n "${CLAUDE_LOGIN_PRIVATE:-}" ]; then
   if app="$(chrome_app)"; then
-    exec open -na "$app" --args --incognito --new-window "$URL"
+    exec /usr/bin/open -na "$app" --args --incognito --new-window "$URL"
   fi
   # Safari has no CLI private-window flag; say so rather than pretend.
   echo "claude-login-browser: Chrome not found, so no private window could be" >&2
   echo "  forced. Opening the default browser — if it is already signed into the" >&2
   echo "  wrong Claude account, cancel and re-run with --no-browser instead." >&2
-  exec open "$URL"
+  exec /usr/bin/open "$URL"
 fi
 
-exec open "$URL"
+exec /usr/bin/open "$URL"

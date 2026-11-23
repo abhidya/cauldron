@@ -33,14 +33,36 @@ members = [
     # REL-6a3 rule B: a dev-dependency only; exports CAULDRON_ISOLATED=1 at a
     # test binary's load so every child a test spawns is isolated.
     "testkit/test-isolation",
+    # A dev-dependency of libs/spine only (its per-run scratch root).
+    "testkit/test-scratch",
     # Services whose code lives here. `tts` is the first, rewritten from
     # substrate `lib/tts`; `threads` follows.
     "services/tts",
     # Moved from substrate `lib/threads` @9cf7615 (R3.S2.M, move-and-fit).
     "services/threads",
+    # The MCP door to an environment's soups (`cauldron-mcp`): grants checked
+    # on every call, the one writer of every granted soup it holds open.
+    "services/mcp",
+    # The ripples service (`cauldron-ripples`): one named dump into records,
+    # when its owner asks, through the threads service and the mcp door.
+    "services/ripples",
+    # Local inference (`cauldron-inference`): one supervised `llama-server`
+    # child, loaded when first asked and unloaded when idle, loopback only.
+    "services/inference",
+    # The registered model files, the inference settings and the memory
+    # estimate, read by the inference service, ripples and the CLI.
+    "libs/inference-registry",
     # REL-3.S1: the MINIMAL soup crate on the release branch: the curated
     # `cauldron-build` dataset and its loader, until the real soup lands.
     "libs/soup",
+    # The transaction spine, the store under a cauldron's soup. A
+    # library only: `cauldron create` makes a soup with it and `cauldron soup`
+    # reads and writes one offline. No soup daemon or other service uses it
+    # in this release.
+    "libs/spine",
+    # A cauldron's soup, offline, as a library: what `cauldron soup` does,
+    # without the printing. The CLI is argument parsing and printing over it.
+    "libs/soup-door",
 ]
 # `services/` holds the things that RUN — one declaration (`<name>.toml`) per
 # service, carrying its OWN build profile, and, for a service whose code lives
@@ -48,7 +70,7 @@ members = [
 # discovered by filename, so a service directory is not mistaken for one.
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.17"
 edition = "2021"
 
 [workspace.dependencies]

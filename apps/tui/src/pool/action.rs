@@ -85,16 +85,96 @@ pub enum Mode {
 pub const ALREADY_LIVE_MARKER: &str = "already-live:";
 pub const DRY_RUN_MARKER: &str = "--dry-run: stopping here";
 
-/// The `claude-accounts` bash tool. `TUI_POOL_ACCOUNTS_TOOL` overrides it
-/// (tests point it at a stub; nothing in a test may touch the real machine
-/// login). DEPTH-DEPENDENT default: this crate lives two directories down.
-pub fn accounts_tool() -> PathBuf {
-    if let Some(p) = std::env::var_os("TUI_POOL_ACCOUNTS_TOOL") {
-        return PathBuf::from(p);
+/// The `claude-accounts` bash tool this process would run, BEFORE any check:
+/// `TUI_POOL_ACCOUNTS_TOOL` when it is set (tests point it at a stub; nothing
+/// in a test may touch the real machine login), else the default of this
+/// build ([`default_accounts_tool`]), else `None`. What may actually run is
+/// decided by [`local_refusal`].
+pub fn accounts_tool() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("TUI_POOL_ACCOUNTS_TOOL").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(p));
     }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../services/threads/scripts/claude-accounts")
+    default_accounts_tool()
 }
+
+/// Where the helper is installed, relative to the cauldron root (the
+/// directory above this binary's `bin/`): `scripts/install` lays it down there
+/// on the prebuilt and the from-source path alike.
+pub const INSTALLED_HELPER: &str = "share/cauldron/scripts/threads/claude-accounts";
+
+/// **THE INSTALLED HELPER** (issue #30): `<root>/share/cauldron/scripts/threads/claude-accounts`,
+/// where `<root>` is the directory above the one this executable sits in,
+/// every link resolved (the installed `tui` is `<root>/bin/tui`). Read at run
+/// time, never compiled in; `None` when there is no file there. It is still
+/// only run when [`local_refusal`] admits it.
+pub fn installed_accounts_tool() -> Option<PathBuf> {
+    installed_tool_for(&std::env::current_exe().ok()?)
+}
+
+/// [`installed_accounts_tool`] for the executable `exe`.
+pub fn installed_tool_for(exe: &std::path::Path) -> Option<PathBuf> {
+    let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let p = exe.parent()?.parent()?.join(INSTALLED_HELPER);
+    p.is_file().then_some(p)
+}
+
+/// **A RELEASE-BUNDLE `tui` COMPILES IN NO HELPER PATH.** It was compiled in
+/// a scratch directory that does not exist on the machine it runs on, and a
+/// path compiled from it (`/private/tmp/...` on the build machine) is one any
+/// local user could create. Its default is the helper installed beside it
+/// ([`installed_accounts_tool`]), or none.
+#[cfg(cauldron_release_bundle)]
+pub fn default_accounts_tool() -> Option<PathBuf> {
+    installed_accounts_tool()
+}
+
+/// A `tui` built from a checkout runs the installed helper when it is
+/// installed ([`installed_accounts_tool`]), else that checkout's
+/// `services/threads/scripts/claude-accounts`. DEPTH-DEPENDENT: this crate
+/// lives two directories down. Either is only run when [`local_refusal`]
+/// admits it: owned by you, in directories only you or root can write, so a
+/// checkout built in a shared directory is refused rather than trusted.
+#[cfg(not(cauldron_release_bundle))]
+pub fn default_accounts_tool() -> Option<PathBuf> {
+    installed_accounts_tool()
+        .or_else(|| Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../services/threads/scripts/claude-accounts")))
+}
+
+/// The threads store the helper is told to use (`CLAUDE_ACCOUNTS_HOME`): the
+/// environment's `<data root>/threads/store`, the daemon's `THREADS_HOME` as
+/// the shipped declaration sets it. `None` when the environment does not
+/// resolve or the store is not there (an installed helper then refuses,
+/// saying the store must be named).
+pub fn accounts_store() -> Option<PathBuf> {
+    let env = env::Environment::resolve().ok()?;
+    let store = env.service_data("threads").ok()?.join("store");
+    store.is_dir().then_some(store)
+}
+
+/// The environment a helper run gets on top of this process's: the store.
+pub fn helper_env() -> Vec<(&'static str, PathBuf)> {
+    accounts_store().map(|s| vec![("CLAUDE_ACCOUNTS_HOME", s)]).unwrap_or_default()
+}
+
+/// **How the helper is started** (the preflight and the terminal switch
+/// alike): `argv` from the accounts store (or `/` when there is none), never
+/// the directory `tui` was started from, so nothing planted in a project the
+/// board was opened in is found; with no variable that would make the script
+/// or its python load a file the caller chose, and a PATH of absolute entries
+/// only (`env::trust::helper_command`); plus [`helper_env`].
+pub fn helper_command(argv: &[String]) -> std::process::Command {
+    let dir = accounts_store().unwrap_or_else(|| PathBuf::from("/"));
+    let mut cmd = env::trust::helper_command(argv[0].as_ref(), &dir);
+    cmd.args(&argv[1..]).envs(helper_env());
+    cmd
+}
+
+/// What `tui` says when there is no helper to run.
+pub const NO_HELPER_IN_THIS_BUILD: &str = "set-live-login needs the claude-accounts helper, which is installed \
+     with cauldron at <cauldron root>/share/cauldron/scripts/threads/claude-accounts and is not there. Install or \
+     upgrade with the release bundle's `install --prebuilt <tarball> --replace-running` or `scripts/install \
+     --replace-running` (a clone), or start the board with TUI_POOL_ACCOUNTS_TOOL naming a copy (a file you own, \
+     in directories only you or root can write to).";
 
 /// **REL-6a5: AN ISOLATED PROCESS NEVER RUNS THE REAL `claude-accounts`.**
 /// `set-live-login` switches the machine's Claude login, so under isolation
@@ -104,12 +184,35 @@ pub fn accounts_tool() -> PathBuf {
 /// Since MERGE-15 this is [`isolated_set_live_refusal`] on the configured tool
 /// — the same choke point, not a second rule.
 pub fn isolation_refusal() -> Option<String> {
-    isolated_set_live_refusal(&accounts_tool())
+    isolated_set_live_refusal(&accounts_tool().unwrap_or_default())
+}
+
+/// **EVERY LOCAL RUN PASSES HERE** (the preflight and the terminal switch
+/// alike): the isolation rule first, then whether `tool` may be executed at
+/// all ([`env::trust::trusted_executable`]: an absolute path to a regular
+/// file you own, not writable by group or others, in directories owned by
+/// you or root that nobody else can write). An empty `tool` is the release
+/// bundle's "no helper" ([`NO_HELPER_IN_THIS_BUILD`]). `None` = run it.
+pub fn local_refusal(tool: &std::path::Path) -> Option<String> {
+    if let Some(why) = isolated_set_live_refusal(tool) {
+        return Some(why);
+    }
+    helper_refusal(tool)
+}
+
+/// [`local_refusal`] without the isolation rule.
+pub fn helper_refusal(tool: &std::path::Path) -> Option<String> {
+    if tool.as_os_str().is_empty() {
+        return Some(NO_HELPER_IN_THIS_BUILD.to_string());
+    }
+    env::trust::trusted_executable(tool, false)
+        .err()
+        .map(|why| format!("refused to run the claude-accounts helper: {why}. Nothing ran."))
 }
 
 pub fn set_live_argv(label: &str, mode: Mode) -> Vec<String> {
     let mut v = vec![
-        accounts_tool().to_string_lossy().into_owned(),
+        accounts_tool().unwrap_or_default().to_string_lossy().into_owned(),
         "set-live-login".to_string(),
         label.to_string(),
     ];

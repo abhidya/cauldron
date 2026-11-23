@@ -92,6 +92,7 @@ pub mod import;
 /// **`/health` ANSWERED OFF THE RUNTIME** (R9.C7i): a std listener on its own
 /// OS thread that answers from a lag stamp and the last cached verdict.
 pub mod health_door;
+pub mod helpers;
 /// **THE PERIODIC SUBAGENT HEALTH INVARIANT** (R10.H2, HEALTH F3): I1–I5,
 /// every 5 min, warned on the `warnings` shape with the ids named.
 pub mod health_check;
@@ -218,6 +219,9 @@ pub fn build_manager_noticing(config: Config, notice: &dyn Fn(&'static str)) -> 
 /// re-dispatch queues — the boot half of G1/G10/Q4; R9.C7g moved it behind
 /// the serve, see `crate::recovery`).
 pub async fn run_daemon(config: Config) -> Result<()> {
+    // Where the account helper scripts are installed (`helpers`): read from
+    // the supervisor's CAULDRON_HOME once, here, and never in a library use.
+    crate::helpers::adopt_cauldron_home_from_env();
     let host = config.host.clone();
     // **ONE PORT, THE CHASSIS PORT (R2.S4).** The daemon used to bind the
     // legacy door (`config.port`, 3651) here and stand the chassis up beside it

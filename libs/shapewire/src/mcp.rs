@@ -152,6 +152,14 @@ pub trait McpTools: Send + Sync {
         name: &'a str,
         arguments: Value,
     ) -> BoxFut<'a, Result<Value, Refusal>>;
+
+    /// The `instructions` text `initialize` answers. `None`, the default,
+    /// answers the chassis's own text; a producer whose callers are not run
+    /// tokens says what its door is instead.
+    fn instructions(&self, caller: &Caller) -> Option<String> {
+        let _ = caller;
+        None
+    }
 }
 
 /// What one POST body turned out to be.
@@ -355,13 +363,13 @@ pub async fn answer(
                     "protocolVersion": version,
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": identity.daemon, "version": identity.version },
-                    "instructions": format!(
+                    "instructions": tools.instructions(caller).unwrap_or_else(|| format!(
                         "You are thread {}. Every tool here is a façade over one method path on \
                          this daemon; a command acknowledges and the fact arrives on a shape, a \
                          read answers. A refusal is a tool result with isError and a typed code — \
                          read it; it is never an absence.",
                         caller.thread_id
-                    ),
+                    )),
                 }),
             );
             r.session = Some(mint_session());
@@ -416,11 +424,17 @@ pub fn tool_result(payload: Value) -> Value {
     })
 }
 
-/// A refused `tools/call`, rendered where the model reads it.
+/// A refused `tools/call`, rendered where the model reads it. A refusal's
+/// structured `detail`, when it carries one, rides beside the code and the
+/// message (`refused.detail`); one without it renders exactly as before.
 pub fn tool_refused(r: &Refusal) -> Value {
+    let mut refused = json!({ "code": r.code, "message": r.message });
+    if let Some(d) = &r.detail {
+        refused["detail"] = d.clone();
+    }
     json!({
         "content": [{ "type": "text", "text": format!("refused ({}): {}", r.code, r.message) }],
-        "structuredContent": { "refused": { "code": r.code, "message": r.message } },
+        "structuredContent": { "refused": refused },
         "isError": true,
     })
 }
@@ -492,6 +506,16 @@ pub mod http {
                 ),
             );
         };
+        door(tools, producer.identity(), &headers, &body).await
+    }
+
+    /// **THE DOOR WITHOUT A CHASSIS**: steps 2 to 4 of [`post`] — the
+    /// transport checks, the bearer handed to [`McpTools::verify`], and the
+    /// message — for a producer that mounts `POST /mcp` on a router of its
+    /// own (one that serves tools and no shapes, and so has no [`Chassis`]).
+    /// [`post`] answers through exactly this function, so the two cannot
+    /// drift apart.
+    pub async fn door(tools: &dyn McpTools, identity: &Identity, headers: &HeaderMap, body: &[u8]) -> Response {
         // ── 2. THE TRANSPORT CHECKS THE REFERENCE SERVER MAKES ───────────
         let accept = headers
             .get(header::ACCEPT)
@@ -544,17 +568,17 @@ pub mod http {
                     body,
                     &[(
                         "www-authenticate",
-                        format!("Bearer realm=\"{}\"", producer.identity().daemon),
+                        format!("Bearer realm=\"{}\"", identity.daemon),
                     )],
                 );
             }
         };
         // ── 4. THE MESSAGE ───────────────────────────────────────────────
-        let incoming = match parse(&body) {
+        let incoming = match parse(body) {
             Ok(i) => i,
             Err(e) => return json_response(e.status, e.body(), &[]),
         };
-        let reply = answer(tools, producer.identity(), &caller, incoming, || {
+        let reply = answer(tools, identity, &caller, incoming, || {
             uuid::Uuid::new_v4().simple().to_string()
         })
         .await;
@@ -812,6 +836,17 @@ mod tests {
         assert_eq!(result["structuredContent"]["args"]["agent"], json!("t-a"));
         let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(text, result["structuredContent"], "the text IS the structure");
+    }
+
+    /// A refusal's structured `detail` rides in `refused.detail`; one with no
+    /// detail renders exactly the two keys it always did.
+    #[test]
+    fn a_refusal_detail_rides_beside_the_code_and_only_when_present() {
+        let plain = tool_refused(&Refusal::new(codes::BUSY, "later"));
+        assert_eq!(plain["structuredContent"]["refused"], json!({"code": "busy", "message": "later"}));
+        let rich = tool_refused(&Refusal::with_detail(codes::BUSY, "later", json!({"n": 2})));
+        assert_eq!(rich["structuredContent"]["refused"], json!({"code": "busy", "message": "later", "detail": {"n": 2}}));
+        assert_eq!(rich["content"][0]["text"], json!("refused (busy): later"));
     }
 
     /// Everything else is `-32601`, and the message says where facts live.

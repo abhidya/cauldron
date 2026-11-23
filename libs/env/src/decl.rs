@@ -885,9 +885,58 @@ fn default_stop_grace_secs() -> u64 {
 /// then the ones that ship with this workspace, so `cauldron start echo` works
 /// with no setup and can still be overridden per root by dropping a file in
 /// `<root>/services/`.
+///
+/// A release-bundle binary also looks, last, in `<root>/share/cauldron/services`
+/// (the declarations `scripts/install --prebuilt` places there). The services
+/// a release ships (`cauldron-ripples`, ...) run from the root's version store
+/// (`data/shared/builds/<service>/<label>/`), where nothing ships beside
+/// them, so this is the only place they find another service's declaration
+/// (`ripples` reads `threads`'s to find its address).
 pub fn search_paths(root_services: &Path) -> Vec<PathBuf> {
-    vec![
-        root_services.to_path_buf(),
+    let mut v = vec![root_services.to_path_buf(), shipped_services_dir()];
+    #[cfg(cauldron_release_bundle)]
+    if let Some(root) = root_services.parent() {
+        let installed = root.join("share/cauldron/services");
+        if !v.contains(&installed) {
+            v.push(installed);
+        }
+    }
+    v
+}
+
+/// **A RELEASE BUNDLE'S BINARY HAS NO SOURCE TREE.** `scripts/build-release-bundle`
+/// compiles with `--cfg cauldron_release_bundle`, and such a binary looks for
+/// what ships with it beside itself: `<dir of this executable>/../share/cauldron/<what>`
+/// (`<bundle>/bin/cauldron` reads `<bundle>/share/cauldron/`, and the copy
+/// `cauldron install` places at `<root>/bin/cauldron` reads
+/// `<root>/share/cauldron/`, which `scripts/install --prebuilt` fills). The
+/// build machine's scratch directory is not compiled in at all.
+///
+/// The executable's path is CANONICAL (every symlink resolved), so a
+/// `~/bin/cauldron` symlinked to `<root>/bin/cauldron` reads
+/// `<root>/share/cauldron/`, not `~/share/cauldron/`.
+#[cfg(cauldron_release_bundle)]
+pub fn release_share_dir(what: &str) -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    exe.parent()
+        .and_then(Path::parent)
+        .unwrap_or(Path::new("/"))
+        .join("share/cauldron")
+        .join(what)
+}
+
+/// The shipped declarations directory: `<this workspace>/services` for a
+/// binary built from a checkout, `../share/cauldron/services` beside the
+/// executable for a release-bundle binary ([`release_share_dir`]).
+#[cfg(cauldron_release_bundle)]
+fn shipped_services_dir() -> PathBuf {
+    release_share_dir("services")
+}
+
+#[cfg(not(cauldron_release_bundle))]
+fn shipped_services_dir() -> PathBuf {
+    {
         // `<this workspace>/services`, resolved without `..` so the path
         // prints readably in a "looked in" message.
         //
@@ -899,8 +948,8 @@ pub fn search_paths(root_services: &Path) -> Vec<PathBuf> {
             .ancestors()
             .nth(2)
             .unwrap_or(Path::new("/"))
-            .join("services"),
-    ]
+            .join("services")
+    }
 }
 
 /// **THE CAULDRON WORKSPACE THIS BINARY WAS BUILT FROM.**
@@ -914,6 +963,17 @@ pub fn search_paths(root_services: &Path) -> Vec<PathBuf> {
 /// directories down (`libs/env`). Move the crate and this silently points
 /// somewhere else; `cauldron status` prints the whole search path, which is
 /// how you check it.
+#[cfg(cauldron_release_bundle)]
+pub fn shipped_workspace() -> Result<PathBuf> {
+    anyhow::bail!(
+        "this cauldron is a release-bundle binary: it was not built from a checkout, so there is no \
+         source workspace to build a service from. Install a service from the bundle \
+         (`cauldron build <service> --artifact <image>`, which `scripts/install --prebuilt` runs), \
+         or build cauldron from a clone of the repository."
+    )
+}
+
+#[cfg(not(cauldron_release_bundle))]
 pub fn shipped_workspace() -> Result<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()

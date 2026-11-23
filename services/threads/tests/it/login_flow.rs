@@ -469,3 +469,41 @@ async fn a_rotation_that_produces_no_json_is_an_error() {
          result would read as 'nothing needed doing': {err}"
     );
 }
+
+/// **The login runs the INSTALLED script** (issue #30). On an install there is
+/// no `<data dir>/scripts/`: the helpers are laid down under the cauldron root,
+/// `share/cauldron/scripts/threads/`. The daemon finds `add-account` there and
+/// the login reaches its URL; with no copy anywhere it is refused, naming the
+/// install that lays it down; and a copy another user could replace is not
+/// run at all.
+#[tokio::test]
+async fn a_login_on_an_install_finds_the_installed_script() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, data) = (tmp.path().join("root"), tmp.path().join("data/prod/threads/store"));
+    std::fs::create_dir_all(&data).unwrap();
+    let sessions = sessions(&data);
+
+    // Nothing installed yet: refused, with what to run.
+    let missing = threads::helpers::locate_in(Some(&root), &data, "add-account");
+    let err = sessions.begin(&missing, &data, "aa-owned", LoginOptions::default()).await.unwrap_err().to_string();
+    assert!(err.contains("login script is not at") && err.contains("--replace-running"), "{err}");
+
+    // Installed: found under the root, and the login runs.
+    let at = root.join(threads::helpers::INSTALLED_DIR).join("add-account");
+    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    std::fs::copy(fixture(), &at).unwrap();
+    std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = threads::helpers::locate_in(Some(&root), &data, "add-account");
+    assert_eq!(script, at, "the installed copy, not <data dir>/scripts");
+    assert!(!data.join("scripts").exists());
+    let begun = sessions.begin(&script, &data, "aa-owned", LoginOptions::default()).await.expect("begin should reach the prompt");
+    assert!(begun.url.starts_with("https://claude.com/cai/oauth/authorize"), "{}", begun.url);
+    assert!(sessions.cancel(&begun.session_id).await);
+
+    // A copy someone else could replace is never spawned.
+    std::fs::set_permissions(at.parent().unwrap(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let err = sessions.begin(&script, &data, "aa-owned", LoginOptions::default()).await.unwrap_err().to_string();
+    assert!(err.contains("is not run") && err.contains("writable by group or others"), "{err}");
+    std::fs::set_permissions(at.parent().unwrap(), std::fs::Permissions::from_mode(0o755)).unwrap();
+}

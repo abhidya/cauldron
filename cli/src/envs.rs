@@ -277,12 +277,17 @@ pub(crate) fn verb_env_create(args: &[String]) -> Result<i32> {
     let mut from: Option<String> = None;
     let mut auto_restart = false;
     let mut pins_only = false;
+    // `--no-engine` is accepted and changes nothing. This
+    // release has no engine to turn off; the flag exists so the same command
+    // (the plugin README's, the soup import refusal's) works on every line.
+    let mut no_engine = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         match a {
             "--auto-restart" => auto_restart = true,
             "--pins-only" => pins_only = true,
+            "--no-engine" => no_engine = true,
             "--from" => {
                 i += 1;
                 from = Some(args.get(i).cloned().context("`--from` needs an environment name")?);
@@ -449,6 +454,9 @@ pub(crate) fn verb_env_create(args: &[String]) -> Result<i32> {
             "  hosted ports   {} (fresh, kernel-free when created; change with `pin --addr`)",
             hosted.join("  ")
         );
+    }
+    if no_engine {
+        println!("  engine         none in this release (`--no-engine` accepted; nothing to turn off)");
     }
     println!();
     println!(

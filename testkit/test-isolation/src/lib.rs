@@ -26,9 +26,19 @@ pub const MARKER: &str = "CAULDRON_ISOLATED";
 
 static RAN: AtomicBool = AtomicBool::new(false);
 
+/// The owner acts' variable (`env::owner_acts::VAR`). A development or
+/// check root opens owner acts by setting it in its own environment; a test
+/// binary removes it at load, so every test starts from the default
+/// (`terminal`) whatever the shell that ran `cargo test` carries, and a test
+/// that needs it sets it on the child it spawns.
+pub const OWNER_ACTS_VAR: &str = "CAULDRON_OWNER_ACTS";
+
 extern "C" fn at_load() {
     if std::env::var(MARKER).ok().as_deref() != Some("1") {
         std::env::set_var(MARKER, "1");
+    }
+    if std::env::var_os(OWNER_ACTS_VAR).is_some() {
+        std::env::remove_var(OWNER_ACTS_VAR);
     }
     RAN.store(true, Ordering::SeqCst);
 }
@@ -54,6 +64,7 @@ macro_rules! install {
         fn rel6a3_this_test_binary_exports_cauldron_isolated_to_its_children() {
             assert!($crate::ran(), "the load-time initializer did not run in this test binary");
             assert_eq!(std::env::var($crate::MARKER).as_deref(), Ok("1"), "the marker is not in this process's environment");
+            assert!(std::env::var_os($crate::OWNER_ACTS_VAR).is_none(), "the owner acts' variable reached a test binary");
         }
     };
 }

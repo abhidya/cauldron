@@ -440,6 +440,6 @@ fn r9c7_c_threads_alone_declares_a_quiet_signal_and_every_other_service_does_not
     // file the predicate failed to read cannot pass as "declares none".
     assert_eq!(
         none,
-        ["claude-account-expiry-alarm", "echo", "soup-backup", "tally", "tts", "ui-server"]
+        ["claude-account-expiry-alarm", "echo", "inference", "mcp", "ripples", "soup-backup", "tally", "tts", "ui-server"]
     );
 }

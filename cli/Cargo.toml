@@ -21,16 +21,43 @@ name = "cauldron-launcher"
 path = "src/bin/cauldron-launcher.rs"
 
 
-# DG-5: every integration test is a module of tests/it/main.rs; add new ones
-# there, never as a new top-level tests/*.rs (skill core:cargo-lease).
+# Every integration test is a module of tests/it/main.rs; add new ones there,
+# never as a new top-level tests/*.rs (one test binary per crate keeps build
+# time and disk use down).
 [[test]]
 name = "it"
 path = "tests/it/main.rs"
+
+[features]
+# Test-only: builds the spine's fault-injection seam into this crate's
+# binaries, so a test can stop a real `cauldron soup import` at a named
+# commit stage (`SPINE_FAULT=decided`) instead of racing a kill against the
+# clock; and the dump removal's seam, so a test can stop `cauldron soup
+# dump-remove` after any of its steps (`CAULDRON_REMOVE_FAULT=marked`). Off in
+# every normal build, where a set SPINE_FAULT or CAULDRON_REMOVE_FAULT is
+# refused.
+#   cargo test -p cauldron --features fault-injection --test it soup
+#   cargo test -p cauldron --features fault-injection --test it d7
+fault-injection = ["spine/fault-injection", "soup-door/fault-injection"]
 
 [dependencies]
 env = { path = "../libs/env" }
 # REL-3.S1: `env create cauldron-build` seeds the curated dataset it owns.
 soup = { package = "soup-seed", path = "../libs/soup" }
+# `cauldron create` makes a cauldron's soup (one `ws` pool, grammar v6)
+# and `cauldron soup` opens it offline. Default features: the one-door gate
+# stays closed.
+spine = { path = "../libs/spine" }
+# `cauldron soup` and `cauldron link` are argument parsing and printing over it.
+soup-door = { path = "../libs/soup-door" }
+# The registered local model files, the inference settings and the memory
+# estimate (`cauldron inference models`).
+inference-registry = { path = "../libs/inference-registry" }
+# `rename` / `remove` read a cauldron's own `spine.db` READ-ONLY for a
+# live tranche. The version and features spine already links.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# `soup import` reads records as JSON or YAML; the version spine already links.
+serde_yaml = "0.9"
 # R5.S2 (DEC-34): the MCP tool host the daemon owns.
 mcp-host = { path = "../libs/mcp-host" }
 serde = { workspace = true }
@@ -54,12 +81,22 @@ toml = { workspace = true }
 # tokio, no axum, no env).
 tungstenite = "0.24"
 shapewire = { path = "../libs/shapewire", default-features = false }
+# The stdio bridge opens a session's transcript with O_NOFOLLOW and
+# O_NONBLOCK, and names ELOOP: constants only, no `unsafe`. The version the
+# lockfile already holds.
+libc = "0.2"
 
 # REL-6a5: the `it` binary exports CAULDRON_ISOLATED=1 at load, so every
 # `cauldron` child a test spawns is isolated and refuses his real root, his
 # launchd domain and his live ports (env::egress).
 [dev-dependencies]
 test-isolation = { path = "../testkit/test-isolation" }
+# `mcp_reads`: the MCP door's read tools, called in process, against the
+# `cauldron soup` verbs this crate builds, on one fixture. Dev only: the door
+# is a separate service and never linked into this binary.
+cauldron-mcp = { path = "../services/mcp" }
 
 [lints.rust]
 unsafe_code = "forbid"
+# Set by scripts/build-release-bundle for the prebuilt binaries.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(cauldron_release_bundle)"] }

@@ -70,7 +70,42 @@
 //! supervisor process. See [`verb_status`].
 
 mod bundle;
+// The `--seed` hook `cauldrons::create_seeded` calls; refuses here.
+mod cauldron_seed;
+// `cauldron create | list | rename | remove`.
+mod cauldrons;
 mod ctl;
+// `cauldron soup import | recover | regions | get | nodes |
+// search | region | dump | dumps | dump-get | dump-remove`, the soup offline, and the
+// dumps kept beside it.
+mod soup;
+// `cauldron soup import-corpus`: the older corpus format, as workspace-v6 records.
+mod corpus5;
+// `cauldron link` and the `.cauldron` project marker the soup verbs read.
+mod link;
+// `cauldron mcp grant | revoke | grants | status | stdio`: which cauldrons the
+// MCP door may open, the service, and the stdio bridge Claude Code launches.
+mod mcp;
+// The way from the command line to the `mcp` service (bridge, forwarded
+// import, status).
+mod mcp_door;
+// `cauldron mcp stdio`: the bridge Claude Code launches.
+mod mcp_bridge;
+// The owner acts' one gate (`env::owner_acts`), on the command line.
+mod owner_acts;
+// `cauldron ripples`: a dump into records, by hand or automatically, through the ripples service.
+mod ripples;
+// `cauldron ripples review`: the records a ripple wrote, waiting for review.
+mod review;
+// `cauldron ripples review --interactive`: the owner's pass over the queue, at a terminal.
+mod review_pass;
+// `cauldron inference`: local model files registered by hand, and the
+// `inference` service that runs them on demand.
+mod inference;
+// `cauldron inference models pull`: the built-in catalogue and the download.
+mod inference_pull;
+// `ensure_soup_cauldron` only; this release has no engine.
+mod engine;
 mod daemon;
 mod envs;
 mod gc;
@@ -112,6 +147,16 @@ const VERBS: &[(&str, &str)] = &[
     ("supervisions", "every act this environment's supervisor performed on a service, and WHY"),
     ("tui", "the Cauldron face (the default); --chat for the chat face"),
     ("ctl", "the coordinator's face, headless: dump | frame | node (`ctl help`)"),
+    ("create", "make a cauldron (cauldrons/<name>/, with its own empty soup) in this environment"),
+    ("list", "the cauldrons of this environment (the implicit legacy one marked)"),
+    ("rename", "rename a cauldron of this environment (its soup, dumps and MCP grant follow)"),
+    ("remove", "put a cauldron away in cauldrons/.removed/ (never deleted; a dry run without --yes)"),
+    ("soup", "a cauldron's soup, offline: import | recover | regions | get | nodes | search | region | dump | dumps | dump-get | dump-remove | approve (`soup help`)"),
+    ("link", "name this project's cauldron in a .cauldron marker, so `soup` finds it from here (`link help`; an edge between records is `soup link`)"),
+    ("mcp", "the MCP door: grant | revoke | grants | status | stdio (`mcp help`)"),
+    ("ripples", "a dump into knowledge-graph records: run | status | eval | on | off | review | approve | reject (`ripples help`)"),
+    ("owner-acts", "who may act for the owner without a terminal: open | terminal | unset | show (`owner-acts help`)"),
+    ("inference", "local models on this machine: models add | list | remove, status, unload (`inference help`)"),
 ];
 
 const USAGE: &str = "\
@@ -126,6 +171,37 @@ cauldron — the Cauldron entry point
                                      stdin) exactly as the send key does; `ctl frame` is one
                                      `--dump` frame; `ctl node <id>` reads one soup node.
                                      JSON out, non-zero on refusal (`cauldron ctl help`)
+    cauldron create <cauldron> [--env <e>]
+                                     make a cauldron: cauldrons/<name>/ with its own
+                                     empty soup (one pool, `ws`, grammar v6)
+    cauldron list [--env <e>] [--json]
+                                     the cauldrons of an environment; writes nothing
+    cauldron rename <old> <new> [--env <e>]
+                                     rename a cauldron; its soup, dumps and MCP grant
+                                     follow. Refused while a face or the mcp service
+                                     holds it. A .cauldron marker naming <old> is not
+                                     updated
+    cauldron remove <cauldron> [--env <e>] [--yes]
+                                     move a cauldron to cauldrons/.removed/<name>-<stamp>/
+                                     and drop its MCP grant; never deletes. Without
+                                     --yes, a dry run (exit 2)
+    cauldron soup import|recover|regions|get|nodes|search|region|dump|dumps|dump-get|dump-remove|approve ...
+                                     a cauldron's soup, offline: land records in the
+                                     published schema shape as one all-or-nothing
+                                     write; settle an interrupted import; list
+                                     regions; read and search nodes; keep text as a
+                                     dump beside the soup, read dumps back, and remove
+                                     one; approve a ripple's records (at a terminal,
+                                     unless the owner opened it: `owner-acts`).
+                                     JSON out, non-zero on refusal (`cauldron soup help`)
+    cauldron owner-acts open|terminal|unset|show [--only <acts>] [--cauldron <c>]
+                                     who may act for the owner without a terminal
+                                     (grant, approve, ripples on); default `terminal`
+                                     (`cauldron owner-acts help`)
+    cauldron link <cauldron> --env <e> [--dir <path>] | --show
+                                     write a .cauldron marker naming this project's
+                                     environment and cauldron, so `cauldron soup` run
+                                     here or below needs neither (`cauldron link help`)
     cauldron --build-stamp           the commit THIS binary was built from, as
                                      one `key=value` line, the format it reads
                                      off every service it launches
@@ -147,13 +223,18 @@ cauldron — the Cauldron entry point
     cauldron build  [service]        build and install one version
                     [--env-copy]     ... as a NEW version `<label>+<env>` (or `+<env>.N`)
                                      that no other environment pins; `<label>` is untouched
+    cauldron build <service> --artifact <image> [--env-copy] [--json]
+                                     install a prebuilt image (a release bundle's) as a
+                                     version, with no compiler; the image states its commit.
+                                     A release build's bare `build <service>` installs the
+                                     image the release shipped (inference, ripples, mcp …)
     cauldron build --snapshot-declaration <service> <label> [--force]
                                      BACKFILL: copy the CURRENT declaration into an
                                      existing build dir as its `declaration.toml`
                                      (refuses to overwrite one without --force)
     cauldron envs   [--probe]        every environment in this root, side by side
     cauldron env list [--probe]      the same listing, under the `env` verb
-    cauldron env create <name> [--auto-restart] [--from <env> [--pins-only]]
+    cauldron env create <name> [--auto-restart] [--from <env> [--pins-only]] [--no-engine]
                                      make a new environment: its own data root,
                                      seam table, logs, hold and launchd label.
                                      --from SEEDS it: the source's pins, a fresh
@@ -334,6 +415,16 @@ fn run() -> Result<i32> {
             Ok(2)
         }
         Some("ctl") => ctl::verb_ctl(&argv[1..]),
+        Some("soup") => soup::verb_soup(&argv[1..]),
+        Some("link") => link::verb_link(&argv[1..]),
+        Some("mcp") => mcp::verb_mcp(&argv[1..]),
+        Some("ripples") => ripples::verb_ripples(&argv[1..]),
+        Some("owner-acts") => owner_acts::verb_owner_acts(&argv[1..]),
+        Some("inference") => inference::verb_inference(&argv[1..]),
+        Some("create") => cauldrons::verb_create(&argv[1..]),
+        Some("list") | Some("ls") => cauldrons::verb_list(&argv[1..]),
+        Some("rename") => cauldrons::verb_rename(&argv[1..]),
+        Some("remove") => cauldrons::verb_remove(&argv[1..]),
         Some("daemon") => daemon::verb_daemon(&argv[1..]),
         Some("install") => launchd::verb_install(&argv[1..]),
         Some("uninstall") => launchd::verb_uninstall(&argv[1..]),
@@ -371,7 +462,12 @@ fn run() -> Result<i32> {
 /// The verbs that start, stop, restart, drain, pin or otherwise control a
 /// daemon or its launchd job (REL-6a5, REL-6a3-I F1).
 const CONTROL_VERBS: &[&str] =
-    &["daemon", "install", "uninstall", "promote", "restart", "start", "stop", "down", "pin", "rollback", "env", "test"];
+    &["daemon", "install", "uninstall", "promote", "restart", "start", "stop", "down", "pin", "rollback", "env", "test",
+      // `create` writes a cauldron; `soup import` writes its
+      // soup, and the soup reads share the guard; `mcp` writes the grants.
+      "create", "rename", "remove", "soup", "mcp",
+      // `owner-acts` writes the root's owner_acts setting.
+      "owner-acts"];
 
 /// **REL-6a5: A DAEMON-CONTROL VERB IN AN ISOLATED PROCESS ACTS ONLY ON A
 /// SCRATCH ROOT.** Isolated (`env::egress::process_isolation`: the marker,
@@ -413,7 +509,7 @@ mod rel6a5_control_verbs {
     #[test]
     fn rel6a5_a_control_verb_in_an_isolated_process_acts_only_on_a_scratch_root() {
         let real = Path::new("/Users/someone/.cauldron");
-        for v in ["start", "stop", "restart", "daemon", "install", "uninstall", "promote", "down", "pin", "rollback", "env", "test"] {
+        for v in ["start", "stop", "restart", "daemon", "install", "uninstall", "promote", "down", "pin", "rollback", "env", "test", "create", "rename", "remove", "soup", "mcp"] {
             assert!(admit_control_verb_with(v, real, Some(real), "a test").is_err(), "`{v}` admitted on his real root");
             assert!(admit_control_verb_with(v, &real.join("x"), Some(real), "a test").is_err(), "`{v}` admitted inside it");
             assert!(admit_control_verb_with(v, Path::new("/tmp/scratch/.cauldron"), Some(real), "a test").is_ok(), "`{v}` refused on scratch");
@@ -618,6 +714,13 @@ struct Opts {
     /// over `<label>`, which every environment in the root shares and another
     /// one may be pinned to. `scripts/install` uses it.
     env_copy: bool,
+    /// `build <service> --artifact <image>`: install THAT image as a version
+    /// of the service, with no compiler, instead of building the
+    /// declaration's cargo source. The image states its own commit
+    /// (`<image> --build-stamp`), exactly as a declaration's `[build]
+    /// artifact` with `stamp_args = ["--build-stamp"]` would. The release
+    /// bundle's `scripts/install --prebuilt` uses it.
+    artifact: Option<String>,
     /// `test --test-env <name>`: which environment the test runs in. Never the
     /// caller's — see `verb_test`.
     test_env: Option<String>,
@@ -643,6 +746,7 @@ fn parse(args: &[String]) -> Result<Opts> {
         probe: false,
         allow_dirty: false,
         env_copy: false,
+        artifact: None,
         test_env: None,
         snapshot_declaration: false,
         force: false,
@@ -656,6 +760,12 @@ fn parse(args: &[String]) -> Result<Opts> {
             "--probe" => o.probe = true,
             "--allow-dirty" => o.allow_dirty = true,
             "--env-copy" => o.env_copy = true,
+            "--artifact" => {
+                i += 1;
+                let v = args.get(i).with_context(|| "`--artifact` needs the path of an image after it".to_string())?;
+                o.artifact = Some(v.clone());
+            }
+            s if s.starts_with("--artifact=") => o.artifact = Some(s["--artifact=".len()..].to_string()),
             "--snapshot-declaration" => o.snapshot_declaration = true,
             "--force" => o.force = true,
             "--test-env" => {
@@ -1198,6 +1308,11 @@ fn verb_status(args: &[String]) -> Result<i32> {
                     .iter()
                     .map(|(s, _, j)| (s.clone(), j.clone()))
                     .collect::<serde_json::Map<_, _>>(),
+                // Per cauldron, how many records a ripple wrote wait for
+                // the owner's review.
+                "review": review::waiting_all(&env, None),
+                // Who may act for the owner without a terminal.
+                "owner_acts": {"summary": owner_acts::summary(&env), "cauldrons": owner_acts::per_cauldron(&env)},
             }))?
         );
     } else {
@@ -1242,6 +1357,25 @@ fn verb_status(args: &[String]) -> Result<i32> {
         }
         for (svc, line, _) in &gates {
             println!("\n{svc}: {line}");
+        }
+        {
+            let oa = owner_acts::summary(&env);
+            let open: Vec<String> = owner_acts::per_cauldron(&env)
+                .iter()
+                .filter(|c| c["setting"] != "terminal")
+                .map(|c| format!("{} {}", c["cauldron"].as_str().unwrap_or("?"), c["setting"].as_str().unwrap_or("?")))
+                .collect();
+            let var = oa["env_var"]["opens"].as_str().map(|v| format!("; CAULDRON_OWNER_ACTS opens {v} for this process")).unwrap_or_default();
+            println!(
+                "\nowner acts: root {}{}{var} (`cauldron owner-acts show`)",
+                oa["root"].as_str().unwrap_or("?"),
+                if open.is_empty() { String::new() } else { format!("; open without a terminal: {}", open.join(", ")) },
+            );
+        }
+        for w in review::waiting_all(&env, None) {
+            if let Some(cmd) = w["review"].as_str() {
+                println!("\ncauldron {}: {} record(s) a ripple wrote wait for review: {cmd}", w["cauldron"].as_str().unwrap_or("?"), w["unreviewed"]);
+            }
         }
         // WHICH DECLARATION, per service that this environment runs or pins.
         // One line each, because the phrase `shipped (no snapshot)` is the
@@ -1746,7 +1880,47 @@ fn verb_build(args: &[String]) -> Result<i32> {
             );
         }
     }
-    let decls = owned_targets(&env, &o.services, "build")?;
+    let mut decls = owned_targets(&env, &o.services, "build")?;
+    // A release-bundle cauldron has no source tree and no cargo: a bare
+    // `cauldron build <service>` of a service the bundle carries an image of
+    // (`libexec/<bin>`) installs THAT image, exactly as `--artifact` would.
+    let mut o = o;
+    if o.artifact.is_none() && o.services.len() == 1 && decls.len() == 1 {
+        if let Some(image) = bundled_image(&decls[0]) {
+            if !o.json {
+                println!(
+                    "cauldron: no source tree in a release build; installing the image this release shipped, {} \
+                     (as `--artifact` would)",
+                    image.display()
+                );
+            }
+            o.artifact = Some(image.display().to_string());
+        }
+    }
+    if let Some(image) = &o.artifact {
+        // ONE named service, and its build source becomes the image: no
+        // cargo, the commit read off the bytes. Everything else in the
+        // declaration (launch, permissions, the snapshot that travels with
+        // the version) is the declaration's own.
+        if o.services.len() != 1 || decls.len() != 1 {
+            bail!("`cauldron build --artifact <image>` installs ONE image: name exactly one service (`cauldron build <service> --artifact <image>`).");
+        }
+        if o.allow_dirty {
+            bail!("`--allow-dirty` is about a working tree; an `--artifact` build compiles nothing and reads the image's own dirt from it.");
+        }
+        let path = std::path::absolute(image).with_context(|| format!("resolving --artifact {image}"))?;
+        let d = &mut decls[0];
+        let b = d.build()?.clone();
+        d.build = Some(decl::Build {
+            workspace: None,
+            package: None,
+            args: Vec::new(),
+            artifact: Some(path.display().to_string()),
+            stamp_args: vec!["--build-stamp".to_string()],
+            target_dir: None,
+            ..b
+        });
+    }
     let mut out = Vec::new();
     for d in &decls {
         let rec = build_one(&env, d, o.json, o.allow_dirty, o.env_copy)?;
@@ -1768,6 +1942,37 @@ fn verb_build(args: &[String]) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// **THE IMAGE OF `d` THAT THIS RELEASE BUNDLE SHIPPED**, for a bare
+/// `cauldron build <service>` in a release-bundle binary (which has no source
+/// tree to compile). Only for a declaration whose build is a cargo source
+/// with no `workspace` of its own (the shipped `inference`, `ripples`, `mcp`
+/// and so on): one that names a workspace or an artifact means what it says.
+/// Looked for, in order, at `<this binary's dir>/../libexec/<bin>` (run from
+/// the unpacked bundle, or from the copy the installer keeps at
+/// `<root>/share/cauldron/releases/<version>-<commit>/`) and at
+/// `<root>/share/cauldron/releases/<this version>-<this commit>/libexec/<bin>`
+/// (the installed `<root>/bin/cauldron`). The image still states its own
+/// commit, which names the version; nothing here trusts the file name.
+/// A checkout build never looks: it compiles.
+#[cfg(cauldron_release_bundle)]
+fn bundled_image(d: &decl::Declaration) -> Option<PathBuf> {
+    let b = d.build.as_ref()?;
+    if b.artifact.is_some() || b.workspace.is_some() || b.package.is_none() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let beside = exe.parent()?.parent()?.join("libexec").join(&b.bin);
+    let short: String = SELF_COMMIT.chars().take(12).collect();
+    let installed = decl::release_share_dir(&format!("releases/{}-{short}/libexec", env!("CARGO_PKG_VERSION"))).join(&b.bin);
+    [beside, installed].into_iter().find(|p| p.is_file())
+}
+
+#[cfg(not(cauldron_release_bundle))]
+fn bundled_image(_d: &decl::Declaration) -> Option<PathBuf> {
+    None
 }
 
 /// **`cauldron build --json`'s stdout: the build records, as a JSON array.**
@@ -3236,6 +3441,11 @@ fn launch_hosted(env: &Environment, l: &Launchable) -> Result<Seam> {
     for (k, v) in &d.env {
         cmd.env(k, expand_hosted(&expand(v, &data_dir), &launch.addr));
     }
+    // CAULDRON_OWNER_ACTS means "the command the owner ran may act": it is read
+    // only by that command, never inherited by a service (not from the shell that
+    // started this, nor from a declaration). The mcp service decides MCP approve
+    // and reject from the persisted owner_acts setting alone.
+    cmd.env_remove(env::owner_acts::VAR);
     use std::os::unix::process::CommandExt;
     // ITS OWN PROCESS GROUP, and this is what makes everything else possible.
     // The child is therefore NOT in launchd's job, so launchd restarting the
@@ -4179,7 +4389,7 @@ fn verb_pin(args: &[String]) -> Result<i32> {
     if let Some(a) = &addr {
         if d.registers {
             bail!(
-                "REFUSED: `--addr` is for a HOSTED service; `{service}` registers its own seam on                  a kernel-assigned port (127.0.0.1:0), so it has no address to declare"
+                "REFUSED: `--addr` is for a HOSTED service; `{service}` registers its own seam on a kernel-assigned port (127.0.0.1:0), so it has no address to declare"
             );
         }
     }
@@ -4653,6 +4863,11 @@ fn start_one(env: &Environment, l: &Launchable) -> Result<Seam> {
     for (k, v) in &d.env {
         cmd.env(k, v);
     }
+    // CAULDRON_OWNER_ACTS means "the command the owner ran may act": it is read
+    // only by that command, never inherited by a service (not from the shell that
+    // started this, nor from a declaration). The mcp service decides MCP approve
+    // and reject from the persisted owner_acts setting alone.
+    cmd.env_remove(env::owner_acts::VAR);
     // Its own process group, so it outlives this shell and a Ctrl-C here does
     // not reach it. Stable std API; no unsafe, no libc.
     use std::os::unix::process::CommandExt;

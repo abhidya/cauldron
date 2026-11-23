@@ -73,6 +73,40 @@
 # kind `home` or `email`, any path-name hit, any link target, any secret, any
 # export-subst use. The SECRET patterns have no exemption of any kind.
 #
+# History patterns: the same private file may also hold `history` lines,
+# patterns for development-history residue that must not reach a public
+# release (ids of private conversations, citations of private messages,
+# internal process codes, private repository names and paths). They are
+# matched against the lines of the artifact that are NEW since the last
+# published release, named by one `history-base<TAB><commit>` line: the
+# archive of that commit is built the same way, and a line counts as new
+# when its file holds more copies of it than the same path did in the base
+# archive. Lines that already shipped are not re-judged; a path new since the
+# base is matched by name too. Binary members (any NUL byte) are skipped by
+# this scan only. Line types, tab-separated:
+#   history<TAB><kind><TAB><regex>          (Python re, case-sensitive; use
+#                                            (?i) where case should not matter)
+#   history-allow<TAB><kind><TAB><regex>    (a match of <kind> that this regex
+#                                            matches in full is not a hit)
+#   history-sample<TAB><kind><TAB><text>    (must be a hit of <kind>)
+#   history-base<TAB><commit>
+#   history-fixtures<TAB><path>             (optional: a self-test file, see
+#                                            below; relative to the repo top)
+# Every history kind needs a sample that is a hit; history lines without a
+# base, a base that is not a commit here, or an allow line for an unknown
+# kind exit 2. History hits have no line keys: reword the line, or (for a
+# synthetic value) widen the allow list, which is a reviewable diff of the
+# private file.
+#
+# History self-test: a `history-fixtures` line names a file (private too,
+# export-ignored) of known-bad and known-good lines, checked on every run
+# before anything is scanned:
+#   bad<TAB><kind><TAB><text>    (must be a history hit of <kind>)
+#   good<TAB><text>              (must be no history hit of any kind)
+# A bad line that is not caught, a good line that is, or a named file that
+# is missing exits 2: the pattern set is not trusted until it passes. The
+# lines that failed are named by line number and kind only, never quoted.
+#
 # Exit: 0 clean · 1 a hit (each printed, personal matches masked as
 # <personal>, secrets as their kind only) · 2 the check could not measure
 # (no pattern file in the operator's tree, a sample that does not match, an
@@ -213,6 +247,17 @@ if [ -f "$real_index" ]; then
 fi
 [ -s "$TMP/sources" ] || die2 "nothing to scan: no HEAD and no index"
 
+# History scan: the archive of the last published release, to tell new
+# lines from lines that already shipped (see the header).
+if [ -n "$PATTERNS_FILE" ] && awk -F'\t' '$1=="history-base"{f=1} END{exit !f}' "$PATTERNS_FILE"; then
+  hist_base=$(awk -F'\t' '$1=="history-base"{print $2}' "$PATTERNS_FILE")
+  [ "$(printf '%s\n' "$hist_base" | wc -l | tr -d ' ')" = 1 ] || die2 "more than one history-base line"
+  base_sha=$(git rev-parse -q --verify "$hist_base^{commit}") \
+    || die2 "the history base is not a commit in this repository; refusing to report clean"
+  "$top/scripts/build-public-archive" "$base_sha" "$TMP/history-base.tar" > /dev/null \
+    || die2 "build-public-archive (history base) failed"
+fi
+
 # Secrets are refused in the private TREE too, not only in what ships: a real
 # key in an export-ignored note is still a key in the repository's history.
 secret_tree=0
@@ -230,7 +275,7 @@ done
 
 set +e
 LINE_KEYS="$LINE_KEYS" EXPORT_SUBST_ALLOW="$EXPORT_SUBST_ALLOW" DECODE_ALLOW="$DECODE_ALLOW" SECRET_PATTERN="$SECRET_PATTERN" \
-PATTERNS_FILE="$PATTERNS_FILE" python3 - "$TMP" <<'PY'
+PATTERNS_FILE="$PATTERNS_FILE" TOP="$top" python3 - "$TMP" <<'PY'
 import os, re, io, sys, tarfile, zipfile, zlib, bz2, lzma, hashlib, unicodedata
 
 tmp = sys.argv[1]
@@ -240,6 +285,11 @@ def die2(msg):
 # ---- patterns ---------------------------------------------------------
 PK = []          # (kind, compiled)
 samples = []
+HK = []          # history: (kind, compiled), case-sensitive
+HALLOW = {}      # history kind -> [compiled], matched in full against a hit
+hsamples = []
+hbase = []
+hfix = []        # the history self-test file, at most one
 pf = os.environ.get("PATTERNS_FILE", "")
 if pf:
     try:
@@ -249,6 +299,11 @@ if pf:
             f = ln.split("\t")
             if f[0] == "personal" and len(f) == 3: PK.append((f[1], re.compile(f[2], re.I)))
             elif f[0] == "sample" and len(f) == 3: samples.append((f[1], f[2]))
+            elif f[0] == "history" and len(f) == 3: HK.append((f[1], re.compile(f[2])))
+            elif f[0] == "history-allow" and len(f) == 3: HALLOW.setdefault(f[1], []).append(re.compile(f[2]))
+            elif f[0] == "history-sample" and len(f) == 3: hsamples.append((f[1], f[2]))
+            elif f[0] == "history-base" and len(f) == 2: hbase.append(f[1])
+            elif f[0] == "history-fixtures" and len(f) == 2: hfix.append(f[1])
             else: die2("unparseable line in the personal-pattern file")
     except (OSError, re.error) as e:
         die2("cannot load the personal-pattern file: %s" % type(e).__name__)
@@ -260,6 +315,84 @@ if pf:
         if not any(pk == k and rx.search(s) for pk, rx in PK):
             die2("a %r sample does not match its own patterns; the pattern set cannot be trusted" % k)
 ANYP = re.compile("|".join("(?:%s)" % rx.pattern for _, rx in PK), re.I) if PK else None
+
+def hist_kinds(s):
+    """The history kinds with a match in `s` that no allow line of that
+    kind matches in full."""
+    ks = set()
+    for k, rx in HK:
+        for mt in rx.finditer(s):
+            if not any(a.fullmatch(mt.group(0)) for a in HALLOW.get(k, ())):
+                ks.add(k); break
+    return ks
+if HK or hbase or HALLOW or hsamples:
+    hkinds = {k for k, _ in HK}
+    if not HK: die2("history lines without any `history` pattern")
+    if len(hbase) != 1: die2("history patterns need exactly one history-base line")
+    for k in set(HALLOW) - hkinds: die2("history-allow for unknown kind %r" % k)
+    for k in hkinds:
+        if not any(sk == k for sk, _ in hsamples): die2("history kind %r has no history-sample line" % k)
+    for k, s in hsamples:
+        if k not in hist_kinds(s):
+            die2("a %r history-sample is not a hit of its own kind; the pattern set cannot be trusted" % k)
+if hfix:
+    # The history self-test (see the header): every known-bad line caught by
+    # its kind, every known-good line by none.
+    if len(hfix) != 1: die2("more than one history-fixtures line")
+    if not HK: die2("history-fixtures without any `history` pattern")
+    fx = os.path.join(os.environ["TOP"], hfix[0])
+    try:
+        flines = open(fx, encoding="utf-8").read().split("\n")
+    except OSError as e:
+        die2("the history fixtures file named in the pattern file cannot be read (%s); refusing to report clean" % type(e).__name__)
+    nbad = ngood = 0; ffail = []
+    for n, ln in enumerate(flines, 1):
+        if not ln or ln.startswith("#"): continue
+        f = ln.split("\t")
+        if f[0] == "bad" and len(f) == 3:
+            nbad += 1
+            if f[1] not in hkinds: die2("history fixtures line %d names an unknown kind %r" % (n, f[1]))
+            if f[1] not in hist_kinds(f[2]): ffail.append("line %d: a known-bad %s line is not caught" % (n, f[1]))
+        elif f[0] == "good" and len(f) == 2:
+            ngood += 1
+            ks = hist_kinds(f[1])
+            if ks: ffail.append("line %d: a known-good line is caught as %s" % (n, ",".join(sorted(ks))))
+        else:
+            die2("unparseable line %d in the history fixtures file" % n)
+    for m in ffail: print("check-no-personal-data: history self-test: " + m, file=sys.stderr)
+    if ffail: die2("the history self-test failed (%d of %d lines); the pattern set cannot be trusted" % (len(ffail), nbad + ngood))
+    if not nbad or not ngood: die2("the history fixtures file needs at least one bad and one good line")
+    print("check-no-personal-data: history self-test: %d known-bad lines caught, %d known-good lines clean" % (nbad, ngood), file=sys.stderr)
+HBASE = {}       # path -> {line bytes: count} in the base archive
+if HK:
+    try:
+        with tarfile.open(os.path.join(tmp, "history-base.tar"), mode="r:") as tf:
+            for m in tf:
+                cnt = HBASE.setdefault(m.name, {})
+                if m.isfile():
+                    fh = tf.extractfile(m)
+                    for lb in (fh.read() if fh else b"").split(b"\n"):
+                        cnt[lb] = cnt.get(lb, 0) + 1
+    except (tarfile.TarError, OSError) as e:
+        die2("cannot read the history-base archive: %s" % type(e).__name__)
+    if not HBASE: die2("the history-base archive is empty; nothing to compare against")
+
+def hist_scan(path, data):
+    """(ident, message) for every NEW line of `path` with a history hit."""
+    out = []
+    if b"\x00" in data: return out
+    base = HBASE.get(path, {}); used = {}
+    for i, lb in enumerate(data.split(b"\n"), 1):
+        used[lb] = used.get(lb, 0) + 1
+        if used[lb] <= base.get(lb, 0): continue   # shipped already
+        vs = [lb.decode("latin-1")]
+        if not lb.isascii(): vs.append(norm(lb.decode("utf-8", "replace")))
+        ks = set()
+        for v in vs: ks |= hist_kinds(v)
+        if ks:
+            out.append((("H", path, i), "HISTORY: %s:%d: [%s] %s" % (mask(path), i, ",".join(sorted(ks)), mask(vs[-1]))))
+    return out
+HCACHE = {}
 # Email patterns can only match a line with an `@`, so the gate runs them on
 # those lines alone (a leading `[...]+` makes a whole-blob search quadratic).
 for k, rx in PK:
@@ -699,6 +832,9 @@ for label, commit in sources:
                 if m.issym() or m.islnk():
                     check_string(m.name, "link target", m.linkname, label)
                 replay(EV, label, seen)
+                if HK and m.name not in HBASE:
+                    ks = hist_kinds(m.name) | hist_kinds(norm(m.name))
+                    if ks: note(("H", m.name, "path"), "HISTORY: %s: path [%s]" % (mask(m.name), ",".join(sorted(ks))), label)
                 if m.isfile():
                     f = tf.extractfile(m)
                     data = f.read() if f else b""
@@ -717,6 +853,9 @@ for label, commit in sources:
                         scan_blob(m.name, data, label, 0, seen)
                         CACHE[ck] = EV
                     replay(CACHE[ck], label, seen)
+                    if HK:
+                        if ck not in HCACHE: HCACHE[ck] = hist_scan(m.name, data)
+                        for ident, msg in HCACHE[ck]: note(ident, msg, label)
             EV = []
             for k, v in (tf.pax_headers or {}).items():
                 check_string("<pax global header>", "pax header", "%s=%s" % (k, v), label)

@@ -1,0 +1,1250 @@
+{
+  "edge_kinds": {
+    "blocks": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "danger"
+        },
+        {
+          "at": "local",
+          "node_type": "issue"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        }
+      ],
+      "to": [
+        {
+          "at": "local",
+          "node_type": "directive"
+        },
+        {
+          "at": "local",
+          "node_type": "milestone"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        }
+      ]
+    },
+    "depends_on": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "milestone"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        }
+      ],
+      "to": [
+        {
+          "at": "local",
+          "node_type": "milestone"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        }
+      ]
+    },
+    "derived_from": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "constraint"
+        },
+        {
+          "at": "local",
+          "node_type": "danger"
+        },
+        {
+          "at": "local",
+          "node_type": "decision"
+        },
+        {
+          "at": "local",
+          "node_type": "directive"
+        },
+        {
+          "at": "local",
+          "node_type": "handoff"
+        },
+        {
+          "at": "local",
+          "node_type": "idea"
+        },
+        {
+          "at": "local",
+          "node_type": "issue"
+        },
+        {
+          "at": "local",
+          "node_type": "milestone"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        },
+        {
+          "at": "local",
+          "node_type": "region"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        }
+      ],
+      "to": [
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "constraint"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "danger"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "decision"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "directive"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "handoff"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "idea"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "issue"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "milestone"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "question"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "region"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "task"
+        }
+      ]
+    },
+    "in_region": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "constraint"
+        },
+        {
+          "at": "local",
+          "node_type": "danger"
+        },
+        {
+          "at": "local",
+          "node_type": "decision"
+        },
+        {
+          "at": "local",
+          "node_type": "directive"
+        },
+        {
+          "at": "local",
+          "node_type": "handoff"
+        },
+        {
+          "at": "local",
+          "node_type": "idea"
+        },
+        {
+          "at": "local",
+          "node_type": "issue"
+        },
+        {
+          "at": "local",
+          "node_type": "milestone"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        }
+      ],
+      "to": [
+        {
+          "at": "local",
+          "node_type": "region"
+        }
+      ]
+    },
+    "narrows": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "region"
+        }
+      ],
+      "to": [
+        {
+          "at": "local",
+          "node_type": "region"
+        }
+      ]
+    },
+    "ref": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "constraint"
+        },
+        {
+          "at": "local",
+          "node_type": "danger"
+        },
+        {
+          "at": "local",
+          "node_type": "decision"
+        },
+        {
+          "at": "local",
+          "node_type": "directive"
+        },
+        {
+          "at": "local",
+          "node_type": "handoff"
+        },
+        {
+          "at": "local",
+          "node_type": "idea"
+        },
+        {
+          "at": "local",
+          "node_type": "issue"
+        },
+        {
+          "at": "local",
+          "node_type": "milestone"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        },
+        {
+          "at": "local",
+          "node_type": "region"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        }
+      ],
+      "to": [
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "constraint"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "danger"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "decision"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "directive"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "handoff"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "idea"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "issue"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "milestone"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "question"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "region"
+        },
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "task"
+        }
+      ]
+    },
+    "rejected_by": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "constraint"
+        },
+        {
+          "at": "local",
+          "node_type": "danger"
+        },
+        {
+          "at": "local",
+          "node_type": "decision"
+        },
+        {
+          "at": "local",
+          "node_type": "directive"
+        },
+        {
+          "at": "local",
+          "node_type": "handoff"
+        },
+        {
+          "at": "local",
+          "node_type": "idea"
+        },
+        {
+          "at": "local",
+          "node_type": "issue"
+        },
+        {
+          "at": "local",
+          "node_type": "milestone"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        }
+      ],
+      "to": [
+        {
+          "at": "local",
+          "node_type": "region"
+        }
+      ]
+    },
+    "relates": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "region"
+        }
+      ],
+      "to": [
+        {
+          "at": "local",
+          "node_type": "region"
+        }
+      ]
+    },
+    "resolved_by": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "issue"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        }
+      ],
+      "to": [
+        {
+          "at": "local",
+          "node_type": "decision"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        },
+        {
+          "at": "reach",
+          "kind": "blueprint",
+          "node_type": "migration"
+        },
+        {
+          "at": "reach",
+          "kind": "blueprint",
+          "node_type": "release"
+        }
+      ]
+    },
+    "serves": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "milestone"
+        }
+      ],
+      "to": [
+        {
+          "at": "local",
+          "node_type": "directive"
+        }
+      ]
+    },
+    "shows": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "fields": {
+        "cite": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": true
+        },
+        "why": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        }
+      },
+      "from": [
+        {
+          "at": "local",
+          "node_type": "viewer"
+        }
+      ],
+      "to": [
+        {
+          "at": "local",
+          "node_type": "constraint"
+        },
+        {
+          "at": "local",
+          "node_type": "danger"
+        },
+        {
+          "at": "local",
+          "node_type": "decision"
+        },
+        {
+          "at": "local",
+          "node_type": "directive"
+        },
+        {
+          "at": "local",
+          "node_type": "handoff"
+        },
+        {
+          "at": "local",
+          "node_type": "idea"
+        },
+        {
+          "at": "local",
+          "node_type": "issue"
+        },
+        {
+          "at": "local",
+          "node_type": "milestone"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        }
+      ]
+    },
+    "supersedes": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "constraint"
+        },
+        {
+          "at": "local",
+          "node_type": "danger"
+        },
+        {
+          "at": "local",
+          "node_type": "decision"
+        },
+        {
+          "at": "local",
+          "node_type": "directive"
+        },
+        {
+          "at": "local",
+          "node_type": "handoff"
+        },
+        {
+          "at": "local",
+          "node_type": "idea"
+        },
+        {
+          "at": "local",
+          "node_type": "issue"
+        },
+        {
+          "at": "local",
+          "node_type": "milestone"
+        },
+        {
+          "at": "local",
+          "node_type": "question"
+        },
+        {
+          "at": "local",
+          "node_type": "region"
+        },
+        {
+          "at": "local",
+          "node_type": "task"
+        }
+      ],
+      "to": [
+        {
+          "at": "same_as_source"
+        }
+      ]
+    }
+  },
+  "kind": "workspace",
+  "node_types": {
+    "constraint": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "CON",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {},
+      "states": [
+        "standing",
+        "retired"
+      ]
+    },
+    "danger": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "D",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {},
+      "states": [
+        "lurking",
+        "being-slain",
+        "slain"
+      ]
+    },
+    "decision": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "DEC",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {},
+      "states": [
+        "decided",
+        "revisited"
+      ]
+    },
+    "directive": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": true
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "DIR",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {},
+      "states": [
+        "active",
+        "done",
+        "dropped"
+      ]
+    },
+    "handoff": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "HO",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {},
+      "states": [
+        "current"
+      ]
+    },
+    "idea": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "C",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {},
+      "states": [
+        "idea",
+        "exploring",
+        "stub",
+        "active",
+        "done",
+        "dropped"
+      ]
+    },
+    "issue": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "IS",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {},
+      "states": [
+        "open",
+        "resolved"
+      ]
+    },
+    "milestone": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "M",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {
+        "serves": 1
+      },
+      "states": [
+        "pending",
+        "active",
+        "done",
+        "dropped"
+      ]
+    },
+    "question": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "Q",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {},
+      "states": [
+        "open",
+        "closed"
+      ]
+    },
+    "region": {
+      "count_cells": {},
+      "fields": {
+        "boundary": {
+          "kind": "text",
+          "max_chars": 1000,
+          "min_chars": 40,
+          "required": true
+        },
+        "deferred_by": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "provisional": {
+          "kind": "boolean",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "retired": {
+          "kind": "boolean",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "thresholds": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "wake_when": {
+          "kind": "text",
+          "max_chars": 500,
+          "min_chars": null,
+          "required": false
+        }
+      },
+      "id_prefix": "R",
+      "required_edges_at_mint": {},
+      "states": []
+    },
+    "task": {
+      "count_cells": {},
+      "fields": {
+        "body": {
+          "kind": "text",
+          "max_chars": 10000,
+          "min_chars": null,
+          "required": false
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "operator": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        },
+        "searched": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": false
+        }
+      },
+      "id_prefix": "T",
+      "required_at_mint_any_of": [
+        {
+          "edges": {
+            "in_region": 1
+          },
+          "fields": []
+        },
+        {
+          "edges": {
+            "rejected_by": 2
+          },
+          "fields": [
+            "searched"
+          ]
+        }
+      ],
+      "required_edges_at_mint": {},
+      "states": [
+        "ready",
+        "active",
+        "done"
+      ]
+    },
+    "viewer": {
+      "count_cells": {},
+      "fields": {
+        "role": {
+          "kind": "text",
+          "max_chars": null,
+          "min_chars": 1,
+          "required": true
+        }
+      },
+      "id_prefix": "V",
+      "required_edges_at_mint": {},
+      "states": []
+    }
+  },
+  "pool": "ws",
+  "version": 6
+}

@@ -49,6 +49,7 @@ scripts/prune-target
 scripts/test-prune-target
 apps/tui/HANDOFF.md
 scripts/personal-patterns.private
+scripts/history-fixtures.private
 services/threads/docs/R1.S4-promote-provenance-gate.patch
 services/threads/docs/account-model-changes.md
 services/threads/docs/aui-data-contract.md
@@ -66,6 +67,7 @@ libs/tui-render/PROVENANCE.md
 libs/projects/PROVENANCE.md
 libs/aui-wire/PROVENANCE.md
 libs/term-shell/PROVENANCE.md
+libs/spine/tests/grammar_v6_data_source.rs
 scripts/prove-warnings
 scripts/prove-compile-gate
 scripts/prove-supervisor
@@ -74,13 +76,57 @@ scripts/prove-alarm-hosted
 '
 # Public paths the archive must contain. README.md shows the image, so an
 # export-ignore that caught it would publish a broken README; README.md links
-# CHANGELOG.md and ROADMAP.md, so the same holds for those.
+# CHANGELOG.md and ROADMAP.md, so the same holds for those. The workspace
+# lists libs/soup-door as a member that the `cauldron` CLI links, and
+# services/mcp as a member (the CLI's tests link it), and services/ripples as
+# a member whose binary reads its dump package (prompt and schema) at build
+# time, and services/inference and libs/inference-registry as members (the
+# CLI and ripples link the registry), so an archive without any of them would not build. The plugin's MCP server is its .mcp.json, a dot
+# file an export rule could drop without breaking the build. The plugin is
+# installed from the repository by its root marketplace (`/plugin
+# marketplace add <owner>/<repo>` reads .claude-plugin/marketplace.json at the
+# root), another dot path, and the plugin manifest that marketplace points at.
+# The published record schemas (workspace-v6 and cauldron-v1) and the
+# plugin's copy of them are what a session and an outside writer read to
+# write records; nothing fails to build without them, so they are listed.
 REQUIRED_PATHS='
+.claude-plugin/marketplace.json
+claude-code/cauldron/.claude-plugin/plugin.json
+claude-code/cauldron/.mcp.json
+claude-code/cauldron/bin/cauldron-mcp
 docs/images/cauldron.png
 README.md
 CHANGELOG.md
 ROADMAP.md
 LICENSE
+libs/soup-door/Cargo.toml
+libs/soup-door/src/lib.rs
+services/mcp.toml
+services/mcp/Cargo.toml
+services/mcp/src/lib.rs
+services/ripples.toml
+services/ripples/Cargo.toml
+services/ripples/src/lib.rs
+services/ripples/package/dump/v1/prompt.md
+services/ripples/package/dump/v1/batch.schema.json
+services/inference.toml
+services/inference/Cargo.toml
+services/inference/src/lib.rs
+libs/inference-registry/Cargo.toml
+libs/inference-registry/src/lib.rs
+schema/soup/workspace-v6/grammar.json
+schema/soup/workspace-v6/README.md
+schema/soup/cauldron-v1/grammar.json
+schema/soup/cauldron-v1/edges.json
+schema/soup/cauldron-v1/node.cluster.schema.json
+schema/soup/cauldron-v1/remint.cluster.schema.json
+schema/soup/cauldron-v1/README.md
+claude-code/cauldron/schema/grammar.json
+claude-code/cauldron/schema/cauldron-v1/grammar.json
+claude-code/cauldron/schema/cauldron-v1/edges.json
+claude-code/cauldron/schema/cauldron-v1/node.cluster.schema.json
+claude-code/cauldron/schema/cauldron-v1/remint.cluster.schema.json
+claude-code/cauldron/schema/cauldron-v1/README.md
 '
 # A path every archive of this repo must contain: the positive sentinel that
 # proves the archive listing and the match below can find a path at all.

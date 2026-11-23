@@ -1,0 +1,60 @@
+[package]
+name = "cauldron-mcp"
+version.workspace = true
+edition.workspace = true
+description = "The MCP door to an environment's soups: a supervised loopback service that answers JSON-RPC on POST /mcp, opens a cauldron only when its owner granted it, reads through the soup's read-only connections, and is the one writer of every granted soup it holds."
+
+# One integration-test binary (tests/it/); a new test is a module there.
+autotests = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "cauldron-mcp"
+path = "src/main.rs"
+
+[features]
+# Test-only, as `cauldron`'s own: builds the spine's fault-injection seam into
+# this binary, and the dump removal's (`CAULDRON_REMOVE_FAULT`). Off in every
+# normal build, where a set SPINE_FAULT or CAULDRON_REMOVE_FAULT is refused.
+fault-injection = ["spine/fault-injection", "soup-door/fault-injection"]
+
+[dependencies]
+env = { path = "../../libs/env" }
+# The MCP carrier (`server`) and the seam a service registers through (`seam`).
+shapewire = { path = "../../libs/shapewire", features = ["server", "seam"] }
+# The soup's logic: reads, the import, the budget, the grants.
+soup-door = { path = "../../libs/soup-door" }
+# The writer thread holds a `spine::Cauldron` and submits `soup_link`'s
+# statement itself. Default features: the one-door gate stays closed.
+spine = { path = "../../libs/spine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+axum = { workspace = true }
+# The connection loop under the router (`http::serve`): a cap on connections,
+# a header timeout and a bounded read buffer, which `axum::serve` does not
+# offer. The versions axum already brings in.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+http-body-util = { version = "0.1" }
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+[dev-dependencies]
+# Every child a test spawns is isolated (CAULDRON_ISOLATED=1).
+test-isolation = { path = "../../testkit/test-isolation" }
+# A test plants a note stored before the door bounded notes straight into a
+# pool file (the version spine already links).
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[lints.rust]
+unsafe_code = "forbid"

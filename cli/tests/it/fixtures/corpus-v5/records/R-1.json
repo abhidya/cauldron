@@ -1,0 +1,6 @@
+{
+  "id": "R-1",
+  "handle": "THE IMPORTER - bringing records from older stores into a soup.",
+  "boundary": "Inside: how records from an older store are read, mapped and landed. Outside: the schema itself (R-3).",
+  "schema_version": 5
+}

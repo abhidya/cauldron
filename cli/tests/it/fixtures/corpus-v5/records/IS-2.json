@@ -1,0 +1,9 @@
+{
+  "id": "IS-2",
+  "type": "issue",
+  "state": "open",
+  "handle": "A corpus may name a region that is not in the file.",
+  "in_region": [
+    "R-3"
+  ]
+}

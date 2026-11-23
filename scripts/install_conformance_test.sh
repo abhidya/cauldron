@@ -91,6 +91,23 @@
 # variable aborts install / this suite with rc != 0, not the rc 0 that bash
 # 3.2 gives a `set -u` abort under an EXIT trap.
 #
+# THE MCP STEP (4c), cases 12, 13, 14a, 17b, 19b', 21b, 26b, 29 and 30: a
+# fresh environment also gets `cauldron build mcp --json --env-copy` and
+# `pin mcp <label>+<env>` after threads; an existing env.toml with an mcp pin
+# is never touched (12); an existing env.toml WITHOUT one (the upgrade) gets
+# the same build and `cauldron pin mcp`, said in a line of its own, once: a
+# re-run changes nothing (13, 30); a run stopped between the two pins is
+# finished by a re-run that pins only mcp, and a third run changes nothing
+# (29a-c); an env.toml edited by hand after the threads pin keeps its edit,
+# the stale marker is cleared and mcp is added as an upgrade (29d). Case 31:
+# an EXISTING mcp pin at an older build than this checkout's is rebuilt and
+# re-pinned once under --replace-running (the supervisor moves the running
+# service; the script kills nothing), a re-run changes nothing, without the
+# flag it is left exactly as it is and the run says plainly that the mcp
+# service is still the old build with the two commands that upgrade it (12
+# too), a re-pin made by another writer during the build stands, and a
+# dirty checkout is refused at 2c.
+#
 #   INSTALL=<path> overrides the script under test (used to force it red).
 #   SUITE_UNDER_TEST=<path> overrides the suite case 28 mutates (same reason).
 set -euo pipefail
@@ -183,13 +200,13 @@ run() {
     set +e
     OUT="$(cd "${RUN_CWD:-${PWD}}" && env -u CAULDRON_HOME -u HARNESS_SIGN_SCRIPT \
         ${RUN_SIGNER:+HARNESS_SIGN_SCRIPT="${RUN_SIGNER}"} \
-        HOME="${RUN_HOME:-${T}/home}" PATH="${T}/stub:${RUN_REAL_GIT:+${T}/empty}${RUN_REAL_GIT:-${T}/gitstub}:${PATH}" \
+        HOME="${RUN_HOME:-${T}/home}" PATH="${RUN_PATH_HEAD:-}${T}/stub:${RUN_REAL_GIT:+${T}/empty}${RUN_REAL_GIT:-${T}/gitstub}:${PATH}" \
         STUB_LOG="${STUB_LOG}" STUB_LOADED="${loaded}" STUB_LIST_HIDE="${hide}" \
         STUB_LIST_FAIL="${STUB_LIST_FAIL:-0}" \
         STUB_GIT_DIRTY="${STUB_GIT_DIRTY:-}" STUB_GIT_FAIL="${STUB_GIT_FAIL:-0}" \
         STUB_GIT_DIRTY_AT="${STUB_GIT_DIRTY_AT:-}" STUB_WS="${STUB_WS:-${T}/repo}" STUB_PROBE="${STUB_PROBE:-}" \
         CLOG="${CLOG:-${T}/cauldron.log}" GIT_DIRS_LOG="${T}/gitdirs.log" \
-        bash "${RUN_AS:-${INSTALL}}" "$@" 2>"${T}/stderr")"
+        "${RUN_BASH:-bash}" "${RUN_AS:-${INSTALL}}" "$@" 2>"${T}/stderr")"
     RC=$?
     set -e
     ERR="$(cat "${T}/stderr")"
@@ -202,11 +219,29 @@ home_empty() { [[ -z "$(find "${T}/home" -mindepth 1 -print -quit)" ]]; }
 SEAL="${T}/sealed"; EXEC_LOG="${T}/exec.log"; SIGN_LOG="${T}/sign.log"
 mkdir -p "${SEAL}" "${T}/repo/scripts" "${T}/repo/services/threads/scripts"
 : >"${EXEC_LOG}"; : >"${SIGN_LOG}"
+# The account helper scripts the from-source path lays down (issue #30), as
+# fakes in the scratch checkout, each naming where it came from.
+for h in add-account claude-accounts claude-login-browser; do
+    printf '#!/usr/bin/env bash\n# helper %s from the checkout\nexit 0\n' "${h}" >"${T}/repo/services/threads/scripts/${h}"
+    /bin/chmod 0755 "${T}/repo/services/threads/scripts/${h}"
+done
+# helpers_at <home> <text>: the three helpers are installed at
+# <root>/share/cauldron/scripts/threads/, each mode 755 and carrying <text>,
+# and every directory from share/ down is 755.
+helpers_at() {
+    local d="$1/.cauldron/share/cauldron/scripts/threads" h x
+    for h in add-account claude-accounts claude-login-browser; do
+        [[ -f "${d}/${h}" && "$(/usr/bin/stat -f %Lp "${d}/${h}")" == 755 ]] && /usr/bin/grep -q "$2" "${d}/${h}" || return 1
+    done
+    for x in "$1/.cauldron/share" "$1/.cauldron/share/cauldron" "$1/.cauldron/share/cauldron/scripts" "${d}"; do
+        [[ "$(/usr/bin/stat -f %Lp "${x}")" == 755 ]] || return 1
+    done
+}
 real_of() { local d; for d in /usr/bin /bin /usr/sbin /sbin; do if [[ -x "${d}/$1" ]]; then echo "${d}/$1"; return 0; fi; done; echo "no real $1" >&2; return 1; }
 # Logging shims for the plain utilities. Mutating ones refuse (98) any
 # absolute path argument outside ${T} (cp: its destination only, since it may
 # read a source elsewhere).
-for c in dirname basename sed uname sw_vers id stat awk grep wc tr cat mkdir cp mv rm chmod bash shasum; do
+for c in dirname basename sed uname sw_vers id stat awk grep wc tr cat mkdir cp mv rm chmod bash shasum tar od cmp ls; do
     r="$(real_of "${c}")"
     cat >"${SEAL}/${c}" <<SHIM
 #!/bin/bash
@@ -220,6 +255,12 @@ case "${c}" in
         fi
         for a in "\$@"; do check "\$a"; done ;;
     mkdir|rm|chmod) for a in "\$@"; do check "\$a"; done ;;
+    # STUB_ARCH: what \`uname -m\` answers (the prebuilt path's arm64 check).
+    uname) if [[ "\${1:-}" == -m && -n "\${STUB_ARCH:-}" ]]; then echo "\${STUB_ARCH}"; exit 0; fi ;;
+    # A fake executable is marked FAKEMACHO:arm64; od reads it as a thin arm64 Mach-O header.
+    od) for a in "\$@"; do f="\$a"; done
+        if /usr/bin/grep -aq 'FAKEMACHO:arm64' "\$f" 2>/dev/null; then echo " cf fa ed fe 0c 00 00 01"; exit 0; fi ;;
+    tar) prev=""; for a in "\$@"; do [[ "\$prev" == -C ]] && check "\$a"; prev="\$a"; done ;;
     cp) check "\${@: -1}" ;;
     sed) case " \$* " in *" -i "*) check "\${@: -1}" ;; esac ;;
     bash) [[ \$# -eq 0 ]] || check "\$1" ;;
@@ -245,13 +286,28 @@ printf 'codesign %s\n' "$*" >>"${EXEC_LOG:?}"
 f="${@: -1}"
 case "$1" in
     --force) id=""; while [[ $# -gt 1 ]]; do [[ "$1" == --identifier ]] && id="$2"; shift; done
-             printf '\nFAKESIGN:%s\n' "${id}" >>"${f}" ;;
-    -dvvv)   id="$(/usr/bin/sed -n 's/^FAKESIGN://p' "${f}" 2>/dev/null | /usr/bin/tail -n 1)"
+             printf '\nFAKESIGN:%s\n' "${id}" >>"${f}"
+             # The sum of everything but itself: \`--verify\` fails once a byte changes.
+             printf 'FAKESUM:%s\n' "$(/usr/bin/grep -av '^FAKESUM:' "${f}" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')" >>"${f}" ;;
+    -dvvv|-dv) id="$(/usr/bin/sed -n 's/^FAKESIGN://p' "${f}" 2>/dev/null | /usr/bin/tail -n 1)"
              if [[ -n "${id}" ]]; then printf 'Identifier=%s\nSignature=adhoc\n' "${id}" >&2; else echo "${f}: code object is not signed at all" >&2; exit 1; fi ;;
+    --verify) want="$(/usr/bin/sed -n 's/^FAKESUM://p' "${f}" 2>/dev/null | /usr/bin/tail -n 1)"
+             have="$(/usr/bin/grep -av '^FAKESUM:' "${f}" 2>/dev/null | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+             if [[ -n "${want}" && "${want}" == "${have}" ]]; then exit 0; fi
+             echo "${f}: invalid signature (code or signature have been modified)" >&2; exit 1 ;;
     *) echo "fake codesign: unexpected $*" >&2; exit 64 ;;
 esac
 FAKE
-/bin/chmod +x "${SEAL}/launchctl" "${SEAL}/git" "${SEAL}/cargo" "${SEAL}/codesign"
+# curl: a fake. \`-o OUT URL\` copies STUB_CURL_FILE to OUT (logged); nothing is fetched.
+cat >"${SEAL}/curl" <<'FAKE'
+#!/bin/bash
+printf 'curl %s\n' "$*" >>"${EXEC_LOG:?}"
+out=""; prev=""; for a in "$@"; do [[ "${prev}" == -o ]] && out="${a}"; prev="${a}"; done
+[[ -n "${out}" && -f "${STUB_CURL_FILE:-}" ]] || { echo "fake curl: no -o or no STUB_CURL_FILE" >&2; exit 22; }
+case "${out}" in "${HOME}"/*) ;; *) printf 'ESCAPE curl %s\n' "${out}" >>"${EXEC_LOG}"; exit 98 ;; esac
+/bin/cp "${STUB_CURL_FILE}" "${out}"
+FAKE
+/bin/chmod +x "${SEAL}/launchctl" "${SEAL}/git" "${SEAL}/cargo" "${SEAL}/codesign" "${SEAL}/curl"
 # The threads signer, at the path install derives from its own location, as
 # a fake that signs through `codesign` ON PATH (the fake) and verifies.
 cat >"${T}/repo/services/threads/scripts/build-threads.sh" <<'FAKE'
@@ -273,7 +329,7 @@ srun() {
     if [[ -d "${home}" ]]; then /bin/cp -Rp "${home}/." "${T}/twin/"; fi
     # REL-4.S5c stub knobs, passed to the run AND its twin. Paths here hold no
     # spaces (all under ${T}), so word splitting is safe.
-    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-}"
+    local SRUN_STUBS="STUB_GIT_DIRTY_AT=${STUB_GIT_DIRTY_AT:-} STUB_WS=${STUB_WS:-${T}/repo} STUB_PROBE=${STUB_PROBE:-} STUB_CREATE_KILL=${STUB_CREATE_KILL:-0} STUB_CREATE_FAIL=${STUB_CREATE_FAIL:-0} STUB_BUILD_TOUCH=${STUB_BUILD_TOUCH:-0} STUB_MV_KILL=${STUB_MV_KILL:-} STUB_MCP_REFUSE=${STUB_MCP_REFUSE:-0} STUB_MCP_REPIN_DURING=${STUB_MCP_REPIN_DURING:-0} STUB_NAME_ONLY=${STUB_NAME_ONLY:-0} STUB_ARCH=${STUB_ARCH:-} STUB_CURL_FILE=${STUB_CURL_FILE:-}"
     set +e
     OUT="$(cd "${T}" && /usr/bin/env -i HOME="${RUN_HOME:-${T}/home}" PATH="${SEAL}${SRUN_PATH_EXTRA:+:${SRUN_PATH_EXTRA}}" \
         ${RUN_SIGNER:+HARNESS_SIGN_SCRIPT="${RUN_SIGNER}"} \
@@ -340,6 +396,21 @@ if [[ ${RC} -eq 0 ]]; then ok "rc 0"; else bad "rc ${RC}, wanted 0" "${OUT}"; fi
 if has "no cauldron job for 'prod' is loaded"; then ok "says none loaded"; else bad "no 'none loaded' line" "${OUT}"; fi
 if ! grep -qF 'WARNING: launchctl list failed' <<<"${ERR}"; then ok "no list WARNING when list works"; else bad "list WARNING with a working list" "${ERR}"; fi
 if grep -qE '^install: \$ .*/cauldron --env prod install$' <<<"${OUT}"; then ok "step 5 runs cauldron install without --replace-running"; else bad "step 5 line wrong" "${OUT}"; fi
+# The closing lines on the bridge's PATH: the plan says them too, before its last line.
+bridge_ok() {
+    # <root> <a line that must come AFTER them> <tag> [<a line that must come BEFORE them>]
+    local n c b=0
+    n="$(grep -nF 'MCP:      the plugin'"'"'s MCP server is its launcher, bin/cauldron-mcp, which runs `cauldron mcp stdio`' <<<"${OUT}" | head -n 1 | cut -d: -f1)"
+    c="$(grep -nF "${2}" <<<"${OUT}" | tail -n 1 | cut -d: -f1)"
+    if [[ -n "${4:-}" ]]; then b="$(grep -nF "${4}" <<<"${OUT}" | head -n 1 | cut -d: -f1)"; fi
+    if [[ -n "${n}" && -n "${c}" && -n "${b}" && ${c} -gt ${n} && ${n} -gt ${b} ]] && has "without needing \`cauldron\` on the PATH Claude Code was started with. It looks at" \
+        && has "\$CAULDRON_BIN, then the install marker ${1%/.cauldron}/Library/Application Support/cauldron/cauldron-bin (written for prod)," \
+        && has "then ${1}/bin/cauldron, then PATH." \
+        && has "to check: \`/mcp\` inside a session lists cauldron as connected"; then
+        ok "${3}: closing lines say where the plugin's launcher looks for cauldron, and how to check"
+    else bad "${3}: no bridge PATH lines (or not at the end)" "${OUT}"; fi
+}
+bridge_ok "${T}/home/.cauldron" "DRY RUN complete" "1 (dry run)"
 
 printf '\n== 2. legacy com.broomstick.cauldron loaded -> REFUSED\n'
 run "com.broomstick.cauldron:4242" 0 --dry-run
@@ -356,6 +427,19 @@ if [[ ${RC} -eq 0 ]]; then ok "rc 0"; else bad "rc ${RC}, wanted 0" "${OUT}"; fi
 if has "WILL RESTART com.broomstick.cauldron (pid 4242)"; then ok "WILL RESTART line"; else bad "no WILL RESTART line" "${OUT}"; fi
 if has "== 5. supervisor"; then ok "plan reaches step 5"; else bad "plan stops early" "${OUT}"; fi
 if grep -qE '^install: \$ .*/cauldron --env prod install --replace-running$' <<<"${OUT}"; then ok "--replace-running passed through to cauldron install"; else bad "flag not passed to cauldron install" "${OUT}"; fi
+
+printf '\n== 3b. --owner-acts: open records the choice through step 5'"'"'s cauldron install, terminal closes it, anything else is refused\n'
+run "" 0 --dry-run --owner-acts open
+if [[ ${RC} -eq 0 ]] && grep -qE '^install: \$ env CAULDRON_OWNER_ACTS=open .*/cauldron --env prod install --owner-acts open$' <<<"${OUT}"; then ok "open: cauldron install records it, with the variable for that one command"; else bad "rc ${RC}, no install --owner-acts open line" "${OUT}"; fi
+n5="$(grep -nF -- '== 5. supervisor' <<<"${OUT}" | head -n 1 | cut -d: -f1)"; noa="$(grep -nF -- 'install --owner-acts open' <<<"${OUT}" | head -n 1 | cut -d: -f1)"
+if [[ -n "${n5}" && -n "${noa}" && "${n5}" -lt "${noa}" ]]; then ok "open: in step 5"; else bad "owner-acts planned before step 5" "${OUT}"; fi
+if ! has "--how"; then ok "open: no --how argument (the code path records install)"; else bad "a --how argument" "${OUT}"; fi
+run "" 0 --dry-run --owner-acts=terminal
+if [[ ${RC} -eq 0 ]] && grep -qE '^install: \$ .*/cauldron --env prod install --owner-acts terminal$' <<<"${OUT}" && ! has "CAULDRON_OWNER_ACTS"; then ok "terminal: planned, no variable"; else bad "rc ${RC}, no install --owner-acts terminal line" "${OUT}"; fi
+run "" 0 --dry-run
+if [[ ${RC} -eq 0 ]] && ! has "owner-acts"; then ok "no flag: the setting is left alone"; else bad "rc ${RC}, owner-acts without the flag" "${OUT}"; fi
+run "" 0 --dry-run --owner-acts yes
+if [[ ${RC} -eq 2 ]] && has "--owner-acts is \`open\` or \`terminal\`, not \`yes\`" && ! has "== 3. binaries"; then ok "an unknown value: rc 2 before anything"; else bad "rc ${RC}" "${OUT}"; fi
 
 printf '\n== 4. any other prefix (list only) -> REFUSED\n'
 run "org.example.cauldron:77" 0 --dry-run
@@ -407,6 +491,8 @@ MARK() { echo "$1/.cauldron/data/.install-threads-pending.prod"; }
 ENVT() { echo "$1/.cauldron/data/prod/env.toml"; }
 # line_no <ERE>: the first line of OUT matching it, or 0.
 line_no() { local n; n="$(grep -nE -- "$1" <<<"${OUT}" | head -n 1 | cut -d: -f1)"; echo "${n:-0}"; }
+# prefix_of <before> <after>: <after> starts with every byte of <before>.
+prefix_of() { [[ -f "$2" ]] && /usr/bin/head -c "$(/usr/bin/wc -c <"$1" | /usr/bin/tr -d ' ')" "$2" | /usr/bin/cmp -s - "$1"; }
 RE_BUILD='^install: \$ .*/cauldron --env prod build threads --json --env-copy$'
 RE_SIGN='^install: \$ bash .*/services/threads/scripts/build-threads\.sh --sign-only .*/data/prod/\.threads-image\.[0-9]+/threads$'
 RE_PIN='^install: \$ .*/cauldron --env prod pin threads [^ ]+ --addr auto$'
@@ -434,18 +520,36 @@ RUN_HOME="${T}/home11" run "" 0 --dry-run --env dev
 if [[ ${RC} -eq 0 ]] && grep -qE '^install: \$ .*/cauldron --env dev pin threads [^ ]+\+dev --addr auto$' <<<"${OUT}" && has "'dev' is not prod: it gets its OWN free loopback port"; then ok "--env dev pins its own <label>+dev with --addr auto, and says it gets its own port"; else bad "dev plan wrong (rc ${RC})" "${OUT}"; fi
 if [[ -z "$(find "${T}/home11" -mindepth 1 -print -quit)" ]]; then ok "dry run wrote nothing"; else bad "dry run wrote" "$(find "${T}/home11")"; fi
 
-printf '\n== 12. existing env.toml with threads pinned -> NOT rebuilt, NOT re-pinned\n'
+printf '\n== 12. existing env.toml with threads AND mcp pinned -> NOT rebuilt, NOT re-pinned\n'
 mkdir -p "${T}/home12/.cauldron/data/prod"
-printf '[supervisor]\nauto_restart = true\n\n[services.threads]\nversion = "aaaaaaaaaaaa-release"\naddr = "127.0.0.1:3753"\n' >"${T}/home12/.cauldron/data/prod/env.toml"
+printf '[supervisor]\nauto_restart = true\n\n[services.threads]\nversion = "threadsold-release"\naddr = "127.0.0.1:3753"\n\n[services.mcp]\nversion = "mcpold-release+prod"\n' >"${T}/home12/.cauldron/data/prod/env.toml"
 cp "${T}/home12/.cauldron/data/prod/env.toml" "${T}/env12.before"
 RUN_HOME="${T}/home12" run "" 0 --dry-run
-if [[ ${RC} -eq 0 ]] && has "threads is already pinned in"; then ok "rc 0, says the existing pin is kept"; else bad "rc ${RC}" "${OUT}"; fi
-if [[ $(line_no "${RE_BUILD}") -eq 0 ]] && ! grep -qE -- "${RE_ANYPIN}" <<<"${OUT}"; then ok "no threads build or pin in the plan"; else bad "existing env would be rebuilt/re-pinned" "${OUT}"; fi
+if [[ ${RC} -eq 0 ]] && has "threads is already pinned in" && has "mcp is already pinned in"; then ok "rc 0, says both existing pins are kept"; else bad "rc ${RC}" "${OUT}"; fi
+if [[ $(line_no "${RE_BUILD}") -eq 0 ]] && ! grep -E '^install: \$ ' <<<"${OUT}" | grep -qE -- "${RE_ANYPIN}|build mcp|pin mcp"; then ok "no build or pin of threads or mcp in the plan"; else bad "existing env would be rebuilt/re-pinned" "${OUT}"; fi
+# Its mcp pin is an older build (`mcpold-…`): without --replace-running it
+# is left as it is, and the run says so plainly with the two commands.
+old_mcp_said() {
+    # <tag> <cauldron path the commands name>
+    if has "mcp is pinned at mcpold-release+prod, which is NOT this checkout's build" \
+        && has "THE mcp SERVICE IS STILL THE OLD BUILD: it is pinned at mcpold-release+prod" \
+        && has "    ${2} --env prod build mcp --env-copy" \
+        && has "    then: ${2} --env prod pin mcp <the label that build printed>" \
+        && has "(or run this install again with --replace-running, which does both)" \
+        && has "mcp:      the mcp service is still the old build (mcpold-release+prod); to upgrade it:" \
+        && has "            ${2} --env prod pin mcp <the label that build printed>"; then
+        ok "${1}: says the mcp service is still the old build, and the two commands that upgrade it (in 4c and at the end)"
+    else bad "${1}: no plain old-build lines" "${OUT}"; fi
+}
+old_mcp_said "12 plan" "$(sed -nE 's/^install: \$ (.*\/cauldron) --env prod install$/\1/p' <<<"${OUT}")"
 # F4: the byte check, on a REAL (sealed) run whose stub cauldron's `pin`
 # really appends to env.toml — so a run that pinned WOULD change the bytes.
 # Its positive sentinel is case 14, where the same stub pin does write.
 mkdir -p "${T}/bin14"
 CLOG="${T}/cauldron.log"
+# The commit the stub git names, and so the stubs' build label for it,
+# spelt in pieces (a long hex run reads as a hash).
+TL="$(printf 'feed%s1234-release' c0de)"
 cat >"${T}/bin14/cauldron" <<'STUBC'
 #!/bin/bash
 # Stub cauldron: logs argv. `env create` writes env.toml; `pin` APPENDS the
@@ -502,27 +606,67 @@ case "$*" in
         printf 'name = "threads"\n' >"${d}/declaration.toml"
         echo "cargo noise on stderr" >&2
         printf '[\n  {\n    "service": "threads",\n    "label": "%s",\n    "bin": "threads"\n  }\n]\n' "${l}" ;;
+    "build mcp --json --env-copy")
+        # As `build threads --env-copy`: a NEW `<label>+<env>` claimed with a
+        # plain mkdir. STUB_MCP_REFUSE=1 refuses it, as a dirty tree would.
+        if [[ "${STUB_MCP_REFUSE:-0}" == 1 ]]; then
+            echo "Error: REFUSED to install a version of \`mcp\` (stub)" >&2; exit 1
+        fi
+        # STUB_MCP_REPIN_DURING=1: another writer re-pins mcp WHILE the build runs.
+        if [[ "${STUB_MCP_REPIN_DURING:-0}" == 1 ]]; then
+            f="${root}/data/${e}/env.toml"
+            /usr/bin/sed 's/^version = "mcpold-release+prod"$/version = "otherwriter-release+prod"/' "${f}" >"${f}.stub" && /bin/mv -f "${f}.stub" "${f}"
+        fi
+        # Its label starts with the commit, as the real one's does (the stub
+        # git names it): an install compares an existing pin with it.
+        b="${root}/data/shared/builds/mcp"; base="$(git -C "${root}" rev-parse --short=12 HEAD)-release"; /bin/mkdir -p "${b}"
+        k=1; l="${base}+${e}"
+        until /bin/mkdir "${b}/${l}" 2>/dev/null; do
+            k=$((k+1)); l="${base}+${e}.${k}"; [[ ${k} -lt 100 ]] || exit 70
+        done
+        /bin/cp /bin/ls "${b}/${l}/cauldron-mcp"
+        printf '{\n  "service": "mcp",\n  "label": "%s",\n  "bin": "cauldron-mcp"\n}\n' "${l}" >"${b}/${l}/build.json"
+        printf '[\n  {\n    "service": "mcp",\n    "label": "%s",\n    "bin": "cauldron-mcp"\n  }\n]\n' "${l}" ;;
     "pin threads "*" --addr auto")
         printf '\n[services.threads]\nversion = "%s"\n' "$3" >>"${root}/data/${e}/env.toml" ;;
+    "pin mcp "*)
+        # A first pin appends the section; a re-pin rewrites its version in
+        # place (STUB_PIN_REWRITE logs it), as the real one leaves the rest.
+        f="${root}/data/${e}/env.toml"
+        if /usr/bin/grep -qx '\[services.mcp\]' "${f}"; then
+            /usr/bin/awk -v v="$3" '/^\[/{sec=$0} sec=="[services.mcp]" && /^version = /{print "version = \"" v "\""; next} {print}' "${f}" >"${f}.stub" && /bin/mv -f "${f}.stub" "${f}"
+        else
+            printf '\n[services.mcp]\nversion = "%s"\n' "$3" >>"${f}"
+        fi ;;
     "env remove ${e} --yes") /bin/rm -rf "${root}/data/${e}" ;;
-    "install") ;;
+    "install"|"install --replace-running") ;;
+    "mcp grants")
+        # Read-only, as the real one. STUB_NAME_ONLY=1: one grant names its
+        # cauldron only by name, said on stderr as the real one says it.
+        if [[ "${STUB_NAME_ONLY:-0}" == 1 ]]; then
+            echo "cauldron: WARNING: the grant of cauldron \`kb\` in environment \`${e}\` names it only by name (it was written by a pre-release build), so every call to it through the MCP door is refused until it is granted again, in a terminal: cauldron mcp grant kb --env ${e} --scopes read,dump" >&2
+        fi
+        printf '{"env": "%s", "grants": []}\n' "${e}" ;;
     *) echo "stub cauldron: unexpected: $*" >&2; exit 64 ;;
 esac
 STUBC
 /bin/chmod +x "${T}/bin14/cauldron"; : >"${T}/bin14/tui"; /bin/chmod +x "${T}/bin14/tui"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${T}/home12" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 ]] && has "threads is already pinned in"; then ok "sealed real run: rc 0, says the existing pin is kept"; else bad "sealed real run: rc ${RC}" "${OUT}"; fi
-if [[ "$(cat "${CLOG}")" == "--env prod install" ]]; then ok "sealed real run: cauldron called for install only (no build, no pin)"; else bad "existing env was rebuilt/re-pinned" "$(cat "${CLOG}")"; fi
+if [[ ${RC} -eq 0 ]] && has "threads is already pinned in" && has "mcp is already pinned in"; then ok "sealed real run: rc 0, says both existing pins are kept"; else bad "sealed real run: rc ${RC}" "${OUT}"; fi
+if [[ "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]]; then ok "sealed real run: cauldron asked which tree it builds (read-only) and called for install only (no build, no pin)"; else bad "existing env was rebuilt/re-pinned" "$(cat "${CLOG}")"; fi
+old_mcp_said "12 sealed real run" "${T}/bin14/cauldron"
 if cmp -s "${T}/env12.before" "${T}/home12/.cauldron/data/prod/env.toml"; then ok "env.toml byte-identical after a REAL run"; else bad "env.toml changed" "$(diff "${T}/env12.before" "${T}/home12/.cauldron/data/prod/env.toml")"; fi
 sealed_ok "case 12"
 
-printf '\n== 13. existing env.toml WITHOUT threads -> told how, NOT pinned\n'
+printf '\n== 13. existing env.toml WITHOUT threads or mcp -> threads told how, NOT pinned; mcp added once (upgrade)\n'
 mkdir -p "${T}/home13/.cauldron/data/prod"
 printf '[supervisor]\nauto_restart = true\n' >"${T}/home13/.cauldron/data/prod/env.toml"
 RUN_HOME="${T}/home13" run "" 0 --dry-run
 if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing"; then ok "rc 0, says threads is not pinned"; else bad "rc ${RC}" "${OUT}"; fi
 if [[ $(line_no "${RE_BUILD}") -eq 0 && $(line_no "${RE_PIN}") -eq 0 ]]; then ok "no threads build or pin step"; else bad "existing env would be edited" "${OUT}"; fi
+bm="$(line_no '^install: \$ .*/cauldron --env prod build mcp --json --env-copy$')"; pm="$(line_no '^install: \$ .*/cauldron --env prod pin mcp \\<label\\>\+prod$')"; s5="$(line_no "${RE_STEP5}")"
+if has "mcp is NOT pinned in the existing" && has "adding it (upgrade)" && [[ ${bm} -gt 0 && ${pm} -gt ${bm} && ${s5} -gt ${pm} ]]; then ok "13 plan: says mcp is added (upgrade); build mcp --env-copy < pin mcp <label>+prod < step 5"; else bad "13: no mcp upgrade in the plan (build ${bm} pin ${pm} step5 ${s5})" "${OUT}"; fi
 # REL-4.S5c M3: the same, as a REAL (sealed) run whose stub `pin` really
 # appends to env.toml. Its positive sentinel is 17b: the same stub, with the
 # marker present, does pin and does change the bytes.
@@ -531,9 +675,16 @@ cp "${T}/home13/.cauldron/data/prod/env.toml" "${T}/env13.before"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${T}/home13" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing"; then ok "13 sealed real run: rc 0, says threads is not pinned"; else bad "13 sealed real run: rc ${RC}" "${OUT}"; fi
-if [[ "$(cat "${CLOG}")" == "--env prod install" ]]; then ok "13 sealed real run: cauldron called for install only (no build, no pin)"; else bad "13: an env.toml without the marker was built/pinned" "$(cat "${CLOG}")"; fi
-if cmp -s "${T}/env13.before" "${T}/home13/.cauldron/data/prod/env.toml"; then ok "13: env.toml byte-identical after a REAL run"; else bad "13: env.toml changed" "$(diff "${T}/env13.before" "${T}/home13/.cauldron/data/prod/env.toml")"; fi
+if has "mcp is NOT pinned in the existing" && has "adding it (upgrade)"; then ok "13: says mcp is not pinned and is added (upgrade)"; else bad "13: no mcp upgrade line" "${OUT}"; fi
+want13="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install' '--env prod mcp grants')"
+if [[ "$(cat "${CLOG}")" == "${want13}" ]]; then ok "13 sealed real run: no threads build or pin; mcp built --env-copy and pinned by cauldron pin; install"; else bad "13: cauldron calls wrong" "$(cat "${CLOG}")"; fi
+if prefix_of "${T}/env13.before" "$(ENVT "${T}/home13")" && [[ "$(grep -c '^\[services.mcp\]$' "$(ENVT "${T}/home13")")" == 1 ]] && ! grep -q 'services.threads' "$(ENVT "${T}/home13")"; then ok "13: env.toml keeps its bytes and gains exactly one mcp pin (and no threads pin)"; else bad "13: env.toml wrong" "$(cat "$(ENVT "${T}/home13")")"; fi
+if has "services: mcp pinned at ${TL}+prod"; then ok "13: done line names the mcp pin"; else bad "13: no mcp done line" "${OUT}"; fi
 sealed_ok "case 13"
+cp "$(ENVT "${T}/home13")" "${T}/env13.after"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${T}/home13" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]] && has "mcp is already pinned in" && cmp -s "${T}/env13.after" "$(ENVT "${T}/home13")"; then ok "13 re-run: idempotent (no build, no pin, env.toml byte-identical)"; else bad "13 re-run (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 13 re-run"
 
 printf '\n== 14. the step for real (SEALED): its own new version, signed in the env dir, shared build untouched\n'
 B14() { echo "$1/.cauldron/data/shared/builds/threads/$2"; }
@@ -542,8 +693,12 @@ sha() { /usr/bin/shasum -a 256 "$1" 2>/dev/null | /usr/bin/awk '{print $1}'; }
 : >"${CLOG}"; : >"${EXEC_LOG}"; : >"${SIGN_LOG}"; mkdir -p "${T}/home14"
 RUN_HOME="${T}/home14" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]]; then ok "rc 0"; else bad "rc ${RC}, wanted 0" "${OUT}"; fi
-want=$'--env prod versions install-workspace-probe\n--env prod env create prod --auto-restart\n--env prod build threads --json --env-copy\n--env prod pin threads feedc0de1234-release+prod --addr auto\n--env prod install'
-if [[ "$(cat "${CLOG}")" == "${want}" ]]; then ok "cauldron called: workspace probe, env create, build --env-copy, pin threads <label>+prod --addr auto, install"; else bad "cauldron calls wrong" "$(cat "${CLOG}")"; fi
+# The stub's threads label, spelt in pieces (a long hex run reads as a hash).
+TL="$(printf 'feed%s1234-release' c0de)"
+want="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod env create prod --auto-restart' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install')"
+if [[ "$(cat "${CLOG}")" == "${want}" ]]; then ok "cauldron called: workspace probe, env create, build --env-copy, pin threads <label>+prod --addr auto, build mcp --env-copy, pin mcp <label>+prod, install"; else bad "cauldron calls wrong" "$(cat "${CLOG}")"; fi
+if grep -qx '\[services.mcp\]' "${T}/home14/.cauldron/data/prod/env.toml" && [[ -d "${T}/home14/.cauldron/data/shared/builds/mcp/${TL}+prod" && ! -e "${T}/home14/.cauldron/data/shared/builds/mcp/${TL}" ]]; then ok "14a: mcp pinned at its own new version; the shared label never created"; else bad "14a: mcp not pinned as its own version" "$(find "${T}/home14/.cauldron/data/shared/builds" 2>&1)"; fi
+if has "services: mcp pinned at ${TL}+prod" && has "mcp grant <cauldron> --env prod"; then ok "14a: done line names the mcp pin and the grant command"; else bad "14a: no mcp done line" "${OUT}"; fi
 # REL-4.S5c M2/M4: the marker existed when env create ran (sentinel: it WAS
 # written, at the path MARK names), and a first install leaves none behind.
 if [[ "$(cat "${CLOG}.mark" 2>/dev/null)" == present ]]; then ok "14a: the marker existed when env create ran (written before it)"; else bad "14a: no marker when env create ran" "$(cat "${CLOG}.mark" 2>&1)"; fi
@@ -556,6 +711,10 @@ if grep -qF '"label": "feedc0de1234-release+prod"' "${OWN14}/build.json" && [[ -
 if grep -q "^signer --sign-only ${T}/home14/.cauldron/data/prod/.threads-image.[0-9]*/threads$" "${SIGN_LOG}"; then ok "signed in the environment's own data dir"; else bad "signed elsewhere" "$(cat "${SIGN_LOG}")"; fi
 if [[ -z "$(find "${T}/home14/.cauldron" -name '.threads-image.*' -o -name '.threads.signing.*' | head -n 1)" ]]; then ok "no staging copy left behind"; else bad "staging left" "$(find "${T}/home14/.cauldron")"; fi
 if has "services: threads pinned at feedc0de1234-release+prod"; then ok "done line names the pin"; else bad "done line" "${OUT}"; fi
+if has "local:    local inference (the inference and ripples services) is installed OFF: nothing pinned, nothing started." \
+   && has "To use it: ${T}/home14/.cauldron/bin/cauldron --env prod build inference   (and ripples; from this checkout (cargo))" \
+   && ! grep -qE ' (build|pin|start) (inference|ripples)' "${CLOG}"; then ok "14a: inference and ripples neither built, pinned nor started; the closing lines say how"; else bad "14a: local inference lines wrong" "$(cat "${CLOG}")${OUT}"; fi
+if helpers_at "${T}/home14" "from the checkout" && has "placed the account helpers (add-account, claude-accounts, claude-login-browser)"; then ok "14a: the account helpers installed from the checkout at share/cauldron/scripts/threads/, 755, directories 755"; else bad "14a: helpers not installed" "$(ls -laR "${T}/home14/.cauldron/share" 2>&1)"; fi
 sealed_ok "case 14a"
 # 14b. dev, in a root where the shared label ALREADY EXISTS (prod is pinned
 # to it, signed) and so does a `+dev` copy from an earlier install. sha256 of
@@ -576,6 +735,7 @@ if [[ -n "${sh_img}" && "$(sha "${SH}/threads")" == "${sh_img}" && "$(/usr/bin/s
 if [[ -n "${sh_rec}" && "$(sha "${SH}/build.json")" == "${sh_rec}" ]]; then ok "prod's pinned shared build.json: same sha256"; else bad "prod's pinned build.json was rewritten" "$(cat "${SH}/build.json")"; fi
 if [[ "$(sha "${DV}/threads")" == "${dv_img}" && "$(sha "${DV}/build.json")" == "${dv_rec}" && "$(/usr/bin/stat -f %i "${DV}/threads")" == "${ino_d}" ]]; then ok "an existing +dev copy: same sha256 (image, record), same inode"; else bad "an existing per-env copy was written into"; fi
 if grep -q 'FAKESIGN:com.harness.threads' "$(B14 "${H}" feedc0de1234-release+dev.2)/threads" 2>/dev/null; then ok "the new +dev.2 version is the signed one"; else bad "+dev.2 not signed" "$(ls -la "$(B14 "${H}" feedc0de1234-release+dev.2)" 2>&1)"; fi
+if [[ ! -e "${H}/Library/Application Support/cauldron/cauldron-bin" ]]; then ok "14b: no install marker for a non-prod environment"; else bad "14b: a dev install wrote the prod marker"; fi
 sealed_ok "case 14b"
 # 14c. Identity arm with a signer that signs nothing: the verify refuses, so
 # install stops BEFORE the pin; the unsigned version it claimed is removed,
@@ -619,7 +779,7 @@ if [[ ${RC} -eq 2 ]] && has "install:      M README.md" && ! has "== 3. binaries
 STUB_GIT_FAIL=1 RUN_HOME="${T}/home16" run "" 0 --dry-run
 if [[ ${RC} -eq 2 ]] && has "\`git status\` failed in"; then ok "a git status that fails is refused, never read as clean"; else bad "failed git status not refused (rc ${RC})" "${OUT}"; fi
 STUB_GIT_DIRTY='?? x' RUN_HOME="${T}/home12" run "" 0 --dry-run
-if [[ ${RC} -eq 0 ]] && has "step 4b will not build threads"; then ok "opposed: a dirty tree is NOT refused when 4b builds nothing (threads already pinned)"; else bad "refused although 4b builds nothing (rc ${RC})" "${OUT}"; fi
+if [[ ${RC} -eq 0 ]] && has "steps 4b and 4c will build nothing"; then ok "opposed: a dirty tree is NOT refused when 4b and 4c build nothing (threads and mcp already pinned)"; else bad "refused although 4b and 4c build nothing (rc ${RC})" "${OUT}"; fi
 
 printf '\n== 17. a re-run COMPLETES an install that stopped before the threads pin (SEALED)\n'
 H17="${T}/home17"; mkdir -p "${H17}"; : >"${CLOG}"; : >"${EXEC_LOG}"
@@ -630,19 +790,20 @@ sealed_ok "case 17a"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H17}" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 ]] && has "finishing step 4b now"; then ok "17b re-run: rc 0, says it finishes step 4b"; else bad "17b re-run did not finish 4b (rc ${RC})" "${OUT}"; fi
-want17=$'--env prod versions install-workspace-probe\n--env prod build threads --json --env-copy\n--env prod pin threads feedc0de1234-release+prod --addr auto\n--env prod install'
+want17="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install')"
 if [[ "$(cat "${CLOG}")" == "${want17}" ]]; then ok "17b: build --env-copy, pin <label>+prod --addr auto, install; no second env create"; else bad "17b calls" "$(cat "${CLOG}")"; fi
 if grep -qx '\[services.threads\]' "$(ENVT "${H17}")" && grep -qx 'version = "feedc0de1234-release+prod"' "$(ENVT "${H17}")"; then ok "17b: env.toml now pins threads"; else bad "17b: env.toml has no threads pin" "$(cat "$(ENVT "${H17}")")"; fi
 if [[ ! -e "$(MARK "${H17}")" ]]; then ok "17b: marker cleared after the pin"; else bad "17b: marker left after the pin"; fi
 if grep -q 'FAKESIGN:com.harness.threads' "$(B14 "${H17}" feedc0de1234-release+prod)/threads" 2>/dev/null; then ok "17b: the pinned version is the signed one"; else bad "17b: pinned version not signed"; fi
 if has "PATH:     \`cauldron\` is not on your PATH yet (it is in ${H17}/.cauldron/bin)" && has "echo 'export PATH=\"${H17}/.cauldron/bin:\$PATH\"' >> ~/.zshrc"; then ok "17b: done says exactly how to put cauldron on PATH"; else bad "17b: no PATH instruction" "${OUT}"; fi
+bridge_ok "${H17}/.cauldron" "whose instructions say how to install." "17b (real run)" "install: == done"
 sealed_ok "case 17b"
 cp "$(ENVT "${H17}")" "${T}/env17.before" 2>/dev/null || : >"${T}/env17.before"
 mkdir -p "${H17}/.cauldron/data/prod" "${H17}/.cauldron/bin"; : >"$(MARK "${H17}")"
 printf '#!/bin/bash\nexit 0\n' >"${H17}/.cauldron/bin/cauldron"; /bin/chmod +x "${H17}/.cauldron/bin/cauldron"
 : >"${CLOG}"; : >"${EXEC_LOG}"
 SRUN_PATH_EXTRA="${H17}/.cauldron/bin" RUN_HOME="${H17}" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "--env prod install" ]]; then ok "17c third run (pinned, stale marker): no rebuild, no re-pin"; else bad "17c rebuilt or re-pinned (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]]; then ok "17c third run (pinned, stale marker): no rebuild, no re-pin"; else bad "17c rebuilt or re-pinned (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 if cmp -s "${T}/env17.before" "$(ENVT "${H17}")" && [[ ! -e "$(MARK "${H17}")" ]]; then ok "17c: env.toml byte-identical, stale marker cleared"; else bad "17c: env.toml changed or marker kept"; fi
 if ! has "is not on your PATH yet"; then ok "opposed: no PATH instruction when ${H17}/.cauldron/bin is on PATH"; else bad "PATH instruction printed although cauldron is on PATH" "${OUT}"; fi
 sealed_ok "case 17c"
@@ -682,10 +843,11 @@ if ! has "env remove"; then ok "19b opposed: no \`env remove\` offered for prod 
 if [[ ! -s "${CLOG}" ]] && cmp -s "${T}/env19.before" "$(ENVT "${H19}")" && [[ -e "$(MARK "${H19}")" ]]; then ok "19b: no cauldron call, env.toml byte-identical, marker left for the operator"; else bad "19b: called cauldron or changed env.toml" "$(cat "${CLOG}")"; fi
 sealed_ok "case 19b"
 # 19b': doing what the refusal says (remove the marker) -> an existing env
-# without threads: told the two commands, never pinned.
+# without threads: told the two commands, never pinned; mcp is added
+# (upgrade), and the bytes that were there are kept.
 /bin/rm -f "$(MARK "${H19}")"; : >"${CLOG}"; : >"${EXEC_LOG}"
 RUN_HOME="${H19}" srun "" --from "${T}/bin14"
-if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing" && [[ "$(cat "${CLOG}")" == "--env prod install" ]] && cmp -s "${T}/env19.before" "$(ENVT "${H19}")"; then ok "19b': after rm of the marker: rc 0, told how, env.toml byte-identical"; else bad "19b' (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if [[ ${RC} -eq 0 ]] && has "threads is NOT pinned in the existing" && [[ "$(cat "${CLOG}")" == "${want13}" ]] && prefix_of "${T}/env19.before" "$(ENVT "${H19}")" && ! grep -q 'services.threads' "$(ENVT "${H19}")"; then ok "19b': after rm of the marker: rc 0, threads told how, mcp added, the earlier bytes kept"; else bad "19b' (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
 sealed_ok "case 19b'"
 # 19c: env create FAILS -> its rc, and no marker left behind (opposes an
 # install that writes the marker and never takes it back).
@@ -915,15 +1077,394 @@ RUN_HOME="${H26c}" srun "" --from "${T}/bin14"
 if [[ ${RC} -eq 0 && -f "${H26c}/.cauldron/data/.install-threads-pending.prod.tmp.$$" && -f "${H26c}/.cauldron/data/.install-threads-pending.prod.tmp.x1" ]] && ! has "a temp marker an install"; then ok "26c: a live install's temp marker and a non-pid one are left alone; the run completes"; else bad "26c: removed a temp marker that was not stale (rc ${RC})" "$(find "${H26c}/.cauldron/data" -maxdepth 1)${OUT}"; fi
 sealed_ok "case 26c"
 
+printf '\n== 29. a re-run COMPLETES an install that stopped between the threads pin and the mcp pin (SEALED)\n'
+# The stub's `build mcp` refuses (as on a dirty tree): env.toml then holds
+# the threads pin (an edit AFTER the marker's first fingerprint), so the
+# marker must have been bound to it again for the re-run to resume.
+H29="${T}/home29"; mkdir -p "${H29}"; : >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_MCP_REFUSE=1 RUN_HOME="${H29}" srun "" --from "${T}/bin14"
+if [[ ${RC} -ne 0 ]] && grep -qx '\[services.threads\]' "$(ENVT "${H29}")" && ! grep -q 'services.mcp' "$(ENVT "${H29}")" && [[ -e "$(MARK "${H29}")" ]]; then ok "29a partial: rc ${RC}, threads pinned, no mcp pin, marker left"; else bad "29a: not the partial state (rc ${RC})" "$(cat "$(ENVT "${H29}")" 2>&1)${OUT}"; fi
+want29a="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod env create prod --auto-restart' '--env prod build threads --json --env-copy' "--env prod pin threads ${TL}+prod --addr auto" '--env prod build mcp --json --env-copy')"
+if [[ "$(cat "${CLOG}")" == "${want29a}" ]]; then ok "29a: threads built and pinned, mcp build refused, no install"; else bad "29a calls" "$(cat "${CLOG}")"; fi
+if [[ -z "$(find "${H29}/.cauldron/data/shared/builds" -path '*/mcp/*' -print -quit 2>/dev/null)" ]]; then ok "29a: no mcp version left behind"; else bad "29a: an mcp version left" "$(find "${H29}/.cauldron/data/shared/builds")"; fi
+sealed_ok "case 29a"
+cp "$(ENVT "${H29}")" "${T}/env29.before"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H29}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 ]] && has "pinned threads and stopped before pinning mcp"; then ok "29b re-run: rc 0, says it finishes step 4c"; else bad "29b re-run (rc ${RC})" "${OUT}"; fi
+if [[ "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install')" ]]; then ok "29b: no env create, no threads build or pin; mcp built and pinned; install"; else bad "29b calls" "$(cat "${CLOG}")"; fi
+if grep -qx '\[services.mcp\]' "$(ENVT "${H29}")" && [[ "$(grep -c '^\[services.threads\]$' "$(ENVT "${H29}")")" == 1 ]] && [[ ! -e "$(MARK "${H29}")" ]]; then ok "29b: env.toml pins mcp, threads pinned once, marker cleared"; else bad "29b: wrong end state" "$(cat "$(ENVT "${H29}")")"; fi
+sealed_ok "case 29b"
+cp "$(ENVT "${H29}")" "${T}/env29.after"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H29}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]] && has "mcp is already pinned in" && cmp -s "${T}/env29.after" "$(ENVT "${H29}")"; then ok "29c: a third run builds and pins nothing, env.toml byte-identical"; else bad "29c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 29c"
+# 29d: an env.toml edited after the threads pin is not the one the marker
+# records. The marker's own job (the threads pin) is done, so it protects
+# nothing: the re-run clears it and adds mcp as an upgrade, keeping the edit.
+# (A marker that does not match an env.toml WITHOUT threads still refuses:
+# 19b, 21, 22b, 22c, 22e.)
+H29d="${T}/home29d"; mkdir -p "${H29d}"; : >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_MCP_REFUSE=1 RUN_HOME="${H29d}" srun "" --from "${T}/bin14"
+printf '# edited by hand\n' >>"$(ENVT "${H29d}")"; cp "$(ENVT "${H29d}")" "${T}/env29d.before"
+: >"${CLOG}"
+RUN_HOME="${H29d}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 ]] && has "an earlier install pinned threads and stopped before clearing its marker" && [[ "$(cat "${CLOG}")" == "${want13}" ]]; then ok "29d: threads left as it is, mcp built and pinned as an upgrade"; else bad "29d (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if prefix_of "${T}/env29d.before" "$(ENVT "${H29d}")" && [[ "$(grep -c '^\[services.threads\]$' "$(ENVT "${H29d}")")" == 1 && "$(grep -c '^\[services.mcp\]$' "$(ENVT "${H29d}")")" == 1 && ! -e "$(MARK "${H29d}")" ]]; then ok "29d: the hand edit kept, one threads pin, one mcp pin, marker cleared"; else bad "29d: wrong end state" "$(cat "$(ENVT "${H29d}")")"; fi
+sealed_ok "case 29d"
+
+printf '\n== 30. the UPGRADE: an existing env with threads pinned and no mcp gets mcp, once (SEALED)\n'
+# An environment made before mcp shipped: threads pinned, no mcp pin, a
+# holder loaded, upgraded with --replace-running as the docs say.
+H30="${T}/home30"; mkdir -p "${H30}/.cauldron/data/prod"
+printf '[supervisor]\nauto_restart = true\n\n[services.threads]\nversion = "threadsold-release"\naddr = "127.0.0.1:3653"\n' >"$(ENVT "${H30}")"
+cp "$(ENVT "${H30}")" "${T}/env30.before"
+# 30a: the plan.
+RUN_HOME="${H30}" run "ai.broomstick.cauldron:4242" 0 --dry-run --replace-running
+bm="$(line_no '^install: \$ .*/cauldron --env prod build mcp --json --env-copy$')"; pm="$(line_no '^install: \$ .*/cauldron --env prod pin mcp \\<label\\>\+prod$')"; s5="$(line_no "${RE_STEP5}")"
+if [[ ${RC} -eq 0 ]] && has "mcp is NOT pinned in the existing" && has "adding it (upgrade)" && [[ ${bm} -gt 0 && ${pm} -gt ${bm} && ${s5} -gt ${pm} ]]; then ok "30a plan: says mcp is added (upgrade); build mcp < pin mcp < step 5"; else bad "30a plan (rc ${RC}, build ${bm} pin ${pm} step5 ${s5})" "${OUT}"; fi
+if [[ $(line_no "${RE_BUILD}") -eq 0 ]] && ! grep -qE -- "${RE_ANYPIN}" <<<"${OUT}" && has "threads is already pinned in"; then ok "30a plan: threads neither built nor re-pinned"; else bad "30a: threads would be touched" "${OUT}"; fi
+if cmp -s "${T}/env30.before" "$(ENVT "${H30}")"; then ok "30a: the dry run wrote nothing"; else bad "30a: the dry run changed env.toml"; fi
+# 30b: for real.
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H30}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
+want30="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install --replace-running' '--env prod mcp grants')"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want30}" ]]; then ok "30b: mcp built --env-copy and pinned by cauldron pin, then install --replace-running"; else bad "30b calls (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if prefix_of "${T}/env30.before" "$(ENVT "${H30}")" && [[ "$(grep -c '^\[services.mcp\]$' "$(ENVT "${H30}")")" == 1 ]] && grep -qx 'version = "threadsold-release"' "$(ENVT "${H30}")"; then ok "30b: the threads pin is kept byte for byte; one mcp pin added"; else bad "30b: env.toml wrong" "$(cat "$(ENVT "${H30}")")"; fi
+if has "services: mcp pinned at ${TL}+prod" && has "mcp grant <cauldron> --env prod"; then ok "30b: done names the mcp pin and the grant command"; else bad "30b: no mcp done line" "${OUT}"; fi
+if [[ -d "${H30}/.cauldron/data/shared/builds/mcp/${TL}+prod" && ! -e "${H30}/.cauldron/data/shared/builds/mcp/${TL}" ]]; then ok "30b: its own version; the shared label never written"; else bad "30b: builds wrong" "$(find "${H30}/.cauldron/data/shared" 2>&1)"; fi
+sealed_ok "case 30b"
+# 30c: re-run: idempotent.
+cp "$(ENVT "${H30}")" "${T}/env30.after"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H30}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install --replace-running' '--env prod mcp grants')" ]] && has "mcp is already pinned in" && has "this checkout's build" && cmp -s "${T}/env30.after" "$(ENVT "${H30}")"; then ok "30c: a re-run builds and pins nothing, env.toml byte-identical"; else bad "30c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 30c"
+# 30d: the upgrade builds, so a dirty checkout is refused at 2c, before
+# anything (the opposed arm, both pinned, is 16's last check).
+H30d="${T}/home30d"; mkdir -p "${H30d}/.cauldron/data/prod"; cp "${T}/env30.before" "$(ENVT "${H30d}")"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_GIT_DIRTY='?? notes.txt' RUN_HOME="${H30d}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 2 ]] && has "uncommitted or untracked files" && [[ ! -s "${CLOG}" ]] && cmp -s "${T}/env30.before" "$(ENVT "${H30d}")"; then ok "30d: dirty tree on an upgrade: rc 2 at 2c, cauldron never ran, env.toml byte-identical"; else bad "30d (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 30d"
+# 30e: the mcp build fails on an upgrade: env.toml untouched and nothing
+# left behind; the next run (the stop resumed) adds it.
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_MCP_REFUSE=1 RUN_HOME="${H30d}" srun "" --from "${T}/bin14"
+if [[ ${RC} -ne 0 ]] && ! grep -q 'pin mcp' "${CLOG}" && cmp -s "${T}/env30.before" "$(ENVT "${H30d}")" && [[ -z "$(find "${H30d}/.cauldron/data/shared/builds" -path '*/mcp/*' -print -quit 2>/dev/null)" ]]; then ok "30e: a failed mcp build: rc ${RC}, no pin, env.toml byte-identical, no version left"; else bad "30e (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 30e"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H30d}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want13}" ]] && [[ "$(grep -c '^\[services.mcp\]$' "$(ENVT "${H30d}")")" == 1 ]]; then ok "30e: the next run adds mcp once"; else bad "30e re-run (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 30e re-run"
+
+printf '\n== 31. the UPGRADE of an existing mcp pin: an older build is re-pinned under --replace-running, once (SEALED)\n'
+# An environment from 0.1.6/0.1.7: threads and mcp both pinned, mcp at an
+# older build than this checkout's, a holder loaded, upgraded with
+# --replace-running as the docs say.
+H31="${T}/home31"; mkdir -p "${H31}/.cauldron/data/prod"
+printf '[supervisor]\nauto_restart = true\n\n[services.threads]\nversion = "threadsold-release"\naddr = "127.0.0.1:3653"\n\n[services.mcp]\nversion = "mcpold-release+prod"\n' >"$(ENVT "${H31}")"
+cp "$(ENVT "${H31}")" "${T}/env31.before"
+# What env.toml must be after: the same bytes, the mcp version alone changed.
+/usr/bin/sed "s/^version = \"mcpold-release+prod\"\$/version = \"${TL}+prod\"/" "${T}/env31.before" >"${T}/env31.want"
+# 31a: the plan.
+RUN_HOME="${H31}" run "ai.broomstick.cauldron:4242" 0 --dry-run --replace-running
+bm="$(line_no '^install: \$ .*/cauldron --env prod build mcp --json --env-copy$')"; pm="$(line_no '^install: \$ .*/cauldron --env prod pin mcp \\<label\\>\+prod$')"; s5="$(line_no '^install: \$ .*/cauldron --env prod install --replace-running$')"
+if [[ ${RC} -eq 0 ]] && has "mcp is pinned at mcpold-release+prod, which is NOT this checkout's build" && has "--replace-running: step 4c builds mcp from this checkout and re-pins it (upgrade)" && has "re-pinning it (upgrade," && [[ ${bm} -gt 0 && ${pm} -gt ${bm} && ${s5} -gt ${pm} ]]; then ok "31a plan: says the old mcp pin is re-pinned (upgrade); build mcp < pin mcp < step 5 --replace-running"; else bad "31a plan (rc ${RC}, build ${bm} pin ${pm} step5 ${s5})" "${OUT}"; fi
+if [[ $(line_no "${RE_BUILD}") -eq 0 ]] && ! grep -qE -- "${RE_ANYPIN}" <<<"${OUT}" && has "threads is already pinned in" && ! has "STILL THE OLD BUILD"; then ok "31a plan: threads neither built nor re-pinned; no old-build warning"; else bad "31a: threads touched, or a warning" "${OUT}"; fi
+if cmp -s "${T}/env31.before" "$(ENVT "${H31}")"; then ok "31a: the dry run wrote nothing"; else bad "31a: the dry run changed env.toml"; fi
+# 31b: for real.
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H31}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
+want31="$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod build mcp --json --env-copy' "--env prod pin mcp ${TL}+prod" '--env prod install --replace-running' '--env prod mcp grants')"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want31}" ]]; then ok "31b: mcp built --env-copy and re-pinned once by cauldron pin, then install --replace-running"; else bad "31b calls (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+if helpers_at "${H31}" "from the checkout"; then ok "31b: an install from before the helpers, upgraded with --replace-running, gets them"; else bad "31b: helpers not laid down on the upgrade" "$(ls -laR "${H31}/.cauldron/share" 2>&1)"; fi
+if cmp -s "${T}/env31.want" "$(ENVT "${H31}")"; then ok "31b: env.toml changed in the mcp version alone (threads pin and every other byte kept)"; else bad "31b: env.toml wrong" "$(diff "${T}/env31.want" "$(ENVT "${H31}")")"; fi
+if has "services: mcp re-pinned at ${TL}+prod (it was mcpold-release+prod); the supervisor runs that build, and every grant is kept." && ! has "STILL THE OLD BUILD"; then ok "31b: done names the re-pin, and no old-build warning"; else bad "31b: no re-pin done line" "${OUT}"; fi
+if [[ -d "${H31}/.cauldron/data/shared/builds/mcp/${TL}+prod" && ! -e "${H31}/.cauldron/data/shared/builds/mcp/${TL}" ]]; then ok "31b: its own new version; the shared label never written"; else bad "31b: builds wrong" "$(find "${H31}/.cauldron/data/shared" 2>&1)"; fi
+# The running service is moved by the supervisor (cauldron pin, then step
+# 5's restart of the holder), never stopped or killed by the script.
+if ! /usr/bin/grep -qE '^\++XTRACE (kill|pkill|killall|launchctl (bootout|kill|stop|remove))( |$)' "${T}/trace" && ! grep -q '^MUTATING' "${STUB_LOG}"; then ok "31b: the script itself stopped and killed nothing"; else bad "31b: the script signalled a process" "$(/usr/bin/grep -E 'XTRACE (kill|pkill|killall|launchctl)' "${T}/trace")"; fi
+sealed_ok "case 31b"
+# 31c: re-run: idempotent (the pin is this checkout's build now).
+cp "$(ENVT "${H31}")" "${T}/env31.after"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H31}" srun "ai.broomstick.cauldron:4242" --from "${T}/bin14" --replace-running
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install --replace-running' '--env prod mcp grants')" ]] && has "mcp is pinned at ${TL}+prod, this checkout's build" && cmp -s "${T}/env31.after" "$(ENVT "${H31}")" && ! has "STILL THE OLD BUILD"; then ok "31c: a re-run builds and pins nothing, env.toml byte-identical, no warning"; else bad "31c (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 31c"
+# 31d: without the flag (no job loaded), an upgraded pin says nothing old.
+: >"${CLOG}"
+RUN_HOME="${H31}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 ]] && ! has "STILL THE OLD BUILD" && ! has "still the old build" && cmp -s "${T}/env31.after" "$(ENVT "${H31}")"; then ok "31d: no flag, current pin: no warning, nothing changed"; else bad "31d (rc ${RC})" "${OUT}"; fi
+# 31e: without the flag, an OLD pin is left exactly as it is, and said.
+H31e="${T}/home31e"; mkdir -p "${H31e}/.cauldron/data/prod"; cp "${T}/env31.before" "$(ENVT "${H31e}")"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H31e}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 ]] && cmp -s "${T}/env31.before" "$(ENVT "${H31e}")" && ! grep -qE 'build mcp|pin mcp' "${CLOG}"; then ok "31e: no flag: the old pin is untouched (no build, no pin, env.toml byte-identical)"; else bad "31e (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+old_mcp_said "31e" "${T}/bin14/cauldron"
+sealed_ok "case 31e"
+# 31f: another writer re-pins mcp while this run builds: that pin stands,
+# and the version this run built is removed.
+H31f="${T}/home31f"; mkdir -p "${H31f}/.cauldron/data/prod"; cp "${T}/env31.before" "$(ENVT "${H31f}")"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_MCP_REPIN_DURING=1 RUN_HOME="${H31f}" srun "" --from "${T}/bin14" --replace-running
+if [[ ${RC} -eq 0 ]] && has "mcp was pinned in" && has "while this run built it; that pin is left as it is" && ! grep -q 'pin mcp' "${CLOG}" && grep -qx 'version = "otherwriter-release+prod"' "$(ENVT "${H31f}")" && [[ -z "$(find "${H31f}/.cauldron/data/shared/builds" -path '*/mcp/*' -print -quit 2>/dev/null)" ]]; then ok "31f: a re-pin made during the build stands; no pin by this run; its build removed"; else bad "31f (rc ${RC})" "$(cat "${CLOG}")$(cat "$(ENVT "${H31f}")")${OUT}"; fi
+sealed_ok "case 31f"
+# 31g: the upgrade builds, so a dirty checkout is refused at 2c, before anything.
+H31g="${T}/home31g"; mkdir -p "${H31g}/.cauldron/data/prod"; cp "${T}/env31.before" "$(ENVT "${H31g}")"
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_GIT_DIRTY='?? notes.txt' RUN_HOME="${H31g}" srun "" --from "${T}/bin14" --replace-running
+if [[ ${RC} -eq 2 ]] && has "uncommitted or untracked files" && ! grep -q 'mcp' "${CLOG}" && cmp -s "${T}/env31.before" "$(ENVT "${H31g}")"; then ok "31g: dirty tree on an mcp upgrade: rc 2 at 2c, nothing built, env.toml byte-identical"; else bad "31g (rc ${RC})" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 31g"
+
+printf '\n== 32. an upgrade names a grant that names its cauldron only by name, in its closing lines (SEALED)\n'
+# The env of case 31 (upgraded, current pin). The stub's `mcp grants` says on
+# stderr, as the real one does, that `kb`'s grant names it only by name.
+: >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_NAME_ONLY=1 RUN_HOME="${H31}" srun "" --from "${T}/bin14"
+more="$(line_no '^install: more: ')"; gl="$(line_no '^install: grants:   an MCP grant names its cauldron only by name')"
+if [[ ${RC} -eq 0 ]] && [[ ${gl} -gt ${more} && ${more} -gt 0 ]] && has "the grant of cauldron \`kb\` in environment \`prod\` names it only by name" && has "terminal: cauldron mcp grant kb --env prod --scopes read,dump"; then ok "32: the closing lines name the grant and the command that grants it again"; else bad "32 (rc ${RC}, more ${more}, grants ${gl})" "${OUT}"; fi
+if [[ "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod versions install-workspace-probe' '--env prod install' '--env prod mcp grants')" ]] && cmp -s "${T}/env31.after" "$(ENVT "${H31}")"; then ok "32: only a read-only \`mcp grants\` was added, and env.toml is byte-identical"; else bad "32 calls" "$(cat "${CLOG}")"; fi
+sealed_ok "case 32"
+# Opposed: with no such grant, nothing is said (case 31d's run said nothing
+# either), and a FIRST install never asks (case 14's call list has no
+# `mcp grants`).
+: >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${H31}" srun "" --from "${T}/bin14"
+if [[ ${RC} -eq 0 ]] && ! has "only by name" && ! has "install: grants:"; then ok "32: no name-only grant, no grants line"; else bad "32: a grants line with nothing to name" "${OUT}"; fi
+
+# ── THE PREBUILT PATH (--prebuilt), cases 33-39 ─────────────────────────────
+# A FAKE release bundle, made here: bin/cauldron is a stub (FAKEMACHO:arm64,
+# so the od shim reads an arm64 header) that installs `--artifact` images the
+# way the real `cauldron build <service> --artifact` does (a NEW
+# `<commit12>-release+<env>` version, the commit read off the image) and
+# hands every other verb to the stub cauldron above. Every binary is signed
+# by the fake codesign, whose --verify fails once a byte changes. The
+# commits are spelt in pieces (a long hex run reads as a hash).
+PBC1="$(printf 'a1b2%.0s' 1 2 3 4 5 6 7 8 9 10)"
+PBC2="$(printf 'c3d4%.0s' 1 2 3 4 5 6 7 8 9 10)"
+PBV=0.1.99
+PBN="cauldron-${PBV}-aarch64-apple-darwin"
+mkdir -p "${T}/pb"
+cat >"${T}/pb/cauldron.head" <<STUBPB
+#!/bin/bash
+# FAKEMACHO:arm64
+case "\$*" in
+    *" build threads --json --env-copy --artifact "*|*" build mcp --json --env-copy --artifact "*)
+        printf '%s\n' "\$*" >>"\${CLOG:?}"
+        root="\${HOME}/.cauldron"; e="\$2"; svc="\$4"; img="\${@: -1}"
+        [[ "\${svc}" == threads ]] && bin=threads || bin=cauldron-mcp
+        c="\$(/usr/bin/sed -n 's/^STAMP://p' "\${img}")"; [[ -n "\${c}" ]] || { echo "stub: image states no commit" >&2; exit 1; }
+        b="\${root}/data/shared/builds/\${svc}"; base="\${c:0:12}-release"; /bin/mkdir -p "\${b}"
+        k=1; l="\${base}+\${e}"
+        until /bin/mkdir "\${b}/\${l}" 2>/dev/null; do k=\$((k+1)); l="\${base}+\${e}.\${k}"; [[ \${k} -lt 100 ]] || exit 70; done
+        /bin/cp "\${img}" "\${b}/\${l}/\${bin}"
+        printf '{\n  "service": "%s",\n  "label": "%s",\n  "bin": "%s"\n}\n' "\${svc}" "\${l}" "\${bin}" >"\${b}/\${l}/build.json"
+        printf 'name = "%s"\n' "\${svc}" >"\${b}/\${l}/declaration.toml"
+        printf '[\n  {\n    "service": "%s",\n    "label": "%s",\n    "bin": "%s"\n  }\n]\n' "\${svc}" "\${l}" "\${bin}"
+        exit 0 ;;
+esac
+exec "${T}/bin14/cauldron" "\$@"
+STUBPB
+# make_bundle <out-dir> <commit> [<mutation>]: the tarball <out-dir>/${PBN}.tar.gz
+# and <out-dir>/SHA256SUMS. Mutations: tamper-resummed (a byte of
+# libexec/threads changed after signing, every sum made again), tamper (the
+# same, sums left), escape (an entry <top>/../evil), link (a symlink entry).
+make_bundle() {
+    local out="$1" c="$2" mut="${3:-}" st b f
+    st="$(mktemp -d "${T}/pbstage.XXXXXX")"; b="${st}/${PBN}"
+    mkdir -p "${out}" "${b}/bin" "${b}/libexec" "${b}/share/cauldron/services" "${b}/share/cauldron/mcp"
+    cp "${T}/pb/cauldron.head" "${b}/bin/cauldron"
+    printf '#!/bin/bash\n# FAKEMACHO:arm64\nexit 0\n' >"${b}/bin/tui"
+    printf '#!/bin/bash\n# FAKEMACHO:arm64\nexit 0\nSTAMP:%s\n' "${c}" >"${b}/libexec/threads"
+    printf '#!/bin/bash\n# FAKEMACHO:arm64\nexit 0\nSTAMP:%s\n' "${c}" >"${b}/libexec/cauldron-mcp"
+    chmod +x "${b}/bin/cauldron" "${b}/bin/tui" "${b}/libexec/threads" "${b}/libexec/cauldron-mcp"
+    for f in bin/cauldron:cauldron bin/tui:tui libexec/threads:com.harness.threads libexec/cauldron-mcp:cauldron-mcp; do
+        EXEC_LOG=/dev/null "${SEAL}/codesign" --force --sign - --identifier "${f#*:}" "${b}/${f%%:*}"
+    done
+    # The local-inference services and their declarations (mutation
+    # no-inference leaves the inference image out).
+    for f in cauldron-inference cauldron-ripples; do
+        [[ "${mut}" == no-inference && "${f}" == cauldron-inference ]] && continue
+        printf '#!/bin/bash\n# FAKEMACHO:arm64\nexit 0\nSTAMP:%s\n' "${c}" >"${b}/libexec/${f}"; chmod +x "${b}/libexec/${f}"
+        EXEC_LOG=/dev/null "${SEAL}/codesign" --force --sign - --identifier "${f}" "${b}/libexec/${f}"
+    done
+    printf 'name = "inference"\n' >"${b}/share/cauldron/services/inference.toml"
+    printf 'name = "ripples"\n' >"${b}/share/cauldron/services/ripples.toml"
+    printf 'name = "threads"\n' >"${b}/share/cauldron/services/threads.toml"
+    printf 'name = "mcp"\n# bundle %s\n' "${c:0:4}" >"${b}/share/cauldron/services/mcp.toml"
+    printf '# no tools\n' >"${b}/share/cauldron/mcp/agents.toml"
+    if [[ "${mut}" != no-helpers ]]; then
+        mkdir -p "${b}/share/cauldron/scripts/threads"
+        for f in add-account claude-accounts claude-login-browser; do
+            printf '#!/usr/bin/env bash\n# helper %s of bundle %s\nexit 0\n' "${f}" "${c:0:4}" >"${b}/share/cauldron/scripts/threads/${f}"
+            chmod 0755 "${b}/share/cauldron/scripts/threads/${f}"
+        done
+    fi
+    printf '#!/bin/bash\nexit 0\n' >"${b}/install"; printf 'license\n' >"${b}/LICENSE"
+    printf 'name=cauldron\nversion=%s\ncommit=%s\ntarget=aarch64-apple-darwin\nsigned=adhoc\n' "${PBV}" "${c}" >"${b}/BUNDLE"
+    case "${mut}" in tamper|tamper-resummed) /usr/bin/sed -i '' 's/exit 0/exit 7/' "${b}/libexec/threads" ;; esac
+    pb_sums() { (cd "${b}" && find . -type f ! -name SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "${f}"; done) >"${st}/sums" && mv "${st}/sums" "${b}/SHA256SUMS"; }
+    if [[ "${mut}" == tamper ]]; then
+        # Sums of the bundle BEFORE the change (recomputed on a pristine copy).
+        /usr/bin/sed -i '' 's/exit 7/exit 0/' "${b}/libexec/threads"; pb_sums; /usr/bin/sed -i '' 's/exit 0/exit 7/' "${b}/libexec/threads"
+    else
+        pb_sums
+    fi
+    case "${mut}" in
+        escape) printf 'evil\n' >"${st}/evil"
+                (cd "${st}" && COPYFILE_DISABLE=1 /usr/bin/tar -czf "${out}/${PBN}.tar.gz" -s "|^evil\$|${PBN}/../evil|" "${PBN}" evil) ;;
+        link)   ln -s /etc/hosts "${b}/share/cauldron/hosts"
+                (cd "${st}" && COPYFILE_DISABLE=1 /usr/bin/tar -czf "${out}/${PBN}.tar.gz" "${PBN}") ;;
+        *)      (cd "${st}" && COPYFILE_DISABLE=1 /usr/bin/tar -czf "${out}/${PBN}.tar.gz" "${PBN}") ;;
+    esac
+    (cd "${out}" && shasum -a 256 "${PBN}.tar.gz") >"${out}/SHA256SUMS"
+    rm -rf "${st}"
+}
+PBSHA() { shasum -a 256 "$1/${PBN}.tar.gz" | awk '{print $1}'; }
+REL() { echo "$1/.cauldron/share/cauldron/releases/${PBV}-$2"; }
+make_bundle "${T}/pb/one" "${PBC1}"
+make_bundle "${T}/pb/two" "${PBC2}"
+L1="${PBC1:0:12}-release"; L2="${PBC2:0:12}-release"
+no_stage() { [[ -z "$(find "$1" -maxdepth 1 -name '.cauldron.prebuilt.*' -print -quit 2>/dev/null)" ]]; }
+
+printf '\n== 33. --prebuilt --dry-run: verifies the tarball, plans --artifact installs, writes nothing\n'
+mkdir -p "${T}/home33" "${T}/pbstub"
+# The unsealed dry run reads the fake binaries through the fake codesign and
+# the od shim, too.
+/bin/cp "${SEAL}/codesign" "${SEAL}/od" "${T}/pbstub/"
+PATH="${T}/pbstub:${PATH}" EXEC_LOG=/dev/null RUN_HOME="${T}/home33" run "" 0 --dry-run --prebuilt "${T}/pb/one/${PBN}.tar.gz"
+if [[ ${RC} -eq 0 ]] && has "checksum   OK: sha256 $(PBSHA "${T}/pb/one")" && has "signatures bin/cauldron, bin/tui, libexec/threads, libexec/cauldron-mcp: arm64, ad-hoc signed, verified"; then ok "33: rc 0; checksum from the SHA256SUMS beside it, signatures verified"; else bad "33: rc ${RC}" "${OUT}"; fi
+if grep -qE '^install: \$ .*/bin/cauldron --env prod build threads --json --env-copy --artifact .*/libexec/threads$' <<<"${OUT}" \
+   && grep -qE '^install: \$ .*/bin/cauldron --env prod build mcp --json --env-copy --artifact .*/libexec/cauldron-mcp$' <<<"${OUT}"; then ok "33: the plan installs threads and mcp from the bundle with --artifact"; else bad "33: no --artifact lines" "${OUT}"; fi
+if has "signatures libexec/cauldron-inference, libexec/cauldron-ripples: arm64, ad-hoc signed, verified (local inference: laid down, not pinned, not started)" \
+   && ! grep -qE ' (build|pin|start) (inference|ripples)' <<<"$(grep '^install: \$' <<<"${OUT}")" \
+   && has "local:    local inference (the inference and ripples services) is installed OFF: nothing pinned, nothing started." \
+   && has "To use it: ${T}/home33/.cauldron/bin/cauldron --env prod build inference   (and ripples; from the bundle's image (no cargo))"; then ok "33: inference and ripples verified, never built, pinned or started; the plan says how to turn them on"; else bad "33: local inference lines wrong" "${OUT}"; fi
+if ! grep -qE 'cargo build|build-threads\.sh' <<<"${OUT}" && has "would place the bundle at ${T}/home33/.cauldron/share/cauldron/releases/${PBV}-${PBC1:0:12}"; then ok "33: no cargo build and no re-sign in the plan; names where the bundle goes"; else bad "33: plan wrong" "${OUT}"; fi
+if [[ -z "$(find "${T}/home33" -mindepth 1 -print -quit)" ]]; then ok "33: dry run wrote nothing under HOME"; else bad "33: dry run wrote" "$(find "${T}/home33")"; fi
+
+printf '\n== 34. --prebuilt on a FRESH machine (SEALED): no cargo, no git, the same layout and later steps\n'
+mkdir -p "${T}/home34"; : >"${CLOG}"; : >"${EXEC_LOG}"; : >"${SIGN_LOG}"
+RUN_HOME="${T}/home34" srun "" --prebuilt "${T}/pb/one/${PBN}.tar.gz"
+R1="$(REL "${T}/home34" "${PBC1:0:12}")"
+want34="$(printf '%s\n' '--env prod env create prod --auto-restart' "--env prod build threads --json --env-copy --artifact ${R1}/libexec/threads" "--env prod pin threads ${L1}+prod --addr auto" "--env prod build mcp --json --env-copy --artifact ${R1}/libexec/cauldron-mcp" "--env prod pin mcp ${L1}+prod" '--env prod install')"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want34}" ]]; then ok "34: rc 0; env create, threads and mcp from the bundle (--artifact), pinned, then install"; else bad "34: rc ${RC}, cauldron calls wrong" "$(cat "${CLOG}")${OUT}"; fi
+if [[ -f "${R1}/libexec/cauldron-inference" && -f "${R1}/libexec/cauldron-ripples" && -f "${T}/home34/.cauldron/share/cauldron/services/inference.toml" && -f "${T}/home34/.cauldron/share/cauldron/services/ripples.toml" ]] \
+   && ! grep -qE 'services\.(inference|ripples)' "$(ENVT "${T}/home34")" && [[ ! -e "${T}/home34/.cauldron/data/shared/builds/inference" && ! -e "${T}/home34/.cauldron/data/shared/builds/ripples" ]] \
+   && has "local:    local inference (the inference and ripples services) is installed OFF"; then ok "34: inference and ripples laid down with the bundle and their declarations; not built, not pinned"; else bad "34: local inference layout or pins wrong" "$(find "${T}/home34/.cauldron" 2>&1)$(cat "$(ENVT "${T}/home34")")"; fi
+if [[ -f "${R1}/bin/cauldron" && -f "${R1}/libexec/threads" && -f "${T}/home34/.cauldron/share/cauldron/services/threads.toml" && -f "${T}/home34/.cauldron/share/cauldron/mcp/agents.toml" ]]; then ok "34: the bundle at share/cauldron/releases/<version>-<commit>, its declarations at share/cauldron/{services,mcp}"; else bad "34: layout wrong" "$(find "${T}/home34/.cauldron/share" 2>&1)"; fi
+T34="${T}/home34/.cauldron/data/shared/builds/threads/${L1}+prod/threads"
+if EXEC_LOG=/dev/null "${SEAL}/codesign" --verify --strict "${T34}" 2>/dev/null && grep -qx '\[services.threads\]' "$(ENVT "${T}/home34")" && grep -qx '\[services.mcp\]' "$(ENVT "${T}/home34")"; then ok "34: the threads version is the bundle's signed image; threads and mcp pinned"; else bad "34: version or pins wrong" "$(cat "$(ENVT "${T}/home34")" 2>&1)"; fi
+if ! grep -qE '^(git|CARGO) ' "${EXEC_LOG}" && ! grep -q 'signer' "${SIGN_LOG}"; then ok "34: neither git nor cargo nor the threads signer ran"; else bad "34: git, cargo or the signer ran" "$(grep -E '^(git|CARGO) ' "${EXEC_LOG}")"; fi
+if no_stage "${T}/home34" && [[ ! -e "$(MARK "${T}/home34")" ]] && has "services: threads pinned at ${L1}+prod" && has "services: mcp pinned at ${L1}+prod"; then ok "34: no scratch dir or marker left; the done lines name both pins"; else bad "34: leftovers or done lines" "$(ls -a "${T}/home34")${OUT}"; fi
+if helpers_at "${T}/home34" "of bundle ${PBC1:0:4}"; then ok "34: the bundle's account helpers installed at share/cauldron/scripts/threads/, 755, directories 755"; else bad "34: helpers not installed" "$(ls -laR "${T}/home34/.cauldron/share/cauldron/scripts" 2>&1)"; fi
+M34="${T}/home34/Library/Application Support/cauldron/cauldron-bin"
+if [[ "$(cat "${M34}" 2>/dev/null)" == "${T}/home34/.cauldron/bin/cauldron" ]]; then ok "34: the install marker the plugin's launcher reads names <root>/bin/cauldron"; else bad "34: no install marker" "$(cat "${M34}" 2>&1)"; fi
+sealed_ok "case 34"
+
+printf '\n== 35. --prebuilt UPGRADE over a running job: refused without --replace-running; with it mcp moves, once (SEALED)\n'
+cp "$(ENVT "${T}/home34")" "${T}/env35.before"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${T}/home34" srun "ai.broomstick.cauldron:4242" --prebuilt "${T}/pb/two/${PBN}.tar.gz"
+if [[ ${RC} -eq 2 ]] && has "REFUSED: a cauldron job for environment 'prod' is already loaded" && [[ ! -s "${CLOG}" ]] && cmp -s "${T}/env35.before" "$(ENVT "${T}/home34")" && no_stage "${T}/home34"; then ok "35a: refused at 2b; no cauldron call, env.toml byte-identical, nothing staged"; else bad "35a: rc ${RC}" "$(cat "${CLOG}")${OUT}"; fi
+RUN_HOME="${T}/home34" srun "ai.broomstick.cauldron:4242" --prebuilt "${T}/pb/two/${PBN}.tar.gz" --replace-running
+R2="$(REL "${T}/home34" "${PBC2:0:12}")"
+want35="$(printf '%s\n' "--env prod build mcp --json --env-copy --artifact ${R2}/libexec/cauldron-mcp" "--env prod pin mcp ${L2}+prod" '--env prod install --replace-running' '--env prod mcp grants')"
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "${want35}" ]] && has "mcp is pinned at ${L1}+prod, which is NOT this bundle's build"; then ok "35b: mcp installed from the new bundle and re-pinned; threads left; install --replace-running"; else bad "35b: rc ${RC}" "$(cat "${CLOG}")${OUT}"; fi
+if grep -qx "version = \"${L2}+prod\"" "$(ENVT "${T}/home34")" && grep -q "version = \"${L1}+prod\"" "$(ENVT "${T}/home34")" && [[ -d "${R1}" && -d "${R2}" ]] && grep -q "bundle ${PBC2:0:4}" "${T}/home34/.cauldron/share/cauldron/services/mcp.toml" && grep -q "bundle ${PBC1:0:4}" "${T}/home34/.cauldron/share/cauldron/services.prev/mcp.toml"; then ok "35b: mcp at the new build, threads at the old; both releases kept; declarations replaced, the old ones kept as .prev"; else bad "35b: state wrong" "$(cat "$(ENVT "${T}/home34")")"; fi
+if helpers_at "${T}/home34" "of bundle ${PBC2:0:4}" && /usr/bin/grep -q "of bundle ${PBC1:0:4}" "${T}/home34/.cauldron/share/cauldron/scripts/threads.prev/add-account"; then ok "35b: the upgrade replaced the helpers with the new bundle's, the old ones kept as threads.prev"; else bad "35b: helpers not upgraded" "$(ls -laR "${T}/home34/.cauldron/share/cauldron/scripts" 2>&1)"; fi
+sealed_ok "case 35b"
+cp "$(ENVT "${T}/home34")" "${T}/env35.after"; : >"${CLOG}"
+RUN_HOME="${T}/home34" srun "ai.broomstick.cauldron:4242" --prebuilt "${T}/pb/two/${PBN}.tar.gz" --replace-running
+if [[ ${RC} -eq 0 && "$(cat "${CLOG}")" == "$(printf '%s\n' '--env prod install --replace-running' '--env prod mcp grants')" ]] && cmp -s "${T}/env35.after" "$(ENVT "${T}/home34")" && has "the bundle is already in place at ${R2} (same contents); kept"; then ok "35c: a re-run changes nothing (no build, no pin; the bundle kept)"; else bad "35c: rc ${RC}" "$(cat "${CLOG}")${OUT}"; fi
+sealed_ok "case 35c"
+
+pb_refused() {  # <tag> <home> <expected text>
+    if [[ ${RC} -eq 2 ]] && has "$3" && has "Nothing was installed, written or loaded." && [[ ! -s "${CLOG}" ]] && [[ ! -e "$2/.cauldron" ]] && no_stage "$2"; then
+        ok "$1: refused (rc 2) before any cauldron call; nothing under HOME, no scratch dir left"
+    else bad "$1: rc ${RC}" "$(cat "${CLOG}")${OUT}$(find "$2" 2>&1)"; fi
+}
+printf '\n== 36. a bad checksum is refused before anything is unpacked (SEALED)\n'
+mkdir -p "${T}/home36"; : >"${CLOG}"; : >"${EXEC_LOG}"
+WRONG="$(PBSHA "${T}/pb/two")"
+RUN_HOME="${T}/home36" srun "" --prebuilt "${T}/pb/one/${PBN}.tar.gz" --sha256 "${WRONG}"
+pb_refused "36a (--sha256 of another file)" "${T}/home36" "it is not the file the checksum is for"
+sealed_ok "case 36a"
+make_bundle "${T}/pb/badsum" "${PBC1}"; (cd "${T}/pb/two" && shasum -a 256 "${PBN}.tar.gz") >"${T}/pb/badsum/SHA256SUMS"
+RUN_HOME="${T}/home36" srun "" --prebuilt "${T}/pb/badsum/${PBN}.tar.gz"
+pb_refused "36b (SHA256SUMS beside it names other bytes)" "${T}/home36" "it is not the file the checksum is for"
+mkdir -p "${T}/pb/nosum"; cp "${T}/pb/one/${PBN}.tar.gz" "${T}/pb/nosum/"
+RUN_HOME="${T}/home36" srun "" --prebuilt "${T}/pb/nosum/${PBN}.tar.gz"
+pb_refused "36c (no checksum at all)" "${T}/home36" "no checksum for"
+
+printf '\n== 37. a tampered binary is refused (SEALED)\n'
+make_bundle "${T}/pb/tamper2" "${PBC1}" tamper-resummed
+mkdir -p "${T}/home37"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${T}/home37" srun "" --prebuilt "${T}/pb/tamper2/${PBN}.tar.gz"
+pb_refused "37a (changed after signing, every sum made again)" "${T}/home37" "libexec/threads in the bundle does not carry a valid ad-hoc signature as com.harness.threads"
+sealed_ok "case 37a"
+make_bundle "${T}/pb/noinf" "${PBC1}" no-inference
+RUN_HOME="${T}/home37" srun "" --prebuilt "${T}/pb/noinf/${PBN}.tar.gz"
+pb_refused "37c (a bundle without the local-inference service)" "${T}/home37" "the bundle lacks: libexec/cauldron-inference."
+make_bundle "${T}/pb/tamper1" "${PBC1}" tamper
+RUN_HOME="${T}/home37" srun "" --prebuilt "${T}/pb/tamper1/${PBN}.tar.gz"
+pb_refused "37b (changed after the bundle was built)" "${T}/home37" "does not match the bundle's own SHA256SUMS"
+
+printf '\n== 38. a tarball with an entry escaping its directory (../), or a link, is refused before unpacking (SEALED)\n'
+make_bundle "${T}/pb/escape" "${PBC1}" escape
+if /usr/bin/tar -tzf "${T}/pb/escape/${PBN}.tar.gz" | grep -qx "${PBN}/../evil"; then ok "38: fixture has the entry ${PBN}/../evil"; else bad "38: fixture lacks the escaping entry" "$(/usr/bin/tar -tzf "${T}/pb/escape/${PBN}.tar.gz")"; fi
+mkdir -p "${T}/home38"; : >"${CLOG}"; : >"${EXEC_LOG}"
+RUN_HOME="${T}/home38" srun "" --prebuilt "${T}/pb/escape/${PBN}.tar.gz"
+pb_refused "38a (../)" "${T}/home38" "has entries outside ${PBN}/"
+if [[ -z "$(find "${T}" -name evil -print -quit)" ]]; then ok "38a: no file named evil was written anywhere in the scratch dir"; else bad "38a: evil written" "$(find "${T}" -name evil)"; fi
+sealed_ok "case 38a"
+make_bundle "${T}/pb/link" "${PBC1}" link
+RUN_HOME="${T}/home38" srun "" --prebuilt "${T}/pb/link/${PBN}.tar.gz"
+pb_refused "38b (a symlink entry)" "${T}/home38" "entries that are not plain files or directories"
+if has "${PBN}/share/cauldron/hosts" && ! has "/etc/hosts"; then ok "38b: the refusal names the link entry itself, not its target"; else bad "38b: the refusal does not name the entry" "${OUT}"; fi
+
+printf '\n== 39. a machine that is not arm64 is refused with a clear message (SEALED), and a URL must be https with --sha256\n'
+mkdir -p "${T}/home39"; : >"${CLOG}"; : >"${EXEC_LOG}"
+STUB_ARCH=x86_64 RUN_HOME="${T}/home39" srun "" --prebuilt "${T}/pb/one/${PBN}.tar.gz"
+pb_refused "39a (x86_64)" "${T}/home39" "the prebuilt bundle holds arm64 (Apple silicon) binaries only, and this machine (or this shell) is x86_64. On an Intel Mac, install from source"
+sealed_ok "case 39a"
+RUN_HOME="${T}/home39" srun "" --prebuilt "http://example.invalid/${PBN}.tar.gz" --sha256 "$(PBSHA "${T}/pb/one")"
+pb_refused "39b (plain http)" "${T}/home39" "is plain http"
+RUN_HOME="${T}/home39" srun "" --prebuilt "https://example.invalid/${PBN}.tar.gz"
+pb_refused "39c (https without --sha256)" "${T}/home39" "a --prebuilt URL needs --sha256"
+STUB_CURL_FILE="${T}/pb/one/${PBN}.tar.gz" RUN_HOME="${T}/home39" srun "" --prebuilt "https://example.invalid/${PBN}.tar.gz" --sha256 "$(PBSHA "${T}/pb/one")"
+if [[ ${RC} -eq 0 ]] && grep -q "^curl --proto =https --proto-redir =https --tlsv1.2 --max-filesize 268435456 -fsSL -o ${T}/home39/.cauldron.prebuilt.[0-9]*/download.tar.gz https://example.invalid/${PBN}.tar.gz$" "${EXEC_LOG}" && grep -qx "\[services.mcp\]" "$(ENVT "${T}/home39")" && no_stage "${T}/home39"; then ok "39d: https + --sha256: downloaded (https only) into the scratch dir, verified, installed; scratch removed"; else bad "39d: rc ${RC}" "$(cat "${EXEC_LOG}")${OUT}"; fi
+sealed_ok "case 39d"
+make_bundle "${T}/pb/quar" "${PBC1}"; /usr/bin/xattr -w com.apple.quarantine "0081;00000000;Example;" "${T}/pb/quar/${PBN}.tar.gz"
+: >"${CLOG}"; mkdir -p "${T}/home39q"
+RUN_HOME="${T}/home39q" srun "" --prebuilt "${T}/pb/quar/${PBN}.tar.gz"
+pb_refused "39f (a quarantined download)" "${T}/home39q" "carries macOS's quarantine attribute"
+if has "xattr -d com.apple.quarantine ${T}/pb/quar/${PBN}.tar.gz"; then ok "39f: names the command that removes the attribute"; else bad "39f: no xattr command" "${OUT}"; fi
+sealed_ok "case 39f"
+RUN_HOME="${T}/home39" run "" 0 --dry-run --prebuilt "${T}/pb/one/${PBN}.tar.gz" --from "${T}/bin14"
+if [[ ${RC} -eq 2 ]] && has "--prebuilt and --from are two different sources"; then ok "39e: --prebuilt with --from is refused"; else bad "39e: rc ${RC}" "${OUT}"; fi
+
+printf '\n== 40. a bundle without the account helpers is refused before anything is installed (SEALED)\n'
+make_bundle "${T}/pb/nohelpers" "${PBC1}" no-helpers
+mkdir -p "${T}/home40"; : >"${CLOG}"
+RUN_HOME="${T}/home40" srun "" --prebuilt "${T}/pb/nohelpers/${PBN}.tar.gz"
+pb_refused "40" "${T}/home40" "the bundle lacks: share/cauldron/scripts/threads/add-account share/cauldron/scripts/threads/claude-accounts share/cauldron/scripts/threads/claude-login-browser."
+
 printf '\n== 27. an unset variable aborts install with rc != 0 (bash 3.2 + EXIT trap, REL-4.S5e)\n'
 # A copy with an unset variable read right before 4b's staging mkdir, where
 # the EXIT trap has long been set (at 55f74d6b it was set two lines earlier).
 M27="${T}/repo/scripts/install27"
 /usr/bin/awk '$0 == "    run mkdir \"${STAGE}\"" { print "    : \"${conf_unbound_27}\"" } { print }' "${INSTALL}" >"${M27}"
 if [[ "$(/usr/bin/grep -cxF '    : "${conf_unbound_27}"' "${M27}")" == 1 ]]; then ok "27: the copy has the injected unset read"; else bad "27: injection failed"; fi
-mkdir -p "${T}/home27"; RUN_HOME="${T}/home27" RUN_AS="${M27}" run "" 0 --dry-run
+# The rc-0 abort is a property of bash 3.2 (macOS's /bin/bash), so that arm
+# runs under /bin/bash by name: the bash first on PATH may be a newer one
+# (Homebrew's 5.x), whose `set -u` abort already exits 1 and reaches the trap
+# as 1, which the trap passes through (no ABORTED line, nothing to convert).
+# The second arm asserts only what holds under any bash: rc != 0.
+mkdir -p "${T}/home27"; RUN_BASH=/bin/bash RUN_HOME="${T}/home27" RUN_AS="${M27}" run "" 0 --dry-run
 if [[ ${RC} -ne 0 ]] && grep -qF 'conf_unbound_27: unbound variable' <<<"${ERR}" && ! has "== 5. supervisor"; then ok "27: the abort exits rc ${RC}, not 0, and stops before step 5"; else bad "27: a set -u abort read as rc ${RC}" "${OUT}"; fi
-if [[ ${RC} -eq 70 ]] && has "install: ABORTED"; then ok "27: rc 70 and says ABORTED"; else bad "27: rc ${RC}, no ABORTED line" "${ERR}"; fi
+if [[ ${RC} -eq 70 ]] && has "install: ABORTED"; then ok "27: under /bin/bash (3.2): rc 70 and says ABORTED"; else bad "27: rc ${RC}, no ABORTED line" "${ERR}"; fi
+RUN_HOME="${T}/home27" RUN_AS="${M27}" run "" 0 --dry-run
+if [[ ${RC} -ne 0 ]] && grep -qF 'conf_unbound_27: unbound variable' <<<"${ERR}" && ! has "== 5. supervisor"; then ok "27: under the bash on PATH ($(bash -c 'echo ${BASH_VERSION}')): the abort exits rc ${RC}, not 0"; else bad "27: under the bash on PATH, a set -u abort read as rc ${RC}" "${OUT}"; fi
 
 printf '\n== 28. an unset variable aborts THIS suite with rc != 0 (REL-4.S5e)\n'
 M28="${T}/suite28.sh"
@@ -933,6 +1474,18 @@ M28="${T}/suite28.sh"
 if [[ "$(/usr/bin/grep -cxF ': "${conf_unbound_28}"' "${M28}")" == 1 ]]; then ok "28: the suite copy has the injected unset read"; else bad "28: injection failed"; fi
 set +e; out28="$(INSTALL="${INSTALL}" /bin/bash "${M28}" 2>&1)"; rc28=$?; set -e
 if [[ ${rc28} -ne 0 ]] && grep -qF 'conf_unbound_28: unbound variable' <<<"${out28}" && ! grep -q '^passed ' <<<"${out28}"; then ok "28: the aborted suite exits rc ${rc28}, not 0"; else bad "28: an aborted suite read as rc ${rc28}" "${out28}"; fi
+
+printf '\n== 29. nothing planted in the directory install is run from is run\n'
+# `.` first on PATH, run from a directory holding programs named like every
+# tool the installer runs by name: PATH keeps only its absolute entries, so
+# none of them runs and the stubs answer as in every other case.
+P29="${T}/project29"; mkdir -p "${P29}" "${T}/home29"; : >"${T}/planted29.log"
+for c in launchctl git shasum tar codesign cargo cauldron mkdir cp mv chmod find sed grep awk stat id uname basename dirname; do
+    printf '#!/bin/sh\necho "planted %s $*" >> "%s"\nexit 0\n' "${c}" "${T}/planted29.log" >"${P29}/${c}"; /bin/chmod 0755 "${P29}/${c}"
+done
+RUN_PATH_HEAD=".:" RUN_CWD="${P29}" RUN_HOME="${T}/home29" run "" 0 --dry-run
+if [[ ${RC} -eq 0 ]] && has "no cauldron job for 'prod' is loaded"; then ok "29: the dry run still answers from the stubs"; else bad "29: rc ${RC}" "${OUT}"; fi
+if [[ ! -s "${T}/planted29.log" ]]; then ok "29: no program planted in its directory ran"; else bad "29: a planted program ran" "$(cat "${T}/planted29.log")"; fi
 
 printf '\n--- refusal message (case 2) ---\n%s\n' "${SAVED_REFUSAL}"
 printf '\npassed %d, failed %d\n' "${PASS}" "${FAIL}"

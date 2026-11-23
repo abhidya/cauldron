@@ -1,0 +1,9 @@
+[package]
+name = "test-scratch"
+version.workspace = true
+edition.workspace = true
+description = "Linked ONLY into test binaries (a dev-dependency); at load it makes ONE per-run scratch root ($CAULDRON_TEST_SCRATCH or $TMPDIR, /cauldron-test-<pid>), points TMPDIR at it, and at exit removes it, failing the run if anything leaked into it."
+publish = false
+
+[lib]
+path = "src/lib.rs"

@@ -79,6 +79,10 @@ done
 
 DIR="$PWD"
 PROMPT="$(cat)"
+
+# Refuse what the real CLI refuses, as it refuses it (`claude-cli-check`).
+. "$(dirname "${BASH_SOURCE[0]}")/claude-cli-check"
+claude_cli_check "$@"
 # Like the real CLI (claude 2.1.280, measured by the R13.2 inspector): an
 # empty stdin is refused before any `init` — so an attempt whose write never
 # happened can never look as if it came up (R13.2-inspect R2).

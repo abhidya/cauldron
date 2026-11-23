@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# probe-creatable-paths [--deny <dir>]... -- <command> [args...]
+#
+# Runs ONE command under macOS's sandbox (`sandbox-exec`, which needs no
+# privileges) with every file access to a location any local user can create
+# things in turned into SIGKILL: the shared temporary directories
+# (/private/tmp, /private/var/tmp), /Users/Shared, and each --deny directory
+# (scripts/build-release-bundle passes its own scratch build root). A stat,
+# an open, a read, a write or an exec of anything that EXISTS there all
+# count, so a binary that looks for a helper at a compiled-in scratch path is
+# caught while that path exists (scripts/build-release-bundle runs its check
+# before it removes its scratch tree, and denies that tree).
+#
+# Two limits, both of the method. The sandbox checks an access only once the
+# path resolves, so a lookup of a name that does not exist (yet) is not
+# seen; the byte scan in check-release-bundle is what catches such a path.
+# And it sees only what the given arguments run. A syscall trace (dtruss,
+# fs_usage) would see more, but needs root, which is why this uses the
+# sandbox.
+#
+# The command runs with a scratch HOME and TMPDIR of its own (inside the
+# per-user temporary directory, never the shared one), PATH=/usr/bin:/bin,
+# stdin from /dev/null, and its cwd in that scratch directory.
+#
+# Exit 0: the command finished (with any exit status of its own; that status
+# is printed) and touched none of the denied locations. Exit 1: it was killed
+# for touching one. Exit 2: usage, or sandbox-exec is not available.
+set -euo pipefail
+
+DENY=(/private/tmp /private/var/tmp /Users/Shared)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --deny) [[ $# -ge 2 ]] || { echo "probe-creatable-paths: --deny needs a directory" >&2; exit 2; }
+                DENY+=("$2"); shift 2 ;;
+        --) shift; break ;;
+        *) echo "usage: probe-creatable-paths [--deny <dir>]... -- <command> [args...]" >&2; exit 2 ;;
+    esac
+done
+[[ $# -ge 1 ]] || { echo "usage: probe-creatable-paths [--deny <dir>]... -- <command> [args...]" >&2; exit 2; }
+[[ -x /usr/bin/sandbox-exec ]] || { echo "probe-creatable-paths: /usr/bin/sandbox-exec is not available" >&2; exit 2; }
+
+base="${TMPDIR:-}"
+[[ -n "${base}" && "${base}" != /tmp* && "${base}" != /private/tmp* ]] || base="$(getconf DARWIN_USER_TEMP_DIR)"
+WORK="$(mktemp -d "${base%/}/probe-creatable-paths.XXXXXX")"
+trap 'rm -rf "${WORK}"' EXIT
+mkdir "${WORK}/home" "${WORK}/tmp"
+
+# The profile: allow everything, then deny every access under each location,
+# with SIGKILL so the command cannot catch or ignore it. Paths are quoted as
+# SBPL strings (a backslash or a quote in a --deny path is refused).
+{
+    echo '(version 1)'
+    echo '(allow default)'
+    for d in "${DENY[@]}"; do
+        case "${d}" in *\"*|*\\*) echo "probe-creatable-paths: refusing a --deny path with a quote or backslash: ${d}" >&2; exit 2 ;; esac
+        # Both the path as given and its physical form (/tmp is /private/tmp).
+        for p in "${d}" "$(cd -P "${d}" 2>/dev/null && pwd -P || echo "${d}")"; do
+            printf '(deny file-read* file-write* process-exec (subpath "%s") (with send-signal SIGKILL))\n' "${p%/}"
+        done
+    done
+} >"${WORK}/profile.sb"
+
+rc=0
+(cd "${WORK}/home" && env -i HOME="${WORK}/home" TMPDIR="${WORK}/tmp/" PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+    /usr/bin/sandbox-exec -f "${WORK}/profile.sb" "$@" </dev/null >"${WORK}/out" 2>&1) || rc=$?
+if [[ ${rc} -eq 137 ]]; then
+    echo "probe-creatable-paths: $* was killed for touching one of: ${DENY[*]}"
+    sed 's/^/    | /' "${WORK}/out" | tail -5
+    exit 1
+fi
+echo "probe-creatable-paths: $* exited ${rc} and touched none of: ${DENY[*]}"
+exit 0

@@ -1,0 +1,16 @@
+{
+  "name": "cauldron",
+  "owner": {
+    "name": "Cauldron"
+  },
+  "metadata": {
+    "description": "The Cauldron plugin for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "cauldron",
+      "source": "./claude-code/cauldron",
+      "description": "The cauldron MCP server, dump commands, a curator subagent and the published soup schema, for using a Cauldron soup as a knowledge graph from Claude Code."
+    }
+  ]
+}

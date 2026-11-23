@@ -177,6 +177,236 @@ pub const ACCOUNTING_REV: i64 = 1;
 /// A filesystem path as the path part of an SQLite `file:` URI: the three
 /// characters the URI grammar gives meaning to (`%`, `?`, `#`) are
 /// percent-encoded, everything else passes through.
+// ------------------------------------------------- reading a quiet store
+
+/// **A connection to the store at `path` that cannot write and creates
+/// nothing beside it**, and that no writer can change under a read.
+///
+/// The same rule as the soup's offline reads (`spine::offline::
+/// read_only_connection`, which this crate cannot depend on: its only
+/// workspace dependency is the chassis), for the same fault:
+///
+/// - with a `-wal` present, a writer's side files exist, and `mode=ro`
+///   reads through them without creating any, inside SQLite's own locking
+///   (a checkpoint waits for this reader);
+/// - with no `-wal`, the main file is not opened in place (an
+///   `immutable=1` open takes no lock, and a writer that opens the store
+///   and checkpoints rewrites pages under it). It is copied to a private
+///   file in a directory made for this one read in the temporary
+///   directory, which only its owner can enter and which is removed before
+///   the read returns ([`ReadDir`]; on APFS the copy is a clone), the copy is
+///   kept only if no `-wal` appeared and the original's identity (device,
+///   inode, size, modification and change times) did not change across the
+///   copy, and it is opened `immutable=1` and unlinked at once. A file that
+///   changed during the copy is tried again, up to [`READ_ATTEMPTS`] times;
+///   after that, or with no private directory to be had, it is read
+///   `mode=ro`, which is correct but may leave `-wal` and `-shm` beside it.
+fn private_read_connection(path: &Path) -> Result<Connection> {
+    private_read_connection_in(path, &std::env::temp_dir())
+}
+
+/// [`private_read_connection`], with its private directories made in `base`.
+fn private_read_connection_in(path: &Path, base: &Path) -> Result<Connection> {
+    let wal = side_file(path, "-wal");
+    for attempt in 0..READ_ATTEMPTS {
+        if wal.exists() {
+            return open_read_uri(path, "mode=ro");
+        }
+        if let Some(conn) = settled_copy(path, &wal, base)? {
+            return Ok(conn);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1 + attempt as u64));
+    }
+    open_read_uri(path, "mode=ro")
+}
+
+/// How many times [`private_read_connection`] copies a store that changed
+/// during the copy before it reads through SQLite's locking instead.
+const READ_ATTEMPTS: usize = 20;
+
+fn side_file(path: &Path, suffix: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
+    PathBuf::from(p)
+}
+
+/// What changes when a file is written: any write between two readings
+/// changes its modification and change times.
+fn file_identity(path: &Path) -> Result<(u64, u64, u64, i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path)
+        .map_err(|e| Error::Store(format!("cannot open {} read-only: {e}", path.display())))?;
+    Ok((m.dev(), m.ino(), m.size(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()))
+}
+
+/// A private copy of `path` taken while nothing wrote to it, opened
+/// `immutable=1` and already unlinked; `None` when a write was seen during
+/// the copy, or when no private directory can be had.
+fn settled_copy(path: &Path, wal: &Path, base: &Path) -> Result<Option<Connection>> {
+    let before = file_identity(path)?;
+    let Some(dir) = ReadDir::new(base) else {
+        return Ok(None);
+    };
+    let copy = dir.path.join("copy.db");
+    if let Err(e) = std::fs::copy(path, &copy) {
+        if !dir.path.is_dir() {
+            return Ok(None);
+        }
+        return Err(Error::Store(format!(
+            "cannot open {} read-only (copying it to read: {e})",
+            path.display()
+        )));
+    }
+    if wal.exists() || file_identity(path)? != before {
+        return Ok(None);
+    }
+    let conn = open_read_uri(&copy, "immutable=1");
+    Ok(Some(conn?))
+    // `dir` drops here: the copy (already open) and the directory go.
+}
+
+/// The prefix of every directory a read makes for its private copy:
+/// `threads-read-<pid>.<n>.<random>` in the temporary directory.
+const READ_DIR_PREFIX: &str = "threads-read-";
+
+/// The file in a read's directory whose lock says the read is alive.
+const READ_DIR_LOCK: &str = ".lock";
+
+/// A directory of the sweep's age with no lock file is a crash between its
+/// `mkdir` and its lock, never a live read.
+const UNLOCKED_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// **One read's private directory**, made for that read and removed when it
+/// is dropped, so a read leaves nothing in the temporary directory and two
+/// reads never share one. (The same design as the soup's reads, in spine's
+/// `offline` module; this crate depends on no workspace crate but the
+/// chassis, so it is a copy.)
+///
+/// - Its name, `threads-read-<pid>.<n>.<random>`, is new: a non-recursive
+///   create, mode 0700, fails if anything is already there (another name is
+///   tried, so a name someone else made first is never used), and it is
+///   used only while it is a real directory nobody else can enter. The
+///   random part comes from the standard library's per-process hash keys.
+/// - It holds a lock file, locked for the read's life. A process that dies
+///   mid-read leaves its directory and the OS drops the lock: the first
+///   read of every later process sweeps every directory of this user whose
+///   lock it can take (or that has no lock file and is older than a minute).
+struct ReadDir {
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl ReadDir {
+    fn new(base: &Path) -> Option<ReadDir> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..8 {
+            let path = base.join(format!(
+                "{READ_DIR_PREFIX}{}.{}.{:016x}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed),
+                random_u64()
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            }
+            let m = std::fs::symlink_metadata(&path).ok()?;
+            if !m.file_type().is_dir() || m.mode() & 0o077 != 0 {
+                return None;
+            }
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path.join(READ_DIR_LOCK))
+                .ok()
+                .filter(|f| f.try_lock().is_ok());
+            let Some(lock) = lock else {
+                remove_read_dir(&path);
+                return None;
+            };
+            sweep_once(base, m.uid());
+            return Some(ReadDir { path, _lock: lock });
+        }
+        None
+    }
+}
+
+impl Drop for ReadDir {
+    fn drop(&mut self) {
+        remove_read_dir(&self.path);
+    }
+}
+
+/// Remove a read's directory: the files directly in it (a symlink is
+/// removed as a link, never followed), then the directory.
+fn remove_read_dir(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// 64 bits no other process can guess.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.finish()
+}
+
+/// Once per process: sweep what reads of dead processes left in `base`.
+fn sweep_once(base: &Path, uid: u32) {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    DONE.get_or_init(|| sweep_read_dirs(base, uid));
+}
+
+/// Remove every read directory of user `uid` in `base` that no live read
+/// holds. Only a real directory owned by `uid` is touched. The directory
+/// 0.1.17's first build shared (`threads-read-<uid>`, no dot) is left alone.
+fn sweep_read_dirs(base: &Path, uid: u32) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.strip_prefix(READ_DIR_PREFIX).is_some_and(|rest| rest.contains('.')) {
+            continue;
+        }
+        let dir = e.path();
+        let Ok(m) = std::fs::symlink_metadata(&dir) else { continue };
+        if !m.file_type().is_dir() || m.uid() != uid {
+            continue;
+        }
+        let stale = match std::fs::OpenOptions::new().write(true).open(dir.join(READ_DIR_LOCK)) {
+            Ok(f) => f.try_lock().is_ok(),
+            Err(_) => m
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > UNLOCKED_STALE),
+        };
+        if stale {
+            remove_read_dir(&dir);
+        }
+    }
+}
+
+fn open_read_uri(path: &Path, param: &str) -> Result<Connection> {
+    let uri = format!("file:{}?{param}", uri_escape_path(path));
+    Ok(Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+    )?)
+}
+
 fn uri_escape_path(path: &Path) -> String {
     let mut out = String::new();
     for c in path.to_string_lossy().chars() {
@@ -1290,11 +1520,14 @@ impl Store {
     /// a live daemon and must see that log.
     /// * `-wal` present → `mode=ro`: reads through the log, so a live daemon's
     ///   uncheckpointed rows are seen. Creates no file the run did not find.
-    /// * `-wal` absent → `immutable=1`: no WAL connection is open (one would
-    ///   hold a `-wal`), so the file is the whole database; SQLite opens it
-    ///   with no locking and no side files. The window it accepts: a writer
-    ///   that opens the store DURING this read is not seen — tolerable for a
-    ///   one-row lookup, wrong for anything that holds the connection.
+    /// * `-wal` absent → the file is the whole database, but it is NOT read
+    ///   in place: an `immutable=1` open takes no lock, so a writer that opens
+    ///   the store meanwhile and checkpoints its log into the main file (an
+    ///   automatic checkpoint, or its last connection closing) rewrites pages
+    ///   under a read in flight, which then answers `database disk image is
+    ///   malformed` or, worse, a wrong answer that parses. So the file is read
+    ///   through a private, checked copy ([`private_read_connection`]), and
+    ///   the store holds that snapshot. Creates no file beside the store.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if !path.is_file() {
@@ -1303,20 +1536,7 @@ impl Store {
                 path.display()
             )));
         }
-        let mut wal = path.as_os_str().to_os_string();
-        wal.push("-wal");
-        let param = if Path::new(&wal).exists() {
-            "mode=ro"
-        } else {
-            "immutable=1"
-        };
-        let uri = format!("file:{}?{param}", uri_escape_path(path));
-        let conn = Connection::open_with_flags(
-            &uri,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_URI,
-        )?;
+        let conn = private_read_connection(path)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -6434,5 +6654,185 @@ mod durability {
             // and nothing else: no checkpoint, no shutdown path.
         }
         assert_eq!(count(&p), 25);
+    }
+}
+
+#[cfg(test)]
+mod quiet_reads {
+    //! **A read-only open of a store nobody holds** reads a private, checked
+    //! copy, never the file in place (see [`private_read_connection`]).
+
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Readers hammering a WAL store while a writer lands write after write,
+    /// each on a connection of its own that it closes (so its log is
+    /// checkpointed into the main file and removed, as a short-lived
+    /// `threads` process's is). Every write moves value between rows and
+    /// keeps the total, so a read that mixed pages of two states would see
+    /// another total. Zero refusals and every total right. (With the old
+    /// in-place `immutable=1` open this sees wrong totals and `database disk
+    /// image is malformed`.)
+    #[test]
+    fn reads_while_writes_land_are_never_refused_or_torn() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("threads.db");
+        const ROWS: i64 = 3000;
+        {
+            let c = Connection::open(&p).unwrap();
+            c.pragma_update(None, "journal_mode", "WAL").unwrap();
+            c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, pad BLOB); CREATE INDEX tv ON t(v, pad);").unwrap();
+            let tx = c.unchecked_transaction().unwrap();
+            for i in 0..ROWS {
+                tx.execute("INSERT INTO t VALUES (?1, 100, randomblob(150))", [i]).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        assert!(!side_file(&p, "-wal").exists(), "the writer's close removed its log");
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (p, stop) = (p.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    let c = Connection::open(&p).unwrap();
+                    c.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+                    let a = (n * 7919) as i64 % ROWS;
+                    c.execute_batch(&format!(
+                        "BEGIN IMMEDIATE; UPDATE t SET v = v - 5, pad = randomblob(150) WHERE id % 11 = {k}; \
+                         UPDATE t SET v = v + 5, pad = randomblob(150) WHERE id IN (SELECT id + 1 FROM t WHERE id % 11 = {k} AND id + 1 < {ROWS}); \
+                         UPDATE t SET v = v + 5 * (SELECT count(*) FROM t WHERE id % 11 = {k} AND id + 1 >= {ROWS}) WHERE id = {a}; COMMIT;",
+                        k = n % 11
+                    ))
+                    .unwrap();
+                    drop(c);
+                    n += 1;
+                }
+                n
+            })
+        };
+        let t0 = std::time::Instant::now();
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let (mut reads, mut failures) = (0u64, Vec::new());
+                    while t0.elapsed() < std::time::Duration::from_secs(6) {
+                        let got = (|| -> std::result::Result<i64, String> {
+                            let store = Store::open_read_only(&p).map_err(|e| e.to_string())?;
+                            let c = store.conn().map_err(|e| e.to_string())?;
+                            let mut st = c.prepare("SELECT v, length(pad) FROM t INDEXED BY tv").map_err(|e| e.to_string())?;
+                            let mut rows = st.query([]).map_err(|e| e.to_string())?;
+                            let (mut total, mut k) = (0i64, 0u64);
+                            while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+                                total += r.get::<_, i64>(0).map_err(|e| e.to_string())?;
+                                k += 1;
+                                if k % 25 == 0 {
+                                    std::thread::sleep(std::time::Duration::from_micros(100));
+                                }
+                            }
+                            Ok(total)
+                        })();
+                        reads += 1;
+                        match got {
+                            Ok(total) if total == ROWS * 100 => {}
+                            Ok(total) => failures.push(format!("torn read: total {total}")),
+                            Err(e) => failures.push(e),
+                        }
+                    }
+                    (reads, failures)
+                })
+            })
+            .collect();
+        let (mut all, mut reads) = (Vec::new(), 0);
+        for r in readers {
+            let (n, f) = r.join().unwrap();
+            reads += n;
+            all.extend(f);
+        }
+        stop.store(true, Ordering::SeqCst);
+        let writes = writer.join().unwrap();
+        eprintln!("{reads} reads during {writes} writes");
+        assert!(writes > 50 && reads > 50, "{reads} reads, {writes} writes");
+        assert!(all.is_empty(), "{} of {reads} reads failed: {:?}", all.len(), &all[..all.len().min(5)]);
+    }
+
+    /// A read-only open of a store at rest leaves nothing: no side file,
+    /// the same file, no private copy; and its store cannot write.
+    #[test]
+    fn a_read_of_a_store_at_rest_leaves_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("threads.db");
+        drop(Store::open(&p).unwrap());
+        assert!(!side_file(&p, "-wal").exists(), "precondition: at rest");
+        let list = || {
+            let mut v: Vec<String> = std::fs::read_dir(d.path()).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).collect();
+            v.sort();
+            v
+        };
+        let before = (list(), file_identity(&p).unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp_list = || std::fs::read_dir(tmp.path()).unwrap().count();
+        let conn = private_read_connection_in(&p, tmp.path()).unwrap();
+        assert_eq!(tmp_list(), 0, "the copy and its directory are gone before the read returns");
+        assert!(conn.execute("CREATE TABLE x(y)", []).is_err(), "it cannot write");
+        drop(conn);
+        let store = Store::open_read_only(&p).unwrap();
+        assert!(store.list_disabled_accounts().is_ok());
+        assert!(store.conn().unwrap().execute("CREATE TABLE x(y)", []).is_err(), "it cannot write");
+        drop(store);
+        assert_eq!((list(), file_identity(&p).unwrap()), before, "the read wrote beside or to the file");
+        assert_eq!(tmp_list(), 0, "a private copy was left behind");
+    }
+
+    /// A read's directory is new, mode 0700, locked while it lives and
+    /// removed on drop; the sweep removes what a dead read left (its lock
+    /// free) and leaves a live read's, a young one being made, the older
+    /// shared directory, a symlink (and its target) and other names alone.
+    #[test]
+    fn a_read_directory_is_private_and_the_sweep_takes_only_dead_ones() {
+        use std::os::unix::fs::MetadataExt;
+        let base = tempfile::tempdir().unwrap();
+        let b = base.path();
+        let me = std::fs::metadata(b).unwrap().uid();
+        let one = ReadDir::new(b).expect("made");
+        let two = ReadDir::new(b).expect("made");
+        assert_ne!(one.path, two.path);
+        assert_eq!(std::fs::symlink_metadata(&one.path).unwrap().mode() & 0o777, 0o700);
+        let lock = std::fs::OpenOptions::new().write(true).open(one.path.join(READ_DIR_LOCK)).unwrap();
+        assert!(lock.try_lock().is_err(), "a live read's lock cannot be taken");
+        drop(lock);
+        let (p1, p2) = (one.path.clone(), two.path.clone());
+        drop(one);
+        drop(two);
+        assert!(!p1.exists() && !p2.exists());
+        let mk = |name: &str| {
+            let d = b.join(name);
+            std::fs::create_dir(&d).unwrap();
+            d
+        };
+        let dead = mk("threads-read-1.0.00000000000000aa");
+        std::fs::write(dead.join(READ_DIR_LOCK), b"").unwrap();
+        std::fs::write(dead.join("copy.db"), b"left").unwrap();
+        let alive = mk("threads-read-2.0.00000000000000bb");
+        let held = std::fs::OpenOptions::new().write(true).create_new(true).open(alive.join(READ_DIR_LOCK)).unwrap();
+        held.try_lock().unwrap();
+        let young = mk("threads-read-3.0.00000000000000cc");
+        let legacy = mk(&format!("threads-read-{me}"));
+        let target = mk("target");
+        std::fs::write(target.join(READ_DIR_LOCK), b"").unwrap();
+        std::fs::write(target.join("keep"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, b.join("threads-read-4.0.00000000000000dd")).unwrap();
+        sweep_read_dirs(b, me);
+        assert!(!dead.exists(), "a dead read's directory is swept");
+        for kept in [&alive, &young, &legacy, &target] {
+            assert!(kept.exists(), "{} kept", kept.display());
+        }
+        assert!(target.join("keep").exists(), "a symlink's target is never entered");
+        drop(held);
+        sweep_read_dirs(b, me + 1);
+        assert!(alive.exists(), "another user's sweep touches none of ours");
+        sweep_read_dirs(b, me);
+        assert!(!alive.exists());
     }
 }

@@ -1,0 +1,81 @@
+[package]
+name = "spine"
+version.workspace = true
+edition.workspace = true
+# Carried as a literal: cauldron's `[workspace.package]` declares no
+# rust-version, and this crate needs 1.85.
+rust-version = "1.85"
+# The victim is declared below as a `[[bin]]` from its examples/ path; auto
+# discovery off so the same file is not ALSO an example target.
+autoexamples = false
+
+# The transaction spine. Library only — no binary in this build. A separate
+# crate from `soup`, deliberately: the spine is multi-pool with per-pool
+# pinned grammars; soup's constraint engine and single compiled-in grammar
+# are excluded structurally.
+
+[features]
+# The test-only fault-injection seam. With the feature: `SPINE_FAULT=<stage>` aborts the process at
+# that stage. Without it: the abort code is compiled out AND a set SPINE_FAULT
+# makes the door refuse loudly by name — "absent or refusing" is testable in
+# both builds.
+fault-injection = []
+# The ONE-DOOR enforcement gate (a second write path or side door is a
+# defect by construction). With the feature: `Pool::apply_part`,
+# `Pool::create`, the SpineDb row-lifecycle flips and state setters
+# (`set_halted`, `set_quiesced`), the lock-table writers (`locks::acquire`,
+# `release_at_clear`, `release_on_abort`, `release_cleared_orphans`) and the
+# recovery writers (`recover::abort_row`, `recover::halt`) are `pub`, so
+# test suites can stage crash and lock states directly. Without it (every
+# production consumer): they are `pub(crate)`, and the only writes a
+# consumer can reach are `Cauldron::create`, `Cauldron::add_pool` (the cluster
+# pool, `cauldron@1`, and no other grammar: one whole
+# pool file moved into place, judged against the handle's pins), `Cauldron::open` (it runs the
+# recovery pass before it returns a handle), `submit`, `recover`,
+# `quiesce`, `resume` and `resume_all` (the by-hand lift). The test-support-only `Cauldron::open_unrecovered` writes nothing.
+# `tests/adversary_grammar_one_door.rs` proves the boundary by
+# building a default-features consumer crate. The dev-dependency below turns
+# the feature on for this crate's own tests; behavior is identical in both
+# builds.
+test-support = []
+# The opt-in for a maintainer-only probe that compares `grammar_v6` with the
+# external specification it was written from. That probe is not part of the
+# published source, so in this tree the feature enables nothing. No code
+# depends on it.
+v6-source-probe = []
+
+# `spine_victim` — the process the kill suites kill (tests/util/kill.rs). A
+# `[[bin]]` and not an example ONLY so that cargo sets
+# `CARGO_BIN_EXE_spine_victim` for this crate's integration tests: when the
+# build directory is shared or relocated, a test cannot guess where the
+# victim was put, so cargo's variable is the one reliable way to find it. Test-only:
+# `required-features` keeps it out of every build without `test-support`, and
+# a dependent never builds a dependency's bins, so "library only" still holds
+# for every consumer. `test = false`: it has no unit tests of its own.
+[[bin]]
+name = "spine_victim"
+path = "examples/spine_victim.rs"
+required-features = ["test-support"]
+test = false
+
+[dependencies]
+# Crate-local, the way cauldron's other SQLite users pin it
+# (`services/threads/Cargo.toml`, `services/tts/Cargo.toml`): same version and
+# features as elsewhere, so the lock resolves the one libsqlite3-sys
+# already in this workspace.
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# The v5 REGIONS pool reader (`migrate::v5`): the import by
+# regeneration reads `nodes/*.yaml` and `manifest.yaml` as the v5 pen writes
+# them.
+serde_yaml = "0.9"
+
+[dev-dependencies]
+# Self-reference: enables `test-support` for this crate's OWN test suites
+# (and examples), and for nobody else — the standard cargo shape for a
+# feature that must be on under `cargo test` and off for consumers.
+spine = { path = ".", features = ["test-support"] }
+# Every test binary's scratch under one per-run root.
+test-scratch = { path = "../../testkit/test-scratch" }

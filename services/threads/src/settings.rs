@@ -455,6 +455,48 @@ pub struct ThreadSettings {
     /// thread uuid, summary, flags here). Stored and returned, never read.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub metadata: Value,
+    /// **A BARE COMPLETION, NOT AN AGENT.** `None` (the default, and what
+    /// every thread that does not name it gets) changes nothing. `Some` makes
+    /// every turn of this thread a text answer with nothing attached: no
+    /// tools of any kind, no MCP server (not even this daemon's own MCP endpoint),
+    /// no settings files, plugins, hooks, skills or CLAUDE.md, never a
+    /// skip-permissions mode, no session file, a bounded answer, and a child
+    /// environment stripped to what `claude` needs to run and log in. The
+    /// exact argv and environment are [`crate::spawn::SpawnConfig`]'s
+    /// (`build_args`, `env`); nothing about it can be loosened by a later
+    /// `threads.update`, because it is not in [`SettingsPatch`] and it
+    /// overrides the tool, permission, plugin and directory settings that are.
+    /// Set at creation only, by a caller that sends untrusted text to a model
+    /// (cauldron's ripples).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<Completion>,
+}
+
+/// What a bare-completion thread is bounded by — see
+/// [`ThreadSettings::completion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Completion {
+    /// The most tokens one answer may have (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`
+    /// in the child's environment), `1..=`[`Completion::MAX_OUTPUT_TOKENS`].
+    pub max_output_tokens: u32,
+}
+
+impl Completion {
+    /// The largest bound a caller may ask for.
+    pub const MAX_OUTPUT_TOKENS: u32 = 64_000;
+
+    /// Refuses a bound of zero or above [`Completion::MAX_OUTPUT_TOKENS`].
+    pub fn check(&self) -> std::result::Result<(), String> {
+        if self.max_output_tokens == 0 || self.max_output_tokens > Self::MAX_OUTPUT_TOKENS {
+            return Err(format!(
+                "`completion.max_output_tokens` must be 1..={}, got {}",
+                Self::MAX_OUTPUT_TOKENS,
+                self.max_output_tokens
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_true() -> bool {
@@ -1017,6 +1059,7 @@ impl ThreadSettings {
             projection: Projection::default(),
             projection_allow_loss: Vec::new(),
             metadata: Value::Null,
+            completion: None,
         }
     }
 

@@ -1,0 +1,52 @@
+{
+  "edge_kinds": {
+    "claims": {
+      "at_most_one_per_from": false,
+      "at_most_one_per_to": false,
+      "from": [
+        {
+          "at": "local",
+          "node_type": "cluster"
+        }
+      ],
+      "to": [
+        {
+          "at": "reach",
+          "kind": "workspace",
+          "node_type": "region"
+        }
+      ]
+    }
+  },
+  "kind": "cauldron",
+  "node_types": {
+    "cluster": {
+      "count_cells": {},
+      "fields": {
+        "boundary": {
+          "kind": "text",
+          "max_chars": 1000,
+          "min_chars": 40,
+          "required": true
+        },
+        "handle": {
+          "kind": "text",
+          "max_chars": 235,
+          "min_chars": 1,
+          "required": true
+        },
+        "meta": {
+          "kind": "object",
+          "max_chars": null,
+          "min_chars": null,
+          "required": false
+        }
+      },
+      "id_prefix": "CL",
+      "required_edges_at_mint": {},
+      "states": []
+    }
+  },
+  "pool": "cauldron",
+  "version": 1
+}

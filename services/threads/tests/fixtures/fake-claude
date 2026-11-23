@@ -177,6 +177,10 @@ done
 
 PROMPT="$(cat)"
 
+# Refuse what the real CLI refuses, as it refuses it (`claude-cli-check`).
+. "$(dirname "${BASH_SOURCE[0]}")/claude-cli-check"
+claude_cli_check "$@"
+
 # PROMPT CAPTURE (opt-in, additive — no existing branch changes behaviour).
 # A prompt carrying `promptfile=<path>` gets written VERBATIM to that path,
 # APPENDED with a NUL separator so several turns on one thread can each be

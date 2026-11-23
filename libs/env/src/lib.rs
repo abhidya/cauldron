@@ -45,6 +45,9 @@
 //!    consumer* — never by sitting in the data path.
 
 pub mod alias;
+// Cauldrons live inside environments (`data/<env>/cauldrons/<name>/`).
+pub mod cauldron;
+pub use cauldron::{Cauldron, CauldronKind, CauldronMeta, CauldronSource, Fallback};
 // R9.CFG1 (E18-19): `[cli] interface` — which binary PATH's `cauldron` runs.
 pub mod cli_config;
 pub mod decl;
@@ -57,10 +60,19 @@ pub mod hold;
 pub mod hosting;
 pub mod identity;
 pub mod lock;
+// Who may act for the owner: the one decision every owner act asks.
+pub mod owner_acts;
 pub mod paths;
+pub mod private;
+// The region locks a writer holds while it prepares a write (a ripple).
+pub mod region_locks;
+// Automatic processing of dumps: the per-cauldron setting and its journal.
+pub mod ripples_auto;
 pub mod seams;
 pub mod supervisions;
 pub mod tccd;
+// Whether a helper path may be executed: owner, mode and every directory on it.
+pub mod trust;
 pub mod warnings;
 
 pub use paths::Environment;

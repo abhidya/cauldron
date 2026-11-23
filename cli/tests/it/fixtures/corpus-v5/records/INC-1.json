@@ -1,0 +1,10 @@
+{
+  "id": "INC-1",
+  "type": "incident",
+  "state": "closed",
+  "handle": "An import once stopped half way.",
+  "in_region": [
+    "R-1"
+  ],
+  "cite": "notes#9"
+}

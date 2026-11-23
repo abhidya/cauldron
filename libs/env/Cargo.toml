@@ -9,6 +9,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
+# Region-lock rows carry RFC 3339 instants (`region_locks`).
+chrono = { workspace = true }
 # sha256 of a build directory's declaration snapshot, checked at every launch
 # (`decl::snapshot`). Already in the lock at 0.10 for `services/tts`.
 sha2 = "0.10"
@@ -18,3 +20,5 @@ url = "2"
 
 [lints.rust]
 unsafe_code = "forbid"
+# Set by scripts/build-release-bundle for the prebuilt binaries.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(cauldron_release_bundle)"] }

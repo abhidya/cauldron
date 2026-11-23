@@ -76,7 +76,8 @@ async fn perform_unmasked(h: &client::Handle, a: &Action) -> Outcome {
         Command::Local { argv } => {
             // ONE refusal path (MERGE-15): env::egress::admit_login_tool,
             // whose first arm is REL-6a5's "not pointed at a stand-in" rule.
-            if let Some(why) = action::isolated_set_live_refusal(std::path::Path::new(&argv[0])) {
+            // Then whether the helper may be executed at all (local_refusal).
+            if let Some(why) = action::local_refusal(std::path::Path::new(&argv[0])) {
                 return Outcome::Done(why, Tone::Bad);
             }
             if let Some(why) = action::config_dir_refusal() {
@@ -113,8 +114,7 @@ async fn perform_unmasked(h: &client::Handle, a: &Action) -> Outcome {
 async fn run_captured(argv: &[String]) -> Result<(bool, String, String), String> {
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        tokio::process::Command::new(&argv[0])
-            .args(&argv[1..])
+        tokio::process::Command::from(action::helper_command(argv))
             .stdin(std::process::Stdio::null())
             .output(),
     )

@@ -1,0 +1,112 @@
+# Sourced by the fake `claude` fixtures (never run on its own, never a real
+# invocation): refuse a command line the way the real CLI (2.1.x) refuses it,
+# BEFORE the fake does anything a test can mistake for a turn. Each refusal
+# below is the real CLI's own message, exit 1, nothing on stdout; each was
+# observed on the installed CLI with no model reached. A fake that accepts
+# what the real CLI refuses is how a release shipped a completion argv no real
+# `claude` would start (an unloadable `--json-schema`), with every test green.
+#
+# What it checks:
+#   - every option is one `claude --help` lists, with its argument shape
+#     (a flag, one value, a variadic list, an optional value; `--x=v` too);
+#     `tests/it/claude_help_flags.rs` holds this table to the real `--help`;
+#   - `--session-id` is a UUID, and is never combined with `--resume` or
+#     `--continue` without `--fork-session`;
+#   - `--print` with `--output-format stream-json` also has `--verbose`;
+#   - `--json-schema` is a JSON object whose top-level `$schema`, if any, is
+#     the draft-07 one (the CLI cannot load the 2020-12 meta-schema);
+#   - `--print` reads its prompt from stdin to EOF (the caller must close it)
+#     or from a positional argument, and refuses when there is neither.
+#
+# Call `claude_cli_check "$@"` after `PROMPT="$(cat)"` (or with
+# `CLAUDE_CLI_CHECK_NO_STDIN=1` for a call that reads no stdin).
+
+CLAUDE_CLI_FLAGS=" --allow-dangerously-skip-permissions --ax-screen-reader --bg --background --bare --brief --chrome -c --continue --dangerously-skip-permissions --desktop --disable-slash-commands --exclude-dynamic-system-prompt-sections --fork-session --forward-subagent-text -h --help --ide --include-hook-events --include-partial-messages --no-chrome --no-session-persistence -p --print --replay-user-messages --restricted --safe-mode --strict-mcp-config --tmux --verbose -v --version "
+CLAUDE_CLI_ONE=" --agent --agents --append-system-prompt --autocompact --debug-file --effort --environment --fallback-model --input-format --json-schema --max-budget-usd --model -n --name --output-format --permission-mode --permission-prompts --plugin-dir --plugin-url --remote-control-session-name-prefix --session-id --setting-sources --settings --system-prompt --system-prompt-snapshot "
+CLAUDE_CLI_MANY=" --add-dir --allowedTools --allowed-tools --betas --disallowedTools --disallowed-tools --file --mcp-config --tools "
+CLAUDE_CLI_OPTIONAL=" --cloud -d --debug --from-pr --prompt-suggestions --remote-control -r --resume --teleport -w --worktree "
+
+claude_cli_refuse() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+claude_cli_check() {
+  local print=0 verbose=0 fork=0 resume=0 sid="" fmt="" schema="" have_schema=0 positional=0
+  local args=("$@") i=0 n=$# a opt val
+  while (( i < n )); do
+    a="${args[$i]}"
+    i=$((i + 1))
+    case "$a" in
+      --) positional=$((positional + n - i)); break ;;
+      -*) ;;
+      *) positional=$((positional + 1)); continue ;;
+    esac
+    opt="$a"
+    val=""
+    local inline=0
+    if [[ "$a" == --*=* ]]; then
+      opt="${a%%=*}"
+      val="${a#*=}"
+      inline=1
+    fi
+    if [[ "$CLAUDE_CLI_FLAGS" == *" $opt "* ]]; then
+      (( inline )) && claude_cli_refuse "error: option '$opt' does not take an argument"
+    elif [[ "$CLAUDE_CLI_ONE" == *" $opt "* ]]; then
+      if (( ! inline )); then
+        (( i < n )) || claude_cli_refuse "error: option '$opt' argument missing"
+        val="${args[$i]}"
+        i=$((i + 1))
+      fi
+    elif [[ "$CLAUDE_CLI_MANY" == *" $opt "* ]]; then
+      if (( ! inline )); then
+        (( i < n )) || claude_cli_refuse "error: option '$opt' argument missing"
+        # Variadic: every following argument that is not an option.
+        while (( i < n )) && [[ "${args[$i]}" != -* ]]; do
+          i=$((i + 1))
+        done
+      fi
+    elif [[ "$CLAUDE_CLI_OPTIONAL" == *" $opt "* ]]; then
+      if (( ! inline )) && (( i < n )) && [[ "${args[$i]}" != -* ]]; then
+        val="${args[$i]}"
+        i=$((i + 1))
+      fi
+    else
+      claude_cli_refuse "error: unknown option '$opt'"
+    fi
+    case "$opt" in
+      -p|--print) print=1 ;;
+      --verbose) verbose=1 ;;
+      --fork-session) fork=1 ;;
+      -r|--resume|-c|--continue) resume=1 ;;
+      --session-id) sid="$val" ;;
+      --output-format) fmt="$val" ;;
+      --json-schema) schema="$val"; have_schema=1 ;;
+    esac
+  done
+  if [[ -n "$sid" ]]; then
+    [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+      || claude_cli_refuse "Error: Invalid session ID. Must be a valid UUID."
+    if (( resume && ! fork )); then
+      claude_cli_refuse "Error: --session-id can only be used with --continue or --resume if --fork-session is also specified."
+    fi
+  fi
+  if (( print )) && [[ "$fmt" == "stream-json" ]] && (( ! verbose )); then
+    claude_cli_refuse "Error: When using --print, --output-format=stream-json requires --verbose"
+  fi
+  if (( have_schema )); then
+    [[ "$schema" =~ ^[[:space:]]*\{ ]] || claude_cli_refuse "Error: --json-schema is not a valid JSON Schema: the schema must be a JSON object"
+    local dialect_re='"\$schema"[[:space:]]*:[[:space:]]*"([^"]*)"'
+    if [[ "$schema" =~ $dialect_re ]]; then
+      local d="${BASH_REMATCH[1]}"
+      d="${d%#}"
+      if [[ "$d" != "http://json-schema.org/draft-07/schema" ]]; then
+        claude_cli_refuse "Error: --json-schema is not a valid JSON Schema: no schema with key or ref \"${BASH_REMATCH[1]}\""
+      fi
+    fi
+  fi
+  if (( print )) && (( positional == 0 )) && [[ -z "${CLAUDE_CLI_CHECK_NO_STDIN:-}" ]] && [[ -z "${PROMPT//[[:space:]]/}" ]]; then
+    claude_cli_refuse "Error: Input must be provided either through stdin or as a prompt argument when using --print"
+  fi
+  return 0
+}

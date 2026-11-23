@@ -8,12 +8,9 @@
 //! (`test_isolation::install!`), so every child is isolated.
 //!
 //! **The `tui` here is the REAL one**, which `cargo test -p cauldron` does not
-//! build: it is looked for beside this crate's `cauldron`, then in the
-//! workspace's `target/debug/`. Under cargo-lease `target/debug/` holds only
-//! the CURRENT command's outputs, so run this with the face in the same
-//! command: `cargo test -p cauldron -p tui --test it ctl`. A missing or
-//! stale one — one that does not know `--send` — FAILS the test rather than
-//! skipping it.
+//! build: the tests build it themselves, from this worktree, once per test
+//! process (`tui_bin`), so `cargo test -p cauldron --test it` runs them alone.
+//! One that does not know `--send` FAILS the test rather than skipping it.
 //!
 //! - **C1** `ctl dump` and the face's own `--dump --send`, given the same
 //!   bucket, append the same record (`seq`/`at` masked), and what `ctl`
@@ -41,17 +38,34 @@ use serde_json::{json, Value};
 
 const CAULDRON: &str = env!("CARGO_BIN_EXE_cauldron");
 
-/// The built face, or a failure saying how to build it. Fresh means it knows
-/// `--send` (its usage names it): a stale `tui` would pass C1 for nothing.
+/// The face, built from THIS worktree by cargo once per test process (as
+/// `mcp_service` builds its service), at the path cargo reports. Building it
+/// here means `cargo test -p cauldron --test it` needs no `-p tui` beside it
+/// and can never pick up a stale face. Fresh means it knows `--send` (its
+/// usage names it): a stale `tui` would pass C1 for nothing.
 fn tui_bin() -> PathBuf {
-    let beside = Path::new(CAULDRON).parent().map(|d| d.join("tui"));
-    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("target").join("debug").join("tui");
-    let found = beside.into_iter().chain([ws]).find(|p| p.is_file()).unwrap_or_else(|| {
-        panic!("no built `tui` beside {CAULDRON} or in target/debug: run it in the same cargo command as the face (`cargo test -p cauldron -p tui --test it ctl`): cargo-lease leaves only the CURRENT command's outputs in target/debug")
-    });
-    let help = Command::new(&found).args(["--cauldron", "--help"]).env("CAULDRON_OPENER", "none").output().expect("run tui --help");
-    assert!(String::from_utf8_lossy(&help.stdout).contains("--send"), "{} is stale (no --send): rebuild with `cargo build --workspace`", found.display());
-    found
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let target = Path::new(CAULDRON).parent().unwrap().parent().unwrap();
+        let out = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["build", "-p", "tui", "--bin", "tui", "--message-format=json-render-diagnostics", "--target-dir"])
+            .arg(target)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stderr(Stdio::inherit())
+            .output()
+            .expect("spawn cargo build -p tui");
+        assert!(out.status.success(), "building tui for the test: {:?}", out.status);
+        let exe = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == "tui" && m["target"]["kind"][0] == "bin")
+            .find_map(|m| m["executable"].as_str().map(PathBuf::from))
+            .expect("cargo reported no tui executable");
+        let help = Command::new(&exe).args(["--cauldron", "--help"]).env("CAULDRON_OPENER", "none").output().expect("run tui --help");
+        assert!(String::from_utf8_lossy(&help.stdout).contains("--send"), "{} does not know --send", exe.display());
+        exe
+    })
+    .clone()
 }
 
 struct Scratch(PathBuf);

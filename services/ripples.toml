@@ -1,0 +1,44 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  ripples — A DUMP BECOMES KNOWLEDGE-GRAPH RECORDS, WHEN ITS OWNER ASKS.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# One per environment. OFF unless started: the installer does not pin it (a
+# release bundle carries its image; `cauldron --env <env> build ripples`
+# installs it with no cargo), and
+# in this release it processes nothing on its own. It runs one dump only when
+# the owner runs `cauldron ripples run <DM-n> --env <env> --cauldron <name>`.
+#
+# * It never opens a cauldron. It reads the dump and the soup, and writes
+#   records, only through the `mcp` service's ripple seam, which mints the
+#   records' provenance and is still the one writer of every granted soup.
+# * The model call goes through the `threads` service (the owner's own Claude
+#   login): one structured-output call, Opus unless `--model` chooses
+#   another, with one Opus retry.
+# * Its files live in `data/<env>/ripples/`: `run.secret` (0600, minted at
+#   every start; `cauldron ripples` reads it) and `runs.jsonl` (the run
+#   journal: every step of every run, with its token counts; never dump text).
+
+name        = "ripples"
+description = "Turns one named dump into unreviewed knowledge-graph records when its owner runs `cauldron ripples run`. Off unless started. Writes only through the mcp service. Registers its own seam."
+kind        = "daemon"
+
+# The HELLO handshake against this start's boot token.
+probe = "seam"
+
+# TERM ends the process; a run it cuts short is left in the journal as
+# interrupted, and running it again is safe.
+stop_signal = "TERM"
+
+start_timeout_ms = 15000
+
+[build]
+# A cargo source in this repository.
+package = "cauldron-ripples"
+bin     = "cauldron-ripples"
+profile = "release"
+
+# Inherits cauldron's per-environment identity; nothing signs this image
+# with an identifier of its own.
+[permissions]
+responsibility = "inherit"
+identity = ""

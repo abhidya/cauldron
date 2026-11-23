@@ -1,0 +1,16 @@
+[package]
+name = "inference-registry"
+version.workspace = true
+edition.workspace = true
+description = "Local inference, as files: the registered model files of an environment (name, path, size, sha256), the inference service's settings, a GGUF header reader, and the memory estimate a model is held to before it is loaded. Read by the inference service, the ripples service and the `cauldron` CLI; it starts nothing and dials nothing."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
